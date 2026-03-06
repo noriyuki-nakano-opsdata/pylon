@@ -1180,21 +1180,36 @@ PYLON_OIDC_CLIENT_ID=pylon
 
 ## Appendix A: Competitive Differentiation
 
-| Feature | LangGraph | CrewAI | OpenHands | Google ADK | AutoGen | Pylon |
-|---------|-----------|--------|-----------|------------|---------|-------|
-| Framework-independent | No | No | N/A | No | No | **Yes** |
-| MCP native (JSON-RPC 2.0) | No | No | Partial | Partial | No | **Yes** |
-| A2A native | No | No | No | Yes | No | **Yes** |
-| Sandbox-by-default | No | No | Docker | No | No | **gVisor/Firecracker** |
-| Checkpoint replay | Yes | No | No | No | No | **Yes (event log)** |
-| Autonomy ladder | No | No | Partial | No | No | **Yes (A0-A4)** |
-| Multi-tenant (OSS) | Commercial | No | No | No | No | **Yes** |
-| Rule-of-Two+ safety | No | No | No | No | No | **Yes** |
-| Prompt injection guard | No | No | No | No | No | **Yes** |
-| MIT license | Yes* | No | MIT | Apache 2.0 | MIT | **MIT** |
-| macOS/Windows dev | Yes | Yes | Yes | Yes | Yes | **Yes (Docker tier)** |
+*Last verified: 2026-03-07. Ratings: Native / Adapter / Community / None.*
 
-*LangGraph OSS is MIT but enterprise features require commercial license.
+| Feature | LangGraph | CrewAI | OpenHands | Google ADK | MS Agent Framework | Pylon |
+|---------|-----------|--------|-----------|------------|-------------------|-------|
+| Framework-independent | None (LangChain) | None | N/A | Partial (Vertex opt.) | None (.NET/Python) | **Native** |
+| MCP support | Native (v0.2+) | Native (crewai-tools-mcp) | Native (SDK) | Native | Native | **Native (JSON-RPC 2.0)** |
+| A2A support | Native (Server) | Native (v1.9+) | None | Native (originator) | Native | **Native** |
+| Sandbox-by-default | None | None | Docker | Native (GKE gVisor) | None | **Native (gVisor/Firecracker, cloud-agnostic)** |
+| Checkpoint replay | Native (Time Travel) | None | Partial (event-sourced) | Partial (SessionService) | Partial | **Native (event log, deterministic)** |
+| Autonomy ladder | None | None | Partial | None | Partial (HITL) | **Native (A0-A4 + Policy Engine)** |
+| Multi-tenant (OSS) | Commercial only | None | None | None | Commercial only | **Native (OSS)** |
+| Safety Triad† | None | None | None | None | None | **Native** |
+| Prompt injection guard | None | None | None | None | None | **Native (multi-layer)** |
+| License | MIT* | MIT | MIT | Apache 2.0 | MIT | **MIT** |
+
+†Safety Triad = Rule-of-Two+ capability separation + Autonomy Ladder + Multi-path Kill Switch (integrated).
+*LangGraph OSS is MIT but enterprise features (LangSmith) require commercial license.
+
+**Pylon's core differentiation axis:** Not protocol support (competitors have caught up), but **Safety-by-Default integration depth** — the combination of Rule-of-Two+, Autonomy Ladder, Kill Switch, Prompt Guard, and Sandbox-by-Default as a unified, first-class safety architecture. No competing framework offers all five as built-in, policy-driven, OSS features.
+
+**Capability laundering prevention:** To prevent agents from circumventing Rule-of-Two+ by routing through intermediate agents, capability checks are applied transitively across the full agent call chain. An agent delegating to a child inherits the union of both capability sets for validation purposes.
+
+### Key competitive threats (2026)
+
+| Competitor | Threat | Pylon response |
+|-----------|--------|----------------|
+| LangGraph v0.2+ | MCP/A2A native, mature Time Travel, large community | Deeper safety integration, cloud-agnostic sandbox, OSS multi-tenant |
+| Google ADK + GKE Agent Sandbox | gVisor sandbox with SandboxClaim CRD, Google ecosystem | Cloud-agnostic (not GKE-locked), integrated safety triad |
+| MS Agent Framework | Enterprise reach, Azure integration, multi-language | MIT OSS, no cloud lock-in, superior safety model |
+| OpenAgents | Similar MCP+A2A positioning | Safety Triad, production-grade sandbox, checkpoint replay |
 
 ---
 
@@ -1226,3 +1241,53 @@ The following detailed design documents must be written before implementation be
 | RFC-003 | SPIFFE/SPIRE Trust Domain Design | M3 | **Required** |
 | RFC-004 | OAuth 2.1 Implementation Details | M1 | **Required** |
 | RFC-005 | OpenTelemetry GenAI Integration | M3 | **Required** |
+
+---
+
+## Appendix D: OSS Sustainability Strategy
+
+### License Boundary
+
+| OSS (MIT) | Enterprise (ELv2 or BSL) |
+|-----------|--------------------------|
+| Single-tenant runtime | Multi-tenant management console |
+| gVisor + Docker sandbox | Firecracker microVM tier |
+| Local checkpoints + replay | Distributed checkpoints + cross-region DR |
+| Basic Policy Engine + Autonomy Ladder | Policy Packs (compliance templates), WORM audit log long-term retention |
+| CLI + Python/TS SDK | Web Console, SSO/SAML integration |
+| Community support | SLA-backed support, dedicated CSM |
+| Basic OTel instrumentation | Agent thought-process visualization, cost attribution dashboards |
+
+### Revenue Model Options (post-GA)
+
+1. **Open Core** (recommended): MIT core + Enterprise modules under ELv2
+2. **Managed Service** ("Pylon Cloud"): Hosted platform (M5+ roadmap)
+3. **Support & Consulting**: Enterprise support SLA + deployment consulting
+
+### Plugin/Extension Architecture (M2+)
+
+Three plugin categories with defined interfaces:
+
+| Category | Interface | Example |
+|----------|-----------|---------|
+| Sandbox Runtime | `SandboxProvider` protocol | Custom Kata Containers, Wasm sandbox |
+| LLM Provider | `LLMProvider` protocol | Custom fine-tuned model, local inference |
+| Policy Rule | `PolicyRule` protocol | Industry-specific compliance checks |
+
+Plugin discovery via `pylon plugin install <name>` (CLI) and Plugin Registry (Web Console).
+Plugin SDK and development guide planned for M2.
+
+---
+
+## Appendix E: Killer Use Case Strategy
+
+### Primary Use Case: Autonomous Code Review & Repair
+
+Pylon's Coding Loop (FR-04) + Safety Triad positions it uniquely for **autonomous code review with automated fix suggestions**, targeting:
+- SWE-bench Verified top-tier performance (target: >40% resolve rate at M2)
+- Enterprise CI/CD integration (GitHub Actions, GitLab CI)
+- Safety guarantees that no competing tool offers (sandbox execution, approval gates, audit trail)
+
+### Success Metric
+
+By M2 (Developer Beta), publish reproducible SWE-bench Verified results demonstrating competitive or superior performance to OpenHands/Aider, with the additional safety guarantees as the differentiator.
