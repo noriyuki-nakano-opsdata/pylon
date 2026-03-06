@@ -1,1 +1,1 @@
-"""Pylon sandbox — gVisor/Firecracker/Docker isolation (FR-05)."""
+"""Pylon sandbox isolation layer (FR-06)."""
