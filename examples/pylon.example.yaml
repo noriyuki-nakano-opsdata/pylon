@@ -1,0 +1,62 @@
+# pylon.yaml — Example: PR Code Review Pipeline
+# This is the minimal project definition for Pylon.
+# 30 lines to get started, scales to enterprise.
+
+version: "1"
+name: pr-review-pipeline
+description: Automated code review with plan-review-approve workflow
+
+agents:
+  planner:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Analyze PR diffs and create a structured review plan.
+      Focus on security, performance, and maintainability.
+    autonomy: A2
+    tools: [github-pr-read, file-read, file-search]
+    sandbox: gvisor
+
+  reviewer:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Execute the review plan. Post inline comments on issues found.
+      Provide actionable suggestions with code examples.
+    autonomy: A2
+    tools: [github-pr-comment, file-read]
+    sandbox: gvisor
+
+  approver:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Final review gate. Approve or request changes based on severity.
+    autonomy: A3  # Requires human approval before merging
+    tools: [github-pr-approve, github-pr-request-changes]
+
+workflow:
+  type: graph
+  nodes:
+    analyze:
+      agent: planner
+      next: review
+    review:
+      agent: reviewer
+      next:
+        - target: approve
+          condition: "state.issues_found > 0"
+        - target: END
+          condition: "state.issues_found == 0"
+    approve:
+      agent: approver
+      next: END
+
+policy:
+  max_cost_usd: 5.0
+  max_duration: 30m
+  require_approval_above: A3
+  safety:
+    blocked_actions:
+      - "git push --force"
+      - "git branch -D main"
+    max_file_changes: 50
+  compliance:
+    audit_log: required
