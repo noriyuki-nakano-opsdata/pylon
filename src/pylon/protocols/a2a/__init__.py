@@ -1,1 +1,1 @@
-"""A2A RC v1.0 protocol implementation (FR-09)."""
+"""A2A protocol implementation (FR-09)."""
