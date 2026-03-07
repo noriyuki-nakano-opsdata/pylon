@@ -6,7 +6,7 @@ import click
 
 from pylon.cli.output import OutputFormatter, auto_detect_format
 
-_VERSION = "0.1.0"
+_VERSION = "0.2.0"
 
 
 class CliContext:

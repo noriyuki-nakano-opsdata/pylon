@@ -22,7 +22,7 @@
 
 ```bash
 # Install
-pip install pylon
+pip install pylon-ai
 
 # Initialize a project
 pylon init my-project

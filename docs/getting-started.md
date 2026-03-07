@@ -8,7 +8,7 @@
 ## Installation
 
 ```bash
-pip install pylon
+pip install pylon-ai
 ```
 
 Or for development:
@@ -86,8 +86,8 @@ pylon run
 # Run with input
 pylon run --input '{"topic": "distributed systems"}'
 
-# Run with a specific workflow
-pylon run --workflow research-pipeline
+# Run a specific workflow
+pylon run research-pipeline
 ```
 
 ## Agent Autonomy Levels
@@ -112,19 +112,6 @@ Pylon enforces safety at multiple levels:
 4. **Output Validation**: Shell injection and path traversal detection before tool execution
 5. **Kill Switch**: Emergency halt at global, tenant, workflow, or agent scope
 6. **Sandbox Isolation**: Resource limits and network policies per execution tier
-
-## Starting the API Server
-
-```bash
-# Start the API server
-pylon server --port 8080
-
-# With authentication
-pylon server --port 8080 --auth-token YOUR_TOKEN
-
-# Health check
-curl http://localhost:8080/health
-```
 
 ## Environment Variables
 
