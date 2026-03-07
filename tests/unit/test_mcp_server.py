@@ -114,10 +114,11 @@ class TestInitialize:
         req = JsonRpcRequest(method="initialize", params={"capabilities": {}}, id=1)
         resp = server.handle_request(req)
         assert resp.error is None
-        assert resp.result["capabilities"]["tools"] is True
-        assert resp.result["capabilities"]["resources"] is True
-        assert resp.result["capabilities"]["prompts"] is True
-        assert resp.result["capabilities"]["sampling"] is True
+        caps = resp.result["capabilities"]
+        assert caps["tools"] == {"listChanged": True}
+        assert caps["resources"] == {"listChanged": True, "subscribe": True}
+        assert caps["prompts"] == {"listChanged": True}
+        assert caps["sampling"] == {}
         assert "sessionId" in resp.result
         assert resp.headers.get("Mcp-Session-Id") == resp.result["sessionId"]
 
@@ -128,15 +129,38 @@ class TestInitialize:
         assert resp.result["serverInfo"]["name"] == "my-server"
         assert resp.result["serverInfo"]["version"] == "1.0.0"
 
+    def test_initialize_with_supported_protocol_version(self):
+        server = _make_server_with_all()
+        req = JsonRpcRequest(
+            method="initialize",
+            params={"capabilities": {}, "protocolVersion": "2024-11-05"},
+            id=1,
+        )
+        resp = server.handle_request(req)
+        assert resp.error is None
+        assert resp.result["protocolVersion"] == "2025-11-25"
+
+    def test_initialize_with_unsupported_protocol_version(self):
+        server = _make_server_with_all()
+        req = JsonRpcRequest(
+            method="initialize",
+            params={"capabilities": {}, "protocolVersion": "2020-01-01"},
+            id=1,
+        )
+        resp = server.handle_request(req)
+        assert resp.error is not None
+        assert resp.error.message == "Internal error"
+        assert "Unsupported protocol version" in resp.error.data
+
     def test_initialize_empty_server(self):
         server = McpServer()
         req = JsonRpcRequest(method="initialize", params={}, id=1)
         resp = server.handle_request(req)
         caps = resp.result["capabilities"]
-        assert caps["tools"] is False
-        assert caps["resources"] is False
-        assert caps["prompts"] is False
-        assert caps["sampling"] is False
+        assert "tools" not in caps
+        assert "resources" not in caps
+        assert "prompts" not in caps
+        assert "sampling" not in caps
 
 
 # ===== 2. Tools =====

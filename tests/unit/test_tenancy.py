@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
+
 import pytest
 
 from pylon.tenancy.config import (
@@ -21,6 +26,7 @@ from pylon.tenancy.context import (
     deserialize_tenant_context,
     get_tenant,
     require_tenant,
+    run_in_tenant_context,
     serialize_tenant_context,
     set_tenant,
     tenant_scope,
@@ -103,6 +109,23 @@ class TestTenantContext:
                 assert get_tenant().tenant_id == "inner"
             assert get_tenant().tenant_id == "outer"
         assert get_tenant() is None
+
+    @pytest.mark.asyncio
+    async def test_run_in_tenant_context_propagates(self) -> None:
+        ctx = TenantContext(tenant_id="propagated", tenant_name="Propagated")
+        clear_tenant()
+
+        captured: list[str] = []
+
+        async def inner_coro() -> str:
+            t = get_tenant()
+            assert t is not None
+            captured.append(t.tenant_id)
+            return t.tenant_id
+
+        result = await run_in_tenant_context(ctx, inner_coro())
+        assert result == "propagated"
+        assert captured == ["propagated"]
 
 
 # --- Data Isolation Tests ---
@@ -326,3 +349,72 @@ class TestTenantConfigEnhanced:
         assert resolved["timeout"] == 60  # tenant overrides global
         # cleanup
         set_global_policies({})
+
+
+# --- Token Tenant Resolver (JWT Signature) Tests ---
+
+
+def _make_jwt(payload: dict, secret: str | None = None) -> str:
+    """Create a JWT token, optionally signed with HS256."""
+    header = base64.urlsafe_b64encode(
+        json.dumps({"alg": "HS256" if secret else "none", "typ": "JWT"}).encode()
+    ).rstrip(b"=").decode()
+    body = base64.urlsafe_b64encode(
+        json.dumps(payload).encode()
+    ).rstrip(b"=").decode()
+    if secret:
+        signing_input = f"{header}.{body}".encode("ascii")
+        sig = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
+        sig_b64 = base64.urlsafe_b64encode(sig).rstrip(b"=").decode()
+    else:
+        sig_b64 = "unsigned"
+    return f"{header}.{body}.{sig_b64}"
+
+
+class TestTokenTenantResolverSignature:
+    def _make_resolver(self, tenant_id: str = "t1", secret: str | None = None):
+        from pylon.tenancy.middleware import TenantDirectory, TokenTenantResolver
+
+        directory = TenantDirectory()
+        directory.register(TenantContext(tenant_id=tenant_id, tenant_name="Test"))
+        return TokenTenantResolver(directory, secret=secret)
+
+    def test_unsigned_token_works_without_secret(self) -> None:
+        """H4: Legacy mode (no secret) still resolves."""
+        resolver = self._make_resolver(secret=None)
+        token = _make_jwt({"tenant_id": "t1"})
+        ctx = resolver.resolve(token)
+        assert ctx.tenant_id == "t1"
+
+    def test_valid_signature_resolves(self) -> None:
+        """H4: Valid HS256 signature passes verification."""
+        secret = "my-secret-key"
+        resolver = self._make_resolver(secret=secret)
+        token = _make_jwt({"tenant_id": "t1"}, secret=secret)
+        ctx = resolver.resolve(token)
+        assert ctx.tenant_id == "t1"
+
+    def test_invalid_signature_rejected(self) -> None:
+        """H4: Tampered signature is rejected."""
+        from pylon.tenancy.middleware import TenantNotFoundError
+
+        resolver = self._make_resolver(secret="correct-secret")
+        token = _make_jwt({"tenant_id": "t1"}, secret="wrong-secret")
+        with pytest.raises(TenantNotFoundError, match="signature verification failed"):
+            resolver.resolve(token)
+
+    def test_tampered_payload_rejected(self) -> None:
+        """H4: Modified payload with original signature is rejected."""
+        from pylon.tenancy.middleware import TenantNotFoundError
+
+        secret = "my-secret"
+        token = _make_jwt({"tenant_id": "t1"}, secret=secret)
+        # Tamper with payload
+        parts = token.split(".")
+        tampered_payload = base64.urlsafe_b64encode(
+            json.dumps({"tenant_id": "t2"}).encode()
+        ).rstrip(b"=").decode()
+        tampered_token = f"{parts[0]}.{tampered_payload}.{parts[2]}"
+        resolver = self._make_resolver(tenant_id="t2", secret=secret)
+        with pytest.raises(TenantNotFoundError, match="signature verification failed"):
+            resolver.resolve(tampered_token)

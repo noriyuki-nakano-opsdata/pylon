@@ -164,6 +164,8 @@ class OAuthProvider:
             return None
         if code_challenge_method != "S256":
             return None
+        if client.redirect_uri and client.redirect_uri != redirect_uri:
+            return None
 
         code = secrets.token_urlsafe(32)
         self._auth_codes[code] = AuthorizationCode(

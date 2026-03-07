@@ -4,7 +4,7 @@ import pytest
 
 from pylon.errors import WorkflowError
 from pylon.types import ConditionalEdge
-from pylon.workflow.graph import END, WorkflowGraph
+from pylon.workflow.graph import END, WorkflowGraph, _safe_eval_condition
 
 
 class TestWorkflowGraph:
@@ -93,3 +93,116 @@ class TestWorkflowGraph:
         g.add_node("worker2", "agent2", next_nodes=[ConditionalEdge(target=END)])
         warnings = g.validate()
         assert len(warnings) == 0
+
+
+class TestSafeConditionEvaluator:
+    """Tests for the AST-based safe condition evaluator replacing eval()."""
+
+    # -- Valid conditions --
+
+    def test_equality(self):
+        assert _safe_eval_condition('state.status == "done"', {"status": "done"}) is True
+        assert _safe_eval_condition('state.status == "done"', {"status": "pending"}) is False
+
+    def test_numeric_comparison(self):
+        assert _safe_eval_condition("state.count > 0", {"count": 5}) is True
+        assert _safe_eval_condition("state.count > 0", {"count": 0}) is False
+        assert _safe_eval_condition("state.count <= 10", {"count": 10}) is True
+
+    def test_boolean_and(self):
+        assert _safe_eval_condition(
+            "state.x and state.y", {"x": True, "y": True}
+        ) is True
+        assert _safe_eval_condition(
+            "state.x and state.y", {"x": True, "y": False}
+        ) is False
+
+    def test_boolean_or(self):
+        assert _safe_eval_condition(
+            "state.x or state.y", {"x": False, "y": True}
+        ) is True
+        assert _safe_eval_condition(
+            "state.x or state.y", {"x": False, "y": False}
+        ) is False
+
+    def test_not(self):
+        assert _safe_eval_condition("not state.flag", {"flag": False}) is True
+        assert _safe_eval_condition("not state.flag", {"flag": True}) is False
+
+    def test_none_comparison(self):
+        assert _safe_eval_condition("state.val is None", {"val": None}) is True
+        assert _safe_eval_condition("state.val is not None", {"val": 42}) is True
+
+    def test_chained_comparison(self):
+        assert _safe_eval_condition("0 < state.x < 10", {"x": 5}) is True
+        assert _safe_eval_condition("0 < state.x < 10", {"x": 15}) is False
+
+    def test_negative_number(self):
+        assert _safe_eval_condition("state.temp < -5", {"temp": -10}) is True
+
+    # -- Empty / whitespace conditions --
+
+    def test_empty_condition(self):
+        assert _safe_eval_condition("", {"x": 1}) is False
+        assert _safe_eval_condition("   ", {"x": 1}) is False
+
+    # -- Malicious conditions must be blocked --
+
+    def test_blocks_import(self):
+        with pytest.raises(WorkflowError, match="Unsupported"):
+            _safe_eval_condition("__import__('os').system('id')", {"x": 1})
+
+    def test_blocks_dunder_class(self):
+        with pytest.raises(WorkflowError, match="Unsupported"):
+            _safe_eval_condition(
+                "().__class__.__bases__[0].__subclasses__()", {"x": 1}
+            )
+
+    def test_blocks_exec(self):
+        with pytest.raises(WorkflowError, match="Unsupported"):
+            _safe_eval_condition('exec("print(1)")', {"x": 1})
+
+    def test_blocks_open(self):
+        with pytest.raises(WorkflowError, match="Unsupported"):
+            _safe_eval_condition('open("/etc/passwd")', {"x": 1})
+
+    def test_blocks_lambda(self):
+        with pytest.raises(WorkflowError, match="Unsupported"):
+            _safe_eval_condition("(lambda: 1)()", {"x": 1})
+
+    def test_blocks_arbitrary_name(self):
+        with pytest.raises(WorkflowError, match="Unsupported name"):
+            _safe_eval_condition("os", {"x": 1})
+
+    def test_blocks_attribute_on_non_state(self):
+        with pytest.raises(WorkflowError, match="Attribute access only allowed on 'state'"):
+            _safe_eval_condition('"".__class__', {"x": 1})
+
+    def test_blocks_list_comprehension(self):
+        with pytest.raises(WorkflowError, match="Unsupported"):
+            _safe_eval_condition("[x for x in range(10)]", {"x": 1})
+
+    # -- Integration: used via get_next_nodes --
+
+    def test_get_next_nodes_safe_condition(self):
+        g = WorkflowGraph(name="test")
+        g.add_node("a", "agent", next_nodes=[
+            ConditionalEdge(target="b", condition='state.status == "ready"'),
+        ])
+        g.add_node("b", "agent", next_nodes=[ConditionalEdge(target=END)])
+        g.validate()
+
+        assert g.get_next_nodes("a", {"status": "ready"}) == ["b"]
+        assert g.get_next_nodes("a", {"status": "blocked"}) == []
+
+    def test_get_next_nodes_malicious_condition_returns_empty(self):
+        """Malicious conditions should be caught and the edge skipped."""
+        g = WorkflowGraph(name="test")
+        g.add_node("a", "agent", next_nodes=[
+            ConditionalEdge(target="b", condition="__import__('os')"),
+        ])
+        g.add_node("b", "agent", next_nodes=[ConditionalEdge(target=END)])
+        g.validate()
+
+        # Should not raise; malicious condition is caught and edge is skipped
+        assert g.get_next_nodes("a", {"x": 1}) == []

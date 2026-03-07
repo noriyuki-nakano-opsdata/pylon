@@ -138,6 +138,66 @@ class TestTaskQueue:
         q.enqueue(task)
         assert q.requeue(task.id) is False  # still PENDING
 
+    def test_purge_removes_terminal_tasks(self):
+        q = TaskQueue()
+        t1 = _task("t1")
+        t2 = _task("t2")
+        t3 = _task("t3")
+        q.enqueue(t1)
+        q.enqueue(t2)
+        q.enqueue(t3)
+
+        # Dequeue and complete t1
+        dequeued = q.dequeue()
+        dequeued.transition_to(TaskStatus.COMPLETED)
+
+        # Dequeue and fail t2
+        dequeued2 = q.dequeue()
+        dequeued2.transition_to(TaskStatus.FAILED)
+
+        # t3 is still pending
+        assert q.size() == 3  # all in _tasks before purge
+        removed = q.purge()
+        assert removed == 2  # COMPLETED + FAILED removed
+        assert q.size() == 1  # only t3 remains
+
+    def test_purge_cleans_heap(self):
+        q = TaskQueue()
+        created = []
+        for i in range(5):
+            t = _task(f"t{i}")
+            q.enqueue(t)
+            created.append(t)
+
+        # Cancel all but last
+        for t in created[:4]:
+            q.cancel(t.id)
+
+        q.purge()
+        # Only 1 pending task should remain in heap
+        assert len(q._heap) == 1
+
+    def test_dequeue_with_cancelled_tasks_cleans_up(self):
+        """After cancel + dequeue cycle, cancelled tasks are skipped."""
+        q = TaskQueue()
+        created = []
+        for i in range(5):
+            t = _task(f"t{i}")
+            q.enqueue(t)
+            created.append(t)
+
+        # Cancel first 4
+        for t in created[:4]:
+            q.cancel(t.id)
+
+        # Dequeue should skip cancelled and return last pending
+        result = q.dequeue()
+        assert result is not None
+        assert result.name == "t4"
+
+        # Next dequeue returns None
+        assert q.dequeue() is None
+
 
 class TestTaskFSM:
     def test_valid_transition(self):
@@ -254,6 +314,29 @@ class TestCronExpression:
         now = datetime(2026, 3, 7, 12, 3, 0, tzinfo=UTC)
         nxt = cron.next_run_after(now)
         assert nxt == datetime(2026, 3, 7, 12, 5, 0, tzinfo=UTC)
+
+    def test_every_2_days_starts_from_1(self):
+        """*/2 in day field should match 1, 3, 5, ... (1-based stepping)."""
+        cron = CronExpression("0 0 */2 * *")
+        # Day 1 should match (1-based: (1-1)%2 == 0)
+        dt_day1 = datetime(2026, 3, 1, 0, 0, 0, tzinfo=UTC)
+        assert cron._matches(dt_day1) is True
+        # Day 2 should NOT match
+        dt_day2 = datetime(2026, 3, 2, 0, 0, 0, tzinfo=UTC)
+        assert cron._matches(dt_day2) is False
+        # Day 3 should match
+        dt_day3 = datetime(2026, 3, 3, 0, 0, 0, tzinfo=UTC)
+        assert cron._matches(dt_day3) is True
+
+    def test_every_3_months_starts_from_1(self):
+        """*/3 in month field should match Jan(1), Apr(4), Jul(7), Oct(10)."""
+        cron = CronExpression("0 0 1 */3 *")
+        # January (month=1): (1-1)%3 == 0 -> match
+        assert cron._matches(datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)) is True
+        # February (month=2): (2-1)%3 == 1 -> no match
+        assert cron._matches(datetime(2026, 2, 1, 0, 0, 0, tzinfo=UTC)) is False
+        # April (month=4): (4-1)%3 == 0 -> match
+        assert cron._matches(datetime(2026, 4, 1, 0, 0, 0, tzinfo=UTC)) is True
 
     def test_invalid_expression_raises(self):
         with pytest.raises(SchedulerError):

@@ -145,6 +145,41 @@ class TestCircuitBreaker(unittest.TestCase):
         cb.call(lambda: 2)
         self.assertEqual(cb.metrics.total_calls, 2)
 
+    def test_config_validates_half_open_max_calls(self):
+        """C4: half_open_max_calls must be >= success_threshold."""
+        with self.assertRaises(ValueError):
+            CircuitBreakerConfig(success_threshold=3, half_open_max_calls=2)
+        # Valid: equal
+        cfg = CircuitBreakerConfig(success_threshold=2, half_open_max_calls=2)
+        self.assertEqual(cfg.half_open_max_calls, 2)
+
+    def test_default_config_allows_recovery(self):
+        """C4: Default config must allow HALF_OPEN -> CLOSED recovery."""
+        cfg = CircuitBreakerConfig()
+        self.assertGreaterEqual(cfg.half_open_max_calls, cfg.success_threshold)
+
+    def test_callback_not_called_under_lock(self):
+        """C3: State change callback must not deadlock."""
+        cb_ref = [None]
+
+        def callback(old, new):
+            # Access the circuit breaker's state property inside the callback.
+            # Before the fix, this would deadlock because _transition was
+            # called while holding the lock, and state also acquires the lock.
+            _ = cb_ref[0].state
+
+        cb = CircuitBreaker(
+            CircuitBreakerConfig(failure_threshold=1),
+            on_state_change=callback,
+        )
+        cb_ref[0] = cb
+        try:
+            cb.call(lambda: (_ for _ in ()).throw(RuntimeError("fail")))
+        except RuntimeError:
+            pass
+        # If we reach here, no deadlock occurred
+        self.assertEqual(cb.state, CircuitState.OPEN)
+
 
 # --- Retry ---
 

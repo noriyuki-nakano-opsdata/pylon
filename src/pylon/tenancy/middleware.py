@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
+import logging
 from typing import Protocol, runtime_checkable
 
 from pylon.tenancy.context import TenantContext
@@ -57,13 +60,55 @@ class HeaderTenantResolver:
         return ctx
 
 
-class TokenTenantResolver:
-    """Resolves tenant from JWT-like token (base64-encoded JSON payload)."""
+_logger = logging.getLogger(__name__)
 
-    def __init__(self, directory: TenantDirectory) -> None:
+
+class TokenTenantResolver:
+    """Resolves tenant from JWT-like token (base64-encoded JSON payload).
+
+    When ``secret`` is provided, the JWT signature (HS256) is verified
+    before trusting the payload.  Without a secret the resolver falls
+    back to the legacy unsigned behaviour but emits a warning.
+    """
+
+    def __init__(
+        self,
+        directory: TenantDirectory,
+        secret: str | None = None,
+    ) -> None:
         self._directory = directory
+        self._secret = secret
+        if secret is None:
+            _logger.warning(
+                "TokenTenantResolver: no secret configured; "
+                "JWT signatures will NOT be verified."
+            )
+
+    def _verify_signature(self, token: str) -> None:
+        """Verify HS256 JWT signature. Raises TenantNotFoundError on failure."""
+        parts = token.split(".")
+        if len(parts) != 3:
+            raise TenantNotFoundError("invalid token: expected 3 parts for signed JWT")
+        signing_input = f"{parts[0]}.{parts[1]}".encode("ascii")
+        sig_b64 = parts[2]
+        # Add padding
+        padding = 4 - len(sig_b64) % 4
+        if padding != 4:
+            sig_b64 += "=" * padding
+        provided_sig = base64.urlsafe_b64decode(sig_b64)
+        expected_sig = hmac.new(
+            self._secret.encode("utf-8"),
+            signing_input,
+            hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(provided_sig, expected_sig):
+            raise TenantNotFoundError("invalid token: signature verification failed")
 
     def resolve(self, token: str) -> TenantContext:
+        # Verify signature if secret is configured
+        if self._secret is not None:
+            self._verify_signature(token)
+
         try:
             parts = token.split(".")
             if len(parts) < 2:
@@ -75,6 +120,8 @@ class TokenTenantResolver:
                 payload_b64 += "=" * padding
             payload = json.loads(base64.urlsafe_b64decode(payload_b64))
             tenant_id = payload.get("tenant_id", "")
+        except TenantNotFoundError:
+            raise
         except Exception as exc:
             raise TenantNotFoundError(f"invalid token: {exc}") from exc
 

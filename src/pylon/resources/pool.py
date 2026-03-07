@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -50,71 +51,77 @@ class ResourcePool[T]:
         self._active: set[int] = set()  # id(item) tracking
         self._all: dict[int, T] = {}
         self._stats = PoolStats()
+        self._lock = threading.Lock()
 
     @property
     def stats(self) -> PoolStats:
-        self._stats.active = len(self._active)
-        self._stats.idle = len(self._idle)
-        return self._stats
+        with self._lock:
+            self._stats.active = len(self._active)
+            self._stats.idle = len(self._idle)
+            return self._stats
 
     def acquire(self) -> T:
         """Acquire a resource from the pool."""
-        # Try idle items first
-        while self._idle:
-            item = self._idle.popleft()
-            if self._is_valid(item):
-                self._active.add(id(item))
-                return item
-            # Invalid item - discard
-            self._all.pop(id(item), None)
+        with self._lock:
+            # Try idle items first
+            while self._idle:
+                item = self._idle.popleft()
+                if self._is_valid(item):
+                    self._active.add(id(item))
+                    return item
+                # Invalid item - discard
+                self._all.pop(id(item), None)
 
-        # Create new if within bounds
-        total = len(self._active) + len(self._idle)
-        if total >= self._config.max_size:
-            self._stats.wait_count += 1
-            raise PoolExhaustedError(
-                f"Pool exhausted: {total}/{self._config.max_size}",
-                details={"active": len(self._active), "idle": len(self._idle)},
-            )
+            # Create new if within bounds
+            total = len(self._active) + len(self._idle)
+            if total >= self._config.max_size:
+                self._stats.wait_count += 1
+                raise PoolExhaustedError(
+                    f"Pool exhausted: {total}/{self._config.max_size}",
+                    details={"active": len(self._active), "idle": len(self._idle)},
+                )
 
-        item = self._factory()
-        self._all[id(item)] = item
-        self._active.add(id(item))
-        self._stats.total_created += 1
-        return item
+            item = self._factory()
+            self._all[id(item)] = item
+            self._active.add(id(item))
+            self._stats.total_created += 1
+            return item
 
     def release(self, item: T) -> None:
         """Return a resource to the pool."""
-        item_id = id(item)
-        if item_id not in self._active:
-            return
-        self._active.discard(item_id)
-        if self._is_valid(item):
-            self._idle.append(item)
-        else:
-            self._all.pop(item_id, None)
+        with self._lock:
+            item_id = id(item)
+            if item_id not in self._active:
+                return
+            self._active.discard(item_id)
+            if self._is_valid(item):
+                self._idle.append(item)
+            else:
+                self._all.pop(item_id, None)
 
     def destroy(self, item: T) -> None:
         """Permanently remove a resource from the pool."""
-        item_id = id(item)
-        self._active.discard(item_id)
-        # Remove from idle if present
-        self._idle = deque(i for i in self._idle if id(i) != item_id)
-        self._all.pop(item_id, None)
+        with self._lock:
+            item_id = id(item)
+            self._active.discard(item_id)
+            # Remove from idle if present
+            self._idle = deque(i for i in self._idle if id(i) != item_id)
+            self._all.pop(item_id, None)
 
     def fill(self) -> int:
         """Pre-fill pool to min_size. Returns number created."""
-        created = 0
-        while len(self._idle) < self._config.min_size:
-            total = len(self._active) + len(self._idle)
-            if total >= self._config.max_size:
-                break
-            item = self._factory()
-            self._all[id(item)] = item
-            self._idle.append(item)
-            self._stats.total_created += 1
-            created += 1
-        return created
+        with self._lock:
+            created = 0
+            while len(self._idle) < self._config.min_size:
+                total = len(self._active) + len(self._idle)
+                if total >= self._config.max_size:
+                    break
+                item = self._factory()
+                self._all[id(item)] = item
+                self._idle.append(item)
+                self._stats.total_created += 1
+                created += 1
+            return created
 
     def _is_valid(self, item: T) -> bool:
         if self._config.validation_fn is None:

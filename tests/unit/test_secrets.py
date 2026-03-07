@@ -99,12 +99,29 @@ class TestSecretManager:
         assert secret is not None
         assert secret.expires_at == future
 
-    def test_base64_encoding(self):
+    def test_encryption_roundtrip(self):
         mgr = SecretManager()
         mgr.store("key", "hello world")
         secret = mgr.get("key")
         assert secret is not None
         assert secret.value == "hello world"
+
+    def test_stored_value_is_encrypted(self):
+        """Verify that the stored bytes are not plaintext or simple base64."""
+        mgr = SecretManager()
+        mgr.store("key", "sensitive-data")
+        stored = mgr._store["key"][-1]
+        # The encrypted_value should be bytes, not a simple encoding of the plaintext
+        assert isinstance(stored.encrypted_value, bytes)
+        assert b"sensitive-data" not in stored.encrypted_value
+
+    def test_different_keys_produce_different_ciphertext(self):
+        mgr1 = SecretManager(encryption_key=b"key-one-" * 4)
+        mgr2 = SecretManager(encryption_key=b"key-two-" * 4)
+        mgr1.store("k", "same-value")
+        mgr2.store("k", "same-value")
+        # Different master keys should produce different encrypted values
+        assert mgr1._store["k"][-1].encrypted_value != mgr2._store["k"][-1].encrypted_value
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +230,7 @@ class TestSecretRotation:
         # Artificially age the secret
         versions = mgr._store["key"]
         versions[-1] = versions[-1].__class__(
-            encoded_value=versions[-1].encoded_value,
+            encrypted_value=versions[-1].encrypted_value,
             version=versions[-1].version,
             created_at=time.time() - 700_000,  # ~8 days old
             metadata={},

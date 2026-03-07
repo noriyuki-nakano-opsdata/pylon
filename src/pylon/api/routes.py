@@ -28,6 +28,15 @@ class RouteStore:
         self.kill_switches: dict[str, dict] = {}  # scope -> event
 
 
+def _require_tenant_id(request: Request) -> str | None:
+    """Extract tenant_id from request context; return None if missing."""
+    return request.context.get("tenant_id")
+
+
+def _tenant_required_response() -> Response:
+    return Response(status_code=401, body={"error": "Tenant context required"})
+
+
 def register_routes(server: APIServer, store: RouteStore | None = None) -> RouteStore:
     """Register all API routes on the server. Returns the store."""
     s = store or RouteStore()
@@ -36,6 +45,9 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
         return Response(body={"status": "ok", "timestamp": time.time()})
 
     def create_agent(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
         body = request.body or {}
         valid, errors = validate(body, CREATE_AGENT_SCHEMA)
         if not valid:
@@ -50,19 +62,23 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
             "tools": body.get("tools", []),
             "sandbox": body.get("sandbox", "gvisor"),
             "status": "ready",
-            "tenant_id": request.context.get("tenant_id", "default"),
+            "tenant_id": tenant_id,
         }
         s.agents[agent_id] = agent
         return Response(status_code=201, body=agent)
 
     def list_agents(request: Request) -> Response:
-        tenant_id = request.context.get("tenant_id", "default")
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
         agents = [a for a in s.agents.values() if a.get("tenant_id") == tenant_id]
         return Response(body={"agents": agents, "count": len(agents)})
 
     def get_agent(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
         agent_id = request.path_params.get("id", "")
-        tenant_id = request.context.get("tenant_id", "default")
         agent = s.agents.get(agent_id)
         if agent is None:
             return Response(status_code=404, body={"error": f"Agent not found: {agent_id}"})
@@ -71,8 +87,10 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
         return Response(body=agent)
 
     def delete_agent(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
         agent_id = request.path_params.get("id", "")
-        tenant_id = request.context.get("tenant_id", "default")
         agent = s.agents.get(agent_id)
         if agent is None:
             return Response(status_code=404, body={"error": f"Agent not found: {agent_id}"})
@@ -82,8 +100,10 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
         return Response(status_code=204, body=None)
 
     def start_workflow_run(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
         workflow_id = request.path_params.get("id", "")
-        tenant_id = request.context.get("tenant_id", "default")
         body = request.body or {}
         valid, errors = validate(body, WORKFLOW_RUN_SCHEMA)
         if not valid:
@@ -108,9 +128,11 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
         )
 
     def get_workflow_run(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
         workflow_id = request.path_params.get("id", "")
         run_id = request.path_params.get("run_id", "")
-        tenant_id = request.context.get("tenant_id", "default")
         runs = s.workflow_runs.get(workflow_id, {})
         run = runs.get(run_id)
         if run is None:
@@ -120,8 +142,10 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
         return Response(body=run)
 
     def get_workflow_run_by_id(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
         run_id = request.path_params.get("run_id", "")
-        tenant_id = request.context.get("tenant_id", "default")
         run = s.workflow_runs_by_id.get(run_id)
         if run is None:
             return Response(status_code=404, body={"error": f"Run not found: {run_id}"})

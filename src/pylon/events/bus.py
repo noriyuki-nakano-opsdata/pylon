@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -36,6 +37,7 @@ class EventBus:
     def __init__(self) -> None:
         self._subscriptions: dict[str, _Subscription] = {}
         self._dead_letters: list[DeadLetterEntry] = []
+        self._lock = threading.Lock()
 
     def subscribe(
         self,
@@ -45,41 +47,48 @@ class EventBus:
     ) -> str:
         """Subscribe to an event type. Use '*' for all events."""
         sub_id = str(uuid.uuid4())
-        self._subscriptions[sub_id] = _Subscription(
-            id=sub_id,
-            event_type=event_type,
-            handler=handler,
-            event_filter=event_filter,
-        )
+        with self._lock:
+            self._subscriptions[sub_id] = _Subscription(
+                id=sub_id,
+                event_type=event_type,
+                handler=handler,
+                event_filter=event_filter,
+            )
         return sub_id
 
     def unsubscribe(self, subscription_id: str) -> bool:
         """Remove a subscription. Returns True if it existed."""
-        return self._subscriptions.pop(subscription_id, None) is not None
+        with self._lock:
+            return self._subscriptions.pop(subscription_id, None) is not None
 
     def publish(self, event: Event) -> int:
         """Publish an event synchronously. Returns count of notified handlers."""
+        with self._lock:
+            subs = list(self._subscriptions.values())
         count = 0
-        for sub in list(self._subscriptions.values()):
+        for sub in subs:
             if not self._matches(sub, event):
                 continue
             try:
                 sub.handler(event)
                 count += 1
             except Exception as e:
-                self._dead_letters.append(
-                    DeadLetterEntry(
-                        event=event,
-                        subscription_id=sub.id,
-                        error=str(e),
+                with self._lock:
+                    self._dead_letters.append(
+                        DeadLetterEntry(
+                            event=event,
+                            subscription_id=sub.id,
+                            error=str(e),
+                        )
                     )
-                )
         return count
 
     async def publish_async(self, event: Event) -> int:
         """Publish an event, running handlers in the event loop."""
+        with self._lock:
+            subs = list(self._subscriptions.values())
         count = 0
-        for sub in list(self._subscriptions.values()):
+        for sub in subs:
             if not self._matches(sub, event):
                 continue
             try:
@@ -88,22 +97,25 @@ class EventBus:
                     await result
                 count += 1
             except Exception as e:
-                self._dead_letters.append(
-                    DeadLetterEntry(
-                        event=event,
-                        subscription_id=sub.id,
-                        error=str(e),
+                with self._lock:
+                    self._dead_letters.append(
+                        DeadLetterEntry(
+                            event=event,
+                            subscription_id=sub.id,
+                            error=str(e),
+                        )
                     )
-                )
         return count
 
     @property
     def dead_letters(self) -> list[DeadLetterEntry]:
-        return list(self._dead_letters)
+        with self._lock:
+            return list(self._dead_letters)
 
     @property
     def subscription_count(self) -> int:
-        return len(self._subscriptions)
+        with self._lock:
+            return len(self._subscriptions)
 
     def _matches(self, sub: _Subscription, event: Event) -> bool:
         if sub.event_type != "*" and sub.event_type != event.type:

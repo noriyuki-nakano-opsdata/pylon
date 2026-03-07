@@ -202,12 +202,16 @@ class ServerCapabilities:
     sampling: bool = False
 
     def to_dict(self) -> dict:
-        return {
-            "tools": self.tools,
-            "resources": self.resources,
-            "prompts": self.prompts,
-            "sampling": self.sampling,
-        }
+        d: dict[str, Any] = {}
+        if self.tools:
+            d["tools"] = {"listChanged": True}
+        if self.resources:
+            d["resources"] = {"listChanged": True, "subscribe": True}
+        if self.prompts:
+            d["prompts"] = {"listChanged": True}
+        if self.sampling:
+            d["sampling"] = {}
+        return d
 
 
 @dataclass

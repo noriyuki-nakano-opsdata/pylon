@@ -66,8 +66,34 @@ class A2AServer:
         self._stream_handler = handler
         return handler
 
-    async def handle_request(self, request: JsonRpcRequest) -> JsonRpcResponse:
-        """Route a JSON-RPC request to the appropriate handler."""
+    async def handle_request(
+        self,
+        request: JsonRpcRequest,
+        authenticated_peer: str | None = None,
+    ) -> JsonRpcResponse:
+        """Route a JSON-RPC request to the appropriate handler.
+
+        Args:
+            request: The JSON-RPC request to handle.
+            authenticated_peer: If provided, the peer identity verified by an
+                external authentication layer (e.g. mTLS CN). When set, the
+                ``sender`` field in the request params must match this value;
+                a mismatch returns a FORBIDDEN error.
+        """
+        # Verify sender matches authenticated identity when provided
+        FORBIDDEN = -32003
+        if authenticated_peer is not None:
+            params = request.params or {}
+            sender = params.get("sender", "")
+            if sender != authenticated_peer:
+                return JsonRpcResponse(
+                    id=request.id,
+                    error=JsonRpcError(
+                        code=FORBIDDEN,
+                        message="Sender does not match authenticated peer identity.",
+                    ),
+                )
+
         handlers: dict[str, Callable[..., Any]] = {
             "tasks/send": self._handle_send,
             "tasks/get": self._handle_get,

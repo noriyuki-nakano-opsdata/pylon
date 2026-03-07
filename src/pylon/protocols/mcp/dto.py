@@ -230,7 +230,12 @@ class InitializeResponseDTO:
         if session_id is not None and not isinstance(session_id, str):
             raise DtoValidationError("'sessionId' must be a string")
 
-        capabilities = ServerCapabilities(**capabilities_obj)
+        capabilities = ServerCapabilities(
+            tools=bool(capabilities_obj.get("tools")),
+            resources=bool(capabilities_obj.get("resources")),
+            prompts=bool(capabilities_obj.get("prompts")),
+            sampling="sampling" in capabilities_obj,
+        )
         return cls(
             result=InitializeResult(
                 protocol_version=protocol_version,

@@ -64,19 +64,21 @@ class CronExpression:
 
     def _matches(self, dt: datetime) -> bool:
         return (
-            self._field_matches(self._minute, dt.minute)
-            and self._field_matches(self._hour, dt.hour)
-            and self._field_matches(self._day, dt.day)
-            and self._field_matches(self._month, dt.month)
-            and self._field_matches(self._weekday, dt.weekday())
+            self._field_matches(self._minute, dt.minute, one_based=False)
+            and self._field_matches(self._hour, dt.hour, one_based=False)
+            and self._field_matches(self._day, dt.day, one_based=True)
+            and self._field_matches(self._month, dt.month, one_based=True)
+            and self._field_matches(self._weekday, dt.weekday(), one_based=False)
         )
 
     @staticmethod
-    def _field_matches(field: str, value: int) -> bool:
+    def _field_matches(field: str, value: int, *, one_based: bool = False) -> bool:
         if field == "*":
             return True
         if field.startswith("*/"):
             step = int(field[2:])
+            if one_based:
+                return (value - 1) % step == 0
             return value % step == 0
         return int(field) == value
 

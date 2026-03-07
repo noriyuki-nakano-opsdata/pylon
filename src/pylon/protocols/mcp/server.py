@@ -183,8 +183,17 @@ class McpServer:
 
     # --- built-in handlers ---
 
+    SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2024-11-05")
+
     def _handle_initialize(self, request: JsonRpcRequest) -> dict:
-        InitializeParamsDTO.from_params(request.params)
+        params_dto = InitializeParamsDTO.from_params(request.params)
+        raw_params = request.params or {}
+        client_version = raw_params.get("protocolVersion")
+        if client_version and client_version not in self.SUPPORTED_PROTOCOL_VERSIONS:
+            raise ValueError(
+                f"Unsupported protocol version: {client_version}. "
+                f"Supported: {', '.join(self.SUPPORTED_PROTOCOL_VERSIONS)}"
+            )
         session = self._session_manager.create_session()
         session.server_capabilities = self.capabilities
         result = InitializeResult(

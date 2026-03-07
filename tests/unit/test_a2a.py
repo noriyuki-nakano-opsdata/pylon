@@ -357,6 +357,49 @@ class TestPeerAuth:
         server.remove_peer("agent-b")
         assert not server.is_peer_allowed("agent-b")
 
+    def test_authenticated_peer_matches_sender(self):
+        """H2: authenticated_peer matching sender should succeed."""
+        server = A2AServer()
+        task = _make_task("auth-match")
+        resp = _run(server.handle_request(
+            JsonRpcRequest(
+                method="tasks/send",
+                params={"sender": "agent-a", "task": task.to_dict()},
+                id="am1",
+            ),
+            authenticated_peer="agent-a",
+        ))
+        assert resp.error is None
+
+    def test_authenticated_peer_mismatch_rejected(self):
+        """H2: sender spoofing detected via authenticated_peer mismatch."""
+        server = A2AServer()
+        task = _make_task("auth-spoof")
+        resp = _run(server.handle_request(
+            JsonRpcRequest(
+                method="tasks/send",
+                params={"sender": "agent-a", "task": task.to_dict()},
+                id="am2",
+            ),
+            authenticated_peer="agent-b",
+        ))
+        assert resp.error is not None
+        assert resp.error.code == -32003  # FORBIDDEN
+        assert "does not match" in resp.error.message.lower()
+
+    def test_no_authenticated_peer_allows_any_sender(self):
+        """H2: Without authenticated_peer, existing behaviour is preserved."""
+        server = A2AServer()
+        task = _make_task("auth-none")
+        resp = _run(server.handle_request(
+            JsonRpcRequest(
+                method="tasks/send",
+                params={"sender": "anyone", "task": task.to_dict()},
+                id="am3",
+            ),
+        ))
+        assert resp.error is None
+
 
 # ── Rate Limiting Tests ──────────────────────────────────────────────
 

@@ -90,11 +90,15 @@ class TaskQueue:
 
     def dequeue(self) -> Task | None:
         """Remove and return the highest-priority pending task."""
+        skipped = 0
         while self._heap:
             task = heapq.heappop(self._heap)
             if task.status == TaskStatus.PENDING:
                 task.transition_to(TaskStatus.RUNNING)
                 return task
+            skipped += 1
+        if skipped > 0:
+            self._maybe_purge()
         return None
 
     def peek(self) -> Task | None:
@@ -144,3 +148,25 @@ class TaskQueue:
         task.retries += 1
         heapq.heappush(self._heap, task)
         return True
+
+    def purge(self) -> int:
+        """Remove non-PENDING tasks from heap and terminal tasks from _tasks.
+
+        Returns the number of terminal tasks removed from _tasks.
+        """
+        self._heap = [t for t in self._heap if t.status == TaskStatus.PENDING]
+        heapq.heapify(self._heap)
+        terminal_ids = [
+            tid for tid, t in self._tasks.items() if t.is_terminal
+        ]
+        for tid in terminal_ids:
+            del self._tasks[tid]
+        return len(terminal_ids)
+
+    def _maybe_purge(self) -> None:
+        """Auto-purge when heap has grown much larger than active task count."""
+        active_count = sum(
+            1 for t in self._tasks.values() if not t.is_terminal
+        )
+        if len(self._heap) > max(active_count * 2, 16):
+            self.purge()

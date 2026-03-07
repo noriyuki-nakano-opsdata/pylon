@@ -42,7 +42,11 @@ class MethodRouter:
             )
         except Exception as exc:
             return JsonRpcResponse(
-                error=JsonRpcError(code=INTERNAL_ERROR, message=str(exc)),
+                error=JsonRpcError(
+                    code=INTERNAL_ERROR,
+                    message="Internal error",
+                    data=str(exc),
+                ),
                 id=request.id,
             )
 

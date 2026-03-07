@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 
 import pytest
@@ -405,3 +406,35 @@ class TestBusStoreIntegration:
         assert store.count == 3
         correlated = store.get_by_correlation("wf-1")
         assert len(correlated) == 3
+
+
+# --- Thread Safety ---
+
+class TestEventBusThreadSafety:
+    def test_concurrent_publish_and_subscribe(self) -> None:
+        bus = EventBus()
+        received: list[Event] = []
+        lock = threading.Lock()
+
+        def handler(e: Event) -> None:
+            with lock:
+                received.append(e)
+
+        bus.subscribe(AGENT_CREATED, handler)
+        errors: list[Exception] = []
+
+        def publisher() -> None:
+            try:
+                for _ in range(20):
+                    bus.publish(Event(type=AGENT_CREATED, source="thread"))
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=publisher) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0
+        assert len(received) == 100  # 5 threads * 20 publishes

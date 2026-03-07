@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
+from pylon.errors import WorkflowError
+
 
 class RunStatus(StrEnum):
     PENDING = "pending"
@@ -19,6 +21,16 @@ class RunStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+_VALID_RUN_TRANSITIONS: dict[RunStatus, set[RunStatus]] = {
+    RunStatus.PENDING: {RunStatus.RUNNING},
+    RunStatus.RUNNING: {RunStatus.COMPLETED, RunStatus.FAILED},
+    RunStatus.PAUSED: {RunStatus.RUNNING},
+    RunStatus.COMPLETED: set(),
+    RunStatus.FAILED: set(),
+    RunStatus.CANCELLED: set(),
+}
 
 
 @dataclass
@@ -43,15 +55,26 @@ class WorkflowRun:
     completed_at: datetime | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
+    def _validate_transition(self, target: RunStatus) -> None:
+        valid = _VALID_RUN_TRANSITIONS.get(self.status, set())
+        if target not in valid:
+            raise WorkflowError(
+                f"Invalid run transition: {self.status.value} -> {target.value}",
+                details={"run_id": self.id, "current": self.status.value, "target": target.value},
+            )
+
     def start(self) -> None:
+        self._validate_transition(RunStatus.RUNNING)
         self.status = RunStatus.RUNNING
         self.started_at = datetime.now(UTC)
 
     def complete(self) -> None:
+        self._validate_transition(RunStatus.COMPLETED)
         self.status = RunStatus.COMPLETED
         self.completed_at = datetime.now(UTC)
 
     def fail(self, error: str | None = None) -> None:
+        self._validate_transition(RunStatus.FAILED)
         self.status = RunStatus.FAILED
         self.completed_at = datetime.now(UTC)
         if error:

@@ -22,6 +22,11 @@ class TokenBucket:
         self._tokens = self.capacity
         self._last_refill = 0.0  # sentinel; set on first operation
 
+    def can_consume(self, tokens: float = 1.0, now: float | None = None) -> bool:
+        """Check if tokens are available without consuming them."""
+        self._refill(now)
+        return self._tokens >= tokens
+
     def consume(self, tokens: float = 1.0, now: float | None = None) -> bool:
         """Try to consume tokens. Returns True if allowed."""
         self._refill(now)
@@ -63,6 +68,13 @@ class SlidingWindow:
             return True
         return False
 
+    def can_allow(self, now: float | None = None) -> bool:
+        """Check if a request would be allowed without recording it."""
+        now = now or time.monotonic()
+        cutoff = now - self.window_seconds
+        active = sum(1 for t in self._timestamps if t > cutoff)
+        return active < self.max_requests
+
     def count(self, now: float | None = None) -> int:
         now = now or time.monotonic()
         cutoff = now - self.window_seconds
@@ -76,14 +88,27 @@ class CompositeLimit:
         self._limiters = list(limiters)
 
     def allow(self, now: float | None = None) -> bool:
-        """Returns True only if ALL limiters allow."""
+        """Returns True only if ALL limiters allow.
+
+        Uses a two-phase approach: first check all limiters without
+        consuming, then consume only if all would allow. This prevents
+        token consumption when a later limiter denies the request.
+        """
+        # Phase 1: dry-run check
         for limiter in self._limiters:
             if isinstance(limiter, TokenBucket):
-                if not limiter.consume(1.0, now):
+                if not limiter.can_consume(1.0, now):
                     return False
             elif isinstance(limiter, SlidingWindow):
-                if not limiter.allow(now):
+                if not limiter.can_allow(now):
                     return False
+
+        # Phase 2: all passed, actually consume
+        for limiter in self._limiters:
+            if isinstance(limiter, TokenBucket):
+                limiter.consume(1.0, now)
+            elif isinstance(limiter, SlidingWindow):
+                limiter.allow(now)
         return True
 
 

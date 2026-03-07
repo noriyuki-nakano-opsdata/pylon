@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager, contextmanager
@@ -70,11 +71,10 @@ async def async_tenant_scope(ctx: TenantContext) -> AsyncGenerator[TenantContext
 
 async def run_in_tenant_context(ctx: TenantContext, coro: Any) -> Any:
     """Run a coroutine with tenant context propagated across async tasks."""
-    async def _wrapper() -> Any:
-        _current_tenant.set(ctx)
-        return await coro
-
-    return await asyncio.ensure_future(_wrapper())
+    current_ctx = contextvars.copy_context()
+    current_ctx.run(_current_tenant.set, ctx)
+    task = current_ctx.run(asyncio.get_running_loop().create_task, coro)
+    return await task
 
 
 def serialize_tenant_context(ctx: TenantContext) -> str:

@@ -93,6 +93,17 @@ class TestMethodRouter(unittest.TestCase):
         self.assertIsNotNone(resp.error)
         self.assertEqual(resp.error.code, INTERNAL_ERROR)
 
+    def test_handler_exception_does_not_leak_internal_details(self):
+        """H3: Error message must be generic; details go in data field."""
+        def failing(req):
+            raise RuntimeError("secret database connection string")
+
+        self.router.register("leak", failing)
+        req = JsonRpcRequest(method="leak", id=4)
+        resp = self.router.dispatch(req)
+        self.assertEqual(resp.error.message, "Internal error")
+        self.assertEqual(resp.error.data, "secret database connection string")
+
     def test_route_decorator(self):
         @route("tools/list")
         def handler(req):
@@ -549,6 +560,47 @@ class TestOAuthProvider(unittest.TestCase):
             code_challenge_method="plain",
         )
         self.assertIsNone(code)
+
+    def test_redirect_uri_mismatch_rejected(self):
+        """H5: Authorization code denied when redirect_uri doesn't match client registration."""
+        pkce = PKCEChallenge.generate()
+        code = self.provider.create_authorization_code(
+            client_id="test-client",
+            redirect_uri="http://evil.example.com/callback",
+            scopes=["mcp:read"],
+            code_challenge=pkce.code_challenge,
+        )
+        self.assertIsNone(code)
+
+    def test_redirect_uri_match_accepted(self):
+        """H5: Authorization code issued when redirect_uri matches client registration."""
+        pkce = PKCEChallenge.generate()
+        code = self.provider.create_authorization_code(
+            client_id="test-client",
+            redirect_uri="http://localhost:8080/callback",
+            scopes=["mcp:read"],
+            code_challenge=pkce.code_challenge,
+        )
+        self.assertIsNotNone(code)
+
+    def test_redirect_uri_empty_in_client_allows_any(self):
+        """H5: Client with empty redirect_uri allows any redirect_uri (backward compat)."""
+        provider = OAuthProvider()
+        client = OAuthClientConfig(
+            client_id="no-redirect",
+            client_secret="s",
+            redirect_uri="",
+            scopes=[],
+        )
+        provider.register_client(client)
+        pkce = PKCEChallenge.generate()
+        code = provider.create_authorization_code(
+            client_id="no-redirect",
+            redirect_uri="http://any.example.com/cb",
+            scopes=[],
+            code_challenge=pkce.code_challenge,
+        )
+        self.assertIsNotNone(code)
 
 
 if __name__ == "__main__":

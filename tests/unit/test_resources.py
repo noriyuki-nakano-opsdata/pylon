@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from pylon.resources.limiter import (
@@ -60,6 +62,16 @@ class TestTokenBucket:
         assert bucket.consume(5.0) is True
         assert bucket.consume(1.0) is False
 
+    def test_can_consume_does_not_consume(self):
+        bucket = TokenBucket(capacity=5, refill_rate=0)
+        now = 1000.0
+        assert bucket.can_consume(3.0, now) is True
+        assert bucket.available(now) == pytest.approx(5.0, abs=0.01)
+
+    def test_can_consume_returns_false_when_insufficient(self):
+        bucket = TokenBucket(capacity=2, refill_rate=0)
+        assert bucket.can_consume(3.0) is False
+
 
 # === SlidingWindow Tests ===
 
@@ -81,6 +93,18 @@ class TestSlidingWindow:
         assert sw.allow(now + 2) is False
         # After window expires
         assert sw.allow(now + 6) is True
+
+    def test_can_allow_does_not_record(self):
+        sw = SlidingWindow(window_seconds=10.0, max_requests=2)
+        now = 1000.0
+        assert sw.can_allow(now) is True
+        assert sw.count(now) == 0  # nothing recorded
+
+    def test_can_allow_returns_false_at_limit(self):
+        sw = SlidingWindow(window_seconds=10.0, max_requests=1)
+        now = 1000.0
+        sw.allow(now)
+        assert sw.can_allow(now + 1) is False
 
     def test_count(self):
         sw = SlidingWindow(window_seconds=10.0, max_requests=5)
@@ -106,6 +130,35 @@ class TestCompositeLimit:
         comp = CompositeLimit(tb, sw)
         comp.allow()  # consume the 1 token
         assert comp.allow() is False
+
+    def test_no_token_consumed_when_later_limiter_denies(self):
+        """H1: When a later limiter denies, earlier limiters must not consume."""
+        tb = TokenBucket(capacity=5, refill_rate=0)
+        sw = SlidingWindow(window_seconds=60, max_requests=0)  # always denies
+        comp = CompositeLimit(tb, sw)
+        now = 1000.0
+        assert comp.allow(now) is False
+        # TokenBucket should still have all 5 tokens
+        assert tb.available(now) == pytest.approx(5.0, abs=0.01)
+
+    def test_no_sliding_window_recorded_when_token_bucket_denies(self):
+        """H1: When TokenBucket denies, SlidingWindow must not record."""
+        tb = TokenBucket(capacity=0, refill_rate=0)  # always denies
+        sw = SlidingWindow(window_seconds=60, max_requests=10)
+        comp = CompositeLimit(tb, sw)
+        now = 1000.0
+        assert comp.allow(now) is False
+        assert sw.count(now) == 0
+
+    def test_rollback_not_needed_when_all_allow(self):
+        """H1: Both limiters consume when both allow."""
+        tb = TokenBucket(capacity=10, refill_rate=0)
+        sw = SlidingWindow(window_seconds=60, max_requests=10)
+        comp = CompositeLimit(tb, sw)
+        now = 1000.0
+        assert comp.allow(now) is True
+        assert tb.available(now) == pytest.approx(9.0, abs=0.01)
+        assert sw.count(now) == 1
 
 
 # === KeyedRateLimiter Tests ===
@@ -420,3 +473,42 @@ class TestResourceMonitor:
         for i in range(10):
             mon.track("cpu", float(i), now=float(i))
         assert len(mon.get_history("cpu")) == 5
+
+
+# === ResourcePool Thread Safety Tests ===
+
+
+class TestResourcePoolThreadSafety:
+    def test_concurrent_acquire_release(self):
+        counter = {"v": 0}
+        lock = threading.Lock()
+
+        def factory():
+            with lock:
+                counter["v"] += 1
+                return counter["v"]
+
+        pool = ResourcePool(factory, PoolConfig(max_size=50))
+        errors: list[Exception] = []
+        acquired_items: list[list] = [[] for _ in range(10)]
+
+        def worker(idx: int):
+            try:
+                items = []
+                for _ in range(5):
+                    item = pool.acquire()
+                    items.append(item)
+                for item in items:
+                    pool.release(item)
+                acquired_items[idx] = items
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0
+        assert pool.stats.active == 0

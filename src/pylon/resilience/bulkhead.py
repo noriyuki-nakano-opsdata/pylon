@@ -32,8 +32,10 @@ class Bulkhead:
     def __init__(self, max_concurrent: int = 10, max_queue: int = 10) -> None:
         self._max_concurrent = max_concurrent
         self._max_queue = max_queue
-        self._semaphore = threading.Semaphore(max_concurrent)
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._active_count = 0
+        self._queued_count = 0
         self._stats = BulkheadStats()
 
     @property
@@ -48,36 +50,43 @@ class Bulkhead:
 
     def execute(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         with self._lock:
-            if not self._semaphore._value and self._stats.queued >= self._max_queue:
+            if self._active_count < self._max_concurrent:
+                self._active_count += 1
+                self._stats.active += 1
+            elif self._queued_count >= self._max_queue:
                 self._stats.rejected += 1
                 raise BulkheadFullError(self._max_concurrent, self._max_queue)
-            if not self._semaphore._value:
+            else:
+                self._queued_count += 1
                 self._stats.queued += 1
-
-        self._semaphore.acquire(blocking=True)
-        with self._lock:
-            if self._stats.queued > 0:
+                while self._active_count >= self._max_concurrent:
+                    self._condition.wait()
+                self._queued_count -= 1
                 self._stats.queued -= 1
-            self._stats.active += 1
+                self._active_count += 1
+                self._stats.active += 1
 
         try:
             return fn(*args, **kwargs)
         finally:
             with self._lock:
+                self._active_count -= 1
                 self._stats.active -= 1
                 self._stats.completed += 1
-            self._semaphore.release()
+                self._condition.notify()
 
 
 class AsyncBulkhead:
-    """Async bulkhead using asyncio.Semaphore."""
+    """Async bulkhead using asyncio condition variable."""
 
     def __init__(self, max_concurrent: int = 10, max_queue: int = 10) -> None:
         self._max_concurrent = max_concurrent
         self._max_queue = max_queue
-        self._semaphore = asyncio.Semaphore(max_concurrent)
-        self._stats = BulkheadStats()
         self._lock = asyncio.Lock()
+        self._condition = asyncio.Condition(self._lock)
+        self._active_count = 0
+        self._queued_count = 0
+        self._stats = BulkheadStats()
 
     @property
     def stats(self) -> BulkheadStats:
@@ -89,25 +98,30 @@ class AsyncBulkhead:
         )
 
     async def execute(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        async with self._lock:
-            if self._semaphore._value == 0 and self._stats.queued >= self._max_queue:
+        async with self._condition:
+            if self._active_count < self._max_concurrent:
+                self._active_count += 1
+                self._stats.active += 1
+            elif self._queued_count >= self._max_queue:
                 self._stats.rejected += 1
                 raise BulkheadFullError(self._max_concurrent, self._max_queue)
-            if self._semaphore._value == 0:
+            else:
+                self._queued_count += 1
                 self._stats.queued += 1
-
-        await self._semaphore.acquire()
-        async with self._lock:
-            if self._stats.queued > 0:
+                while self._active_count >= self._max_concurrent:
+                    await self._condition.wait()
+                self._queued_count -= 1
                 self._stats.queued -= 1
-            self._stats.active += 1
+                self._active_count += 1
+                self._stats.active += 1
 
         try:
             coro = fn(*args, **kwargs)
             result = await coro
             return result
         finally:
-            async with self._lock:
+            async with self._condition:
+                self._active_count -= 1
                 self._stats.active -= 1
                 self._stats.completed += 1
-            self._semaphore.release()
+                self._condition.notify()

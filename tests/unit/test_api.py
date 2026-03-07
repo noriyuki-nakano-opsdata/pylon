@@ -21,8 +21,9 @@ from pylon.api.server import APIServer, Request, Response
 # ---------------------------------------------------------------------------
 
 def _server_with_routes() -> tuple[APIServer, RouteStore]:
-    """Create a server with all routes registered, no middleware."""
+    """Create a server with all routes registered and default tenant context."""
     server = APIServer()
+    server.add_middleware(TenantMiddleware(require_tenant=False))
     store = register_routes(server)
     return server, store
 
@@ -311,6 +312,27 @@ class TestTenantMiddleware:
         server.add_route("GET", "/test", lambda r: Response())
         resp = server.handle_request("GET", "/test")
         assert resp.status_code == 400
+
+
+class TestTenantRequired:
+    def test_create_agent_without_tenant_returns_401(self):
+        server = APIServer()
+        register_routes(server)
+        resp = server.handle_request("POST", "/agents", body={"name": "x"})
+        assert resp.status_code == 401
+        assert resp.body["error"] == "Tenant context required"
+
+    def test_list_agents_without_tenant_returns_401(self):
+        server = APIServer()
+        register_routes(server)
+        resp = server.handle_request("GET", "/agents")
+        assert resp.status_code == 401
+
+    def test_workflow_run_without_tenant_returns_401(self):
+        server = APIServer()
+        register_routes(server)
+        resp = server.handle_request("POST", "/workflows/wf1/run", body={})
+        assert resp.status_code == 401
 
 
 class TestTenantIsolationOnRoutes:

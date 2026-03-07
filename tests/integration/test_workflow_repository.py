@@ -10,6 +10,9 @@ from pylon.repository.memory import (
     ProceduralEntry,
     SemanticEntry,
 )
+import pytest
+
+from pylon.errors import WorkflowError
 from pylon.repository.workflow import (
     RunStatus,
     WorkflowDefinition,
@@ -106,6 +109,39 @@ async def test_workflow_run_fail():
 
     assert run.status == RunStatus.FAILED
     assert run.state["error"] == "something broke"
+
+
+async def test_workflow_run_invalid_start_from_completed():
+    """COMPLETED -> RUNNING is invalid."""
+    run = WorkflowRun(workflow_id="wf-1")
+    run.start()
+    run.complete()
+    with pytest.raises(WorkflowError, match="Invalid run transition"):
+        run.start()
+
+
+async def test_workflow_run_invalid_fail_from_completed():
+    """COMPLETED -> FAILED is invalid."""
+    run = WorkflowRun(workflow_id="wf-1")
+    run.start()
+    run.complete()
+    with pytest.raises(WorkflowError, match="Invalid run transition"):
+        run.fail("should not work")
+
+
+async def test_workflow_run_invalid_complete_from_pending():
+    """PENDING -> COMPLETED is invalid (must go through RUNNING)."""
+    run = WorkflowRun(workflow_id="wf-1")
+    with pytest.raises(WorkflowError, match="Invalid run transition"):
+        run.complete()
+
+
+async def test_workflow_run_invalid_double_start():
+    """RUNNING -> RUNNING is invalid."""
+    run = WorkflowRun(workflow_id="wf-1")
+    run.start()
+    with pytest.raises(WorkflowError, match="Invalid run transition"):
+        run.start()
 
 
 async def test_workflow_definition_crud():
