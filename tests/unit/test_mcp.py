@@ -94,7 +94,7 @@ class TestMethodRouter(unittest.TestCase):
         self.assertEqual(resp.error.code, INTERNAL_ERROR)
 
     def test_handler_exception_does_not_leak_internal_details(self):
-        """H3: Error message must be generic; details go in data field."""
+        """H3: Error message must be generic; no internal details exposed."""
         def failing(req):
             raise RuntimeError("secret database connection string")
 
@@ -102,7 +102,7 @@ class TestMethodRouter(unittest.TestCase):
         req = JsonRpcRequest(method="leak", id=4)
         resp = self.router.dispatch(req)
         self.assertEqual(resp.error.message, "Internal error")
-        self.assertEqual(resp.error.data, "secret database connection string")
+        self.assertIsNone(resp.error.data)
 
     def test_route_decorator(self):
         @route("tools/list")

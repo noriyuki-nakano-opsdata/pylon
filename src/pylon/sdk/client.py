@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
 from pylon.sdk.config import SDKConfig
+
+logger = logging.getLogger(__name__)
 
 
 class RunStatus(StrEnum):
@@ -168,11 +171,12 @@ class PylonClient:
             run.status = RunStatus.COMPLETED
             run.output = output
             return WorkflowResult(run_id=run_id, status=RunStatus.COMPLETED, output=output)
-        except Exception as exc:
+        except Exception:
+            logger.exception("Workflow %r run %s failed", name, run_id)
             run.status = RunStatus.FAILED
-            run.error = str(exc)
+            run.error = "Internal execution error"
             return WorkflowResult(
-                run_id=run_id, status=RunStatus.FAILED, error=str(exc)
+                run_id=run_id, status=RunStatus.FAILED, error="Internal execution error"
             )
 
     def register_workflow(self, name: str, handler: Any) -> None:

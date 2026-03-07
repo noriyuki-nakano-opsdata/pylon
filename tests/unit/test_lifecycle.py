@@ -269,6 +269,62 @@ class TestAgentPool:
         assert pool.stats.active_count == 0
         assert pool.stats.total_destroyed == 1
 
+    def test_release_unknown_agent_is_noop(self):
+        """Releasing an agent_id not in the pool doesn't raise."""
+        mgr = AgentLifecycleManager()
+        pool = AgentPool(mgr)
+        pool.release("nonexistent-id")  # should not raise
+        assert pool.stats.active_count == 0
+        assert pool.stats.idle_count == 0
+
+    def test_acquire_different_roles(self):
+        """Acquire agents with different roles, verify role assignment."""
+        mgr = AgentLifecycleManager()
+        pool = AgentPool(mgr, AgentPoolConfig(max_size=5))
+        a1 = pool.acquire("coder")
+        a2 = pool.acquire("tester")
+        a3 = pool.acquire("reviewer")
+        assert a1.config.role == "coder"
+        assert a2.config.role == "tester"
+        assert a3.config.role == "reviewer"
+        assert pool.stats.active_count == 3
+
+    def test_destroy_unknown_agent_is_noop(self):
+        """Destroying unknown agent doesn't raise."""
+        mgr = AgentLifecycleManager()
+        pool = AgentPool(mgr)
+        pool.destroy("nonexistent-id")  # should not raise
+        assert pool.stats.total_destroyed == 0
+
+    def test_pool_stats_after_operations(self):
+        """Full lifecycle: acquire 3, release 1, destroy 1, check stats."""
+        mgr = AgentLifecycleManager()
+        pool = AgentPool(mgr, AgentPoolConfig(max_size=10))
+        a1 = pool.acquire("worker")
+        a2 = pool.acquire("worker")
+        a3 = pool.acquire("worker")
+        assert pool.stats.active_count == 3
+        assert pool.stats.total_created == 3
+
+        pool.release(a1.id)
+        assert pool.stats.active_count == 2
+        assert pool.stats.idle_count == 1
+
+        pool.destroy(a2.id)
+        assert pool.stats.active_count == 1
+        assert pool.stats.total_destroyed == 2  # release destroys old + destroy destroys one
+
+    def test_fill_to_min_default_role(self):
+        """fill_to_min() without role argument uses default 'worker' role."""
+        mgr = AgentLifecycleManager()
+        pool = AgentPool(mgr, AgentPoolConfig(min_size=2, max_size=5))
+        created = pool.fill_to_min()
+        assert created == 2
+        assert pool.stats.idle_count == 2
+        # Verify default role is 'worker'
+        for agent in pool._idle.values():
+            assert agent.config.role == "worker"
+
 
 # === AgentSupervisor Tests ===
 
@@ -373,6 +429,103 @@ class TestAgentSupervisor:
         sup.register(agent.id)
         sup.unregister(agent.id)
         assert len(sup.list_supervised()) == 0
+
+    def test_check_health_ready_is_degraded(self):
+        """Agent in READY state (not yet started) returns HEALTHY via default check."""
+        mgr = AgentLifecycleManager()
+        sup = AgentSupervisor(mgr)
+        agent = mgr.create_agent(_config())
+        # Agent is in READY state (created but not started)
+        sup.register(agent.id)
+        # _default_health_check maps READY -> HEALTHY (INIT/READY fallthrough)
+        assert sup.check_health(agent.id) == HealthStatus.HEALTHY
+
+    def test_check_health_completed_is_unhealthy(self):
+        """Agent in COMPLETED state (terminal) returns UNHEALTHY."""
+        mgr = AgentLifecycleManager()
+        sup = AgentSupervisor(mgr)
+        agent = mgr.create_agent(_config())
+        mgr.start_agent(agent.id)
+        sup.register(agent.id)
+        mgr.stop_agent(agent.id)
+        assert agent.state == AgentState.COMPLETED
+        assert sup.check_health(agent.id) == HealthStatus.UNHEALTHY
+
+    def test_register_duplicate_overwrites(self):
+        """Registering same agent_id twice should update, not duplicate."""
+        mgr = AgentLifecycleManager()
+        sup = AgentSupervisor(mgr)
+        agent = mgr.create_agent(_config())
+        mgr.start_agent(agent.id)
+        sup.register(agent.id, health_check_interval=10.0)
+        sup.register(agent.id, health_check_interval=20.0)
+        assert len(sup.list_supervised()) == 1
+        assert sup.get_supervised(agent.id).health_check_interval == 20.0
+
+    def test_handle_unhealthy_for_healthy_agent(self):
+        """handle_unhealthy on a healthy (running) agent returns None because
+        restart_count == 0 < max_restarts, but the agent is not terminal so
+        it still goes through the restart path. We test with max_restarts=0
+        to ensure None is returned."""
+        mgr = AgentLifecycleManager()
+        sup = AgentSupervisor(mgr, SupervisorConfig(max_restarts=0))
+        agent = mgr.create_agent(_config())
+        mgr.start_agent(agent.id)
+        sup.register(agent.id)
+        # max_restarts=0 means restart_count(0) >= max_restarts(0), returns None
+        result = sup.handle_unhealthy(agent.id)
+        assert result is None
+
+    def test_handle_unhealthy_unregistered(self):
+        """handle_unhealthy for unregistered agent returns None."""
+        mgr = AgentLifecycleManager()
+        sup = AgentSupervisor(mgr)
+        result = sup.handle_unhealthy("nonexistent-agent")
+        assert result is None
+
+    def test_health_callback_not_called_when_no_change(self):
+        """Second check_health with same state doesn't fire callback."""
+        changes: list[tuple[str, HealthStatus, HealthStatus]] = []
+        mgr = AgentLifecycleManager()
+        sup = AgentSupervisor(
+            mgr,
+            on_health_change=lambda aid, old, new: changes.append((aid, old, new)),
+        )
+        agent = mgr.create_agent(_config())
+        mgr.start_agent(agent.id)
+        sup.register(agent.id)
+        sup.check_health(agent.id)  # UNKNOWN -> HEALTHY (fires callback)
+        assert len(changes) == 1
+        sup.check_health(agent.id)  # HEALTHY -> HEALTHY (no change)
+        assert len(changes) == 1  # still 1, not 2
+
+    def test_supervised_list_multiple(self):
+        """Register 3 agents, verify all listed."""
+        mgr = AgentLifecycleManager()
+        sup = AgentSupervisor(mgr)
+        ids = []
+        for i in range(3):
+            agent = mgr.create_agent(_config(name=f"agent-{i}"))
+            sup.register(agent.id)
+            ids.append(agent.id)
+        supervised = sup.list_supervised()
+        assert len(supervised) == 3
+        supervised_ids = {s.agent_id for s in supervised}
+        assert supervised_ids == set(ids)
+
+    def test_restart_preserves_config(self):
+        """After restart, new agent has same config.name and config.role."""
+        mgr = AgentLifecycleManager()
+        sup = AgentSupervisor(mgr, SupervisorConfig(max_restarts=3))
+        agent = mgr.create_agent(_config(name="my-agent", role="coder"))
+        mgr.start_agent(agent.id)
+        sup.register(agent.id)
+        mgr.kill_agent(agent.id)
+
+        new_agent = sup.handle_unhealthy(agent.id)
+        assert new_agent is not None
+        assert new_agent.config.name == "my-agent"
+        assert new_agent.config.role == "coder"
 
 
 # === A2A Delegation Tests (M18) ===

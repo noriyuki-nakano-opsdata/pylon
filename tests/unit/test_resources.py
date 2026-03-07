@@ -504,6 +504,121 @@ class TestResourceMonitor:
         history = mon.get_history("cpu", window_seconds=1.5, now=2.0)
         assert len(history) == 2  # timestamps 1.0 and 2.0
 
+    def test_track_records_value(self):
+        mon = ResourceMonitor()
+        mon.track("disk", 42.0, now=10.0)
+        history = mon.get_history("disk")
+        assert len(history) == 1
+        assert history[0].value == 42.0
+
+    def test_track_with_labels_stored(self):
+        mon = ResourceMonitor()
+        labels = {"host": "server-1", "region": "us-east"}
+        mon.track("latency", 120.5, labels=labels, now=1.0)
+        history = mon.get_history("latency")
+        assert history[0].labels == {"host": "server-1", "region": "us-east"}
+
+    def test_alert_triggers_callback(self):
+        fired: list[tuple[str, float, float]] = []
+        mon = ResourceMonitor()
+        mon.add_alert("mem", Alert(
+            threshold=90.0,
+            comparator=Comparator.GT,
+            callback=lambda r, v, t: fired.append((r, v, t)),
+            name="mem-high",
+        ))
+        mon.track("mem", 95.0)
+        mon.check_alerts()
+        assert len(fired) == 1
+        assert fired[0] == ("mem", 95.0, 90.0)
+
+    def test_alert_not_triggered_below(self):
+        fired: list = []
+        mon = ResourceMonitor()
+        mon.add_alert("cpu", Alert(
+            threshold=80.0,
+            comparator=Comparator.GT,
+            callback=lambda r, v, t: fired.append(1),
+        ))
+        mon.track("cpu", 30.0)
+        mon.check_alerts()
+        assert len(fired) == 0
+
+    def test_alert_deduplication(self):
+        count = [0]
+        mon = ResourceMonitor()
+        mon.add_alert("cpu", Alert(
+            threshold=80.0,
+            comparator=Comparator.GT,
+            callback=lambda r, v, t: count.__setitem__(0, count[0] + 1),
+        ))
+        mon.track("cpu", 90.0)
+        mon.check_alerts()
+        # Second check with same value should not fire again
+        mon.check_alerts()
+        assert count[0] == 1
+
+    def test_alert_resets_when_condition_clears(self):
+        count = [0]
+        mon = ResourceMonitor()
+        mon.add_alert("cpu", Alert(
+            threshold=80.0,
+            comparator=Comparator.GT,
+            callback=lambda r, v, t: count.__setitem__(0, count[0] + 1),
+        ))
+        mon.track("cpu", 90.0)
+        mon.check_alerts()
+        assert count[0] == 1
+        # Drop below threshold to reset
+        mon.track("cpu", 50.0)
+        mon.check_alerts()
+        # Alert should have reset (triggered=False), verify by triggering again
+        mon.track("cpu", 95.0)
+        mon.check_alerts()
+        assert count[0] == 2
+
+    def test_get_history_with_window_filters(self):
+        mon = ResourceMonitor()
+        mon.track("net", 10.0, now=100.0)
+        mon.track("net", 20.0, now=200.0)
+        mon.track("net", 30.0, now=300.0)
+        mon.track("net", 40.0, now=400.0)
+        # Window of 150 seconds from now=400 -> cutoff=250
+        history = mon.get_history("net", window_seconds=150.0, now=400.0)
+        assert len(history) == 2
+        assert [p.value for p in history] == [30.0, 40.0]
+
+    def test_get_history_empty_for_unknown(self):
+        mon = ResourceMonitor()
+        assert mon.get_history("nonexistent") == []
+
+    def test_multiple_alerts_same_resource(self):
+        fired_a: list = []
+        fired_b: list = []
+        mon = ResourceMonitor()
+        mon.add_alert("cpu", Alert(
+            threshold=80.0,
+            comparator=Comparator.GT,
+            callback=lambda r, v, t: fired_a.append(v),
+            name="alert-a",
+        ))
+        mon.add_alert("cpu", Alert(
+            threshold=95.0,
+            comparator=Comparator.GT,
+            callback=lambda r, v, t: fired_b.append(v),
+            name="alert-b",
+        ))
+        # 85 exceeds 80 but not 95
+        mon.track("cpu", 85.0)
+        mon.check_alerts()
+        assert len(fired_a) == 1
+        assert len(fired_b) == 0
+        # 99 exceeds both
+        mon.track("cpu", 99.0)
+        mon.check_alerts()
+        assert len(fired_a) == 1  # still deduplicated (triggered=True)
+        assert len(fired_b) == 1
+
 
 # === ResourcePool Thread Safety Tests ===
 

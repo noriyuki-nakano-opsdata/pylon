@@ -21,7 +21,7 @@ format:
 	ruff format src/ tests/
 
 typecheck:
-	@echo "TODO: mypy src/"
+	python -m mypy src/pylon/ --ignore-missing-imports
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

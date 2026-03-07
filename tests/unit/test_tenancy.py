@@ -418,3 +418,84 @@ class TestTokenTenantResolverSignature:
         resolver = self._make_resolver(tenant_id="t2", secret=secret)
         with pytest.raises(TenantNotFoundError, match="signature verification failed"):
             resolver.resolve(tampered_token)
+
+
+# --- Thread Isolation & Middleware Tests ---
+
+
+class TestTenantContextIsolation:
+    def test_tenant_context_isolation_between_threads(self) -> None:
+        """Different threads see different tenant contexts (contextvars are thread-local)."""
+        import threading
+
+        results: dict[str, str | None] = {}
+        barrier = threading.Barrier(2)
+
+        def worker(name: str, tid: str) -> None:
+            ctx = TenantContext(tenant_id=tid, tenant_name=name)
+            set_tenant(ctx)
+            barrier.wait()  # synchronize so both threads read concurrently
+            current = get_tenant()
+            results[name] = current.tenant_id if current else None
+            clear_tenant()
+
+        t1 = threading.Thread(target=worker, args=("thread1", "tenant-a"))
+        t2 = threading.Thread(target=worker, args=("thread2", "tenant-b"))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert results["thread1"] == "tenant-a"
+        assert results["thread2"] == "tenant-b"
+
+    def test_tenant_context_clear(self) -> None:
+        """Setting a tenant then clearing it results in None."""
+        ctx = TenantContext(tenant_id="to-be-cleared", tenant_name="Clear")
+        set_tenant(ctx)
+        assert get_tenant() is not None
+        clear_tenant()
+        assert get_tenant() is None
+
+
+class TestTenantMiddleware:
+    def _make_middleware(self):
+        from pylon.tenancy.middleware import (
+            HeaderTenantResolver,
+            TenantDirectory,
+            TenantMiddleware,
+        )
+
+        directory = TenantDirectory()
+        directory.register(TenantContext(tenant_id="valid-tenant", tenant_name="Valid"))
+        header_resolver = HeaderTenantResolver(directory)
+        return TenantMiddleware(header_resolver=header_resolver)
+
+    def test_tenant_middleware_missing_header_returns_error(self) -> None:
+        """Request without any tenant header raises TenantNotFoundError."""
+        from pylon.tenancy.middleware import TenantNotFoundError
+
+        middleware = self._make_middleware()
+        with pytest.raises(TenantNotFoundError, match="no tenant identifier"):
+            middleware.resolve_tenant({})
+
+    def test_tenant_middleware_invalid_tenant_returns_error(self) -> None:
+        """Tenant ID that doesn't exist in directory raises TenantNotFoundError."""
+        from pylon.tenancy.middleware import TenantNotFoundError
+
+        middleware = self._make_middleware()
+        with pytest.raises(TenantNotFoundError, match="invalid-id-!@#"):
+            middleware.resolve_tenant({"X-Tenant-ID": "invalid-id-!@#"})
+
+    def test_header_resolver_extracts_tenant(self) -> None:
+        """HeaderTenantResolver correctly extracts tenant from X-Tenant-ID header."""
+        middleware = self._make_middleware()
+        ctx = middleware.resolve_tenant({"X-Tenant-ID": "valid-tenant"})
+        assert ctx.tenant_id == "valid-tenant"
+        assert ctx.tenant_name == "Valid"
+
+    def test_header_resolver_case_insensitive(self) -> None:
+        """Middleware also checks lowercase x-tenant-id header."""
+        middleware = self._make_middleware()
+        ctx = middleware.resolve_tenant({"x-tenant-id": "valid-tenant"})
+        assert ctx.tenant_id == "valid-tenant"

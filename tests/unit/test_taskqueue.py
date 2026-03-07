@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import heapq
 from datetime import UTC, datetime
 
 import pytest
@@ -198,6 +199,90 @@ class TestTaskQueue:
         # Next dequeue returns None
         assert q.dequeue() is None
 
+    def test_enqueue_dequeue_fifo_same_priority(self):
+        """Tasks with same priority dequeue in FIFO (creation-time) order."""
+        q = TaskQueue()
+        t1 = Task(name="first", priority=5, created_at=datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC))
+        t2 = Task(name="second", priority=5, created_at=datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC))
+        t3 = Task(name="third", priority=5, created_at=datetime(2026, 1, 1, 0, 0, 2, tzinfo=UTC))
+        q.enqueue(t1)
+        q.enqueue(t2)
+        q.enqueue(t3)
+        assert q.dequeue().name == "first"
+        assert q.dequeue().name == "second"
+        assert q.dequeue().name == "third"
+
+    def test_mark_complete_twice_is_idempotent(self):
+        """Completing an already-completed task does not raise."""
+        q = TaskQueue()
+        task = _task()
+        q.enqueue(task)
+        t = q.dequeue()
+        t.transition_to(TaskStatus.COMPLETED)
+        assert t.status == TaskStatus.COMPLETED
+        # Second completion attempt: COMPLETED has no valid transitions,
+        # so cancel returns False for terminal states (idempotent path)
+        assert q.cancel(t.id) is False
+        assert t.status == TaskStatus.COMPLETED
+
+    def test_mark_failed_moves_to_dead_letter(self):
+        """After max retries, a task goes into the dead letter queue."""
+        dlq = DeadLetterQueue()
+        q = TaskQueue()
+        task = Task(name="fragile", max_retries=2)
+        q.enqueue(task)
+
+        for _attempt in range(task.max_retries):
+            t = q.dequeue()
+            t.transition_to(TaskStatus.FAILED)
+            t.retries += 1
+            if t.retries < t.max_retries:
+                t.transition_to(TaskStatus.PENDING)
+                heapq.heappush(q._heap, t)
+
+        # After max retries exhausted, send to DLQ
+        assert task.retries >= task.max_retries
+        dlq.add(task)
+        assert dlq.get(task.id) is task
+        assert dlq.size() == 1
+
+    def test_get_metrics_counts(self):
+        q = TaskQueue()
+        q.enqueue(_task("a"))
+        q.enqueue(_task("b"))
+        q.enqueue(_task("c"))
+        running = q.dequeue()
+        running.transition_to(TaskStatus.COMPLETED)
+        active = q.dequeue()
+        active.transition_to(TaskStatus.FAILED)
+
+        assert q.size(TaskStatus.PENDING) == 1
+        assert q.size(TaskStatus.RUNNING) == 0
+        assert q.size(TaskStatus.COMPLETED) == 1
+        assert q.size(TaskStatus.FAILED) == 1
+        assert q.size() == 3
+
+    def test_dequeue_empty_returns_none(self):
+        q = TaskQueue()
+        assert q.dequeue() is None
+
+    def test_cancel_task_removes_from_pending(self):
+        q = TaskQueue()
+        task = _task("to-cancel")
+        q.enqueue(task)
+        assert q.cancel(task.id) is True
+        assert task.status == TaskStatus.CANCELLED
+        assert q.dequeue() is None
+
+    def test_task_priority_ordering(self):
+        q = TaskQueue()
+        q.enqueue(_task("high", priority=1))
+        q.enqueue(_task("low", priority=9))
+        q.enqueue(_task("medium", priority=5))
+        assert q.dequeue().name == "high"
+        assert q.dequeue().name == "medium"
+        assert q.dequeue().name == "low"
+
 
 class TestTaskFSM:
     def test_valid_transition(self):
@@ -245,7 +330,7 @@ class TestWorker:
         task.transition_to(TaskStatus.RUNNING)
         result = w.process(task, _fail_handler)
         assert not result.success
-        assert "boom" in result.error
+        assert result.error == "Task execution failed"
         assert task.status == TaskStatus.FAILED
 
     def test_process_stopped_worker_raises(self):

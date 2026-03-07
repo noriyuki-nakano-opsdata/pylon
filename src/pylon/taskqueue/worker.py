@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import logging
 import time
 import uuid
 from collections.abc import Callable
@@ -10,6 +11,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from pylon.errors import PylonError
+
+logger = logging.getLogger(__name__)
 from pylon.taskqueue.queue import Task, TaskStatus
 
 
@@ -73,12 +76,13 @@ class Worker:
                 output=output,
                 duration_seconds=duration,
             )
-        except Exception as exc:
+        except Exception:
+            logger.exception("Task %s execution failed in worker %s", task.id, self.id)
             duration = time.monotonic() - start
             task.transition_to(TaskStatus.FAILED)
             return TaskResult(
                 task_id=task.id,
-                error=str(exc),
+                error="Task execution failed",
                 duration_seconds=duration,
             )
         finally:

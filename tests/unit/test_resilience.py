@@ -180,6 +180,79 @@ class TestCircuitBreaker(unittest.TestCase):
         # If we reach here, no deadlock occurred
         self.assertEqual(cb.state, CircuitState.OPEN)
 
+    def test_half_open_single_failure_returns_to_open(self):
+        """In HALF_OPEN, one failure transitions back to OPEN."""
+        import time
+        cb = CircuitBreaker(CircuitBreakerConfig(failure_threshold=1, timeout=0.05))
+        # Trip to OPEN
+        try:
+            cb.call(lambda: (_ for _ in ()).throw(RuntimeError()))
+        except RuntimeError:
+            pass
+        self.assertEqual(cb.state, CircuitState.OPEN)
+        # Wait for timeout to transition to HALF_OPEN
+        time.sleep(0.06)
+        self.assertEqual(cb.state, CircuitState.HALF_OPEN)
+        # Single failure in HALF_OPEN should go back to OPEN
+        try:
+            cb.call(lambda: (_ for _ in ()).throw(RuntimeError("half-open fail")))
+        except RuntimeError:
+            pass
+        self.assertEqual(cb.state, CircuitState.OPEN)
+
+    def test_state_change_callback_exception_doesnt_break_circuit(self):
+        """If on_state_change callback raises, circuit breaker still works."""
+        def bad_callback(old, new):
+            raise ValueError("callback error")
+
+        cb = CircuitBreaker(
+            CircuitBreakerConfig(failure_threshold=1),
+            on_state_change=bad_callback,
+        )
+        # The callback will raise when transitioning CLOSED -> OPEN,
+        # but the exception propagates from the call() that already raised.
+        # After that the circuit should still be in OPEN state.
+        try:
+            cb.call(lambda: (_ for _ in ()).throw(RuntimeError("trigger")))
+        except (RuntimeError, ValueError):
+            pass
+        # Circuit should still be in OPEN state despite callback error
+        # Access internal state directly to avoid triggering another callback
+        self.assertEqual(cb._state, CircuitState.OPEN)
+
+    def test_consecutive_success_threshold(self):
+        """Verify exact number of successes needed to close from HALF_OPEN."""
+        import time
+        cb = CircuitBreaker(CircuitBreakerConfig(
+            failure_threshold=1, success_threshold=2,
+            timeout=0.05, half_open_max_calls=3,
+        ))
+        # Trip to OPEN
+        try:
+            cb.call(lambda: (_ for _ in ()).throw(RuntimeError()))
+        except RuntimeError:
+            pass
+        time.sleep(0.06)
+        self.assertEqual(cb.state, CircuitState.HALF_OPEN)
+        # First success: still HALF_OPEN (need 2)
+        cb.call(lambda: "ok1")
+        self.assertEqual(cb.state, CircuitState.HALF_OPEN)
+        # Second success: transitions to CLOSED
+        cb.call(lambda: "ok2")
+        self.assertEqual(cb.state, CircuitState.CLOSED)
+
+    def test_metrics_track_failures(self):
+        """After failures, metrics.failures count is correct."""
+        cb = CircuitBreaker(CircuitBreakerConfig(failure_threshold=10))
+        for i in range(5):
+            try:
+                cb.call(lambda: (_ for _ in ()).throw(RuntimeError("fail")))
+            except RuntimeError:
+                pass
+        self.assertEqual(cb.metrics.failures, 5)
+        self.assertIsNotNone(cb.metrics.last_failure_time)
+        self.assertEqual(cb.metrics.total_calls, 5)
+
 
 # --- Retry ---
 

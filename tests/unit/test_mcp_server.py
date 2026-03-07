@@ -150,7 +150,7 @@ class TestInitialize:
         resp = server.handle_request(req)
         assert resp.error is not None
         assert resp.error.message == "Internal error"
-        assert "Unsupported protocol version" in resp.error.data
+        assert resp.error.data is None
 
     def test_initialize_empty_server(self):
         server = McpServer()
@@ -799,3 +799,136 @@ class TestAuthHelpers:
         assert oauth.validate_token(token) is None
         # new token should be valid
         assert oauth.validate_token(new_resp.access_token) is not None
+
+
+# ===== 13. OAuth Token Expiration & Scope Enforcement =====
+
+
+class TestOAuthTokenExpiredReturnsUnauthorized:
+    def test_oauth_token_expired_returns_unauthorized(self):
+        """Expired token returns UNAUTHORIZED from server."""
+        oauth = OAuthProvider()
+        server = _make_server_with_all()
+        server._oauth = oauth
+        token = _get_token(oauth, ["tools:read"])
+        # Simulate expiration by backdating created_at
+        meta = oauth._tokens[token]
+        meta["created_at"] = meta["created_at"] - meta["expires_in"] - 1
+        req = JsonRpcRequest(method="tools/list", id=1)
+        resp = server.handle_request(req, access_token=token)
+        assert resp.error is not None
+        assert resp.error.code == UNAUTHORIZED
+
+    def test_oauth_insufficient_scope_returns_forbidden(self):
+        """Token with limited scopes gets FORBIDDEN for methods requiring different scope."""
+        oauth = OAuthProvider()
+        server = _make_server_with_all()
+        server._oauth = oauth
+        token = _get_token(oauth, ["tools:read"])
+        req = JsonRpcRequest(
+            method="tools/call",
+            params={"name": "echo", "arguments": {"text": "hi"}},
+            id=1,
+        )
+        resp = server.handle_request(req, access_token=token)
+        assert resp.error is not None
+        assert resp.error.code == FORBIDDEN
+        assert "tools:call" in resp.error.message
+
+    def test_oauth_valid_token_allows_request(self):
+        """Token with correct scope allows the request to succeed."""
+        oauth = OAuthProvider()
+        server = _make_server_with_all()
+        server._oauth = oauth
+        token = _get_token(oauth, ["tools:read", "tools:call"])
+        req = JsonRpcRequest(
+            method="tools/call",
+            params={"name": "echo", "arguments": {"text": "hello"}},
+            id=1,
+        )
+        resp = server.handle_request(req, access_token=token)
+        assert resp.error is None
+        assert resp.result == {"echo": "hello"}
+
+
+class TestAuthCodeExpiration:
+    def test_auth_code_expiration(self):
+        """Auth code that has expired cannot be exchanged for a token."""
+        oauth = OAuthProvider()
+        client = OAuthClientConfig(
+            client_id="test-client",
+            client_secret="test-secret",
+            redirect_uri="http://localhost/callback",
+            scopes=["tools:read"],
+        )
+        oauth.register_client(client)
+        pkce = PKCEChallenge.generate()
+        code = oauth.create_authorization_code(
+            client_id="test-client",
+            redirect_uri="http://localhost/callback",
+            scopes=["tools:read"],
+            code_challenge=pkce.code_challenge,
+        )
+        assert code is not None
+        # Simulate expiration by backdating created_at
+        auth_code_obj = oauth._auth_codes[code]
+        auth_code_obj.created_at = auth_code_obj.created_at - auth_code_obj.expires_in - 1
+        token_resp = oauth.exchange_code(
+            code=code,
+            client_id="test-client",
+            redirect_uri="http://localhost/callback",
+            code_verifier=pkce.code_verifier,
+        )
+        assert token_resp is None
+
+
+class TestPkceChallengeTokenExchange:
+    def test_pkce_challenge_mismatch_fails(self):
+        """Exchange with wrong code_verifier fails PKCE verification."""
+        oauth = OAuthProvider()
+        client = OAuthClientConfig(
+            client_id="test-client",
+            client_secret="test-secret",
+            redirect_uri="http://localhost/callback",
+            scopes=["tools:read"],
+        )
+        oauth.register_client(client)
+        pkce = PKCEChallenge.generate()
+        code = oauth.create_authorization_code(
+            client_id="test-client",
+            redirect_uri="http://localhost/callback",
+            scopes=["tools:read"],
+            code_challenge=pkce.code_challenge,
+        )
+        assert code is not None
+        wrong_verifier = "completely-wrong-verifier-value"
+        token_resp = oauth.exchange_code(
+            code=code,
+            client_id="test-client",
+            redirect_uri="http://localhost/callback",
+            code_verifier=wrong_verifier,
+        )
+        assert token_resp is None
+
+
+class TestDynamicClientRegistration:
+    def test_dynamic_client_registration(self):
+        """Register a new client via DCR, verify client_id and secret are returned."""
+        from pylon.protocols.mcp.auth import OAuthServerConfig
+
+        config = OAuthServerConfig(dcr_enabled=True)
+        oauth = OAuthProvider(config=config)
+        client = oauth.dynamic_client_registration(
+            redirect_uris=["http://localhost:9090/callback"],
+            scope="tools:read resources:read",
+        )
+        assert client is not None
+        assert len(client.client_id) > 0
+        assert len(client.client_secret) > 0
+        assert client.redirect_uri == "http://localhost:9090/callback"
+        assert client.scopes == ["tools:read", "resources:read"]
+        # Verify the client is registered and retrievable
+        retrieved = oauth.get_client(client.client_id)
+        assert retrieved is not None
+        assert retrieved.client_id == client.client_id
+        assert retrieved.client_secret == client.client_secret

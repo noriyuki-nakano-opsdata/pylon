@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import enum
+import ipaddress
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 
 class TaskState(enum.Enum):
@@ -120,6 +122,24 @@ class PushNotificationConfig:
         if not self.url.startswith("https://"):
             raise ValueError(
                 f"PushNotificationConfig url must use https scheme, got: {self.url}"
+            )
+        self._validate_not_private(self.url)
+
+    @staticmethod
+    def _validate_not_private(url: str) -> None:
+        """Reject URLs that point to private/internal IP ranges (SSRF prevention)."""
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        if not hostname:
+            raise ValueError("PushNotificationConfig url has no hostname")
+        try:
+            addr = ipaddress.ip_address(hostname)
+        except ValueError:
+            # Not a raw IP (it's a domain name) -- allow it
+            return
+        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+            raise ValueError(
+                "PushNotificationConfig url must not point to a private/internal address"
             )
 
     def to_dict(self) -> dict:

@@ -123,7 +123,8 @@ class TokenTenantResolver:
         except TenantNotFoundError:
             raise
         except Exception as exc:
-            raise TenantNotFoundError(f"invalid token: {exc}") from exc
+            _logger.warning("Token parsing failed: %s", exc)
+            raise TenantNotFoundError("invalid token") from exc
 
         if not tenant_id:
             raise TenantNotFoundError("no tenant_id in token")

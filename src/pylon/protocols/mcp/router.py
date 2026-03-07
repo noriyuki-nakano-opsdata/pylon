@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 
 from pylon.protocols.mcp.dto import DtoValidationError
+
+logger = logging.getLogger(__name__)
 from pylon.protocols.mcp.types import (
     INTERNAL_ERROR,
     INVALID_PARAMS,
@@ -46,14 +49,14 @@ class MethodRouter:
                 error=JsonRpcError(code=INVALID_PARAMS, message=str(exc)),
                 id=request.id,
             )
-        except Exception as exc:
+        except Exception:
+            logger.exception("Unhandled error in JSON-RPC handler for method %s", request.method)
             if request.id is None:
                 return None
             return JsonRpcResponse(
                 error=JsonRpcError(
                     code=INTERNAL_ERROR,
                     message="Internal error",
-                    data=str(exc),
                 ),
                 id=request.id,
             )

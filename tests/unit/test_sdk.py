@@ -163,7 +163,7 @@ class TestPylonClientWorkflows:
         client.register_workflow("bad", lambda _: 1 / 0)
         result = client.run_workflow("bad", input_data=None)
         assert result.status == RunStatus.FAILED
-        assert "division by zero" in result.error
+        assert result.error == "Internal execution error"
 
     def test_get_run(self, client: PylonClient):
         result = client.run_workflow("w")
