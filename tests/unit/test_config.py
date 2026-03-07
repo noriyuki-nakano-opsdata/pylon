@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -88,6 +89,56 @@ class TestConfigLoader:
         assert ConfigSource.YAML.value == "yaml"
         assert ConfigSource.ENV.value == "env"
         assert ConfigSource.DEFAULT.value == "default"
+
+    def test_load_env_nested_keys(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """PYLON_FOO_BAR becomes {"foo": {"bar": value}}."""
+        monkeypatch.setenv("PYLON_FOO_BAR", "baz")
+        # Clear other PYLON_ vars to isolate the test
+        for key in list(os.environ):
+            if key.startswith("PYLON_") and key != "PYLON_FOO_BAR":
+                monkeypatch.delenv(key, raising=False)
+        config = ConfigLoader.load_env("PYLON_")
+        assert config == {"foo": {"bar": "baz"}}
+
+    def test_load_env_ignores_non_pylon_vars(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Env vars without PYLON_ prefix are ignored."""
+        monkeypatch.setenv("OTHER_VAR", "should_not_appear")
+        monkeypatch.setenv("NOTPYLON_KEY", "also_ignored")
+        # Clear PYLON_ vars
+        for key in list(os.environ):
+            if key.startswith("PYLON_"):
+                monkeypatch.delenv(key, raising=False)
+        config = ConfigLoader.load_env("PYLON_")
+        assert config == {}
+        assert "other" not in config
+        assert "notpylon" not in config
+
+    def test_load_yaml_invalid_content_raises(self, tmp_path: Path) -> None:
+        """Non-dict YAML root raises ValueError."""
+        f = tmp_path / "bad.yaml"
+        f.write_text("- item1\n- item2\n")
+        with pytest.raises(ValueError, match="Expected dict"):
+            ConfigLoader.load_yaml(f)
+
+    def test_merge_configs_deep(self) -> None:
+        """Deep merge preserves nested values from both configs."""
+        a = {"db": {"host": "localhost", "port": 5432, "options": {"timeout": 30}}}
+        b = {"db": {"port": 3306, "options": {"ssl": True}}}
+        merged = ConfigLoader.merge(a, b)
+        assert merged["db"]["host"] == "localhost"
+        assert merged["db"]["port"] == 3306
+        assert merged["db"]["options"]["timeout"] == 30
+        assert merged["db"]["options"]["ssl"] is True
+
+    def test_load_empty_config(self, tmp_path: Path) -> None:
+        """Loading empty YAML returns empty dict (defaults)."""
+        f = tmp_path / "empty.yaml"
+        f.write_text("")
+        assert ConfigLoader.load_yaml(f) == {}
+        # Also test YAML with only comments
+        f2 = tmp_path / "comments.yaml"
+        f2.write_text("# just a comment\n")
+        assert ConfigLoader.load_yaml(f2) == {}
 
 
 # --- ConfigValidator ---

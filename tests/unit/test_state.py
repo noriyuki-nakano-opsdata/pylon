@@ -375,6 +375,80 @@ class TestStateMachine(unittest.TestCase):
         self.assertEqual(sm.history[0].from_state, "a")
         self.assertEqual(sm.history[0].to_state, "b")
 
+    def test_get_available_events_from_state(self):
+        """Verify correct events returned for a given state."""
+        sm = self._make_traffic_light()
+        # At red, only "go" is available
+        self.assertEqual(sm.get_available_events(), ["go"])
+        sm.trigger("go")
+        # At green, only "slow" is available
+        self.assertEqual(sm.get_available_events(), ["slow"])
+        sm.trigger("slow")
+        # At yellow, only "stop" is available
+        self.assertEqual(sm.get_available_events(), ["stop"])
+
+    def test_transition_with_guard_that_rejects(self):
+        """Guard function returns False, transition is rejected."""
+        allowed = False
+        sm = StateMachine(StateMachineConfig(initial_state="off"))
+        sm.add_state("off")
+        sm.add_state("on")
+        sm.add_transition("off", "on", "switch", guard=lambda: allowed)
+        sm.start()
+        with self.assertRaises(InvalidTransitionError):
+            sm.trigger("switch")
+        self.assertEqual(sm.current_state, "off")
+        self.assertEqual(len(sm.history), 0)
+
+    def test_on_exit_callback_fires(self):
+        """Verify on_exit callback fires when leaving a state."""
+        log = []
+        sm = StateMachine(StateMachineConfig(initial_state="s1"))
+        sm.add_state("s1", on_exit=lambda s: log.append(f"exit:{s}"))
+        sm.add_state("s2")
+        sm.add_transition("s1", "s2", "advance")
+        sm.start()
+        sm.trigger("advance")
+        self.assertIn("exit:s1", log)
+
+    def test_self_transition_allowed(self):
+        """If configured, a state can transition to itself."""
+        log = []
+        sm = StateMachine(StateMachineConfig(
+            initial_state="running", allow_self_transitions=True
+        ))
+        sm.add_state(
+            "running",
+            on_enter=lambda s: log.append(f"enter:{s}"),
+            on_exit=lambda s: log.append(f"exit:{s}"),
+        )
+        sm.add_transition("running", "running", "tick")
+        sm.start()
+        log.clear()  # clear the initial on_enter
+        result = sm.trigger("tick")
+        self.assertEqual(result, "running")
+        self.assertEqual(sm.current_state, "running")
+        self.assertIn("exit:running", log)
+        self.assertIn("enter:running", log)
+
+    def test_history_records_all_transitions(self):
+        """After 3 transitions, history has 3 entries."""
+        sm = self._make_traffic_light()
+        sm.trigger("go")
+        sm.trigger("slow")
+        sm.trigger("stop")
+        hist = sm.history
+        self.assertEqual(len(hist), 3)
+        self.assertEqual(hist[0].from_state, "red")
+        self.assertEqual(hist[0].to_state, "green")
+        self.assertEqual(hist[0].event, "go")
+        self.assertEqual(hist[1].from_state, "green")
+        self.assertEqual(hist[1].to_state, "yellow")
+        self.assertEqual(hist[1].event, "slow")
+        self.assertEqual(hist[2].from_state, "yellow")
+        self.assertEqual(hist[2].to_state, "red")
+        self.assertEqual(hist[2].event, "stop")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -227,6 +227,68 @@ class TestEventBus:
         assert count == 1
         assert len(received) == 1
 
+    def test_unsubscribe_unknown_handler_is_noop(self) -> None:
+        """Unsubscribing a handler that was never subscribed doesn't raise."""
+        bus = EventBus()
+        result = bus.unsubscribe("never-existed-id")
+        assert result is False
+        # Ensure bus still works normally after
+        received: list[Event] = []
+        bus.subscribe(AGENT_CREATED, lambda e: received.append(e))
+        bus.publish(Event(type=AGENT_CREATED))
+        assert len(received) == 1
+
+    def test_publish_no_subscribers_goes_to_dead_letter(self) -> None:
+        """Publishing event with no subscribers returns 0 and no dead letters
+        (dead letters are for handler failures, not missing subscribers)."""
+        bus = EventBus()
+        count = bus.publish(Event(type=AGENT_CREATED))
+        assert count == 0
+        assert len(bus.dead_letters) == 0
+
+    def test_wildcard_subscription_receives_all_events(self) -> None:
+        """Wildcard subscriber receives events from multiple topics."""
+        bus = EventBus()
+        received: list[Event] = []
+        bus.subscribe("*", lambda e: received.append(e))
+
+        bus.publish(Event(type=AGENT_CREATED))
+        bus.publish(Event(type=WORKFLOW_STARTED))
+        bus.publish(Event(type=TASK_COMPLETED))
+        assert len(received) == 3
+        assert {e.type for e in received} == {AGENT_CREATED, WORKFLOW_STARTED, TASK_COMPLETED}
+
+    def test_handler_exception_doesnt_break_other_handlers(self) -> None:
+        """If one handler raises, other handlers for same event still execute."""
+        bus = EventBus()
+        received: list[str] = []
+
+        bus.subscribe(AGENT_CREATED, lambda e: received.append("first"))
+
+        def failing(e: Event) -> None:
+            raise RuntimeError("broken handler")
+
+        bus.subscribe(AGENT_CREATED, failing)
+        bus.subscribe(AGENT_CREATED, lambda e: received.append("third"))
+
+        count = bus.publish(Event(type=AGENT_CREATED))
+        # Two handlers succeeded, one failed
+        assert count == 2
+        assert received == ["first", "third"]
+        assert len(bus.dead_letters) == 1
+
+    def test_subscribe_and_publish_multiple_handlers(self) -> None:
+        """Multiple handlers for same event all fire."""
+        bus = EventBus()
+        results: list[int] = []
+        bus.subscribe(AGENT_CREATED, lambda e: results.append(1))
+        bus.subscribe(AGENT_CREATED, lambda e: results.append(2))
+        bus.subscribe(AGENT_CREATED, lambda e: results.append(3))
+
+        count = bus.publish(Event(type=AGENT_CREATED))
+        assert count == 3
+        assert results == [1, 2, 3]
+
 
 # --- Handlers ---
 

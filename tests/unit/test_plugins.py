@@ -201,6 +201,36 @@ class TestPluginLoader:
         assert loader.check_version_compatibility("2.0.0", "1.0.0") is False
         assert loader.check_version_compatibility("invalid", "1.0.0") is False
 
+    def test_validate_manifest_missing_name(self):
+        loader = PluginLoader()
+        manifest = make_manifest(name="", version="1.0.0", entry_point="mod:Cls")
+        errors = loader.validate_manifest(manifest)
+        assert any("name" in e.lower() for e in errors)
+
+    def test_validate_manifest_missing_version(self):
+        loader = PluginLoader()
+        manifest = make_manifest(name="valid", version="", entry_point="mod:Cls")
+        errors = loader.validate_manifest(manifest)
+        assert any("version" in e.lower() for e in errors)
+
+    def test_validate_manifest_valid(self):
+        loader = PluginLoader()
+        manifest = make_manifest(
+            name="valid-plugin", version="1.0.0", entry_point="mod:Cls"
+        )
+        errors = loader.validate_manifest(manifest)
+        assert errors == []
+
+    def test_plugin_state_transitions(self):
+        p = make_plugin("lifecycle")
+        assert p.state == PluginState.DISCOVERED
+        p.initialize(PluginConfig())
+        assert p.state == PluginState.INITIALIZED
+        p.activate()
+        assert p.state == PluginState.STARTED
+        p.deactivate()
+        assert p.state == PluginState.STOPPED
+
 
 # === Registry Tests ===
 
@@ -279,6 +309,24 @@ class TestPluginRegistry:
         registry = PluginRegistry()
         with pytest.raises(KeyError):
             registry.configure("ghost", PluginConfig())
+
+    def test_plugin_registry_register_and_get(self):
+        registry = PluginRegistry()
+        p = make_plugin("fetched")
+        registry.register(p)
+        assert registry.get("fetched") is p
+
+    def test_plugin_registry_list(self):
+        registry = PluginRegistry()
+        p1 = make_plugin("alpha")
+        p2 = make_plugin("beta")
+        p3 = make_plugin("gamma")
+        registry.register(p1)
+        registry.register(p2)
+        registry.register(p3)
+        all_plugins = registry.list()
+        names = {pl.info().name for pl in all_plugins}
+        assert names == {"alpha", "beta", "gamma"}
 
     def test_activate_in_dependency_order(self):
         registry = PluginRegistry()

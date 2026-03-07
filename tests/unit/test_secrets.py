@@ -123,6 +123,49 @@ class TestSecretManager:
         # Different master keys should produce different encrypted values
         assert mgr1._store["k"][-1].encrypted_value != mgr2._store["k"][-1].encrypted_value
 
+    def test_store_and_retrieve_secret(self):
+        mgr = SecretManager()
+        mgr.store("app/token", "my-secret-token")
+        secret = mgr.get("app/token")
+        assert secret is not None
+        assert secret.value == "my-secret-token"
+
+    def test_retrieve_nonexistent_returns_none(self):
+        mgr = SecretManager()
+        assert mgr.get("does-not-exist") is None
+
+    def test_delete_secret(self):
+        mgr = SecretManager()
+        mgr.store("temp/key", "temporary")
+        assert mgr.delete("temp/key") is True
+        assert mgr.get("temp/key") is None
+
+    def test_list_secrets(self):
+        mgr = SecretManager()
+        mgr.store("secret/a", "val-a")
+        mgr.store("secret/b", "val-b")
+        mgr.store("secret/c", "val-c")
+        result = mgr.list()
+        names = {m.key for m in result}
+        assert names == {"secret/a", "secret/b", "secret/c"}
+
+    def test_overwrite_secret(self):
+        mgr = SecretManager()
+        mgr.store("key", "first-value")
+        mgr.store("key", "second-value")
+        secret = mgr.get("key")
+        assert secret is not None
+        assert secret.value == "second-value"
+
+    def test_encryption_produces_different_ciphertext(self):
+        mgr = SecretManager()
+        mgr.store("k1", "same-plaintext")
+        mgr.store("k2", "same-plaintext")
+        ct1 = mgr._store["k1"][-1].encrypted_value
+        ct2 = mgr._store["k2"][-1].encrypted_value
+        # Random salt means same plaintext produces different ciphertext
+        assert ct1 != ct2
+
 
 # ---------------------------------------------------------------------------
 # VaultProvider

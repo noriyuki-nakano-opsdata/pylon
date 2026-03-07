@@ -45,6 +45,10 @@ class BasePlugin:
 
     @state.setter
     def state(self, value: PluginState) -> None:
+        if not isinstance(value, PluginState):
+            raise ValueError(
+                f"state must be a PluginState member, got {type(value).__name__}: {value!r}"
+            )
         self._state = value
 
     def initialize(self, config: PluginConfig) -> None:
@@ -118,7 +122,12 @@ class PluginLoader:
                 description=data.get("description", ""),
                 author=data.get("author", ""),
             )
-        except (json.JSONDecodeError, KeyError, ValueError):
+        except (json.JSONDecodeError, KeyError, ValueError) as exc:
+            warnings.warn(
+                f"Failed to load plugin manifest from {path}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             return None
 
     def _manifest_to_info(self, manifest: PluginManifest) -> PluginInfo:
@@ -136,10 +145,16 @@ class PluginLoader:
         errors: list[str] = []
         if not manifest.name:
             errors.append("Plugin name is required")
+        elif not isinstance(manifest.name, str) or not manifest.name.strip():
+            errors.append("Plugin name must be a non-empty string")
         if not manifest.version:
             errors.append("Plugin version is required")
+        elif not isinstance(manifest.version, str) or not manifest.version.strip():
+            errors.append("Plugin version must be a non-empty string")
         if not manifest.entry_point:
             errors.append("Entry point is required")
+        elif not isinstance(manifest.entry_point, str) or not manifest.entry_point.strip():
+            errors.append("Entry point must be a non-empty string")
         return errors
 
     def validate(self, plugin_info: PluginInfo, available: set[str] | None = None) -> list[str]:

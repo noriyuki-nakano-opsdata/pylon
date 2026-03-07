@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 
@@ -89,6 +90,10 @@ class CompositeLimit:
     """Combines multiple rate limiters with AND logic."""
 
     def __init__(self, *limiters: TokenBucket | SlidingWindow) -> None:
+        """Initialize with zero or more limiters.
+
+        An empty limiters list means no restrictions (always allows).
+        """
         self._limiters = list(limiters)
 
     def allow(self, now: float | None = None) -> bool:
@@ -119,7 +124,7 @@ class CompositeLimit:
 class KeyedRateLimiter:
     """Per-key rate limiting (e.g., per tenant, user, or API key)."""
 
-    def __init__(self, factory: callable) -> None:
+    def __init__(self, factory: Callable[[], TokenBucket | SlidingWindow]) -> None:
         self._factory = factory
         self._limiters: dict[str, TokenBucket | SlidingWindow] = {}
 
