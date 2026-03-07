@@ -1,22 +1,29 @@
-"""Agent card generation and registry (FR-09).
+"""Agent card generation and registry (FR-09) - RC v1.0.
 
 Agent cards are served at /.well-known/agent-card.json for A2A discovery.
 """
 
 from __future__ import annotations
 
-from pylon.protocols.a2a.types import AgentCard
+from pylon.protocols.a2a.types import (
+    AgentCapabilities,
+    AgentCard,
+    AgentSkill,
+    AuthMethod,
+)
 
 
 def generate_card(
     name: str,
     url: str,
     *,
-    version: str = "0.1.0",
+    version: str = "1.0.0",
     description: str = "",
-    capabilities: list[str] | None = None,
-    skills: list[str] | None = None,
-    authentication: str = "none",
+    capabilities: AgentCapabilities | None = None,
+    skills: list[AgentSkill] | None = None,
+    authentication: AuthMethod = AuthMethod.NONE,
+    provider: str = "",
+    documentation_url: str = "",
 ) -> AgentCard:
     """Generate an AgentCard from agent configuration."""
     return AgentCard(
@@ -24,9 +31,11 @@ def generate_card(
         version=version,
         description=description,
         url=url,
-        capabilities=capabilities or [],
+        capabilities=capabilities or AgentCapabilities(),
         skills=skills or [],
         authentication=authentication,
+        provider=provider,
+        documentation_url=documentation_url,
     )
 
 
@@ -40,9 +49,10 @@ class AgentCardRegistry:
         self._cards: dict[str, AgentCard] = {}
 
     def register(self, card: AgentCard) -> None:
-        """Register a peer agent card."""
-        if not card.name:
-            raise ValueError("Agent card must have a name")
+        """Register a peer agent card. Validates the card first."""
+        errors = card.validate()
+        if errors:
+            raise ValueError(f"Invalid agent card: {'; '.join(errors)}")
         self._cards[card.name] = card
 
     def unregister(self, name: str) -> None:
@@ -60,3 +70,22 @@ class AgentCardRegistry:
     def list_peers(self) -> list[AgentCard]:
         """List all registered peer cards."""
         return list(self._cards.values())
+
+    def find_by_skill(self, skill_name: str) -> list[AgentCard]:
+        """Find agents that offer a specific skill."""
+        results: list[AgentCard] = []
+        for card in self._cards.values():
+            for skill in card.skills:
+                if skill.name == skill_name:
+                    results.append(card)
+                    break
+        return results
+
+    def find_by_capability(self, capability: str) -> list[AgentCard]:
+        """Find agents with a specific capability enabled."""
+        results: list[AgentCard] = []
+        for card in self._cards.values():
+            caps_dict = card.capabilities.to_dict()
+            if caps_dict.get(capability):
+                results.append(card)
+        return results
