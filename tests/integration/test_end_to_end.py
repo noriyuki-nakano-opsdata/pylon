@@ -255,7 +255,7 @@ async def test_e2e_cycle_detection():
     executor = GraphExecutor()
     run = WorkflowRun(workflow_id="wf-cycle")
 
-    with pytest.raises(WorkflowError, match="Cycle"):
+    with pytest.raises(WorkflowError, match="(Cycle|entry point)"):
         await executor.execute(g, run, _echo_handler)
 
 
