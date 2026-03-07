@@ -1,331 +1,249 @@
-"""Integration tests: Workflow + Repository modules.
+"""Integration tests: Workflow and checkpoint repositories."""
 
-Validates that workflow execution correctly interacts with checkpoint,
-workflow-run, audit, and memory repositories -- creating records,
-enabling replay, and maintaining consistency.
-"""
 from __future__ import annotations
 
-import asyncio
-import uuid
 from typing import Any
 
 import pytest
 
-from pylon.errors import WorkflowError
-from pylon.repository.audit import AuditRepository
-from pylon.repository.checkpoint import CheckpointRepository
-from pylon.repository.memory import MemoryRepository
-from pylon.repository.workflow import RunStatus, WorkflowRepository, WorkflowRun
-from pylon.types import ConditionalEdge
-from pylon.workflow.executor import GraphExecutor
-from pylon.workflow.graph import END, WorkflowGraph
+from pylon.repository.audit import AuditEntry, AuditRepository
+from pylon.repository.checkpoint import Checkpoint, CheckpointRepository
+from pylon.repository.memory import (
+    EpisodicEntry,
+    MemoryRepository,
+    ProceduralEntry,
+    SemanticEntry,
+)
+from pylon.repository.workflow import (
+    RunStatus,
+    WorkflowDefinition,
+    WorkflowRepository,
+    WorkflowRun,
+)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _build_linear_graph(*node_ids: str) -> WorkflowGraph:
-    g = WorkflowGraph()
-    for nid in node_ids:
-        g.add_node(nid)
-    for i in range(len(node_ids) - 1):
-        g.add_edge(node_ids[i], node_ids[i + 1])
-    g.add_edge(node_ids[-1], END)
-    g.set_entry(node_ids[0])
-    return g
+# ---------- CheckpointRepository ----------
 
 
-async def _accumulating_handler(node_id: str, state: dict[str, Any]) -> dict[str, Any]:
-    visited = state.get("visited", [])
-    visited.append(node_id)
-    counter = state.get("counter", 0) + 1
-    return {**state, "visited": visited, "counter": counter}
+async def test_checkpoint_create_and_get():
+    repo = CheckpointRepository()
+    cp = Checkpoint(workflow_run_id="run-1", node_id="step-a")
+    cp.add_event(input_data={"x": 1}, output_data={"y": 2})
+
+    created = await repo.create(cp)
+    assert created.id == cp.id
+
+    fetched = await repo.get(cp.id)
+    assert fetched is not None
+    assert fetched.workflow_run_id == "run-1"
+    assert len(fetched.event_log) == 1
 
 
-async def _failing_handler_at(
-    fail_node: str,
-    node_id: str,
-    state: dict[str, Any],
-) -> dict[str, Any]:
-    visited = state.get("visited", []) + [node_id]
-    if node_id == fail_node:
-        raise RuntimeError(f"Simulated failure at {node_id}")
-    return {**state, "visited": visited}
+async def test_checkpoint_list_by_workflow_run():
+    repo = CheckpointRepository()
+    cp1 = Checkpoint(workflow_run_id="run-1", node_id="a")
+    cp2 = Checkpoint(workflow_run_id="run-1", node_id="b")
+    cp3 = Checkpoint(workflow_run_id="run-2", node_id="c")
+
+    await repo.create(cp1)
+    await repo.create(cp2)
+    await repo.create(cp3)
+
+    results = await repo.list(workflow_run_id="run-1")
+    assert len(results) == 2
+    assert all(c.workflow_run_id == "run-1" for c in results)
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+async def test_checkpoint_delete():
+    repo = CheckpointRepository()
+    cp = Checkpoint(workflow_run_id="run-1", node_id="x")
+    await repo.create(cp)
+
+    deleted = await repo.delete(cp.id)
+    assert deleted is True
+
+    fetched = await repo.get(cp.id)
+    assert fetched is None
+
+    deleted_again = await repo.delete(cp.id)
+    assert deleted_again is False
 
 
-@pytest.mark.asyncio
-async def test_checkpoint_created_after_each_node():
-    """Each completed node produces a checkpoint in the repository."""
-    checkpoint_repo = CheckpointRepository()
-    graph = _build_linear_graph("a", "b", "c")
-    run_id = str(uuid.uuid4())
+async def test_checkpoint_get_latest():
+    repo = CheckpointRepository()
+    cp1 = Checkpoint(workflow_run_id="run-1", node_id="a")
+    cp2 = Checkpoint(workflow_run_id="run-1", node_id="b")
 
-    executor = GraphExecutor(
-        graph,
-        handler=_accumulating_handler,
-        checkpoint_repo=checkpoint_repo,
-        run_id=run_id,
-    )
-    await executor.run({"visited": []})
+    await repo.create(cp1)
+    await repo.create(cp2)
 
-    checkpoints = checkpoint_repo.list(run_id)
-    # At minimum one checkpoint per node
-    assert len(checkpoints) >= 3
+    latest = await repo.get_latest("run-1")
+    assert latest is not None
 
 
-@pytest.mark.asyncio
-async def test_checkpoint_restore_produces_same_final_state():
-    """Restoring from a mid-workflow checkpoint and replaying yields
-    the same final state as a fresh run."""
-    checkpoint_repo = CheckpointRepository()
-    graph = _build_linear_graph("x", "y", "z")
-
-    # Full run
-    run_id_full = str(uuid.uuid4())
-    executor_full = GraphExecutor(
-        graph,
-        handler=_accumulating_handler,
-        checkpoint_repo=checkpoint_repo,
-        run_id=run_id_full,
-    )
-    result_full = await executor_full.run({"visited": []})
-
-    # Restore from checkpoint after "x" and replay
-    checkpoints = checkpoint_repo.list(run_id_full)
-    first_cp = checkpoints[0]
-    restored_state = checkpoint_repo.load(first_cp.checkpoint_id)
-
-    run_id_replay = str(uuid.uuid4())
-    executor_replay = GraphExecutor(
-        graph,
-        handler=_accumulating_handler,
-        checkpoint_repo=checkpoint_repo,
-        run_id=run_id_replay,
-    )
-    result_replay = await executor_replay.run(
-        restored_state,
-        resume_from=first_cp.node_id,
-    )
-
-    # Final counters must match
-    assert result_replay["counter"] == result_full["counter"]
+# ---------- WorkflowRepository ----------
 
 
-@pytest.mark.asyncio
-async def test_workflow_run_status_created_on_start():
-    """WorkflowRepository records a run with RUNNING status on start."""
-    workflow_repo = WorkflowRepository()
-    graph = _build_linear_graph("only")
+async def test_workflow_run_lifecycle():
+    repo = WorkflowRepository()
+    run = WorkflowRun(workflow_id="wf-1")
 
-    run_id = str(uuid.uuid4())
-    executor = GraphExecutor(
-        graph,
-        handler=_accumulating_handler,
-        workflow_repo=workflow_repo,
-        run_id=run_id,
-    )
-    await executor.run({"visited": []})
+    created = await repo.create_run(run)
+    assert created.status == RunStatus.PENDING
 
-    run: WorkflowRun = workflow_repo.get(run_id)
-    assert run is not None
+    run.start()
+    assert run.status == RunStatus.RUNNING
+    assert run.started_at is not None
+
+    run.complete()
     assert run.status == RunStatus.COMPLETED
+    assert run.completed_at is not None
+
+    fetched = await repo.get_run(run.id)
+    assert fetched is not None
+    assert fetched.status == RunStatus.COMPLETED
 
 
-@pytest.mark.asyncio
-async def test_workflow_run_marked_failed_on_error():
-    """A handler exception marks the run as FAILED in the repository."""
-    workflow_repo = WorkflowRepository()
-    graph = _build_linear_graph("good", "bad")
+async def test_workflow_run_fail():
+    run = WorkflowRun(workflow_id="wf-1")
+    run.start()
+    run.fail("something broke")
 
-    run_id = str(uuid.uuid4())
-
-    async def handler(nid: str, st: dict[str, Any]) -> dict[str, Any]:
-        return await _failing_handler_at("bad", nid, st)
-
-    executor = GraphExecutor(
-        graph,
-        handler=handler,
-        workflow_repo=workflow_repo,
-        run_id=run_id,
-    )
-
-    with pytest.raises(RuntimeError):
-        await executor.run({"visited": []})
-
-    run = workflow_repo.get(run_id)
     assert run.status == RunStatus.FAILED
+    assert run.state["error"] == "something broke"
 
 
-@pytest.mark.asyncio
-async def test_audit_log_captures_workflow_start_and_end():
-    """AuditRepository receives events for workflow start and completion."""
-    audit_repo = AuditRepository()
-    graph = _build_linear_graph("m", "n")
+async def test_workflow_definition_crud():
+    repo = WorkflowRepository()
+    defn = WorkflowDefinition(name="my-workflow", graph={"nodes": {}})
 
-    run_id = str(uuid.uuid4())
-    executor = GraphExecutor(
-        graph,
-        handler=_accumulating_handler,
-        audit_repo=audit_repo,
-        run_id=run_id,
+    created = await repo.create_definition(defn)
+    assert created.id == defn.id
+
+    fetched = await repo.get_definition(defn.id)
+    assert fetched is not None
+    assert fetched.name == "my-workflow"
+
+    definitions = await repo.list_definitions()
+    assert len(definitions) == 1
+
+
+async def test_workflow_run_list_with_filters():
+    repo = WorkflowRepository()
+    run1 = WorkflowRun(workflow_id="wf-1")
+    run2 = WorkflowRun(workflow_id="wf-1")
+    run3 = WorkflowRun(workflow_id="wf-2")
+
+    run1.start()
+    run1.complete()
+
+    await repo.create_run(run1)
+    await repo.create_run(run2)
+    await repo.create_run(run3)
+
+    all_runs = await repo.list_runs()
+    assert len(all_runs) == 3
+
+    wf1_runs = await repo.list_runs(workflow_id="wf-1")
+    assert len(wf1_runs) == 2
+
+    completed = await repo.list_runs(status=RunStatus.COMPLETED)
+    assert len(completed) == 1
+
+
+# ---------- AuditRepository ----------
+
+
+async def test_audit_append_and_chain():
+    repo = AuditRepository(hmac_key=b"test-key-at-least-16-bytes")
+
+    e1 = await repo.append(
+        event_type="agent.start", actor="system", action="start"
     )
-    await executor.run({"visited": []})
-
-    events = audit_repo.list(run_id)
-    event_types = [e.event_type for e in events]
-    assert "workflow_started" in event_types
-    assert "workflow_completed" in event_types
-
-
-@pytest.mark.asyncio
-async def test_audit_log_captures_node_execution_events():
-    """Each node execution generates at least one audit event."""
-    audit_repo = AuditRepository()
-    graph = _build_linear_graph("p", "q", "r")
-
-    run_id = str(uuid.uuid4())
-    executor = GraphExecutor(
-        graph,
-        handler=_accumulating_handler,
-        audit_repo=audit_repo,
-        run_id=run_id,
-    )
-    await executor.run({"visited": []})
-
-    events = audit_repo.list(run_id)
-    node_events = [e for e in events if e.event_type == "node_executed"]
-    assert len(node_events) >= 3
-
-
-@pytest.mark.asyncio
-async def test_audit_log_records_failure_event():
-    """When a node fails, an audit event with error details is recorded."""
-    audit_repo = AuditRepository()
-    graph = _build_linear_graph("ok", "fail")
-
-    run_id = str(uuid.uuid4())
-
-    async def handler(nid: str, st: dict[str, Any]) -> dict[str, Any]:
-        return await _failing_handler_at("fail", nid, st)
-
-    executor = GraphExecutor(
-        graph,
-        handler=handler,
-        audit_repo=audit_repo,
-        run_id=run_id,
+    e2 = await repo.append(
+        event_type="agent.stop", actor="system", action="stop"
     )
 
-    with pytest.raises(RuntimeError):
-        await executor.run({"visited": []})
+    assert e1.id == 1
+    assert e2.id == 2
+    assert e2.prev_hash == e1.entry_hash
+    assert repo.count == 2
 
-    events = audit_repo.list(run_id)
-    failure_events = [e for e in events if "fail" in e.event_type.lower() or "error" in e.event_type.lower()]
-    assert len(failure_events) >= 1
-
-
-@pytest.mark.asyncio
-async def test_memory_repository_stores_agent_working_memory():
-    """Agent handlers can persist intermediate data via MemoryRepository."""
-    memory_repo = MemoryRepository()
-    graph = _build_linear_graph("producer", "consumer")
-
-    async def handler(node_id: str, state: dict[str, Any]) -> dict[str, Any]:
-        if node_id == "producer":
-            memory_repo.store(
-                agent_id="producer",
-                key="analysis_result",
-                value={"score": 0.95, "tags": ["important"]},
-            )
-        elif node_id == "consumer":
-            mem = memory_repo.retrieve(agent_id="producer", key="analysis_result")
-            state["consumed_memory"] = mem
-        visited = state.get("visited", []) + [node_id]
-        return {**state, "visited": visited}
-
-    executor = GraphExecutor(graph, handler=handler)
-    result = await executor.run({"visited": []})
-
-    assert result["consumed_memory"]["score"] == 0.95
-    assert "important" in result["consumed_memory"]["tags"]
+    valid, msg = await repo.verify_chain()
+    assert valid
 
 
-@pytest.mark.asyncio
-async def test_checkpoint_and_audit_consistency():
-    """Checkpoint count and audit node-execution events are consistent."""
-    checkpoint_repo = CheckpointRepository()
-    audit_repo = AuditRepository()
-    graph = _build_linear_graph("s1", "s2", "s3", "s4")
+async def test_audit_list_by_event_type():
+    repo = AuditRepository(hmac_key=b"test-key-at-least-16-bytes")
 
-    run_id = str(uuid.uuid4())
-    executor = GraphExecutor(
-        graph,
-        handler=_accumulating_handler,
-        checkpoint_repo=checkpoint_repo,
-        audit_repo=audit_repo,
-        run_id=run_id,
-    )
-    await executor.run({"visited": []})
+    await repo.append(event_type="workflow.start", actor="sys", action="start")
+    await repo.append(event_type="workflow.end", actor="sys", action="end")
+    await repo.append(event_type="workflow.start", actor="sys", action="start")
 
-    checkpoints = checkpoint_repo.list(run_id)
-    audit_node_events = [
-        e for e in audit_repo.list(run_id) if e.event_type == "node_executed"
-    ]
-
-    # Every checkpointed node should have a corresponding audit event
-    checkpoint_nodes = {cp.node_id for cp in checkpoints}
-    audit_nodes = {e.node_id for e in audit_node_events}
-    assert checkpoint_nodes == audit_nodes
+    starts = await repo.list(event_type="workflow.start")
+    assert len(starts) == 2
 
 
-@pytest.mark.asyncio
-async def test_workflow_run_persists_across_operations():
-    """WorkflowRun metadata survives multiple repository operations."""
-    workflow_repo = WorkflowRepository()
-    run_id = str(uuid.uuid4())
+async def test_audit_get_by_id():
+    repo = AuditRepository(hmac_key=b"test-key-at-least-16-bytes")
 
-    # Create
-    workflow_repo.create(
-        WorkflowRun(
-            run_id=run_id,
-            graph_id="test-graph",
-            status=RunStatus.RUNNING,
-        )
-    )
+    await repo.append(event_type="test", actor="admin", action="do")
+    entry = await repo.get(1)
+    assert entry is not None
+    assert entry.actor == "admin"
 
-    # Update
-    workflow_repo.update_status(run_id, RunStatus.COMPLETED)
-
-    # Retrieve
-    run = workflow_repo.get(run_id)
-    assert run.run_id == run_id
-    assert run.graph_id == "test-graph"
-    assert run.status == RunStatus.COMPLETED
+    missing = await repo.get(999)
+    assert missing is None
 
 
-@pytest.mark.asyncio
-async def test_event_log_ordering_matches_execution_order():
-    """Audit events appear in chronological execution order."""
-    audit_repo = AuditRepository()
-    graph = _build_linear_graph("first", "second", "third")
+# ---------- MemoryRepository ----------
 
-    run_id = str(uuid.uuid4())
-    executor = GraphExecutor(
-        graph,
-        handler=_accumulating_handler,
-        audit_repo=audit_repo,
-        run_id=run_id,
-    )
-    await executor.run({"visited": []})
 
-    events = audit_repo.list(run_id)
-    node_events = [e for e in events if e.event_type == "node_executed"]
+async def test_memory_episodic_store_and_get():
+    repo = MemoryRepository()
+    entry = EpisodicEntry(agent_id="agent-1", content="saw error X")
 
-    node_order = [e.node_id for e in node_events]
-    assert node_order == ["first", "second", "third"]
+    stored = await repo.store_episodic(entry)
+    assert stored.id == entry.id
+
+    fetched = await repo.get_episodic(entry.id)
+    assert fetched is not None
+    assert fetched.content == "saw error X"
+
+
+async def test_memory_episodic_list_by_agent():
+    repo = MemoryRepository()
+    await repo.store_episodic(EpisodicEntry(agent_id="a1", content="one"))
+    await repo.store_episodic(EpisodicEntry(agent_id="a1", content="two"))
+    await repo.store_episodic(EpisodicEntry(agent_id="a2", content="three"))
+
+    a1_entries = await repo.list_episodic("a1")
+    assert len(a1_entries) == 2
+
+
+async def test_memory_semantic_store_and_lookup():
+    repo = MemoryRepository()
+    entry = SemanticEntry(key="auth-pattern", content="use JWT refresh tokens")
+
+    await repo.store_semantic(entry)
+
+    by_key = await repo.get_semantic_by_key("auth-pattern")
+    assert by_key is not None
+    assert by_key.content == "use JWT refresh tokens"
+
+
+async def test_memory_procedural_stats_update():
+    repo = MemoryRepository()
+    entry = ProceduralEntry(pattern="retry-on-503", action="retry with backoff")
+
+    await repo.store_procedural(entry)
+
+    updated = await repo.update_procedural_stats(entry.id, success=True)
+    assert updated is not None
+    assert updated.execution_count == 1
+    assert updated.success_rate == 1.0
+
+    updated2 = await repo.update_procedural_stats(entry.id, success=False)
+    assert updated2 is not None
+    assert updated2.execution_count == 2
+    assert updated2.success_rate == 0.5

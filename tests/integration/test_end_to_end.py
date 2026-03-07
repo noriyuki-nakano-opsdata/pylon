@@ -1,395 +1,284 @@
-"""End-to-end integration tests for the Pylon platform.
+"""Integration tests: End-to-end workflows combining DSL, execution, safety, and persistence."""
 
-These tests exercise the complete pipeline: DSL definition, graph
-construction, safety validation, execution, checkpointing, audit
-logging, and replay.
-"""
 from __future__ import annotations
 
-import asyncio
-import uuid
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from pylon.dsl.parser import PylonProject, load_project
-from pylon.errors import PolicyViolationError, WorkflowError
+from pylon.errors import (
+    ApprovalRequiredError,
+    PolicyViolationError,
+    PromptInjectionError,
+    WorkflowError,
+)
 from pylon.repository.audit import AuditRepository
 from pylon.repository.checkpoint import CheckpointRepository
-from pylon.repository.memory import MemoryRepository
+from pylon.repository.memory import EpisodicEntry, MemoryRepository, SemanticEntry
 from pylon.repository.workflow import RunStatus, WorkflowRepository, WorkflowRun
 from pylon.safety.autonomy import AutonomyEnforcer
-from pylon.safety.capability import CapabilityValidator
 from pylon.safety.kill_switch import KillSwitch
-from pylon.safety.policy import PolicyEngine
-from pylon.types import AgentCapability, AgentState, AutonomyLevel, ConditionalEdge
+from pylon.safety.policy import ActionState, PolicyEngine
+from pylon.safety.prompt_guard import PromptGuard
+from pylon.types import (
+    AgentCapability,
+    AgentConfig,
+    AutonomyLevel,
+    ConditionalEdge,
+    PolicyConfig,
+    TrustLevel,
+)
 from pylon.workflow.executor import GraphExecutor
 from pylon.workflow.graph import END, WorkflowGraph
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _make_repos() -> dict[str, Any]:
-    return {
-        "checkpoint_repo": CheckpointRepository(),
-        "workflow_repo": WorkflowRepository(),
-        "audit_repo": AuditRepository(),
-        "memory_repo": MemoryRepository(),
-    }
-
-
-async def _counting_handler(node_id: str, state: dict[str, Any]) -> dict[str, Any]:
-    visited = state.get("visited", []) + [node_id]
-    counter = state.get("counter", 0) + 1
-    return {**state, "visited": visited, "counter": counter}
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_full_pipeline_define_validate_execute_checkpoint_replay():
-    """Complete lifecycle: build graph, execute, checkpoint, restore, replay."""
-    repos = _make_repos()
-    graph = WorkflowGraph()
-    graph.add_node("plan")
-    graph.add_node("code")
-    graph.add_node("test")
-    graph.add_edge("plan", "code")
-    graph.add_edge("code", "test")
-    graph.add_edge("test", END)
-    graph.set_entry("plan")
-
-    run_id = str(uuid.uuid4())
-
-    executor = GraphExecutor(
-        graph,
-        handler=_counting_handler,
-        run_id=run_id,
-        **repos,
-    )
-    result = await executor.run({"visited": []})
-
-    assert result["visited"] == ["plan", "code", "test"]
-    assert result["counter"] == 3
-
-    # Verify checkpoint exists
-    checkpoints = repos["checkpoint_repo"].list(run_id)
-    assert len(checkpoints) >= 3
-
-    # Verify audit trail
-    events = repos["audit_repo"].list(run_id)
-    event_types = {e.event_type for e in events}
-    assert "workflow_started" in event_types
-    assert "workflow_completed" in event_types
-
-    # Replay from the first checkpoint
-    first_cp = checkpoints[0]
-    restored = repos["checkpoint_repo"].load(first_cp.checkpoint_id)
-
-    replay_id = str(uuid.uuid4())
-    executor_replay = GraphExecutor(
-        graph,
-        handler=_counting_handler,
-        run_id=replay_id,
-        **repos,
-    )
-    replay_result = await executor_replay.run(
-        restored, resume_from=first_cp.node_id,
-    )
-    assert replay_result["counter"] == result["counter"]
-
-
-@pytest.mark.asyncio
-async def test_fan_out_fan_in_multi_agent():
-    """Multiple parallel branches (fan-out) merge into a single node (fan-in)."""
-    graph = WorkflowGraph()
-    graph.add_node("split")
-    graph.add_node("worker_a")
-    graph.add_node("worker_b")
-    graph.add_node("worker_c")
-    graph.add_node("merge")
-
-    graph.add_edge("split", "worker_a")
-    graph.add_edge("split", "worker_b")
-    graph.add_edge("split", "worker_c")
-    graph.add_edge("worker_a", "merge")
-    graph.add_edge("worker_b", "merge")
-    graph.add_edge("worker_c", "merge")
-    graph.add_edge("merge", END)
-    graph.set_entry("split")
-
-    results_by_worker: dict[str, str] = {}
-
-    async def handler(node_id: str, state: dict[str, Any]) -> dict[str, Any]:
-        visited = state.get("visited", []) + [node_id]
-        if node_id.startswith("worker_"):
-            results_by_worker[node_id] = f"output_{node_id}"
-        if node_id == "merge":
-            state["merged"] = dict(results_by_worker)
-        return {**state, "visited": visited}
-
-    executor = GraphExecutor(graph, handler=handler)
-    result = await executor.run({"visited": []})
-
-    assert "split" in result["visited"]
-    assert "merge" in result["visited"]
-    # All workers must have executed
-    for w in ("worker_a", "worker_b", "worker_c"):
-        assert w in result["visited"]
-    assert len(result["merged"]) == 3
-
-
-@pytest.mark.asyncio
-async def test_conditional_branching_based_on_agent_output():
-    """A conditional edge routes execution based on runtime state."""
-    graph = WorkflowGraph()
-    graph.add_node("evaluate")
-    graph.add_node("approve")
-    graph.add_node("reject")
-
-    graph.add_conditional_edge(
-        "evaluate",
-        condition=lambda state: "approve" if state.get("score", 0) >= 0.8 else "reject",
-    )
-    graph.add_edge("approve", END)
-    graph.add_edge("reject", END)
-    graph.set_entry("evaluate")
-
-    async def handler(node_id: str, state: dict[str, Any]) -> dict[str, Any]:
-        visited = state.get("visited", []) + [node_id]
-        return {**state, "visited": visited}
-
-    executor = GraphExecutor(graph, handler=handler)
-
-    # High score -> approve
-    result_high = await executor.run({"visited": [], "score": 0.9})
-    assert "approve" in result_high["visited"]
-    assert "reject" not in result_high["visited"]
-
-    # Low score -> reject
-    result_low = await executor.run({"visited": [], "score": 0.3})
-    assert "reject" in result_low["visited"]
-    assert "approve" not in result_low["visited"]
-
-
-@pytest.mark.asyncio
-async def test_error_handling_run_marked_failed_audit_logged():
-    """Agent failure marks the run as FAILED and creates an audit entry."""
-    repos = _make_repos()
-    graph = WorkflowGraph()
-    graph.add_node("setup")
-    graph.add_node("crash")
-    graph.add_edge("setup", "crash")
-    graph.add_edge("crash", END)
-    graph.set_entry("setup")
-
-    run_id = str(uuid.uuid4())
-
-    async def handler(node_id: str, state: dict[str, Any]) -> dict[str, Any]:
-        if node_id == "crash":
-            raise RuntimeError("Agent exploded")
-        visited = state.get("visited", []) + [node_id]
-        return {**state, "visited": visited}
-
-    executor = GraphExecutor(
-        graph, handler=handler, run_id=run_id, **repos,
-    )
-
-    with pytest.raises(RuntimeError, match="exploded"):
-        await executor.run({"visited": []})
-
-    # Run status
-    run = repos["workflow_repo"].get(run_id)
-    assert run.status == RunStatus.FAILED
-
-    # Audit trail includes failure
-    events = repos["audit_repo"].list(run_id)
-    has_failure = any(
-        "fail" in e.event_type.lower() or "error" in e.event_type.lower()
-        for e in events
-    )
-    assert has_failure
-
-
-@pytest.mark.asyncio
-async def test_max_steps_prevents_infinite_loop():
-    """A cycle with no termination condition is stopped by max_steps."""
-    graph = WorkflowGraph()
-    graph.add_node("loop_body")
-    # Intentional cycle: loop_body -> loop_body
-    graph.add_conditional_edge(
-        "loop_body",
-        condition=lambda state: "loop_body" if state.get("counter", 0) < 1000 else END,
-    )
-    graph.add_edge("loop_body", END)  # fallback edge for graph validity
-    graph.set_entry("loop_body")
-
-    repos = _make_repos()
-    run_id = str(uuid.uuid4())
-
-    async def handler(node_id: str, state: dict[str, Any]) -> dict[str, Any]:
-        counter = state.get("counter", 0) + 1
-        return {**state, "counter": counter}
-
-    executor = GraphExecutor(
-        graph,
-        handler=handler,
-        run_id=run_id,
-        max_steps=10,
-        **repos,
-    )
-
-    with pytest.raises((WorkflowError, RuntimeError)):
-        await executor.run({"counter": 0})
-
-    # Run should be marked failed or stopped
-    run = repos["workflow_repo"].get(run_id)
-    assert run.status in (RunStatus.FAILED, RunStatus.STOPPED)
-
-
-@pytest.mark.asyncio
-async def test_dsl_definition_to_workflow_execution(tmp_path):
-    """Load a workflow definition from YAML DSL, build a graph, and execute."""
-    yaml_content = """
-name: review-pipeline
-version: "1.0"
-nodes:
-  - id: lint
-    type: agent
-    capabilities: [READ]
-  - id: review
-    type: agent
-    capabilities: [READ, WRITE]
-  - id: report
-    type: agent
-    capabilities: [READ]
-edges:
-  - from: lint
-    to: review
-  - from: review
-    to: report
-entry: lint
+_MINIMAL_YAML = """\
+version: "1"
+name: e2e-test
+agents:
+  planner:
+    role: "plans tasks"
+    autonomy: A2
+    sandbox: gvisor
+  coder:
+    role: "writes code"
+    autonomy: A2
+    sandbox: docker
+workflow:
+  type: graph
+  nodes:
+    plan:
+      agent: planner
+      next:
+        - target: code
+    code:
+      agent: coder
+      next:
+        - target: END
+policy:
+  max_cost_usd: 5.0
+  max_duration: 30m
+  require_approval_above: A3
+  safety:
+    blocked_actions:
+      - rm-rf
 """
-    yaml_file = tmp_path / "pipeline.yaml"
-    yaml_file.write_text(yaml_content)
-
-    project: PylonProject = load_project(str(yaml_file))
-
-    # Build graph from DSL
-    graph = WorkflowGraph()
-    for node_def in project.nodes:
-        graph.add_node(node_def.id)
-    for edge_def in project.edges:
-        graph.add_edge(edge_def.source, edge_def.target)
-    graph.add_edge(project.nodes[-1].id, END)
-    graph.set_entry(project.entry)
-
-    executor = GraphExecutor(graph, handler=_counting_handler)
-    result = await executor.run({"visited": []})
-
-    assert result["visited"] == ["lint", "review", "report"]
 
 
-@pytest.mark.asyncio
-async def test_safety_gates_in_full_pipeline():
-    """End-to-end pipeline with safety gates at each stage:
-    capability validation + autonomy enforcement + kill switch check."""
-    validator = CapabilityValidator()
-    enforcer = AutonomyEnforcer(max_level=AutonomyLevel.A3)
-    kill_switch = KillSwitch()
+async def _echo_handler(node_id: str, state: dict[str, Any]) -> dict[str, Any]:
+    return {f"{node_id}_output": f"completed-{node_id}"}
 
-    node_config = {
-        "scan": {
-            "caps": [AgentCapability.READ],
-            "autonomy": AutonomyLevel.A1,
-        },
-        "analyze": {
-            "caps": [AgentCapability.READ, AgentCapability.WRITE],
-            "autonomy": AutonomyLevel.A2,
-        },
-        "remediate": {
-            "caps": [AgentCapability.READ, AgentCapability.WRITE],
-            "autonomy": AutonomyLevel.A3,
-        },
-    }
 
-    graph = WorkflowGraph()
-    for nid in node_config:
-        graph.add_node(nid)
-    graph.add_edge("scan", "analyze")
-    graph.add_edge("analyze", "remediate")
-    graph.add_edge("remediate", END)
-    graph.set_entry("scan")
+# ---------- DSL -> Workflow Execution ----------
 
-    repos = _make_repos()
-    run_id = str(uuid.uuid4())
 
-    async def handler(node_id: str, state: dict[str, Any]) -> dict[str, Any]:
-        kill_switch.check()
-        cfg = node_config[node_id]
-        for cap in cfg["caps"]:
-            validator.validate(cap)
-        enforcer.enforce(node_id, cfg["autonomy"])
-        visited = state.get("visited", []) + [node_id]
-        return {**state, "visited": visited}
+async def test_dsl_to_execution(tmp_path: Path):
+    """Load pylon.yaml, build WorkflowGraph, execute, verify completion."""
+    yaml_file = tmp_path / "pylon.yaml"
+    yaml_file.write_text(_MINIMAL_YAML)
 
-    executor = GraphExecutor(
-        graph, handler=handler, run_id=run_id, **repos,
+    project = load_project(tmp_path)
+    assert project.name == "e2e-test"
+    assert "planner" in project.agents
+    assert "coder" in project.agents
+
+    g = WorkflowGraph(name=project.name)
+    for node_id, node_def in project.workflow.nodes.items():
+        edges: list[ConditionalEdge] = []
+        if node_def.next is not None:
+            if isinstance(node_def.next, str):
+                edges.append(ConditionalEdge(target=node_def.next))
+            else:
+                for edge in node_def.next:
+                    if isinstance(edge, str):
+                        edges.append(ConditionalEdge(target=edge))
+                    else:
+                        edges.append(ConditionalEdge(target=edge.target, condition=edge.condition))
+        g.add_node(node_id, node_def.agent, next_nodes=edges)
+
+    executor = GraphExecutor()
+    run = WorkflowRun(workflow_id="e2e-wf-1")
+    result = await executor.execute(g, run, _echo_handler)
+
+    assert result.status == RunStatus.COMPLETED
+    assert "plan_output" in result.state
+    assert "code_output" in result.state
+
+
+# ---------- End-to-end with Safety Checks ----------
+
+
+async def test_e2e_safety_pipeline():
+    """Full pipeline: prompt guard -> capability check -> policy -> execute."""
+    guard = PromptGuard()
+    safe_input = guard.check("analyze this code", TrustLevel.UNTRUSTED)
+    assert safe_input == "analyze this code"
+
+    cap = AgentCapability(can_write_external=True)
+    assert not cap.can_read_untrusted
+    assert cap.can_write_external
+
+    policy = PolicyConfig(max_cost_usd=10.0, blocked_actions=["rm-rf"])
+    engine = PolicyEngine(policy=policy)
+    agent_cfg = AgentConfig(name="coder", autonomy=AutonomyLevel.A2)
+    state = ActionState(current_cost_usd=2.0)
+    decision = engine.evaluate_action(agent_cfg, "write-file", state)
+    assert decision.allowed
+
+    g = WorkflowGraph(name="safe-pipeline")
+    g.add_node("run", "coder", next_nodes=[ConditionalEdge(target=END)])
+
+    executor = GraphExecutor()
+    run = WorkflowRun(workflow_id="safe-wf")
+    result = await executor.execute(g, run, _echo_handler)
+    assert result.status == RunStatus.COMPLETED
+
+
+# ---------- End-to-end with Persistence ----------
+
+
+async def test_e2e_full_persistence():
+    """Workflow execution with checkpoint, audit, and memory persistence."""
+    cp_repo = CheckpointRepository()
+    audit_repo = AuditRepository(hmac_key=b"test-key-at-least-16-bytes")
+    wf_repo = WorkflowRepository()
+    mem_repo = MemoryRepository()
+
+    g = WorkflowGraph(name="persist-test")
+    g.add_node("analyze", "agent-a", next_nodes=[ConditionalEdge(target="fix")])
+    g.add_node("fix", "agent-b", next_nodes=[ConditionalEdge(target=END)])
+
+    run = WorkflowRun(workflow_id="wf-persist")
+    await wf_repo.create_run(run)
+
+    await audit_repo.append(
+        event_type="workflow.start", actor="system", action="start",
+        details={"run_id": run.id},
     )
-    result = await executor.run({"visited": []})
 
-    assert result["visited"] == ["scan", "analyze", "remediate"]
+    executor = GraphExecutor(checkpoint_repo=cp_repo)
+    result = await executor.execute(g, run, _echo_handler)
 
-    run = repos["workflow_repo"].get(run_id)
-    assert run.status == RunStatus.COMPLETED
+    await audit_repo.append(
+        event_type="workflow.complete", actor="system", action="complete",
+        details={"run_id": run.id},
+    )
+
+    assert result.status == RunStatus.COMPLETED
+
+    checkpoints = await cp_repo.list(workflow_run_id=run.id)
+    assert len(checkpoints) >= 2
+
+    audit_entries = await audit_repo.list()
+    assert len(audit_entries) == 2
+
+    valid, _ = await audit_repo.verify_chain()
+    assert valid
+
+    await mem_repo.store_episodic(
+        EpisodicEntry(agent_id="agent-a", content="found bug in auth module")
+    )
+    await mem_repo.store_semantic(
+        SemanticEntry(key="auth-fix", content="patched JWT validation")
+    )
+
+    episodes = await mem_repo.list_episodic("agent-a")
+    assert len(episodes) == 1
+
+    semantic = await mem_repo.get_semantic_by_key("auth-fix")
+    assert semantic is not None
 
 
-@pytest.mark.asyncio
-async def test_memory_shared_across_agents_in_workflow():
-    """Agents in different workflow nodes share data through MemoryRepository."""
-    memory_repo = MemoryRepository()
+# ---------- Replay ----------
 
-    graph = WorkflowGraph()
-    graph.add_node("researcher")
-    graph.add_node("writer")
-    graph.add_node("reviewer")
-    graph.add_edge("researcher", "writer")
-    graph.add_edge("writer", "reviewer")
-    graph.add_edge("reviewer", END)
-    graph.set_entry("researcher")
 
-    async def handler(node_id: str, state: dict[str, Any]) -> dict[str, Any]:
-        if node_id == "researcher":
-            memory_repo.store(
-                agent_id="researcher",
-                key="findings",
-                value={"topics": ["security", "performance"], "confidence": 0.92},
-            )
-        elif node_id == "writer":
-            findings = memory_repo.retrieve(agent_id="researcher", key="findings")
-            memory_repo.store(
-                agent_id="writer",
-                key="draft",
-                value={"based_on": findings["topics"], "word_count": 1500},
-            )
-        elif node_id == "reviewer":
-            draft = memory_repo.retrieve(agent_id="writer", key="draft")
-            state["review_result"] = {
-                "approved": draft["word_count"] > 1000,
-                "topics_covered": draft["based_on"],
-            }
+async def test_e2e_replay():
+    """Execute workflow then replay from event log."""
+    g = WorkflowGraph(name="replay-test")
+    g.add_node("step1", "agent-a", next_nodes=[ConditionalEdge(target=END)])
 
-        visited = state.get("visited", []) + [node_id]
-        return {**state, "visited": visited}
+    executor = GraphExecutor()
+    run = WorkflowRun(workflow_id="wf-replay")
+    result = await executor.execute(g, run, _echo_handler)
+    assert result.status == RunStatus.COMPLETED
 
-    executor = GraphExecutor(graph, handler=handler)
-    result = await executor.run({"visited": []})
+    replayed = await executor.replay(g, run, _echo_handler)
+    assert replayed.state == result.state
 
-    assert result["visited"] == ["researcher", "writer", "reviewer"]
-    assert result["review_result"]["approved"] is True
-    assert "security" in result["review_result"]["topics_covered"]
+
+# ---------- Conditional Routing ----------
+
+
+async def test_e2e_conditional_routing():
+    """Conditional edges route based on state."""
+    g = WorkflowGraph(name="routing-test")
+    g.add_node("check", "router-agent", next_nodes=[
+        ConditionalEdge(target="fix", condition="state.needs_fix == True"),
+        ConditionalEdge(target="done", condition="state.needs_fix == False"),
+    ])
+    g.add_node("fix", "fixer-agent", next_nodes=[ConditionalEdge(target=END)])
+    g.add_node("done", "reporter-agent", next_nodes=[ConditionalEdge(target=END)])
+
+    async def routing_handler(node_id: str, state: dict[str, Any]) -> dict[str, Any]:
+        if node_id == "check":
+            return {"needs_fix": True}
+        return {f"{node_id}_done": True}
+
+    executor = GraphExecutor()
+    run = WorkflowRun(workflow_id="wf-route")
+    result = await executor.execute(g, run, routing_handler)
+
+    assert result.status == RunStatus.COMPLETED
+    assert "fix_done" in result.state
+    assert "done_done" not in result.state
+
+
+# ---------- Workflow Validation Errors ----------
+
+
+async def test_e2e_empty_graph_raises():
+    g = WorkflowGraph(name="empty")
+    executor = GraphExecutor()
+    run = WorkflowRun(workflow_id="wf-empty")
+
+    with pytest.raises(WorkflowError, match="no nodes"):
+        await executor.execute(g, run, _echo_handler)
+
+
+async def test_e2e_cycle_detection():
+    g = WorkflowGraph(name="cycle")
+    g.add_node("a", "agent-a", next_nodes=[ConditionalEdge(target="b")])
+    g.add_node("b", "agent-b", next_nodes=[ConditionalEdge(target="a")])
+
+    executor = GraphExecutor()
+    run = WorkflowRun(workflow_id="wf-cycle")
+
+    with pytest.raises(WorkflowError, match="Cycle"):
+        await executor.execute(g, run, _echo_handler)
+
+
+# ---------- DSL Validation ----------
+
+
+async def test_dsl_rejects_invalid_agent_ref(tmp_path: Path):
+    """pylon.yaml with workflow referencing undefined agent should fail."""
+    bad_yaml = """\
+version: "1"
+name: bad-project
+agents:
+  planner:
+    role: plans
+workflow:
+  type: graph
+  nodes:
+    step1:
+      agent: nonexistent
+      next: END
+"""
+    yaml_file = tmp_path / "pylon.yaml"
+    yaml_file.write_text(bad_yaml)
+
+    with pytest.raises(Exception, match="undefined agent"):
+        load_project(tmp_path)

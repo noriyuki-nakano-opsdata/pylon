@@ -1,4 +1,4 @@
-"""Integration test conftest — full-stack fixtures."""
+"""Integration test conftest -- full-stack fixtures."""
 
 from __future__ import annotations
 
@@ -22,14 +22,9 @@ def full_repos():
     return {
         "checkpoint": CheckpointRepository(),
         "workflow": WorkflowRepository(),
-        "audit": AuditRepository(),
+        "audit": AuditRepository(hmac_key=b"test-key-at-least-16-bytes"),
         "memory": MemoryRepository(),
     }
-
-
-@pytest.fixture
-def executor(full_repos) -> GraphExecutor:
-    return GraphExecutor(checkpoint_repo=full_repos["checkpoint"])
 
 
 @pytest.fixture
