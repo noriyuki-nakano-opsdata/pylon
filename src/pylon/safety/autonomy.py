@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from pylon.approval.types import compute_approval_binding_hash
 from pylon.errors import ApprovalRequiredError, PolicyViolationError
 from pylon.types import AutonomyLevel, PolicyConfig
 
@@ -21,6 +22,8 @@ class ApprovalRequest:
     action: str
     autonomy_level: AutonomyLevel
     plan: Any | None = None
+    plan_hash: str = ""
+    effect_hash: str = ""
     approved: bool | None = None  # None = pending
     approved_by: str | None = None
 
@@ -50,6 +53,7 @@ class AutonomyEnforcer:
         autonomy: AutonomyLevel,
         *,
         plan: Any | None = None,
+        effect_envelope: Any | None = None,
     ) -> ApprovalRequest | None:
         """Check if an action requires approval.
 
@@ -69,6 +73,12 @@ class AutonomyEnforcer:
                 action=action,
                 autonomy_level=autonomy,
                 plan=plan,
+                plan_hash=compute_approval_binding_hash(plan) if plan is not None else "",
+                effect_hash=(
+                    compute_approval_binding_hash(effect_envelope)
+                    if effect_envelope is not None
+                    else ""
+                ),
             )
             request_id = f"{agent_name}:{action}"
             self._pending[request_id] = request
@@ -79,6 +89,8 @@ class AutonomyEnforcer:
                     "agent": agent_name,
                     "action": action,
                     "autonomy_level": autonomy.name,
+                    "plan_hash": request.plan_hash,
+                    "effect_hash": request.effect_hash,
                 },
             )
 
@@ -105,6 +117,48 @@ class AutonomyEnforcer:
     def get_pending(self) -> list[ApprovalRequest]:
         """Get all pending approval requests."""
         return [r for r in self._pending.values() if r.is_pending]
+
+    def validate_approval(
+        self,
+        request: ApprovalRequest,
+        *,
+        plan: Any | None = None,
+        effect_envelope: Any | None = None,
+    ) -> ApprovalRequest:
+        """Ensure an approved request still matches its approved scope."""
+        if request.approved is not True:
+            raise PolicyViolationError(
+                "Approval request is not approved",
+                details={"agent": request.agent_name, "action": request.action},
+            )
+
+        plan_hash = compute_approval_binding_hash(plan) if plan is not None else ""
+        effect_hash = (
+            compute_approval_binding_hash(effect_envelope)
+            if effect_envelope is not None
+            else ""
+        )
+        if request.plan_hash and request.plan_hash != plan_hash:
+            raise PolicyViolationError(
+                "Approval invalidated by plan drift",
+                details={
+                    "agent": request.agent_name,
+                    "action": request.action,
+                    "expected_plan_hash": request.plan_hash,
+                    "actual_plan_hash": plan_hash,
+                },
+            )
+        if request.effect_hash and request.effect_hash != effect_hash:
+            raise PolicyViolationError(
+                "Approval invalidated by effect scope drift",
+                details={
+                    "agent": request.agent_name,
+                    "action": request.action,
+                    "expected_effect_hash": request.effect_hash,
+                    "actual_effect_hash": effect_hash,
+                },
+            )
+        return request
 
     def _is_blocked_action(self, action: str) -> bool:
         return action in self._policy.blocked_actions

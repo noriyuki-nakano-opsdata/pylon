@@ -29,6 +29,7 @@ from pylon.types import (
 )
 from pylon.workflow.executor import GraphExecutor
 from pylon.workflow.graph import END, WorkflowGraph
+from pylon.workflow.result import NodeResult
 
 
 async def _echo_handler(node_id: str, state: dict[str, Any]) -> dict[str, Any]:
@@ -218,6 +219,36 @@ async def test_workflow_completes_with_checkpoint():
 
     checkpoints = await cp_repo.list(workflow_run_id=run.id)
     assert len(checkpoints) >= 2
+
+
+async def test_checkpoint_metadata_secret_scrubbed():
+    cp_repo = CheckpointRepository()
+    executor = GraphExecutor(checkpoint_repo=cp_repo)
+
+    g = WorkflowGraph(name="scrub-test")
+    g.add_node("step1", "agent-a", next_nodes=[ConditionalEdge(target=END)])
+
+    async def handler(node_id: str, state: dict[str, Any]) -> NodeResult:
+        return NodeResult(
+            state_patch={"step1_result": "done"},
+            artifacts=[{"api_key": "sk-1234567890abcdefghijklmnop"}],
+            llm_events=[{"content": "Bearer abcdefghijklmnopqrstuvwx"}],
+            tool_events=[{"password": "super-secret-password"}],
+            metrics={"token_count": 42},
+        )
+
+    run = WorkflowRun(workflow_id="wf-scrub")
+    result = await executor.execute(g, run, handler)
+
+    assert result.event_log[0]["artifacts"] == [{"api_key": "[REDACTED]"}]
+    assert result.event_log[0]["llm_events"] == [{"content": "[REDACTED]"}]
+    assert result.event_log[0]["tool_events"] == [{"password": "[REDACTED]"}]
+    assert result.event_log[0]["state_patch"] == {"step1_result": "done"}
+
+    checkpoints = await cp_repo.list(workflow_run_id=run.id)
+    assert checkpoints[0].event_log[0]["artifacts"] == [{"api_key": "[REDACTED]"}]
+    assert checkpoints[0].event_log[0]["tool_events"] == [{"password": "[REDACTED]"}]
+    assert checkpoints[0].event_log[0]["state_patch"] == {"step1_result": "done"}
 
 
 async def test_workflow_with_audit_trail():

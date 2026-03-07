@@ -26,13 +26,27 @@ class TestCheckpointRepository:
     @pytest.mark.asyncio
     async def test_create_and_get(self, repo):
         cp = Checkpoint(workflow_run_id="run-1", node_id="step1")
-        cp.add_event(input_data={"x": 1}, output_data={"y": 2})
+        cp.state_version = 1
+        cp.state_hash = "abc123"
+        cp.add_event(
+            input_data={"x": 1},
+            input_state_version=0,
+            input_state_hash="prehash",
+            tool_events=[{"tool": "search"}],
+            artifacts=[{"kind": "report"}],
+            state_patch={"y": 2},
+        )
         await repo.create(cp)
 
         result = await repo.get(cp.id)
         assert result is not None
         assert result.node_id == "step1"
         assert len(result.event_log) == 1
+        assert result.state_version == 1
+        assert result.state_hash == "abc123"
+        assert result.event_log[0]["state_patch"] == {"y": 2}
+        assert result.event_log[0]["input_state_hash"] == "prehash"
+        assert result.event_log[0]["tool_events"] == [{"tool": "search"}]
 
     @pytest.mark.asyncio
     async def test_list_by_run(self, repo):
@@ -123,11 +137,15 @@ class TestWorkflowRepository:
         run = WorkflowRun(workflow_id="wf-1")
         await repo.create_run(run)
         run.start()
+        run.state_version = 2
+        run.state_hash = "hash-2"
         await repo.update_run(run)
 
         result = await repo.get_run(run.id)
         assert result is not None
         assert result.status == RunStatus.RUNNING
+        assert result.state_version == 2
+        assert result.state_hash == "hash-2"
 
     @pytest.mark.asyncio
     async def test_list_runs_by_status(self, repo):

@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from pylon.safety.tools import ToolDescriptor
+
 # JSON-RPC 2.0 error codes
 PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
@@ -64,13 +66,25 @@ class ToolDefinition:
     name: str = ""
     description: str = ""
     input_schema: dict = field(default_factory=dict)
+    safety: ToolDescriptor | None = None
 
     def to_dict(self) -> dict:
-        return {
+        payload: dict[str, Any] = {
             "name": self.name,
             "description": self.description,
             "inputSchema": self.input_schema,
         }
+        if self.safety is not None:
+            payload["annotations"] = {
+                "safety": {
+                    "requiresApproval": self.safety.requires_approval,
+                    "writesExternal": self.safety.writes_external,
+                    "accessesSecrets": self.safety.accesses_secrets,
+                    "effectScopes": sorted(self.safety.effect_scopes),
+                    "secretScopes": sorted(self.safety.secret_scopes),
+                }
+            }
+        return payload
 
 
 @dataclass

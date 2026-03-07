@@ -9,11 +9,17 @@ import pytest
 
 from pylon.approval.manager import (
     ApprovalAlreadyDecidedError,
+    ApprovalBindingMismatchError,
     ApprovalManager,
     ApprovalNotFoundError,
 )
 from pylon.approval.store import ApprovalStore
-from pylon.approval.types import ApprovalDecision, ApprovalRequest, ApprovalStatus
+from pylon.approval.types import (
+    ApprovalDecision,
+    ApprovalRequest,
+    ApprovalStatus,
+    compute_approval_binding_hash,
+)
 from pylon.repository.audit import AuditRepository
 from pylon.types import AutonomyLevel
 
@@ -59,11 +65,15 @@ class TestApprovalRequest:
             action="deploy",
             autonomy_level=AutonomyLevel.A4,
             context={"env": "prod"},
+            plan_hash="plan",
+            effect_hash="effect",
         )
         assert req.agent_id == "coder-1"
         assert req.action == "deploy"
         assert req.autonomy_level == AutonomyLevel.A4
         assert req.context == {"env": "prod"}
+        assert req.plan_hash == "plan"
+        assert req.effect_hash == "effect"
 
 
 class TestApprovalDecision:
@@ -72,6 +82,12 @@ class TestApprovalDecision:
         assert d.approved is False
         assert d.decided_by == ""
         assert d.reason == ""
+
+
+class TestApprovalBindingHash:
+    def test_hash_stable(self) -> None:
+        payload = {"nodes": ["a", "b"], "effects": {"net": True}}
+        assert compute_approval_binding_hash(payload) == compute_approval_binding_hash(payload)
 
 
 # --- Store ---
@@ -165,6 +181,20 @@ class TestApprovalManagerSubmit:
         req = await manager.submit_request("agent-1", "deploy", AutonomyLevel.A4, context=ctx)
         assert req.context == ctx
 
+    @pytest.mark.asyncio
+    async def test_submit_records_binding_hashes(self, manager: ApprovalManager) -> None:
+        plan = {"nodes": ["plan", "apply"]}
+        effects = {"write": ["git"], "secrets": []}
+        req = await manager.submit_request(
+            "agent-1",
+            "deploy",
+            AutonomyLevel.A4,
+            plan=plan,
+            effect_envelope=effects,
+        )
+        assert req.plan_hash == compute_approval_binding_hash(plan)
+        assert req.effect_hash == compute_approval_binding_hash(effects)
+
 
 class TestApprovalManagerApprove:
     @pytest.mark.asyncio
@@ -198,6 +228,62 @@ class TestApprovalManagerApprove:
         await manager.approve(req.id, "admin")
         with pytest.raises(ApprovalAlreadyDecidedError):
             await manager.approve(req.id, "admin")
+
+    @pytest.mark.asyncio
+    async def test_validate_binding_passes_for_matching_scope(
+        self, manager: ApprovalManager
+    ) -> None:
+        plan = {"nodes": ["plan", "apply"]}
+        effects = {"write": ["git"], "secrets": []}
+        req = await manager.submit_request(
+            "agent-1",
+            "deploy",
+            AutonomyLevel.A3,
+            plan=plan,
+            effect_envelope=effects,
+        )
+        await manager.approve(req.id, "admin")
+
+        validated = await manager.validate_binding(
+            req.id,
+            plan=plan,
+            effect_envelope=effects,
+        )
+        assert validated.id == req.id
+
+    @pytest.mark.asyncio
+    async def test_validate_binding_rejects_plan_drift(self, manager: ApprovalManager) -> None:
+        req = await manager.submit_request(
+            "agent-1",
+            "deploy",
+            AutonomyLevel.A3,
+            plan={"nodes": ["plan", "apply"]},
+        )
+        await manager.approve(req.id, "admin")
+
+        with pytest.raises(ApprovalBindingMismatchError, match="plan drift"):
+            await manager.validate_binding(
+                req.id,
+                plan={"nodes": ["plan", "apply", "rollback"]},
+            )
+
+    @pytest.mark.asyncio
+    async def test_validate_binding_rejects_effect_drift(
+        self, manager: ApprovalManager
+    ) -> None:
+        req = await manager.submit_request(
+            "agent-1",
+            "deploy",
+            AutonomyLevel.A3,
+            effect_envelope={"write": ["git"]},
+        )
+        await manager.approve(req.id, "admin")
+
+        with pytest.raises(ApprovalBindingMismatchError, match="effect scope drift"):
+            await manager.validate_binding(
+                req.id,
+                effect_envelope={"write": ["git", "prod"]},
+            )
 
 
 class TestApprovalManagerReject:

@@ -24,6 +24,9 @@ from pylon.protocols.mcp import (
     ToolDefinition,
     route,
 )
+from pylon.safety.context import SafetyContext
+from pylon.safety.tools import ToolDescriptor
+from pylon.types import AgentCapability, TrustLevel
 
 
 class TestJsonRpcTypes(unittest.TestCase):
@@ -111,6 +114,16 @@ class TestMethodRouter(unittest.TestCase):
 
         self.assertEqual(handler._rpc_method, "tools/list")
 
+    def test_request_validator_blocks_dispatch(self):
+        self.router.register("echo", lambda req: req.params)
+        self.router.set_request_validator(
+            lambda req: JsonRpcError(code=1234, message="blocked")
+        )
+        req = JsonRpcRequest(method="echo", params={"msg": "hi"}, id=5)
+        resp = self.router.dispatch(req)
+        self.assertIsNotNone(resp.error)
+        self.assertEqual(resp.error.code, 1234)
+
 
 class TestMcpServer(unittest.TestCase):
     def setUp(self):
@@ -156,6 +169,45 @@ class TestMcpServer(unittest.TestCase):
         )
         resp = self.server.handle_request(req)
         self.assertEqual(resp.result, 5)
+
+    def test_tools_call_blocked_by_safety_context(self):
+        self.server.set_safety_context(
+            SafetyContext(
+                agent_name="test-server",
+                held_capability=AgentCapability(can_read_untrusted=True),
+                data_taint=TrustLevel.UNTRUSTED,
+            )
+        )
+        tool = ToolDefinition(name="vault-read", description="Read secrets")
+        self.server.register_tool(
+            tool,
+            handler=lambda args: {"secret": "value"},
+            descriptor=ToolDescriptor(
+                name="vault-read",
+                accesses_secrets=True,
+                secret_scopes=frozenset({"vault"}),
+            ),
+        )
+        req = JsonRpcRequest(
+            method="tools/call",
+            params={"name": "vault-read", "arguments": {}},
+            id=41,
+        )
+        resp = self.server.handle_request(req)
+        self.assertIsNotNone(resp.error)
+        self.assertEqual(resp.error.code, -32003)
+
+    def test_tools_call_blocked_by_output_validator(self):
+        tool = ToolDefinition(name="echo", description="Echo")
+        self.server.register_tool(tool, handler=lambda args: args)
+        req = JsonRpcRequest(
+            method="tools/call",
+            params={"name": "echo", "arguments": {"text": "hello && rm -rf /"}},
+            id=42,
+        )
+        resp = self.server.handle_request(req)
+        self.assertIsNotNone(resp.error)
+        self.assertEqual(resp.error.code, -32602)
 
     def test_tools_call_not_found(self):
         req = JsonRpcRequest(

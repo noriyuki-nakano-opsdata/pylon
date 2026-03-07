@@ -1,19 +1,14 @@
-"""Workflow graph definition and DAG validation (FR-03, ADR-001).
-
-Graph primitives: Node, Edge, Subgraph, Checkpoint.
-Supports conditional transitions and fan-out/fan-in.
-"""
+"""Workflow graph definition and DAG validation (FR-03, ADR-001)."""
 
 from __future__ import annotations
 
-import ast
-import operator
 from dataclasses import dataclass, field
 from typing import Any
 
 from pylon.errors import WorkflowError
-from pylon.types import ConditionalEdge, WorkflowNode, WorkflowNodeType
+from pylon.types import ConditionalEdge, WorkflowJoinPolicy, WorkflowNode, WorkflowNodeType
 from pylon.workflow.compiled import CompiledEdge, CompiledNode, CompiledWorkflow
+from pylon.workflow.conditions import compile_condition, safe_eval_condition
 
 END = "END"
 EdgeKey = tuple[str, int]
@@ -33,6 +28,7 @@ class WorkflowGraph:
         agent: str,
         *,
         node_type: WorkflowNodeType = WorkflowNodeType.AGENT,
+        join_policy: WorkflowJoinPolicy = WorkflowJoinPolicy.ALL_RESOLVED,
         next_nodes: list[ConditionalEdge] | None = None,
     ) -> WorkflowGraph:
         if node_id == END:
@@ -43,6 +39,7 @@ class WorkflowGraph:
             id=node_id,
             agent=agent,
             node_type=node_type,
+            join_policy=join_policy,
             next=next_nodes or [],
         )
         self._validated = False
@@ -116,6 +113,22 @@ class WorkflowGraph:
         if unreachable:
             warnings.append(f"Nodes that cannot reach END: {unreachable}")
 
+        inbound = self.get_inbound_edges()
+        for node_id, node in self.nodes.items():
+            inbound_count = len(inbound.get(node_id, []))
+            if node.join_policy == WorkflowJoinPolicy.ALL_RESOLVED:
+                continue
+            if inbound_count < 2:
+                raise WorkflowError(
+                    f"Join policy '{node.join_policy.value}' requires at least two inbound edges",
+                    details={"node_id": node_id, "inbound_edges": inbound_count},
+                )
+            if node.node_type != WorkflowNodeType.ROUTER:
+                raise WorkflowError(
+                    f"Join policy '{node.join_policy.value}' requires node_type=router",
+                    details={"node_id": node_id, "node_type": node.node_type.value},
+                )
+
         # Simple cycle detection via DFS
         self._detect_cycles()
 
@@ -159,6 +172,7 @@ class WorkflowGraph:
                     source=node_id,
                     target=edge.target,
                     condition=edge.condition,
+                    predicate=compile_condition(edge.condition),
                 )
                 for edge_key, edge in self.get_outbound_edges(node_id)
             )
@@ -166,6 +180,7 @@ class WorkflowGraph:
                 node_id=node_id,
                 agent=node.agent,
                 node_type=node.node_type,
+                join_policy=node.join_policy,
                 inbound_edge_keys=tuple(inbound.get(node_id, [])),
                 outbound_edges=outbound_edges,
             )
@@ -192,7 +207,7 @@ class WorkflowGraph:
             if edge.condition is None:
                 results.append(edge.target)
             elif state is not None:
-                if _safe_eval_condition(edge.condition, state):
+                if safe_eval_condition(edge.condition, state):
                     results.append(edge.target)
         return results
 
@@ -217,120 +232,4 @@ class WorkflowGraph:
             if node_id not in visited:
                 dfs(node_id)
 
-
-_COMPARE_OPS: dict[type, Any] = {
-    ast.Eq: operator.eq,
-    ast.NotEq: operator.ne,
-    ast.Lt: operator.lt,
-    ast.LtE: operator.le,
-    ast.Gt: operator.gt,
-    ast.GtE: operator.ge,
-    ast.Is: operator.is_,
-    ast.IsNot: operator.is_not,
-    ast.In: lambda a, b: a in b,
-    ast.NotIn: lambda a, b: a not in b,
-}
-
-_BOOL_OPS: dict[type, Any] = {
-    ast.And: all,
-    ast.Or: any,
-}
-
-_UNARY_OPS: dict[type, Any] = {
-    ast.Not: operator.not_,
-    ast.USub: operator.neg,
-}
-
-
-def _safe_eval_condition(condition: str, state: dict[str, Any]) -> bool:
-    """Evaluate a condition string safely using AST-based whitelisting.
-
-    Allowed constructs: comparisons, boolean logic (and/or/not), attribute
-    access on ``state``, and literals (str, int, float, bool, None).
-    """
-    if not condition or not condition.strip():
-        return False
-
-    try:
-        tree = ast.parse(condition.strip(), mode="eval")
-    except SyntaxError as exc:
-        raise WorkflowError(f"Invalid condition syntax: {condition}") from exc
-
-    try:
-        return bool(_eval_node(tree.body, state))
-    except AttributeError as exc:
-        raise WorkflowError(f"Condition references missing state field: {exc}") from exc
-
-
-def _eval_node(node: ast.AST, state: dict[str, Any]) -> Any:  # noqa: PLR0911
-    """Recursively evaluate a whitelisted AST node."""
-    if isinstance(node, ast.Expression):
-        return _eval_node(node.body, state)
-
-    # Literals: numbers, strings, booleans, None
-    if isinstance(node, ast.Constant):
-        if not isinstance(node.value, (int, float, str, bool, type(None))):
-            raise WorkflowError(f"Unsupported literal type: {type(node.value).__name__}")
-        return node.value
-
-    # Attribute access: only state.xxx
-    if isinstance(node, ast.Attribute):
-        if not isinstance(node.value, ast.Name) or node.value.id != "state":
-            raise WorkflowError(
-                f"Attribute access only allowed on 'state', got: {ast.dump(node.value)}"
-            )
-        dot = _DotDict(state)
-        return getattr(dot, node.attr)
-
-    # Name: only 'state' itself (for nested attribute chains the leaf resolves here)
-    if isinstance(node, ast.Name):
-        if node.id == "state":
-            return _DotDict(state)
-        if node.id in ("True", "False", "None"):
-            return {"True": True, "False": False, "None": None}[node.id]
-        raise WorkflowError(f"Unsupported name: '{node.id}'")
-
-    # Comparisons: ==, !=, <, >, <=, >=, in, not in, is, is not
-    if isinstance(node, ast.Compare):
-        left = _eval_node(node.left, state)
-        for op_node, comparator in zip(node.ops, node.comparators):
-            op_func = _COMPARE_OPS.get(type(op_node))
-            if op_func is None:
-                raise WorkflowError(f"Unsupported comparison: {type(op_node).__name__}")
-            right = _eval_node(comparator, state)
-            if not op_func(left, right):
-                return False
-            left = right
-        return True
-
-    # Boolean: and, or
-    if isinstance(node, ast.BoolOp):
-        op_func = _BOOL_OPS.get(type(node.op))
-        if op_func is None:
-            raise WorkflowError(f"Unsupported boolean op: {type(node.op).__name__}")
-        values = [_eval_node(v, state) for v in node.values]
-        return op_func(values)
-
-    # Unary: not, - (negative numbers)
-    if isinstance(node, ast.UnaryOp):
-        op_func = _UNARY_OPS.get(type(node.op))
-        if op_func is None:
-            raise WorkflowError(f"Unsupported unary op: {type(node.op).__name__}")
-        return op_func(_eval_node(node.operand, state))
-
-    raise WorkflowError(
-        f"Unsupported expression node: {type(node).__name__}"
-    )
-
-
-class _DotDict:
-    """Dict wrapper allowing dot notation access for condition evaluation."""
-
-    def __init__(self, data: dict[str, Any]) -> None:
-        self._data = data
-
-    def __getattr__(self, key: str) -> Any:
-        try:
-            return self._data[key]
-        except KeyError:
-            raise AttributeError(key) from None
+_safe_eval_condition = safe_eval_condition

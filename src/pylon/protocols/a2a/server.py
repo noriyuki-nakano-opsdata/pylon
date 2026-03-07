@@ -31,6 +31,9 @@ from pylon.protocols.mcp.types import (
     JsonRpcRequest,
     JsonRpcResponse,
 )
+from pylon.safety.context import SafetyContext
+from pylon.safety.engine import SafetyEngine
+from pylon.types import AgentCapability, TrustLevel
 
 TaskHandler = Callable[[A2ATask], Awaitable[A2ATask]]
 StreamHandler = Callable[[A2ATask], AsyncIterator[TaskEvent]]
@@ -40,6 +43,7 @@ RATE_LIMITED = -32000
 
 # Application-defined error code for missing tasks
 TASK_NOT_FOUND = -32001
+FORBIDDEN = -32003
 
 
 class A2AServer:
@@ -50,6 +54,8 @@ class A2AServer:
         allowed_peers: set[str] | None = None,
         rate_limit: int = 0,
         rate_window: float = 60.0,
+        local_capability: AgentCapability | None = None,
+        peer_policies: dict[str, SafetyContext] | None = None,
     ) -> None:
         self._tasks: dict[str, A2ATask] = {}
         self._allowed_peers: set[str] = allowed_peers or set()
@@ -58,6 +64,8 @@ class A2AServer:
         self._rate_limit = rate_limit
         self._rate_window = rate_window
         self._peer_requests: dict[str, list[float]] = defaultdict(list)
+        self._local_capability = local_capability or AgentCapability()
+        self._peer_policies = peer_policies or {}
 
     def on_task(self, handler: TaskHandler) -> TaskHandler:
         """Register a task handler callback (decorator-style)."""
@@ -84,7 +92,6 @@ class A2AServer:
                 a mismatch returns a FORBIDDEN error.
         """
         # Verify sender matches authenticated identity when provided
-        FORBIDDEN = -32003
         if authenticated_peer is not None:
             params = request.params or {}
             sender = params.get("sender", "")
@@ -142,6 +149,9 @@ class A2AServer:
             raise RuntimeError("Rate limit exceeded")
 
         task = A2ATask.from_dict(params.task)
+        safety_error = self._validate_sender_task(sender, task)
+        if safety_error is not None:
+            raise PermissionError(safety_error.message)
         task.transition_to(TaskState.WORKING)
         self._tasks[task.id] = task
 
@@ -220,6 +230,9 @@ class A2AServer:
             )
 
         task = A2ATask.from_dict(params.task)
+        safety_error = self._validate_sender_task(sender, task)
+        if safety_error is not None:
+            return JsonRpcResponse(id=request.id, error=safety_error)
         # Prevent overwrite of existing tasks
         if task.id in self._tasks:
             return JsonRpcResponse(
@@ -299,6 +312,51 @@ class A2AServer:
                 task_id=task_id,
                 push_notification=task.push_notification,
             ),
+        )
+
+    def _validate_sender_task(
+        self,
+        sender: str,
+        task: A2ATask,
+    ) -> JsonRpcError | None:
+        sender_context = self._peer_policies.get(sender) or self._build_sender_context(sender, task)
+        decision = SafetyEngine.evaluate_delegation(
+            sender_context,
+            self._local_capability,
+            receiver_name="local-server",
+        )
+        if decision.allowed:
+            return None
+        return JsonRpcError(code=FORBIDDEN, message=decision.reason)
+
+    def _build_sender_context(self, sender: str, task: A2ATask) -> SafetyContext:
+        metadata = task.metadata.get("safety", {}) if isinstance(task.metadata, dict) else {}
+        capability = AgentCapability.__new__(AgentCapability)
+        object.__setattr__(
+            capability,
+            "can_read_untrusted",
+            bool(metadata.get("can_read_untrusted", False)),
+        )
+        object.__setattr__(
+            capability,
+            "can_access_secrets",
+            bool(metadata.get("can_access_secrets", False)),
+        )
+        object.__setattr__(
+            capability,
+            "can_write_external",
+            bool(metadata.get("can_write_external", False)),
+        )
+        data_taint = TrustLevel.UNTRUSTED if task.messages else TrustLevel.TRUSTED
+        if metadata.get("data_taint") == TrustLevel.UNTRUSTED.value:
+            data_taint = TrustLevel.UNTRUSTED
+        return SafetyContext(
+            agent_name=sender,
+            held_capability=capability,
+            data_taint=data_taint,
+            effect_scopes=frozenset(metadata.get("effect_scopes", [])),
+            secret_scopes=frozenset(metadata.get("secret_scopes", [])),
+            call_chain=tuple(metadata.get("call_chain", [])),
         )
 
     async def _handle_push_notification_get(self, request: JsonRpcRequest) -> JsonRpcResponse:

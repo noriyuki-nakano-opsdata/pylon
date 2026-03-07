@@ -6,8 +6,13 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pylon.approval.store import ApprovalStore
-from pylon.approval.types import ApprovalDecision, ApprovalRequest, ApprovalStatus
-from pylon.errors import PylonError
+from pylon.approval.types import (
+    ApprovalDecision,
+    ApprovalRequest,
+    ApprovalStatus,
+    compute_approval_binding_hash,
+)
+from pylon.errors import PolicyViolationError, PylonError
 from pylon.repository.audit import AuditRepository
 from pylon.types import AutonomyLevel
 
@@ -19,6 +24,11 @@ class ApprovalNotFoundError(PylonError):
 
 class ApprovalAlreadyDecidedError(PylonError):
     code = "APPROVAL_ALREADY_DECIDED"
+    status_code = 409
+
+
+class ApprovalBindingMismatchError(PolicyViolationError):
+    code = "APPROVAL_BINDING_MISMATCH"
     status_code = 409
 
 
@@ -46,6 +56,9 @@ class ApprovalManager:
         action: str,
         autonomy_level: AutonomyLevel,
         context: dict[str, Any] | None = None,
+        *,
+        plan: Any | None = None,
+        effect_envelope: Any | None = None,
     ) -> ApprovalRequest:
         now = datetime.now(UTC)
         request = ApprovalRequest(
@@ -53,6 +66,12 @@ class ApprovalManager:
             action=action,
             autonomy_level=autonomy_level,
             context=context or {},
+            plan_hash=compute_approval_binding_hash(plan) if plan is not None else "",
+            effect_hash=(
+                compute_approval_binding_hash(effect_envelope)
+                if effect_envelope is not None
+                else ""
+            ),
             status=ApprovalStatus.PENDING,
             created_at=now,
             expires_at=now + timedelta(seconds=self._timeout_seconds),
@@ -66,6 +85,8 @@ class ApprovalManager:
                 "request_id": request.id,
                 "autonomy_level": autonomy_level.name,
                 "context": context or {},
+                "plan_hash": request.plan_hash,
+                "effect_hash": request.effect_hash,
             },
         )
         return request
@@ -141,6 +162,52 @@ class ApprovalManager:
         if request and request.status == ApprovalStatus.PENDING:
             if request.expires_at and datetime.now(UTC) >= request.expires_at:
                 await self._expire_request(request)
+        return request
+
+    async def validate_binding(
+        self,
+        request_id: str,
+        *,
+        plan: Any | None = None,
+        effect_envelope: Any | None = None,
+    ) -> ApprovalRequest:
+        """Validate that an approved request still matches its bound scope."""
+        request = await self._store.get(request_id)
+        if request is None:
+            raise ApprovalNotFoundError(
+                f"Approval request not found: {request_id}",
+                details={"request_id": request_id},
+            )
+        if request.status != ApprovalStatus.APPROVED:
+            raise ApprovalAlreadyDecidedError(
+                f"Approval request is not approved: {request_id}",
+                details={"request_id": request_id, "status": request.status.value},
+            )
+
+        supplied_plan_hash = compute_approval_binding_hash(plan) if plan is not None else ""
+        supplied_effect_hash = (
+            compute_approval_binding_hash(effect_envelope)
+            if effect_envelope is not None
+            else ""
+        )
+        if request.plan_hash and request.plan_hash != supplied_plan_hash:
+            raise ApprovalBindingMismatchError(
+                "Approval invalidated by plan drift",
+                details={
+                    "request_id": request_id,
+                    "expected_plan_hash": request.plan_hash,
+                    "actual_plan_hash": supplied_plan_hash,
+                },
+            )
+        if request.effect_hash and request.effect_hash != supplied_effect_hash:
+            raise ApprovalBindingMismatchError(
+                "Approval invalidated by effect scope drift",
+                details={
+                    "request_id": request_id,
+                    "expected_effect_hash": request.effect_hash,
+                    "actual_effect_hash": supplied_effect_hash,
+                },
+            )
         return request
 
     async def _get_valid_pending(self, request_id: str) -> ApprovalRequest:

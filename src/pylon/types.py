@@ -113,6 +113,14 @@ class WorkflowNodeType(enum.Enum):
     ROUTER = "router"
 
 
+class WorkflowJoinPolicy(enum.Enum):
+    """Inbound edge readiness policy for a workflow node."""
+
+    ALL_RESOLVED = "all_resolved"
+    ANY = "any"
+    FIRST = "first"
+
+
 @dataclass
 class ConditionalEdge:
     """Conditional edge in workflow graph."""
@@ -128,6 +136,7 @@ class WorkflowNode:
     id: str
     agent: str  # Agent name from agents section
     node_type: WorkflowNodeType = WorkflowNodeType.AGENT
+    join_policy: WorkflowJoinPolicy = WorkflowJoinPolicy.ALL_RESOLVED
     next: list[ConditionalEdge] = field(default_factory=list)
 
 

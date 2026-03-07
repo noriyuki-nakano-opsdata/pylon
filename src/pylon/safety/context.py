@@ -18,3 +18,4 @@ class SafetyContext:
     effect_scopes: frozenset[str] = field(default_factory=frozenset)
     secret_scopes: frozenset[str] = field(default_factory=frozenset)
     call_chain: tuple[str, ...] = field(default_factory=tuple)
+    approval_token: str | None = None

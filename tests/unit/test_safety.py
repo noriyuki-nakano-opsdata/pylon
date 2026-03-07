@@ -7,6 +7,7 @@ from pylon.safety.autonomy import AutonomyEnforcer
 from pylon.safety.capability import CapabilityValidator
 from pylon.safety.context import SafetyContext
 from pylon.safety.engine import SafetyEngine
+from pylon.safety.tools import ToolDescriptor, resolve_tool_descriptor
 from pylon.types import (
     AgentCapability,
     AgentConfig,
@@ -49,6 +50,7 @@ class TestSafetyContext:
         assert ctx.effect_scopes == frozenset({"fs", "net"})
         assert ctx.secret_scopes == frozenset({"vault"})
         assert ctx.call_chain == ("parent", "child")
+        assert ctx.approval_token is None
 
 
 class TestSafetyEngine:
@@ -70,6 +72,42 @@ class TestSafetyEngine:
         decision = SafetyEngine.evaluate_delegation(
             ctx, receiver_cap, receiver_name="evil-peer"
         )
+        assert decision.allowed is False
+        assert "Forbidden pair" in decision.reason
+
+    def test_evaluate_tool_use_returns_effective_context(self):
+        ctx = SafetyContext(
+            agent_name="sender",
+            held_capability=AgentCapability(can_write_external=True),
+            effect_scopes=frozenset({"git.push"}),
+        )
+        descriptor = ToolDescriptor(
+            name="secret-read",
+            accesses_secrets=True,
+            secret_scopes=frozenset({"vault"}),
+            requires_approval=True,
+        )
+        decision = SafetyEngine.evaluate_tool_use(ctx, descriptor)
+
+        assert decision.allowed is True
+        assert decision.requires_approval is True
+        assert decision.effective_capability is not None
+        assert decision.effective_capability.can_access_secrets is True
+        assert decision.effective_context is not None
+        assert decision.effective_context.secret_scopes == frozenset({"vault"})
+        assert decision.effective_context.effect_scopes == frozenset({"git.push"})
+
+    def test_evaluate_tool_use_rejects_forbidden_pair(self):
+        ctx = SafetyContext(
+            agent_name="sender",
+            held_capability=_make_cap(untrusted=True),
+        )
+        descriptor = ToolDescriptor(
+            name="vault-read",
+            accesses_secrets=True,
+            secret_scopes=frozenset({"vault"}),
+        )
+        decision = SafetyEngine.evaluate_tool_use(ctx, descriptor)
         assert decision.allowed is False
         assert "Forbidden pair" in decision.reason
 
@@ -105,10 +143,12 @@ class TestCapabilityValidator:
         current = AgentCapability(can_write_external=True)
         merged = CapabilityValidator.validate_tool_grant(
             current,
-            tool_trust=TrustLevel.TRUSTED,
-            tool_writes_external=False,
-            tool_accesses_secrets=True,
             agent_name="test",
+            tool_descriptor=ToolDescriptor(
+                name="vault-read",
+                accesses_secrets=True,
+                secret_scopes=frozenset({"vault"}),
+            ),
         )
         assert merged.can_access_secrets
         assert merged.can_write_external
@@ -118,11 +158,29 @@ class TestCapabilityValidator:
         with pytest.raises(PolicyViolationError, match="Forbidden pair"):
             CapabilityValidator.validate_tool_grant(
                 current,
-                tool_trust=TrustLevel.TRUSTED,
-                tool_writes_external=False,
-                tool_accesses_secrets=True,
                 agent_name="test",
+                tool_descriptor=ToolDescriptor(
+                    name="vault-read",
+                    accesses_secrets=True,
+                    secret_scopes=frozenset({"vault"}),
+                ),
             )
+
+    def test_tool_grant_legacy_args_still_supported(self):
+        current = AgentCapability(can_write_external=True)
+        merged = CapabilityValidator.validate_tool_grant(
+            current,
+            tool_trust=TrustLevel.TRUSTED,
+            tool_writes_external=False,
+            tool_accesses_secrets=True,
+            agent_name="test",
+        )
+        assert merged.can_access_secrets is True
+
+    def test_resolve_tool_descriptor_uses_local_policy_defaults(self):
+        descriptor = resolve_tool_descriptor("git-push")
+        assert descriptor.writes_external is True
+        assert descriptor.effect_scopes == frozenset({"git.push"})
 
     def test_subgraph_child_subset(self):
         parent = AgentCapability(can_write_external=True, can_access_secrets=True)
@@ -223,6 +281,61 @@ class TestAutonomyEnforcer:
         result = enforcer.approve(request_id, "admin")
         assert result.approved is True
         assert result.approved_by == "admin"
+
+    def test_approval_binding_records_plan_and_effect_hash(self):
+        policy = PolicyConfig(require_approval_above=AutonomyLevel.A3)
+        enforcer = AutonomyEnforcer(policy)
+        with pytest.raises(ApprovalRequiredError) as exc_info:
+            enforcer.check_action(
+                "agent1",
+                "deploy",
+                AutonomyLevel.A3,
+                plan={"nodes": ["plan", "apply"]},
+                effect_envelope={"write": ["git"]},
+            )
+        request_id = exc_info.value.details["request_id"]
+
+        approved = enforcer.approve(request_id, "admin")
+        assert approved.plan_hash != ""
+        assert approved.effect_hash != ""
+
+    def test_approval_binding_rejects_plan_drift(self):
+        policy = PolicyConfig(require_approval_above=AutonomyLevel.A3)
+        enforcer = AutonomyEnforcer(policy)
+        with pytest.raises(ApprovalRequiredError) as exc_info:
+            enforcer.check_action(
+                "agent1",
+                "deploy",
+                AutonomyLevel.A3,
+                plan={"nodes": ["plan", "apply"]},
+            )
+        request_id = exc_info.value.details["request_id"]
+
+        approved = enforcer.approve(request_id, "admin")
+        with pytest.raises(PolicyViolationError, match="plan drift"):
+            enforcer.validate_approval(
+                approved,
+                plan={"nodes": ["plan", "apply", "rollback"]},
+            )
+
+    def test_approval_binding_rejects_effect_drift(self):
+        policy = PolicyConfig(require_approval_above=AutonomyLevel.A3)
+        enforcer = AutonomyEnforcer(policy)
+        with pytest.raises(ApprovalRequiredError) as exc_info:
+            enforcer.check_action(
+                "agent1",
+                "deploy",
+                AutonomyLevel.A3,
+                effect_envelope={"write": ["git"]},
+            )
+        request_id = exc_info.value.details["request_id"]
+
+        approved = enforcer.approve(request_id, "admin")
+        with pytest.raises(PolicyViolationError, match="effect scope drift"):
+            enforcer.validate_approval(
+                approved,
+                effect_envelope={"write": ["git", "prod"]},
+            )
 
     def test_deny_flow(self):
         policy = PolicyConfig(require_approval_above=AutonomyLevel.A3)

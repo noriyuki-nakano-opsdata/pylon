@@ -51,6 +51,8 @@ class WorkflowRun:
     status: RunStatus = RunStatus.PENDING
     event_log: list[dict[str, Any]] = field(default_factory=list)
     state: dict[str, Any] = field(default_factory=dict)
+    state_version: int = 0
+    state_hash: str = ""
     started_at: datetime | None = None
     completed_at: datetime | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))

@@ -5,13 +5,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from pylon.protocols.mcp.auth import (
-    METHOD_SCOPES,
-    OAuthProvider,
-    check_scope,
-)
+from pylon.protocols.mcp.auth import METHOD_SCOPES, OAuthProvider, check_scope
 from pylon.protocols.mcp.dto import (
     CursorParamsDTO,
+    DtoValidationError,
     InitializeParamsDTO,
     InitializeResponseDTO,
     PromptGetParamsDTO,
@@ -24,6 +21,7 @@ from pylon.protocols.mcp.dto import (
 from pylon.protocols.mcp.router import MethodRouter
 from pylon.protocols.mcp.session import SessionManager
 from pylon.protocols.mcp.types import (
+    INVALID_PARAMS,
     InitializeResult,
     JsonRpcError,
     JsonRpcRequest,
@@ -35,6 +33,10 @@ from pylon.protocols.mcp.types import (
     ServerCapabilities,
     ToolDefinition,
 )
+from pylon.safety.context import SafetyContext
+from pylon.safety.engine import SafetyEngine
+from pylon.safety.output_validator import OutputValidator
+from pylon.safety.tools import ToolDescriptor, resolve_tool_descriptor
 
 # Custom JSON-RPC error code for auth failures
 UNAUTHORIZED = -32001
@@ -49,10 +51,12 @@ class McpServer:
         name: str = "pylon-mcp",
         version: str = "0.1.0",
         oauth_provider: OAuthProvider | None = None,
+        safety_context: SafetyContext | None = None,
     ) -> None:
         self.name = name
         self.version = version
         self._tools: dict[str, ToolDefinition] = {}
+        self._tool_descriptors: dict[str, ToolDescriptor] = {}
         self._tool_handlers: dict[str, Callable] = {}
         self._resources: dict[str, ResourceDefinition] = {}
         self._resource_handlers: dict[str, Callable] = {}
@@ -65,7 +69,10 @@ class McpServer:
         self._router = MethodRouter()
         self._oauth: OAuthProvider | None = oauth_provider
         self._notifications: list[dict[str, Any]] = []
+        self._output_validator = OutputValidator()
+        self._safety_context = safety_context or SafetyContext(agent_name=name)
         self._register_builtin_methods()
+        self._router.set_request_validator(self._validate_request)
 
     def _register_builtin_methods(self) -> None:
         self._router.register("initialize", self._handle_initialize)
@@ -89,12 +96,24 @@ class McpServer:
         )
 
     def register_tool(
-        self, tool: ToolDefinition, handler: Callable | None = None
+        self,
+        tool: ToolDefinition,
+        handler: Callable | None = None,
+        *,
+        descriptor: ToolDescriptor | None = None,
     ) -> None:
+        if descriptor is not None:
+            tool.safety = descriptor
         self._tools[tool.name] = tool
+        self._tool_descriptors[tool.name] = descriptor or tool.safety or resolve_tool_descriptor(
+            tool.name
+        )
         if handler is not None:
             self._tool_handlers[tool.name] = handler
         self._emit_notification("notifications/tools/list_changed", {})
+
+    def set_safety_context(self, context: SafetyContext) -> None:
+        self._safety_context = context
 
     def register_resource(
         self, resource: ResourceDefinition, handler: Callable | None = None
@@ -188,7 +207,7 @@ class McpServer:
     SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2024-11-05")
 
     def _handle_initialize(self, request: JsonRpcRequest) -> dict:
-        params_dto = InitializeParamsDTO.from_params(request.params)
+        InitializeParamsDTO.from_params(request.params)
         raw_params = request.params or {}
         client_version = raw_params.get("protocolVersion")
         if client_version and client_version not in self.SUPPORTED_PROTOCOL_VERSIONS:
@@ -220,6 +239,38 @@ class McpServer:
         if handler is None:
             raise ValueError(f"Tool not found: {params.name}")
         return handler(params.arguments)
+
+    def _validate_request(self, request: JsonRpcRequest) -> JsonRpcError | None:
+        if request.method != "tools/call":
+            return None
+        try:
+            params = ToolCallParamsDTO.from_params(request.params)
+        except DtoValidationError as exc:
+            return JsonRpcError(code=INVALID_PARAMS, message=str(exc))
+        validation = self._output_validator.validate_tool_call_detailed(
+            params.name,
+            params.arguments,
+        )
+        if not validation.valid:
+            return JsonRpcError(
+                code=INVALID_PARAMS,
+                message="Unsafe tool call arguments",
+                data={"violations": validation.violations},
+            )
+        descriptor = self._tool_descriptors.get(params.name, resolve_tool_descriptor(params.name))
+        decision = SafetyEngine.evaluate_tool_use(
+            self._safety_context,
+            descriptor,
+            tool_name=params.name,
+        )
+        if not decision.allowed:
+            return JsonRpcError(code=FORBIDDEN, message=decision.reason)
+        if decision.requires_approval:
+            return JsonRpcError(
+                code=FORBIDDEN,
+                message=f"Tool '{params.name}' requires approval before execution",
+            )
+        return None
 
     def _handle_resources_list(self, request: JsonRpcRequest) -> dict:
         cursor = CursorParamsDTO.from_params(request.params).cursor

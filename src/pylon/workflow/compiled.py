@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from pylon.types import WorkflowNodeType
+from pylon.types import WorkflowJoinPolicy, WorkflowNodeType
+from pylon.workflow.conditions import CompiledCondition
 
 EdgeKey = tuple[str, int]
 
@@ -17,6 +18,18 @@ class CompiledEdge:
     source: str
     target: str
     condition: str | None = None
+    predicate: CompiledCondition | None = None
+
+    @property
+    def decision_key(self) -> str:
+        """Stable serialized identifier for explicit edge decisions."""
+        return f"{self.key[0]}:{self.key[1]}"
+
+    def evaluate(self, state: dict[str, object]) -> bool:
+        """Evaluate the edge condition against the current workflow state."""
+        if self.predicate is None:
+            return self.condition is None
+        return self.predicate.evaluate(state)
 
 
 @dataclass(frozen=True)
@@ -26,6 +39,7 @@ class CompiledNode:
     node_id: str
     agent: str
     node_type: WorkflowNodeType
+    join_policy: WorkflowJoinPolicy
     inbound_edge_keys: tuple[EdgeKey, ...]
     outbound_edges: tuple[CompiledEdge, ...]
 

@@ -23,6 +23,8 @@ from pylon.protocols.a2a.types import (
     TaskState,
 )
 from pylon.protocols.mcp.types import INVALID_PARAMS, METHOD_NOT_FOUND, JsonRpcRequest
+from pylon.safety.context import SafetyContext
+from pylon.types import AgentCapability, TrustLevel
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -127,6 +129,39 @@ class TestA2AServer:
         resp = _run(server.handle_request(req))
         assert resp.error is None
         assert resp.result["state"] == "working"
+
+    def test_send_task_blocked_by_safety_context(self):
+        server = A2AServer(
+            local_capability=AgentCapability(can_access_secrets=True),
+            peer_policies={
+                "peer-a": SafetyContext(
+                    agent_name="peer-a",
+                    held_capability=AgentCapability(can_write_external=True),
+                    data_taint=TrustLevel.UNTRUSTED,
+                )
+            },
+        )
+        task = _make_task()
+        req = JsonRpcRequest(
+            method="tasks/send",
+            params={"sender": "peer-a", "task": task.to_dict()},
+            id="1b",
+        )
+        resp = _run(server.handle_request(req))
+        assert resp.error is not None
+        assert resp.error.code == -32003
+
+    def test_send_task_untrusted_messages_block_secret_receiver_without_peer_claims(self):
+        server = A2AServer(local_capability=AgentCapability(can_access_secrets=True))
+        task = _make_task("test-unsafe", "remote message")
+        req = JsonRpcRequest(
+            method="tasks/send",
+            params={"sender": "peer-a", "task": task.to_dict()},
+            id="1c",
+        )
+        resp = _run(server.handle_request(req))
+        assert resp.error is not None
+        assert resp.error.code == -32003
 
     def test_send_transitions_to_working(self):
         server = A2AServer()
@@ -793,7 +828,6 @@ class TestRateLimitMemoryLeak:
         assert server._peer_requests["stale"] == []
 
     def test_active_peer_entries_are_kept(self):
-        import time
         server = A2AServer(rate_limit=10, rate_window=60.0)
         server._check_rate_limit("active-peer")
         assert "active-peer" in server._peer_requests

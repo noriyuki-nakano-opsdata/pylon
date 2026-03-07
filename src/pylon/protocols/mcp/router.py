@@ -6,8 +6,6 @@ import logging
 from collections.abc import Callable
 
 from pylon.protocols.mcp.dto import DtoValidationError
-
-logger = logging.getLogger(__name__)
 from pylon.protocols.mcp.types import (
     INTERNAL_ERROR,
     INVALID_PARAMS,
@@ -17,15 +15,30 @@ from pylon.protocols.mcp.types import (
     JsonRpcResponse,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class MethodRouter:
     def __init__(self) -> None:
         self._handlers: dict[str, Callable] = {}
+        self._request_validator: Callable[[JsonRpcRequest], JsonRpcError | None] | None = None
 
     def register(self, method: str, handler: Callable) -> None:
         self._handlers[method] = handler
 
+    def set_request_validator(
+        self,
+        validator: Callable[[JsonRpcRequest], JsonRpcError | None] | None,
+    ) -> None:
+        self._request_validator = validator
+
     def dispatch(self, request: JsonRpcRequest) -> JsonRpcResponse | None:
+        if self._request_validator is not None:
+            validation_error = self._request_validator(request)
+            if validation_error is not None:
+                if request.id is None:
+                    return None
+                return JsonRpcResponse(error=validation_error, id=request.id)
         handler = self._handlers.get(request.method)
         if handler is None:
             if request.id is None:

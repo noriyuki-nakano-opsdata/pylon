@@ -12,6 +12,7 @@ from __future__ import annotations
 from pylon.errors import PolicyViolationError
 from pylon.safety.context import SafetyContext
 from pylon.safety.engine import SafetyEngine
+from pylon.safety.tools import ToolDescriptor, resolve_tool_descriptor
 from pylon.types import AgentCapability, AgentConfig, TrustLevel
 
 
@@ -45,26 +46,48 @@ class CapabilityValidator:
     @staticmethod
     def validate_tool_grant(
         current: AgentCapability,
-        tool_trust: TrustLevel,
-        tool_writes_external: bool,
-        tool_accesses_secrets: bool,
+        tool_trust: TrustLevel | None = None,
+        tool_writes_external: bool | None = None,
+        tool_accesses_secrets: bool | None = None,
         *,
         agent_name: str = "",
+        tool_descriptor: ToolDescriptor | None = None,
+        tool_name: str = "",
     ) -> AgentCapability:
         """Validate dynamic tool grant (checkpoint 2).
 
         Returns the merged capability if valid.
         Raises PolicyViolationError if grant would violate Rule-of-Two+.
         """
-        merged = _make_cap(
-            untrusted=current.can_read_untrusted or (tool_trust == TrustLevel.UNTRUSTED),
-            secrets=current.can_access_secrets or tool_accesses_secrets,
-            write=current.can_write_external or tool_writes_external,
-        )
+        descriptor = tool_descriptor
+        if descriptor is None:
+            if tool_name:
+                descriptor = resolve_tool_descriptor(tool_name)
+            else:
+                descriptor = ToolDescriptor(
+                    name=tool_name or "tool",
+                    input_trust=tool_trust or TrustLevel.TRUSTED,
+                    reads_untrusted_input=(tool_trust == TrustLevel.UNTRUSTED),
+                    accesses_secrets=bool(tool_accesses_secrets),
+                    writes_external=bool(tool_writes_external),
+                )
 
-        context = f"tool grant to agent '{agent_name}'" if agent_name else "tool grant"
-        _enforce_rule_of_two_plus(merged, context=context)
-        return merged
+        decision = SafetyEngine.evaluate_tool_use(
+            SafetyContext(
+                agent_name=agent_name or "agent",
+                held_capability=current,
+                data_taint=(
+                    TrustLevel.UNTRUSTED
+                    if current.can_read_untrusted
+                    else TrustLevel.TRUSTED
+                ),
+            ),
+            descriptor,
+            tool_name=tool_name or descriptor.name,
+        )
+        if not decision.allowed or decision.effective_capability is None:
+            raise PolicyViolationError(decision.reason)
+        return decision.effective_capability
 
     @staticmethod
     def validate_subgraph_inheritance(
@@ -146,21 +169,8 @@ def _make_cap(
 def _infer_capability_flags(config: AgentConfig) -> tuple[bool, bool, bool]:
     """Infer capability flags from agent config without constructing AgentCapability."""
     can_read_untrusted = config.input_trust == TrustLevel.UNTRUSTED
-    can_access_secrets = any(
-        t in config.tools
-        for t in ("vault-read", "secret-read", "env-read")
-    )
-    can_write_external = any(
-        t in config.tools
-        for t in (
-            "github-pr-approve",
-            "github-pr-comment",
-            "github-pr-request-changes",
-            "git-push",
-            "db-write",
-            "api-call",
-        )
-    )
+    can_access_secrets = any(resolve_tool_descriptor(t).accesses_secrets for t in config.tools)
+    can_write_external = any(resolve_tool_descriptor(t).writes_external for t in config.tools)
     return can_read_untrusted, can_access_secrets, can_write_external
 
 

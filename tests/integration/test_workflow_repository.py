@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+from pylon.errors import WorkflowError
 from pylon.repository.audit import AuditRepository
 from pylon.repository.checkpoint import Checkpoint, CheckpointRepository
 from pylon.repository.memory import (
@@ -10,9 +13,6 @@ from pylon.repository.memory import (
     ProceduralEntry,
     SemanticEntry,
 )
-import pytest
-
-from pylon.errors import WorkflowError
 from pylon.repository.workflow import (
     RunStatus,
     WorkflowDefinition,
