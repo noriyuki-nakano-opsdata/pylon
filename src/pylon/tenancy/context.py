@@ -1,11 +1,13 @@
-"""Tenant context propagation via contextvars."""
+"""Enhanced tenant context propagation via contextvars."""
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass, field
-from typing import Any, Generator
+import asyncio
+import json
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar, copy_context
+from dataclasses import asdict, dataclass, field
+from typing import Any, AsyncGenerator, Generator
 
 from pylon.tenancy.config import TenantLimits, TenantTier
 
@@ -54,3 +56,52 @@ def tenant_scope(ctx: TenantContext) -> Generator[TenantContext, None, None]:
         yield ctx
     finally:
         _current_tenant.reset(token)
+
+
+@asynccontextmanager
+async def async_tenant_scope(ctx: TenantContext) -> AsyncGenerator[TenantContext, None]:
+    token = _current_tenant.set(ctx)
+    try:
+        yield ctx
+    finally:
+        _current_tenant.reset(token)
+
+
+async def run_in_tenant_context(ctx: TenantContext, coro: Any) -> Any:
+    """Run a coroutine with tenant context propagated across async tasks."""
+    context = copy_context()
+
+    async def _wrapper() -> Any:
+        _current_tenant.set(ctx)
+        return await coro
+
+    return await asyncio.ensure_future(_wrapper())
+
+
+def serialize_tenant_context(ctx: TenantContext) -> str:
+    """Serialize tenant context for NATS messages."""
+    data = {
+        "tenant_id": ctx.tenant_id,
+        "tenant_name": ctx.tenant_name,
+        "tier": ctx.tier.value,
+        "limits": {
+            "max_agents": ctx.limits.max_agents,
+            "max_workflows": ctx.limits.max_workflows,
+            "max_memory_mb": ctx.limits.max_memory_mb,
+            "max_api_calls_per_hour": ctx.limits.max_api_calls_per_hour,
+        },
+        "metadata": ctx.metadata,
+    }
+    return json.dumps(data)
+
+
+def deserialize_tenant_context(data: str) -> TenantContext:
+    """Deserialize tenant context from NATS messages."""
+    parsed = json.loads(data)
+    return TenantContext(
+        tenant_id=parsed["tenant_id"],
+        tenant_name=parsed["tenant_name"],
+        tier=TenantTier(parsed["tier"]),
+        limits=TenantLimits(**parsed["limits"]),
+        metadata=parsed.get("metadata", {}),
+    )

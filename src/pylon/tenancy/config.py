@@ -1,4 +1,4 @@
-"""Tenant configuration and tier management."""
+"""Enhanced tenant configuration with feature flags and policy overrides."""
 
 from __future__ import annotations
 
@@ -23,22 +23,13 @@ class TenantLimits:
 
 TIER_DEFAULTS: dict[TenantTier, TenantLimits] = {
     TenantTier.FREE: TenantLimits(
-        max_agents=5,
-        max_workflows=10,
-        max_memory_mb=512,
-        max_api_calls_per_hour=1000,
+        max_agents=5, max_workflows=10, max_memory_mb=512, max_api_calls_per_hour=1000,
     ),
     TenantTier.PRO: TenantLimits(
-        max_agents=50,
-        max_workflows=100,
-        max_memory_mb=4096,
-        max_api_calls_per_hour=10000,
+        max_agents=50, max_workflows=100, max_memory_mb=4096, max_api_calls_per_hour=10000,
     ),
     TenantTier.ENTERPRISE: TenantLimits(
-        max_agents=-1,  # unlimited
-        max_workflows=-1,
-        max_memory_mb=-1,
-        max_api_calls_per_hour=-1,
+        max_agents=-1, max_workflows=-1, max_memory_mb=-1, max_api_calls_per_hour=-1,
     ),
 }
 
@@ -53,6 +44,45 @@ class TenantConfig:
     tier: TenantTier = TenantTier.FREE
     limits: TenantLimits = field(default_factory=TenantLimits)
     metadata: dict[str, Any] = field(default_factory=dict)
+    feature_flags: dict[str, bool] = field(default_factory=dict)
+    policy_overrides: dict[str, Any] = field(default_factory=dict)
+
+
+# Global defaults for feature flags and policies
+_global_feature_flags: dict[str, bool] = {}
+_global_policies: dict[str, Any] = {}
+
+
+def set_global_feature_flags(flags: dict[str, bool]) -> None:
+    global _global_feature_flags
+    _global_feature_flags = dict(flags)
+
+
+def get_global_feature_flags() -> dict[str, bool]:
+    return dict(_global_feature_flags)
+
+
+def set_global_policies(policies: dict[str, Any]) -> None:
+    global _global_policies
+    _global_policies = dict(policies)
+
+
+def get_global_policies() -> dict[str, Any]:
+    return dict(_global_policies)
+
+
+def resolve_feature_flags(config: TenantConfig) -> dict[str, bool]:
+    """Resolve feature flags with inheritance: global -> tenant override."""
+    merged = dict(_global_feature_flags)
+    merged.update(config.feature_flags)
+    return merged
+
+
+def resolve_policies(config: TenantConfig) -> dict[str, Any]:
+    """Resolve policies with inheritance: global -> tenant override."""
+    merged = dict(_global_policies)
+    merged.update(config.policy_overrides)
+    return merged
 
 
 class ConfigStore:

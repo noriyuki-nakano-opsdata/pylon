@@ -1,9 +1,15 @@
-"""PluginRegistry - Plugin lifecycle management."""
+"""PluginRegistry - Plugin lifecycle management and querying."""
 
 from __future__ import annotations
 
 from pylon.plugins.loader import Plugin
-from pylon.plugins.types import PluginCapability, PluginConfig, PluginState
+from pylon.plugins.types import (
+    EXTENSION_POINT_MAP,
+    PluginCapability,
+    PluginConfig,
+    PluginState,
+    PluginType,
+)
 
 
 class _PluginEntry:
@@ -33,7 +39,7 @@ class PluginRegistry:
         entry = self._plugins.get(name)
         if entry is None:
             return False
-        if entry.state == PluginState.ACTIVE:
+        if entry.state == PluginState.STARTED:
             entry.plugin.deactivate()
         del self._plugins[name]
         return True
@@ -64,6 +70,14 @@ class PluginRegistry:
             results.append(entry.plugin)
         return results
 
+    def get_by_type(self, plugin_type: PluginType) -> list[Plugin]:
+        """Get all plugins of a specific type."""
+        return [
+            entry.plugin
+            for entry in self._plugins.values()
+            if entry.plugin.info().plugin_type == plugin_type
+        ]
+
     def get_by_capability(self, cap: PluginCapability) -> list[Plugin]:
         """Get all plugins with a specific capability."""
         return [
@@ -71,6 +85,24 @@ class PluginRegistry:
             for entry in self._plugins.values()
             if cap in entry.plugin.info().capabilities
         ]
+
+    def get_extension_points(self, plugin_type: PluginType) -> list[Plugin]:
+        """Get all plugins that implement the extension point for a type."""
+        ext_protocol = EXTENSION_POINT_MAP.get(plugin_type)
+        if ext_protocol is None:
+            return []
+        return [
+            entry.plugin
+            for entry in self._plugins.values()
+            if isinstance(entry.plugin, ext_protocol)
+        ]
+
+    def configure(self, name: str, config: PluginConfig) -> None:
+        """Update configuration for a registered plugin."""
+        entry = self._plugins.get(name)
+        if entry is None:
+            raise KeyError(f"Plugin not found: {name}")
+        entry.config = config
 
     def enable(self, name: str) -> None:
         """Initialize and activate a plugin."""
@@ -80,7 +112,7 @@ class PluginRegistry:
         entry.plugin.initialize(entry.config)
         entry.state = PluginState.INITIALIZED
         entry.plugin.activate()
-        entry.state = PluginState.ACTIVE
+        entry.state = PluginState.STARTED
 
     def disable(self, name: str) -> None:
         """Deactivate a plugin."""
@@ -88,13 +120,10 @@ class PluginRegistry:
         if entry is None:
             raise KeyError(f"Plugin not found: {name}")
         entry.plugin.deactivate()
-        entry.state = PluginState.DISABLED
+        entry.state = PluginState.STOPPED
 
     def activate_in_dependency_order(self) -> list[str]:
-        """Activate all enabled plugins respecting dependency order.
-
-        Returns list of activated plugin names in order.
-        """
+        """Activate all enabled plugins respecting dependency order."""
         activated: set[str] = set()
         order: list[str] = []
 
@@ -116,7 +145,7 @@ class PluginRegistry:
                 entry.plugin.initialize(entry.config)
                 entry.state = PluginState.INITIALIZED
                 entry.plugin.activate()
-                entry.state = PluginState.ACTIVE
+                entry.state = PluginState.STARTED
                 activated.add(name)
                 order.append(name)
 

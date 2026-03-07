@@ -42,7 +42,6 @@ class HookSystem:
         self._hooks: dict[str, HookPoint] = {}
         self._subscriptions: dict[str, list[_HookSubscription]] = {}
 
-        # Register pre-defined hooks
         for name, desc in _PREDEFINED_HOOKS:
             self.register_hook(name, desc)
 

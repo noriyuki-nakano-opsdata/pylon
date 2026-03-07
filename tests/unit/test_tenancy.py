@@ -1,324 +1,336 @@
-"""Tests for multi-tenancy module."""
+"""Tests for multi-tenancy hardening."""
 
 from __future__ import annotations
 
-import base64
+import asyncio
 import json
-import unittest
+import time
 
-from pylon.tenancy import (
+import pytest
+
+from pylon.tenancy.config import (
     ConfigStore,
-    CrossTenantAccessError,
-    HeaderTenantResolver,
-    IsolationLevel,
-    ResourceType,
     TenantConfig,
-    TenantContext,
-    TenantDirectory,
-    TenantIsolation,
     TenantLimits,
-    TenantMiddleware,
-    TenantNotFoundError,
-    TenantNotSetError,
     TenantTier,
-    TIER_DEFAULTS,
-    TokenTenantResolver,
+    get_global_feature_flags,
+    resolve_feature_flags,
+    resolve_policies,
+    set_global_feature_flags,
+    set_global_policies,
+)
+from pylon.tenancy.context import (
+    TenantContext,
+    TenantNotSetError,
+    async_tenant_scope,
     clear_tenant,
+    deserialize_tenant_context,
     get_tenant,
-    get_tier_defaults,
     require_tenant,
+    serialize_tenant_context,
     set_tenant,
     tenant_scope,
 )
+from pylon.tenancy.isolation import (
+    CrossTenantAccessError,
+    IsolationLevel,
+    ResourceType,
+    TenantIsolation,
+)
+from pylon.tenancy.lifecycle import (
+    Tenant,
+    TenantAlreadyExistsError,
+    TenantLifecycleManager,
+    TenantNotFoundError,
+    TenantStatus,
+    TenantStatusError,
+)
+from pylon.tenancy.quota import (
+    QuotaExceededError,
+    QuotaManager,
+    QuotaResource,
+    TenantQuota,
+)
 
 
-def _make_ctx(tenant_id: str = "t1", tier: TenantTier = TenantTier.FREE) -> TenantContext:
-    return TenantContext(
-        tenant_id=tenant_id,
-        tenant_name=f"Tenant {tenant_id}",
-        tier=tier,
-        limits=get_tier_defaults(tier),
-    )
+# --- Context Propagation Tests ---
 
 
-def _make_jwt(payload: dict) -> str:
-    header = base64.urlsafe_b64encode(json.dumps({"alg": "none"}).encode()).rstrip(b"=").decode()
-    body = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode()
-    return f"{header}.{body}.sig"
-
-
-# --- Context ---
-
-class TestTenantContext(unittest.TestCase):
-    def tearDown(self):
+class TestTenantContext:
+    def test_set_and_get_tenant(self) -> None:
+        ctx = TenantContext(tenant_id="t1", tenant_name="Test")
+        set_tenant(ctx)
+        assert get_tenant() is ctx
         clear_tenant()
 
-    def test_default_not_set(self):
-        self.assertIsNone(get_tenant())
-
-    def test_set_and_get(self):
-        ctx = _make_ctx()
-        set_tenant(ctx)
-        self.assertEqual(get_tenant().tenant_id, "t1")
-
-    def test_require_when_set(self):
-        ctx = _make_ctx()
-        set_tenant(ctx)
-        result = require_tenant()
-        self.assertEqual(result.tenant_id, "t1")
-
-    def test_require_when_not_set(self):
-        with self.assertRaises(TenantNotSetError):
+    def test_require_tenant_raises_when_not_set(self) -> None:
+        clear_tenant()
+        with pytest.raises(TenantNotSetError):
             require_tenant()
 
-    def test_clear(self):
-        set_tenant(_make_ctx())
+    def test_tenant_scope_context_manager(self) -> None:
+        ctx = TenantContext(tenant_id="t1", tenant_name="Scoped")
         clear_tenant()
-        self.assertIsNone(get_tenant())
+        with tenant_scope(ctx) as c:
+            assert c.tenant_id == "t1"
+            assert get_tenant() is ctx
+        assert get_tenant() is None
 
-    def test_scope_sets_and_restores(self):
-        outer = _make_ctx("outer")
-        set_tenant(outer)
-        inner = _make_ctx("inner")
-        with tenant_scope(inner) as ctx:
-            self.assertEqual(ctx.tenant_id, "inner")
-            self.assertEqual(get_tenant().tenant_id, "inner")
-        self.assertEqual(get_tenant().tenant_id, "outer")
+    @pytest.mark.asyncio
+    async def test_async_tenant_scope(self) -> None:
+        ctx = TenantContext(tenant_id="t2", tenant_name="AsyncScoped")
+        clear_tenant()
+        async with async_tenant_scope(ctx) as c:
+            assert c.tenant_id == "t2"
+            assert get_tenant() is ctx
+        assert get_tenant() is None
 
-    def test_scope_restores_none(self):
-        with tenant_scope(_make_ctx("scoped")):
-            self.assertEqual(get_tenant().tenant_id, "scoped")
-        self.assertIsNone(get_tenant())
-
-    def test_nested_scopes(self):
-        with tenant_scope(_make_ctx("level1")):
-            self.assertEqual(get_tenant().tenant_id, "level1")
-            with tenant_scope(_make_ctx("level2")):
-                self.assertEqual(get_tenant().tenant_id, "level2")
-                with tenant_scope(_make_ctx("level3")):
-                    self.assertEqual(get_tenant().tenant_id, "level3")
-                self.assertEqual(get_tenant().tenant_id, "level2")
-            self.assertEqual(get_tenant().tenant_id, "level1")
-        self.assertIsNone(get_tenant())
-
-    def test_context_metadata(self):
-        ctx = TenantContext(tenant_id="m1", metadata={"region": "us-west"})
-        self.assertEqual(ctx.metadata["region"], "us-west")
-
-    def test_context_tier_default(self):
-        ctx = TenantContext()
-        self.assertEqual(ctx.tier, TenantTier.FREE)
-
-
-# --- Isolation ---
-
-class TestTenantIsolation(unittest.TestCase):
-    def setUp(self):
-        self.iso = TenantIsolation(level=IsolationLevel.SCHEMA)
-
-    def test_unregistered_resource_accessible(self):
-        self.assertTrue(
-            self.iso.validate_access("t1", ResourceType.AGENT, "unknown-agent")
+    def test_serialize_deserialize_context(self) -> None:
+        ctx = TenantContext(
+            tenant_id="t1",
+            tenant_name="Serialized",
+            tier=TenantTier.PRO,
+            limits=TenantLimits(max_agents=50),
+            metadata={"key": "value"},
         )
+        serialized = serialize_tenant_context(ctx)
+        restored = deserialize_tenant_context(serialized)
+        assert restored.tenant_id == ctx.tenant_id
+        assert restored.tenant_name == ctx.tenant_name
+        assert restored.tier == ctx.tier
+        assert restored.limits.max_agents == 50
+        assert restored.metadata == {"key": "value"}
 
-    def test_owner_can_access(self):
-        self.iso.register_resource("t1", ResourceType.AGENT, "agent-1")
-        self.assertTrue(self.iso.validate_access("t1", ResourceType.AGENT, "agent-1"))
-
-    def test_non_owner_denied(self):
-        self.iso.register_resource("t1", ResourceType.AGENT, "agent-1")
-        self.assertFalse(self.iso.validate_access("t2", ResourceType.AGENT, "agent-1"))
-
-    def test_enforce_raises(self):
-        self.iso.register_resource("t1", ResourceType.WORKFLOW, "wf-1")
-        with self.assertRaises(CrossTenantAccessError) as cm:
-            self.iso.enforce_access("t2", ResourceType.WORKFLOW, "wf-1")
-        self.assertEqual(cm.exception.tenant_id, "t2")
-
-    def test_cross_tenant_allowlist(self):
-        self.iso.register_resource("t1", ResourceType.MEMORY, "mem-shared")
-        self.iso.allow_cross_tenant("t2", ResourceType.MEMORY, "mem-shared")
-        self.assertTrue(self.iso.validate_access("t2", ResourceType.MEMORY, "mem-shared"))
-
-    def test_revoke_cross_tenant(self):
-        self.iso.register_resource("t1", ResourceType.MEMORY, "mem-shared")
-        self.iso.allow_cross_tenant("t2", ResourceType.MEMORY, "mem-shared")
-        self.iso.revoke_cross_tenant("t2", ResourceType.MEMORY, "mem-shared")
-        self.assertFalse(self.iso.validate_access("t2", ResourceType.MEMORY, "mem-shared"))
-
-    def test_enforce_isolation_schema(self):
-        result = self.iso.enforce_isolation("t1", {"select": "*", "from": "agents"})
-        self.assertEqual(result["tenant_id"], "t1")
-        self.assertEqual(result["schema"], "tenant_t1")
-
-    def test_enforce_isolation_database(self):
-        iso_db = TenantIsolation(level=IsolationLevel.DATABASE)
-        result = iso_db.enforce_isolation("t1", {"select": "*"})
-        self.assertEqual(result["database"], "db_t1")
-
-    def test_enforce_isolation_shared(self):
-        iso_shared = TenantIsolation(level=IsolationLevel.SHARED)
-        result = iso_shared.enforce_isolation("t1", {"select": "*"})
-        self.assertEqual(result["tenant_id"], "t1")
-        self.assertNotIn("schema", result)
-        self.assertNotIn("database", result)
-
-    def test_all_resource_types(self):
-        for rt in ResourceType:
-            self.iso.register_resource("owner", rt, f"{rt.value}-1")
-            self.assertTrue(self.iso.validate_access("owner", rt, f"{rt.value}-1"))
-            self.assertFalse(self.iso.validate_access("other", rt, f"{rt.value}-1"))
+    def test_nested_tenant_scopes(self) -> None:
+        ctx1 = TenantContext(tenant_id="outer")
+        ctx2 = TenantContext(tenant_id="inner")
+        clear_tenant()
+        with tenant_scope(ctx1):
+            assert get_tenant().tenant_id == "outer"
+            with tenant_scope(ctx2):
+                assert get_tenant().tenant_id == "inner"
+            assert get_tenant().tenant_id == "outer"
+        assert get_tenant() is None
 
 
-# --- Middleware ---
+# --- Data Isolation Tests ---
 
-class TestTenantMiddleware(unittest.TestCase):
-    def setUp(self):
-        self.directory = TenantDirectory()
-        self.directory.register(_make_ctx("tenant-a"))
-        self.directory.register(_make_ctx("tenant-b", TenantTier.PRO))
-        self.header_resolver = HeaderTenantResolver(self.directory)
-        self.token_resolver = TokenTenantResolver(self.directory)
-        self.middleware = TenantMiddleware(
-            header_resolver=self.header_resolver,
-            token_resolver=self.token_resolver,
+
+class TestTenantIsolation:
+    def test_register_and_validate_own_resource(self) -> None:
+        iso = TenantIsolation()
+        iso.register_resource("t1", ResourceType.AGENT, "agent-1")
+        assert iso.validate_access("t1", ResourceType.AGENT, "agent-1") is True
+
+    def test_deny_cross_tenant_access(self) -> None:
+        iso = TenantIsolation()
+        iso.register_resource("t1", ResourceType.AGENT, "agent-1")
+        assert iso.validate_access("t2", ResourceType.AGENT, "agent-1") is False
+
+    def test_enforce_access_raises_on_violation(self) -> None:
+        iso = TenantIsolation()
+        iso.register_resource("t1", ResourceType.WORKFLOW, "wf-1")
+        with pytest.raises(CrossTenantAccessError) as exc_info:
+            iso.enforce_access("t2", ResourceType.WORKFLOW, "wf-1")
+        assert exc_info.value.tenant_id == "t2"
+
+    def test_cross_tenant_allowlist(self) -> None:
+        iso = TenantIsolation()
+        iso.register_resource("t1", ResourceType.MEMORY, "mem-1")
+        iso.allow_cross_tenant("t2", ResourceType.MEMORY, "mem-1")
+        assert iso.validate_access("t2", ResourceType.MEMORY, "mem-1") is True
+        iso.revoke_cross_tenant("t2", ResourceType.MEMORY, "mem-1")
+        assert iso.validate_access("t2", ResourceType.MEMORY, "mem-1") is False
+
+    def test_enforce_isolation_injects_tenant_filter(self) -> None:
+        iso = TenantIsolation(level=IsolationLevel.SCHEMA)
+        query = {"select": "agents"}
+        filtered = iso.enforce_isolation("t1", query)
+        assert filtered["tenant_id"] == "t1"
+        assert filtered["schema"] == "tenant_t1"
+
+    def test_schema_prefix(self) -> None:
+        iso = TenantIsolation()
+        assert iso.get_schema_prefix("t1") == "tenant_t1"
+
+    def test_detect_cross_tenant_access(self) -> None:
+        iso = TenantIsolation()
+        assert iso.detect_cross_tenant_access("t1", {"tenant_id": "t2"}) is True
+        assert iso.detect_cross_tenant_access("t1", {"tenant_id": "t1"}) is False
+        assert iso.detect_cross_tenant_access("t1", {"schema": "tenant_t2"}) is True
+        assert iso.detect_cross_tenant_access("t1", {}) is False
+
+    def test_audit_log_records_breaches(self) -> None:
+        iso = TenantIsolation()
+        iso.register_resource("t1", ResourceType.AGENT, "a1")
+        with pytest.raises(CrossTenantAccessError):
+            iso.enforce_access("t2", ResourceType.AGENT, "a1")
+        breaches = iso.get_breach_log()
+        assert len(breaches) == 1
+        assert breaches[0].tenant_id == "t2"
+        assert breaches[0].allowed is False
+
+    def test_audit_log_records_allowed_access(self) -> None:
+        iso = TenantIsolation()
+        iso.register_resource("t1", ResourceType.AGENT, "a1")
+        iso.enforce_access("t1", ResourceType.AGENT, "a1")
+        log = iso.get_audit_log("t1")
+        assert len(log) == 1
+        assert log[0].allowed is True
+
+
+# --- Quota Enforcement Tests ---
+
+
+class TestQuotaManager:
+    def test_set_and_check_quota(self) -> None:
+        qm = QuotaManager()
+        qm.set_quota("t1", TenantQuota(max_agents=2))
+        assert qm.check_quota("t1", QuotaResource.AGENTS) is True
+
+    def test_quota_exceeded(self) -> None:
+        qm = QuotaManager()
+        qm.set_quota("t1", TenantQuota(max_agents=1))
+        qm.record_usage("t1", QuotaResource.AGENTS, 1)
+        assert qm.check_quota("t1", QuotaResource.AGENTS) is False
+
+    def test_enforce_quota_raises(self) -> None:
+        qm = QuotaManager()
+        qm.set_quota("t1", TenantQuota(max_agents=1))
+        qm.record_usage("t1", QuotaResource.AGENTS, 1)
+        with pytest.raises(QuotaExceededError) as exc_info:
+            qm.enforce_quota("t1", QuotaResource.AGENTS)
+        assert exc_info.value.tenant_id == "t1"
+        assert exc_info.value.resource == QuotaResource.AGENTS
+
+    def test_release_usage(self) -> None:
+        qm = QuotaManager()
+        qm.set_quota("t1", TenantQuota(max_agents=2))
+        qm.record_usage("t1", QuotaResource.AGENTS, 2)
+        assert qm.check_quota("t1", QuotaResource.AGENTS) is False
+        qm.release_usage("t1", QuotaResource.AGENTS, 1)
+        assert qm.check_quota("t1", QuotaResource.AGENTS) is True
+
+    def test_generate_report(self) -> None:
+        qm = QuotaManager()
+        qm.set_quota("t1", TenantQuota(max_agents=10, max_workflows=5))
+        qm.record_usage("t1", QuotaResource.AGENTS, 5)
+        qm.record_usage("t1", QuotaResource.WORKFLOWS, 5)
+        report = qm.generate_report("t1")
+        assert report.tenant_id == "t1"
+        assert report.utilization["agents"] == 50.0
+        assert "workflows" in report.exceeded
+
+    def test_unlimited_quota(self) -> None:
+        qm = QuotaManager()
+        qm.set_quota("t1", TenantQuota(max_agents=-1))
+        qm.record_usage("t1", QuotaResource.AGENTS, 1000)
+        assert qm.check_quota("t1", QuotaResource.AGENTS) is True
+
+    def test_cost_quota(self) -> None:
+        qm = QuotaManager()
+        qm.set_quota("t1", TenantQuota(max_cost_usd=10.0))
+        qm.record_usage("t1", QuotaResource.COST_USD, 10.0)
+        assert qm.check_quota("t1", QuotaResource.COST_USD) is False
+
+
+# --- Tenant Lifecycle Tests ---
+
+
+class TestTenantLifecycle:
+    @pytest.mark.asyncio
+    async def test_create_tenant(self) -> None:
+        mgr = TenantLifecycleManager()
+        tenant = await mgr.create_tenant("t1", "Test Tenant")
+        assert tenant.tenant_id == "t1"
+        assert tenant.name == "Test Tenant"
+        assert tenant.status == TenantStatus.ACTIVE
+
+    @pytest.mark.asyncio
+    async def test_create_duplicate_raises(self) -> None:
+        mgr = TenantLifecycleManager()
+        await mgr.create_tenant("t1", "First")
+        with pytest.raises(TenantAlreadyExistsError):
+            await mgr.create_tenant("t1", "Second")
+
+    @pytest.mark.asyncio
+    async def test_suspend_and_resume(self) -> None:
+        mgr = TenantLifecycleManager()
+        await mgr.create_tenant("t1", "Test")
+        tenant = await mgr.suspend_tenant("t1", reason="billing")
+        assert tenant.status == TenantStatus.SUSPENDED
+        assert tenant.suspended_reason == "billing"
+        tenant = await mgr.resume_tenant("t1")
+        assert tenant.status == TenantStatus.ACTIVE
+        assert tenant.suspended_reason == ""
+
+    @pytest.mark.asyncio
+    async def test_delete_tenant_with_cleanup(self) -> None:
+        mgr = TenantLifecycleManager()
+        await mgr.create_tenant("t1", "Test")
+        tenant = await mgr.delete_tenant("t1")
+        assert tenant.status == TenantStatus.DELETED
+
+    @pytest.mark.asyncio
+    async def test_invalid_status_transition(self) -> None:
+        mgr = TenantLifecycleManager()
+        await mgr.create_tenant("t1", "Test")
+        await mgr.delete_tenant("t1")
+        with pytest.raises(TenantStatusError):
+            await mgr.resume_tenant("t1")
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_hooks(self) -> None:
+        mgr = TenantLifecycleManager()
+        events: list[str] = []
+        mgr.register_hook("create", lambda tid, action, t: events.append(f"created:{tid}"))
+        mgr.register_hook("suspend", lambda tid, action, t: events.append(f"suspended:{tid}"))
+        await mgr.create_tenant("t1", "Hooked")
+        await mgr.suspend_tenant("t1", "test")
+        assert events == ["created:t1", "suspended:t1"]
+
+    @pytest.mark.asyncio
+    async def test_get_nonexistent_tenant(self) -> None:
+        mgr = TenantLifecycleManager()
+        with pytest.raises(TenantNotFoundError):
+            mgr.get_tenant("nonexistent")
+
+    @pytest.mark.asyncio
+    async def test_list_tenants_by_status(self) -> None:
+        mgr = TenantLifecycleManager()
+        await mgr.create_tenant("t1", "Active")
+        await mgr.create_tenant("t2", "ToBeSuspended")
+        await mgr.suspend_tenant("t2", "reason")
+        active = mgr.list_tenants(status=TenantStatus.ACTIVE)
+        assert len(active) == 1
+        assert active[0].tenant_id == "t1"
+
+
+# --- Config Feature Flags & Policy Tests ---
+
+
+class TestTenantConfigEnhanced:
+    def test_feature_flag_inheritance(self) -> None:
+        set_global_feature_flags({"feature_a": True, "feature_b": False})
+        config = TenantConfig(
+            tenant_id="t1",
+            feature_flags={"feature_b": True, "feature_c": True},
         )
+        resolved = resolve_feature_flags(config)
+        assert resolved["feature_a"] is True
+        assert resolved["feature_b"] is True  # tenant overrides global
+        assert resolved["feature_c"] is True
+        # cleanup
+        set_global_feature_flags({})
 
-    def test_resolve_from_header(self):
-        ctx = self.middleware.resolve_tenant({"X-Tenant-ID": "tenant-a"})
-        self.assertEqual(ctx.tenant_id, "tenant-a")
-
-    def test_resolve_from_lowercase_header(self):
-        ctx = self.middleware.resolve_tenant({"x-tenant-id": "tenant-b"})
-        self.assertEqual(ctx.tenant_id, "tenant-b")
-        self.assertEqual(ctx.tier, TenantTier.PRO)
-
-    def test_resolve_from_token(self):
-        token = _make_jwt({"tenant_id": "tenant-a", "sub": "user1"})
-        ctx = self.middleware.resolve_tenant({"Authorization": f"Bearer {token}"})
-        self.assertEqual(ctx.tenant_id, "tenant-a")
-
-    def test_resolve_unknown_tenant(self):
-        with self.assertRaises(TenantNotFoundError):
-            self.middleware.resolve_tenant({"X-Tenant-ID": "unknown"})
-
-    def test_resolve_no_identifier(self):
-        with self.assertRaises(TenantNotFoundError):
-            self.middleware.resolve_tenant({})
-
-    def test_resolve_invalid_token(self):
-        with self.assertRaises(TenantNotFoundError):
-            self.middleware.resolve_tenant({"Authorization": "Bearer bad-token"})
-
-    def test_header_takes_priority_over_token(self):
-        token = _make_jwt({"tenant_id": "tenant-b"})
-        ctx = self.middleware.resolve_tenant({
-            "X-Tenant-ID": "tenant-a",
-            "Authorization": f"Bearer {token}",
-        })
-        self.assertEqual(ctx.tenant_id, "tenant-a")
-
-
-class TestTenantDirectory(unittest.TestCase):
-    def test_register_and_lookup(self):
-        d = TenantDirectory()
-        ctx = _make_ctx("dir-1")
-        d.register(ctx)
-        self.assertEqual(d.lookup("dir-1").tenant_id, "dir-1")
-
-    def test_lookup_missing(self):
-        d = TenantDirectory()
-        self.assertIsNone(d.lookup("missing"))
-
-    def test_remove(self):
-        d = TenantDirectory()
-        d.register(_make_ctx("rm-1"))
-        self.assertTrue(d.remove("rm-1"))
-        self.assertIsNone(d.lookup("rm-1"))
-
-    def test_remove_missing(self):
-        d = TenantDirectory()
-        self.assertFalse(d.remove("missing"))
-
-    def test_list_tenants(self):
-        d = TenantDirectory()
-        d.register(_make_ctx("a"))
-        d.register(_make_ctx("b"))
-        ids = {t.tenant_id for t in d.list_tenants()}
-        self.assertEqual(ids, {"a", "b"})
-
-
-# --- Config ---
-
-class TestTenantConfig(unittest.TestCase):
-    def test_tier_defaults_free(self):
-        limits = get_tier_defaults(TenantTier.FREE)
-        self.assertEqual(limits.max_agents, 5)
-        self.assertEqual(limits.max_workflows, 10)
-
-    def test_tier_defaults_pro(self):
-        limits = get_tier_defaults(TenantTier.PRO)
-        self.assertEqual(limits.max_agents, 50)
-        self.assertEqual(limits.max_workflows, 100)
-
-    def test_tier_defaults_enterprise(self):
-        limits = get_tier_defaults(TenantTier.ENTERPRISE)
-        self.assertEqual(limits.max_agents, -1)
-        self.assertEqual(limits.max_api_calls_per_hour, -1)
-
-    def test_config_store_crud(self):
-        store = ConfigStore()
-        cfg = TenantConfig(tier=TenantTier.PRO, limits=get_tier_defaults(TenantTier.PRO))
-        store.set_config("t1", cfg)
-
-        retrieved = store.get_config("t1")
-        self.assertIsNotNone(retrieved)
-        self.assertEqual(retrieved.tenant_id, "t1")
-        self.assertEqual(retrieved.tier, TenantTier.PRO)
-
-    def test_config_store_get_missing(self):
-        store = ConfigStore()
-        self.assertIsNone(store.get_config("missing"))
-
-    def test_config_store_delete(self):
-        store = ConfigStore()
-        store.set_config("t1", TenantConfig())
-        self.assertTrue(store.delete_config("t1"))
-        self.assertIsNone(store.get_config("t1"))
-
-    def test_config_store_delete_missing(self):
-        store = ConfigStore()
-        self.assertFalse(store.delete_config("missing"))
-
-    def test_config_store_list(self):
-        store = ConfigStore()
-        store.set_config("a", TenantConfig(tier=TenantTier.FREE))
-        store.set_config("b", TenantConfig(tier=TenantTier.PRO))
-        configs = store.list_configs()
-        self.assertEqual(len(configs), 2)
-
-    def test_config_store_overwrite(self):
-        store = ConfigStore()
-        store.set_config("t1", TenantConfig(tier=TenantTier.FREE))
-        store.set_config("t1", TenantConfig(tier=TenantTier.ENTERPRISE))
-        self.assertEqual(store.get_config("t1").tier, TenantTier.ENTERPRISE)
-
-
-# --- Protocol compliance ---
-
-class TestTenantResolverProtocol(unittest.TestCase):
-    def test_header_resolver_is_protocol_compliant(self):
-        from pylon.tenancy import TenantResolver
-        d = TenantDirectory()
-        r = HeaderTenantResolver(d)
-        self.assertIsInstance(r, TenantResolver)
-
-    def test_token_resolver_is_protocol_compliant(self):
-        from pylon.tenancy import TenantResolver
-        d = TenantDirectory()
-        r = TokenTenantResolver(d)
-        self.assertIsInstance(r, TenantResolver)
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_policy_override_inheritance(self) -> None:
+        set_global_policies({"max_retries": 3, "timeout": 30})
+        config = TenantConfig(
+            tenant_id="t1",
+            policy_overrides={"timeout": 60},
+        )
+        resolved = resolve_policies(config)
+        assert resolved["max_retries"] == 3
+        assert resolved["timeout"] == 60  # tenant overrides global
+        # cleanup
+        set_global_policies({})
