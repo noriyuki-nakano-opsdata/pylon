@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import secrets as _secrets
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -28,11 +30,11 @@ class AuthMiddleware:
             return Response(status_code=401, body={"error": "Missing or invalid Authorization header"})
 
         token = auth[7:]
-        if token not in self._valid_tokens:
+        if not any(_secrets.compare_digest(token, t) for t in self._valid_tokens):
             return Response(status_code=401, body={"error": "Invalid token"})
 
         request.context["authenticated"] = True
-        request.context["token"] = token
+        request.context["token_hash"] = hashlib.sha256(token.encode()).hexdigest()[:16]
         return next_handler(request)
 
 

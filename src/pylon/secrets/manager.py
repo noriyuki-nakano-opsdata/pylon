@@ -2,6 +2,11 @@
 
 Stores secrets with base64 encoding, version tracking,
 expiry, and metadata.
+
+WARNING: base64 encoding is used solely for transport/storage formatting
+and provides NO security or confidentiality. Secrets are trivially
+recoverable from base64. In production, use proper encryption at rest
+(e.g., AES-256-GCM via a KMS).
 """
 
 from __future__ import annotations
@@ -37,7 +42,7 @@ class SecretValue:
 class _StoredSecret:
     """Internal versioned storage entry."""
 
-    encoded_value: str  # base64-encoded
+    encoded_value: str  # base64-encoded (NOT encrypted — see module docstring)
     version: int
     created_at: float
     expires_at: float | None = None
@@ -53,7 +58,11 @@ def _decode(encoded: str) -> str:
 
 
 class SecretManager:
-    """In-memory versioned secret manager with base64 encoding."""
+    """In-memory versioned secret manager with base64 encoding.
+
+    WARNING: base64 is an encoding, not encryption. It provides no
+    confidentiality. See module docstring for details.
+    """
 
     def __init__(self) -> None:
         # key -> list of versions (index 0 = version 1)

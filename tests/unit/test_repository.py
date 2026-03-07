@@ -143,7 +143,17 @@ class TestWorkflowRepository:
 class TestAuditRepository:
     @pytest.fixture
     def repo(self):
-        return AuditRepository(hmac_key=b"test-key")
+        return AuditRepository(hmac_key=b"test-key-at-least-16-bytes")
+
+    @pytest.mark.asyncio
+    async def test_hmac_key_required(self):
+        with pytest.raises(ValueError, match="hmac_key must be at least 16 bytes"):
+            AuditRepository(hmac_key=b"short")
+
+    @pytest.mark.asyncio
+    async def test_hmac_key_empty_rejected(self):
+        with pytest.raises(ValueError, match="hmac_key must be at least 16 bytes"):
+            AuditRepository(hmac_key=b"")
 
     @pytest.mark.asyncio
     async def test_append(self, repo):

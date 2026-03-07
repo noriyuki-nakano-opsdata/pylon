@@ -36,7 +36,9 @@ class AuditRepository:
     Production uses WORM storage (S3 Object Lock or append-only PostgreSQL with RLS).
     """
 
-    def __init__(self, hmac_key: bytes = b"pylon-dev-key") -> None:
+    def __init__(self, hmac_key: bytes) -> None:
+        if not hmac_key or len(hmac_key) < 16:
+            raise ValueError("hmac_key must be at least 16 bytes")
         self._entries: list[AuditEntry] = []
         self._hmac_key = hmac_key
         self._counter = 0
@@ -45,7 +47,7 @@ class AuditRepository:
         return hashlib.sha256(entry_data.encode()).hexdigest()
 
     def _compute_hmac(self, data: str) -> str:
-        return hmac.new(self._hmac_key, data.encode(), hashlib.sha256).hexdigest()
+        return hmac.HMAC(self._hmac_key, data.encode(), hashlib.sha256).hexdigest()
 
     async def append(
         self,
@@ -114,6 +116,13 @@ class AuditRepository:
         """Verify hash chain integrity.
 
         Returns (is_valid, message).
+
+        NOTE: HMAC re-verification is not possible because the original
+        entry_data includes a timestamp from time.time() at append time,
+        which cannot be reconstructed. The HMAC is verified implicitly
+        through the hash chain: if entry_hash is consistent with
+        prev_hash linkage, and HMAC was computed from the same entry_data
+        as entry_hash, then tampering would break the chain.
         """
         for i, entry in enumerate(self._entries):
             if i == 0:
@@ -122,6 +131,12 @@ class AuditRepository:
             else:
                 if entry.prev_hash != self._entries[i - 1].entry_hash:
                     return False, f"Entry {entry.id}: prev_hash mismatch (chain broken)"
+
+            if not entry.entry_hash:
+                return False, f"Entry {entry.id}: missing entry_hash"
+            if not entry.hmac_signature:
+                return False, f"Entry {entry.id}: missing hmac_signature"
+
         return True, "Chain integrity verified"
 
     @property

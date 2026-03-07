@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -51,13 +52,15 @@ class CircuitBreaker:
         self._consecutive_successes: int = 0
         self._opened_at: float = 0.0
         self._half_open_calls: int = 0
+        self._lock = threading.Lock()
 
     @property
     def state(self) -> CircuitState:
-        if self._state == CircuitState.OPEN:
-            if time.monotonic() - self._opened_at >= self._config.timeout:
-                self._transition(CircuitState.HALF_OPEN)
-        return self._state
+        with self._lock:
+            if self._state == CircuitState.OPEN:
+                if time.monotonic() - self._opened_at >= self._config.timeout:
+                    self._transition(CircuitState.HALF_OPEN)
+            return self._state
 
     @property
     def metrics(self) -> CircuitMetrics:
@@ -79,24 +82,31 @@ class CircuitBreaker:
             self._on_state_change(old, new_state)
 
     def call(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        current = self.state  # triggers timeout check
-        self._metrics.total_calls += 1
+        with self._lock:
+            current = self._state
+            if current == CircuitState.OPEN:
+                if time.monotonic() - self._opened_at >= self._config.timeout:
+                    self._transition(CircuitState.HALF_OPEN)
+                    current = self._state
+                else:
+                    remaining = max(0.0, self._config.timeout - (time.monotonic() - self._opened_at))
+                    raise CircuitOpenError(remaining)
 
-        if current == CircuitState.OPEN:
-            remaining = max(0.0, self._config.timeout - (time.monotonic() - self._opened_at))
-            raise CircuitOpenError(remaining)
+            self._metrics.total_calls += 1
 
-        if current == CircuitState.HALF_OPEN:
-            if self._half_open_calls >= self._config.half_open_max_calls:
-                raise CircuitOpenError(0.0)
-            self._half_open_calls += 1
+            if current == CircuitState.HALF_OPEN:
+                if self._half_open_calls >= self._config.half_open_max_calls:
+                    raise CircuitOpenError(0.0)
+                self._half_open_calls += 1
 
         try:
             result = fn(*args, **kwargs)
-            self._on_success()
+            with self._lock:
+                self._on_success()
             return result
-        except Exception as exc:
-            self._on_failure()
+        except Exception:
+            with self._lock:
+                self._on_failure()
             raise
 
     def _on_success(self) -> None:
@@ -121,13 +131,16 @@ class CircuitBreaker:
                 self._transition(CircuitState.OPEN)
 
     def reset(self) -> None:
-        self._transition(CircuitState.CLOSED)
-        self._metrics = CircuitMetrics()
-        self._consecutive_failures = 0
-        self._consecutive_successes = 0
+        with self._lock:
+            self._transition(CircuitState.CLOSED)
+            self._metrics = CircuitMetrics()
+            self._consecutive_failures = 0
+            self._consecutive_successes = 0
 
     def force_open(self) -> None:
-        self._transition(CircuitState.OPEN)
+        with self._lock:
+            self._transition(CircuitState.OPEN)
 
     def force_close(self) -> None:
-        self._transition(CircuitState.CLOSED)
+        with self._lock:
+            self._transition(CircuitState.CLOSED)
