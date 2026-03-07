@@ -84,7 +84,7 @@ def retry(fn: Callable[..., Any], policy: RetryPolicy | None = None, *args: Any,
                     p.on_retry(attempt + 1, exc)
                 delay = p.backoff.delay(attempt)
                 time.sleep(delay)
-        except Exception as exc:
+        except Exception:
             # Non-retryable exception
             raise
 

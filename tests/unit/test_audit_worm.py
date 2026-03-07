@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -241,7 +241,7 @@ async def test_get_archivable_entries_none_old(populated_repo: WORMAuditReposito
 @pytest.mark.asyncio
 async def test_get_archivable_entries_with_old_entries(populated_repo: WORMAuditRepository) -> None:
     # Backdate entries
-    old_time = datetime.now(timezone.utc) - timedelta(days=60)
+    old_time = datetime.now(UTC) - timedelta(days=60)
     populated_repo._repo._entries[0].created_at = old_time
     populated_repo._repo._entries[1].created_at = old_time
 

@@ -9,10 +9,8 @@ from pylon.safety.policy_pack import (
     PolicyPackEngine,
     PolicyRule,
     RuleEffect,
-    RuleEvaluation,
     evaluate_condition,
 )
-
 
 # ---------------------------------------------------------------------------
 # Condition evaluator

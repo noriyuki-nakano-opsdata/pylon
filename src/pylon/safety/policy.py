@@ -6,11 +6,9 @@ Integrates CapabilityValidator and AutonomyEnforcer with resource limit checks
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
-from pylon.errors import ApprovalRequiredError, PolicyViolationError
-from pylon.types import AgentConfig, AutonomyLevel, PolicyConfig
+from pylon.types import AgentConfig, PolicyConfig
 
 
 @dataclass

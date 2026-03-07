@@ -14,7 +14,6 @@ from typing import Any
 from pylon.errors import WorkflowError
 from pylon.types import ConditionalEdge, WorkflowNode, WorkflowNodeType
 
-
 END = "END"
 
 

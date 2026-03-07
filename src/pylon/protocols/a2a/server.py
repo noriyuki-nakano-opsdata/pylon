@@ -6,26 +6,23 @@ Supports task handler callbacks, peer authentication, and rate limiting.
 
 from __future__ import annotations
 
-import asyncio
 import time
 from collections import defaultdict
-from typing import Any, AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Any
 
+from pylon.protocols.a2a.types import (
+    A2ATask,
+    TaskEvent,
+    TaskState,
+)
 from pylon.protocols.mcp.types import (
+    INTERNAL_ERROR,
+    INVALID_PARAMS,
+    METHOD_NOT_FOUND,
     JsonRpcError,
     JsonRpcRequest,
     JsonRpcResponse,
-    METHOD_NOT_FOUND,
-    INVALID_PARAMS,
-    INTERNAL_ERROR,
-)
-from pylon.protocols.a2a.types import (
-    A2AMessage,
-    A2ATask,
-    Artifact,
-    Part,
-    TaskEvent,
-    TaskState,
 )
 
 TaskHandler = Callable[[A2ATask], Awaitable[A2ATask]]
@@ -45,6 +42,7 @@ class A2AServer:
         rate_window: float = 60.0,
     ) -> None:
         self._tasks: dict[str, A2ATask] = {}
+        self._push_notifications: dict[str, dict[str, Any]] = {}
         self._allowed_peers: set[str] = allowed_peers or set()
         self._task_handler: TaskHandler | None = None
         self._stream_handler: StreamHandler | None = None
@@ -68,6 +66,8 @@ class A2AServer:
             "tasks/send": self._handle_send,
             "tasks/get": self._handle_get,
             "tasks/cancel": self._handle_cancel,
+            "tasks/pushNotification/set": self._handle_push_notification_set,
+            "tasks/pushNotification/get": self._handle_push_notification_get,
         }
 
         handler = handlers.get(request.method)
@@ -82,7 +82,7 @@ class A2AServer:
 
         try:
             return await handler(request)
-        except Exception as e:
+        except Exception:
             return JsonRpcResponse(
                 id=request.id,
                 error=JsonRpcError(code=INTERNAL_ERROR, message="Internal server error"),
@@ -158,6 +158,65 @@ class A2AServer:
             return False
         self._peer_requests[peer].append(now)
         return True
+
+    async def _handle_push_notification_set(
+        self, request: JsonRpcRequest
+    ) -> JsonRpcResponse:
+        """Set push notification config for a task."""
+        params = request.params or {}
+        task_id = params.get("id", "")
+        if not task_id:
+            return JsonRpcResponse(
+                id=request.id,
+                error=JsonRpcError(
+                    code=INVALID_PARAMS,
+                    message="Missing 'id' in params.",
+                ),
+            )
+        task = self._tasks.get(task_id)
+        if task is None:
+            return JsonRpcResponse(
+                id=request.id,
+                error=JsonRpcError(
+                    code=INVALID_PARAMS,
+                    message=f"Task not found: {task_id}",
+                ),
+            )
+        config = params.get("pushNotificationConfig", {})
+        self._push_notifications[task_id] = config
+        return JsonRpcResponse(
+            id=request.id,
+            result={"id": task_id, "pushNotificationConfig": config},
+        )
+
+    async def _handle_push_notification_get(
+        self, request: JsonRpcRequest
+    ) -> JsonRpcResponse:
+        """Get push notification config for a task."""
+        params = request.params or {}
+        task_id = params.get("id", "")
+        if not task_id:
+            return JsonRpcResponse(
+                id=request.id,
+                error=JsonRpcError(
+                    code=INVALID_PARAMS,
+                    message="Missing 'id' in params.",
+                ),
+            )
+        task = self._tasks.get(task_id)
+        if task is None:
+            return JsonRpcResponse(
+                id=request.id,
+                error=JsonRpcError(
+                    code=INVALID_PARAMS,
+                    message=f"Task not found: {task_id}",
+                ),
+            )
+        config = self._push_notifications.get(task_id, {})
+        return JsonRpcResponse(
+            id=request.id,
+            result={"id": task_id, "pushNotificationConfig": config},
+        )
 
     async def _handle_send(self, request: JsonRpcRequest) -> JsonRpcResponse:
         params = request.params or {}

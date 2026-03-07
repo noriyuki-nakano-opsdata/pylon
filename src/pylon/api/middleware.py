@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import secrets as _secrets
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from pylon.api.server import HandlerFunc, Request, Response

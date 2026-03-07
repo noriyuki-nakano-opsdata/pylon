@@ -11,11 +11,8 @@ from pylon.protocols.mcp.auth import (
     check_scope,
 )
 from pylon.protocols.mcp.router import MethodRouter
-from pylon.protocols.mcp.session import McpSession, SessionManager
+from pylon.protocols.mcp.session import SessionManager
 from pylon.protocols.mcp.types import (
-    INTERNAL_ERROR,
-    INVALID_PARAMS,
-    METHOD_NOT_FOUND,
     InitializeResult,
     JsonRpcError,
     JsonRpcRequest,
@@ -150,7 +147,10 @@ class McpServer:
                         ),
                         id=request.id,
                     )
-        return self._router.dispatch(request)
+        response = self._router.dispatch(request)
+        if request.method == "initialize" and hasattr(self, "_last_session_id"):
+            response.metadata["Mcp-Session-Id"] = self._last_session_id
+        return response
 
     # --- pagination helper ---
 
@@ -173,13 +173,14 @@ class McpServer:
     def _handle_initialize(self, request: JsonRpcRequest) -> dict:
         session = self._session_manager.create_session()
         session.server_capabilities = self.capabilities
+        self._last_session_id = session.session_id
         if request.params and "capabilities" in request.params:
             pass
         result = InitializeResult(
             capabilities=self.capabilities,
             serverInfo={"name": self.name, "version": self.version},
         )
-        return {**result.to_dict(), "sessionId": session.session_id}
+        return result.to_dict()
 
     def _handle_tools_list(self, request: JsonRpcRequest) -> dict:
         params = request.params or {}

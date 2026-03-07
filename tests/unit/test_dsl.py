@@ -8,7 +8,6 @@ from pydantic import ValidationError
 
 from pylon.dsl.parser import PylonProject, load_project
 
-
 MINIMAL_YAML = """
 version: "1"
 name: test-project

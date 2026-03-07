@@ -14,12 +14,11 @@ from __future__ import annotations
 
 import re
 import warnings
-from dataclasses import dataclass, field
-from typing import Callable
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from pylon.errors import PromptInjectionError
 from pylon.types import TrustLevel
-
 
 _DEFAULT_PATTERNS: list[tuple[str, str]] = [
     (r"ignore\s+(all\s+)?previous\s+instructions", "ignore_previous"),

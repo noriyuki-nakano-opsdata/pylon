@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from pylon.observability.metrics import MetricsCollector
-from pylon.observability.tracing import Tracer, Span
-from pylon.observability.logging import StructuredLogger, LogLevel
 from pylon.observability.exporters import (
     ConsoleExporter,
-    InMemoryExporter,
     ExporterProtocol,
+    InMemoryExporter,
 )
+from pylon.observability.logging import LogLevel, StructuredLogger
+from pylon.observability.metrics import MetricsCollector
+from pylon.observability.tracing import Span, Tracer
 
 __all__ = [
     "MetricsCollector",

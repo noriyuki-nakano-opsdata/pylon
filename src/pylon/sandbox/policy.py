@@ -7,12 +7,8 @@ against resource and network constraints.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 from pylon.types import SandboxTier
-
-if TYPE_CHECKING:
-    from pylon.sandbox.manager import Sandbox
 
 
 @dataclass(frozen=True)

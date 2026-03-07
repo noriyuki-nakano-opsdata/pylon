@@ -9,7 +9,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-
 # Scope hierarchy: admin > write > read
 SCOPE_HIERARCHY: dict[str, list[str]] = {
     "admin": [

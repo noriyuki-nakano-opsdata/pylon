@@ -10,15 +10,15 @@ Executes workflow graphs with:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Callable, Awaitable
+from datetime import UTC, datetime
+from typing import Any
 
 from pylon.errors import WorkflowError
 from pylon.repository.checkpoint import Checkpoint, CheckpointRepository
-from pylon.repository.workflow import RunStatus, WorkflowRun
-from pylon.workflow.graph import END, WorkflowGraph
-
+from pylon.repository.workflow import WorkflowRun
+from pylon.workflow.graph import WorkflowGraph
 
 # Type alias for node execution functions
 NodeHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -76,7 +76,7 @@ class GraphExecutor:
         Returns:
             Updated WorkflowRun with final state and event log
         """
-        warnings = graph.validate()
+        graph.validate()
 
         ctx = ExecutionContext(
             graph=graph,
@@ -108,7 +108,7 @@ class GraphExecutor:
                         "node_id": node_id,
                         "agent": graph.nodes[node_id].agent,
                         "output": result,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "timestamp": datetime.now(UTC).isoformat(),
                     }
                     run.event_log.append(event)
 

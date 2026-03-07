@@ -5,7 +5,7 @@ from __future__ import annotations
 import enum
 import heapq
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 
 class TaskStatus(enum.Enum):
@@ -23,7 +23,7 @@ class WorkflowTask:
     workflow_id: str
     tenant_id: str
     priority: int = 5  # 0 (highest) to 9 (lowest)
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     status: TaskStatus = TaskStatus.PENDING
 
     def __lt__(self, other: WorkflowTask) -> bool:

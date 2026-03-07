@@ -13,7 +13,7 @@ NATS and K8s backends are injected in production.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from pylon.types import KillSwitchEvent
 

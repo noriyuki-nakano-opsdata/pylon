@@ -2,24 +2,23 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime
 
 import pytest
 
 from pylon.taskqueue.queue import Task, TaskQueue, TaskQueueError, TaskStatus
-from pylon.taskqueue.worker import Worker, WorkerPool, WorkerStatus, TaskResult, WorkerError
-from pylon.taskqueue.scheduler import (
-    CronExpression,
-    ScheduleType,
-    SchedulerError,
-    TaskScheduler,
-)
 from pylon.taskqueue.retry import (
     DeadLetterQueue,
     ExponentialBackoff,
     FixedRetry,
 )
-
+from pylon.taskqueue.scheduler import (
+    CronExpression,
+    SchedulerError,
+    ScheduleType,
+    TaskScheduler,
+)
+from pylon.taskqueue.worker import Worker, WorkerError, WorkerPool, WorkerStatus
 
 # --- Helper ---
 
@@ -96,7 +95,7 @@ class TestTaskQueue:
         q.enqueue(_task("p1", 1))
         q.enqueue(_task("p3", 3))
         # Cancel p1 so p3 should be returned
-        p1 = q.get(q.list()[0].id)
+        q.get(q.list()[0].id)
         # Find and cancel the priority-1 task
         for t in q.list():
             if t.name == "p1":
@@ -303,27 +302,27 @@ class TestWorkerPool:
 class TestCronExpression:
     def test_every_minute(self):
         cron = CronExpression("* * * * *")
-        now = datetime(2026, 3, 7, 12, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 3, 7, 12, 0, 0, tzinfo=UTC)
         nxt = cron.next_run_after(now)
-        assert nxt == datetime(2026, 3, 7, 12, 1, 0, tzinfo=timezone.utc)
+        assert nxt == datetime(2026, 3, 7, 12, 1, 0, tzinfo=UTC)
 
     def test_every_hour(self):
         cron = CronExpression("0 * * * *")
-        now = datetime(2026, 3, 7, 12, 30, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 3, 7, 12, 30, 0, tzinfo=UTC)
         nxt = cron.next_run_after(now)
-        assert nxt == datetime(2026, 3, 7, 13, 0, 0, tzinfo=timezone.utc)
+        assert nxt == datetime(2026, 3, 7, 13, 0, 0, tzinfo=UTC)
 
     def test_daily_at_midnight(self):
         cron = CronExpression("0 0 * * *")
-        now = datetime(2026, 3, 7, 12, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 3, 7, 12, 0, 0, tzinfo=UTC)
         nxt = cron.next_run_after(now)
-        assert nxt == datetime(2026, 3, 8, 0, 0, 0, tzinfo=timezone.utc)
+        assert nxt == datetime(2026, 3, 8, 0, 0, 0, tzinfo=UTC)
 
     def test_every_5_minutes(self):
         cron = CronExpression("*/5 * * * *")
-        now = datetime(2026, 3, 7, 12, 3, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 3, 7, 12, 3, 0, tzinfo=UTC)
         nxt = cron.next_run_after(now)
-        assert nxt == datetime(2026, 3, 7, 12, 5, 0, tzinfo=timezone.utc)
+        assert nxt == datetime(2026, 3, 7, 12, 5, 0, tzinfo=UTC)
 
     def test_invalid_expression_raises(self):
         with pytest.raises(SchedulerError):
@@ -342,43 +341,43 @@ class TestCronExpression:
         """Cron weekday 0 = Sunday (not Monday as in Python's weekday())."""
         cron = CronExpression("0 0 * * 0")  # every Sunday at midnight
         # 2026-03-08 is a Sunday
-        sat = datetime(2026, 3, 7, 12, 0, 0, tzinfo=timezone.utc)  # Saturday
+        sat = datetime(2026, 3, 7, 12, 0, 0, tzinfo=UTC)  # Saturday
         nxt = cron.next_run_after(sat)
         assert nxt.weekday() == 6  # Python: Sunday = 6
-        assert nxt == datetime(2026, 3, 8, 0, 0, 0, tzinfo=timezone.utc)
+        assert nxt == datetime(2026, 3, 8, 0, 0, 0, tzinfo=UTC)
 
     def test_weekday_monday_is_one(self):
         """Cron weekday 1 = Monday."""
         cron = CronExpression("0 0 * * 1")  # every Monday at midnight
         # 2026-03-08 is Sunday, next Monday is 2026-03-09
-        sun = datetime(2026, 3, 8, 12, 0, 0, tzinfo=timezone.utc)
+        sun = datetime(2026, 3, 8, 12, 0, 0, tzinfo=UTC)
         nxt = cron.next_run_after(sun)
         assert nxt.weekday() == 0  # Python: Monday = 0
-        assert nxt == datetime(2026, 3, 9, 0, 0, 0, tzinfo=timezone.utc)
+        assert nxt == datetime(2026, 3, 9, 0, 0, 0, tzinfo=UTC)
 
 
 class TestTaskScheduler:
     def test_schedule_once(self):
         sched = TaskScheduler()
         task = _task("job1")
-        run_at = datetime(2026, 3, 7, 15, 0, tzinfo=timezone.utc)
+        run_at = datetime(2026, 3, 7, 15, 0, tzinfo=UTC)
         entry = sched.schedule(task, run_at)
         assert entry.schedule_type == ScheduleType.ONCE
 
     def test_get_due_tasks_once(self):
         sched = TaskScheduler()
-        past = datetime(2026, 3, 7, 10, 0, tzinfo=timezone.utc)
-        future = datetime(2026, 3, 7, 20, 0, tzinfo=timezone.utc)
+        past = datetime(2026, 3, 7, 10, 0, tzinfo=UTC)
+        future = datetime(2026, 3, 7, 20, 0, tzinfo=UTC)
         sched.schedule(_task("past"), past)
         sched.schedule(_task("future"), future)
-        now = datetime(2026, 3, 7, 15, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 3, 7, 15, 0, tzinfo=UTC)
         due = sched.get_due_tasks(now)
         assert len(due) == 1
         assert due[0].task.name == "past"
 
     def test_mark_run_disables_once(self):
         sched = TaskScheduler()
-        run_at = datetime(2026, 3, 7, 10, 0, tzinfo=timezone.utc)
+        run_at = datetime(2026, 3, 7, 10, 0, tzinfo=UTC)
         entry = sched.schedule(_task(), run_at)
         sched.mark_run(entry.id)
         assert entry.enabled is False
@@ -390,7 +389,7 @@ class TestTaskScheduler:
 
     def test_cancel(self):
         sched = TaskScheduler()
-        entry = sched.schedule(_task(), datetime.now(timezone.utc))
+        entry = sched.schedule(_task(), datetime.now(UTC))
         assert sched.cancel(entry.id) is True
         assert entry.enabled is False
 

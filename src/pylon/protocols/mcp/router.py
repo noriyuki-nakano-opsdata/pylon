@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
 
 from pylon.protocols.mcp.types import (
+    INTERNAL_ERROR,
+    METHOD_NOT_FOUND,
     JsonRpcError,
     JsonRpcRequest,
     JsonRpcResponse,
-    METHOD_NOT_FOUND,
-    INTERNAL_ERROR,
 )
 
 

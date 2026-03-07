@@ -8,13 +8,7 @@ from pylon.protocols.mcp.server import McpServer
 from pylon.protocols.mcp.types import (
     InitializeResult,
     JsonRpcRequest,
-    PromptDefinition,
-    PromptArgument,
-    ResourceDefinition,
-    ResourceTemplate,
-    SamplingResponse,
     ServerCapabilities,
-    ToolDefinition,
 )
 
 

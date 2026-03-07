@@ -7,7 +7,7 @@ and records rotation events.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from pylon.secrets.manager import SecretManager, SecretMeta
 

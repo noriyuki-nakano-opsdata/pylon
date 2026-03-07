@@ -5,10 +5,10 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 
 
-class DRStrategy(str, Enum):
+class DRStrategy(StrEnum):
     """Disaster recovery strategy."""
 
     ACTIVE_PASSIVE = "active_passive"
@@ -16,7 +16,7 @@ class DRStrategy(str, Enum):
     BACKUP_RESTORE = "backup_restore"
 
 
-class BackupStatus(str, Enum):
+class BackupStatus(StrEnum):
     """Backup job status."""
 
     PENDING = "pending"

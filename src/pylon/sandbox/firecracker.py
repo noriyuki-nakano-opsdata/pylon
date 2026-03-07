@@ -7,9 +7,8 @@ Production implementation would communicate with the Firecracker API socket.
 from __future__ import annotations
 
 import hashlib
-import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol
 
 from pylon.errors import SandboxError

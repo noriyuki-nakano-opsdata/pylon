@@ -13,9 +13,8 @@ from pylon.agents.supervisor import (
     HealthStatus,
     SupervisorConfig,
 )
-from pylon.errors import AgentLifecycleError
-from pylon.types import AgentCapability, AgentConfig, AgentState, PolicyViolation
-
+from pylon.errors import AgentLifecycleError, PolicyViolationError
+from pylon.types import AgentCapability, AgentConfig, AgentState, PolicyViolation, TrustLevel
 
 # --- Helper ---
 
@@ -41,7 +40,7 @@ class TestAgentLifecycleManager:
     def test_create_validates_capability(self):
         """AgentCapability validates in __post_init__, so forbidden pairs
         raise PolicyViolation at construction time."""
-        mgr = AgentLifecycleManager()
+        AgentLifecycleManager()
         with pytest.raises(PolicyViolation):
             AgentCapability(
                 can_read_untrusted=True,
@@ -114,6 +113,30 @@ class TestAgentLifecycleManager:
     def test_get_agent_returns_none_for_missing(self):
         mgr = AgentLifecycleManager()
         assert mgr.get_agent("nonexistent") is None
+
+    def test_create_agent_forbidden_pair_from_config(self):
+        """CapabilityValidator.validate_agent_config infers forbidden pair
+        from input_trust=UNTRUSTED + tools containing secret-read."""
+        mgr = AgentLifecycleManager()
+        config = AgentConfig(
+            name="bad-agent",
+            input_trust=TrustLevel.UNTRUSTED,
+            tools=["secret-read"],
+        )
+        with pytest.raises(PolicyViolationError):
+            mgr.create_agent(config)
+
+    def test_create_agent_safe_config_succeeds(self):
+        """TRUSTED input + secret-read is allowed by Rule-of-Two+."""
+        mgr = AgentLifecycleManager()
+        config = AgentConfig(
+            name="safe-agent",
+            input_trust=TrustLevel.TRUSTED,
+            tools=["secret-read"],
+        )
+        agent = mgr.create_agent(config)
+        assert agent.state == AgentState.READY
+        assert agent.config.name == "safe-agent"
 
     def test_full_lifecycle(self):
         mgr = AgentLifecycleManager()

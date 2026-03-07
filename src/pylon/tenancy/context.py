@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar, copy_context
-from dataclasses import asdict, dataclass, field
-from typing import Any, AsyncGenerator, Generator
+from dataclasses import dataclass, field
+from typing import Any
 
 from pylon.tenancy.config import TenantLimits, TenantTier
 

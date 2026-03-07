@@ -13,8 +13,8 @@ import uuid
 from dataclasses import dataclass, field
 
 from pylon.errors import SandboxError
-from pylon.types import SandboxTier
 from pylon.sandbox.policy import NetworkPolicy, ResourceLimits, ResourceUsage, SandboxPolicy
+from pylon.types import SandboxTier
 
 
 class SandboxStatus(enum.Enum):

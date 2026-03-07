@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Callable
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from pylon.agents.lifecycle import AgentLifecycleManager
 from pylon.agents.runtime import Agent
 from pylon.errors import PylonError
-from pylon.types import AgentConfig, AgentState
+from pylon.types import AgentConfig
 
 
 class PoolExhaustedError(PylonError):

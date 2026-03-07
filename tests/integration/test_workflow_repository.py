@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
-
-import pytest
-
-from pylon.repository.audit import AuditEntry, AuditRepository
+from pylon.repository.audit import AuditRepository
 from pylon.repository.checkpoint import Checkpoint, CheckpointRepository
 from pylon.repository.memory import (
     EpisodicEntry,
@@ -20,7 +16,6 @@ from pylon.repository.workflow import (
     WorkflowRepository,
     WorkflowRun,
 )
-
 
 # ---------- CheckpointRepository ----------
 

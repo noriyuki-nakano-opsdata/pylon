@@ -6,7 +6,7 @@ import enum
 import heapq
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from pylon.errors import PylonError
@@ -45,7 +45,7 @@ class Task:
     priority: int = 5  # 0 (highest) to 9 (lowest)
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     status: TaskStatus = TaskStatus.PENDING
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     started_at: datetime | None = None
     completed_at: datetime | None = None
     retries: int = 0
@@ -60,9 +60,9 @@ class Task:
             )
         self.status = target
         if target == TaskStatus.RUNNING:
-            self.started_at = datetime.now(timezone.utc)
+            self.started_at = datetime.now(UTC)
         elif target in (TaskStatus.COMPLETED, TaskStatus.FAILED):
-            self.completed_at = datetime.now(timezone.utc)
+            self.completed_at = datetime.now(UTC)
 
     @property
     def is_terminal(self) -> bool:

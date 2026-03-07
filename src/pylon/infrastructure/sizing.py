@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 
 
-class InfraProfile(str, Enum):
+class InfraProfile(StrEnum):
     """Infrastructure sizing profile (matches Helm values)."""
 
     SMALL = "small"

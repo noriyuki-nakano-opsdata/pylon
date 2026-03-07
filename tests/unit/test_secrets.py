@@ -2,13 +2,10 @@
 
 import time
 
-import pytest
-
-from pylon.secrets.manager import SecretManager, SecretMeta, SecretValue
-from pylon.secrets.vault import InMemoryVaultProvider, VaultConfig, build_path
-from pylon.secrets.rotation import RotationEvent, RotationPolicy, SecretRotation
 from pylon.secrets.audit import AccessAction, AccessLogEntry, SecretAudit
-
+from pylon.secrets.manager import SecretManager
+from pylon.secrets.rotation import RotationPolicy, SecretRotation
+from pylon.secrets.vault import InMemoryVaultProvider, VaultConfig, build_path
 
 # ---------------------------------------------------------------------------
 # SecretManager
@@ -275,7 +272,7 @@ class TestSecretAudit:
     def test_query_by_time_range(self):
         audit = SecretAudit()
         now = time.time()
-        e1 = audit.log_access("k", "u", AccessAction.READ)
+        audit.log_access("k", "u", AccessAction.READ)
         # Manually adjust timestamps for testing
         audit._entries[0] = AccessLogEntry(
             key="k", actor="u", action=AccessAction.READ, timestamp=now - 100

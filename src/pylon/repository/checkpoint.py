@@ -6,10 +6,9 @@ Large state (>1MB) is stored in S3/MinIO; checkpoint contains URI reference.
 
 from __future__ import annotations
 
-import json
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 
@@ -22,7 +21,7 @@ class Checkpoint:
     node_id: str = ""
     event_log: list[dict[str, Any]] = field(default_factory=list)
     state_ref: str | None = None  # URI for large state in S3/MinIO
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def add_event(
         self,
@@ -38,7 +37,7 @@ class Checkpoint:
             "llm_response": llm_response,
             "tool_results": tool_results or [],
             "output": output_data,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         })
 
     def to_dict(self) -> dict[str, Any]:

@@ -6,19 +6,17 @@ import time
 
 import pytest
 
-from pylon.observability.metrics import (
-    MetricsCollector,
-    MetricType,
-    PREDEFINED_METRICS,
-)
-from pylon.observability.tracing import Tracer, Span, SpanStatus
-from pylon.observability.logging import StructuredLogger, LogLevel
 from pylon.observability.exporters import (
     ConsoleExporter,
-    InMemoryExporter,
     ExporterProtocol,
+    InMemoryExporter,
 )
-
+from pylon.observability.logging import LogLevel, StructuredLogger
+from pylon.observability.metrics import (
+    PREDEFINED_METRICS,
+    MetricsCollector,
+)
+from pylon.observability.tracing import Span, SpanStatus, Tracer
 
 # ---------------------------------------------------------------------------
 # Metrics
@@ -183,7 +181,7 @@ class TestNestedSpans:
     def test_get_trace_returns_ordered(self) -> None:
         tracer = Tracer()
         root = tracer.start_span("root")
-        child = tracer.start_span("child", parent_id=root.span_id)
+        tracer.start_span("child", parent_id=root.span_id)
         spans = tracer.get_trace(root.trace_id)
         assert len(spans) == 2
         assert spans[0].name == "root"

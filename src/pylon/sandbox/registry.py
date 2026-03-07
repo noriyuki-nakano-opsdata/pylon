@@ -6,8 +6,8 @@ with agent-based lookup and tier-based aggregation.
 
 from __future__ import annotations
 
-from pylon.types import SandboxTier
 from pylon.sandbox.manager import Sandbox
+from pylon.types import SandboxTier
 
 
 class SandboxRegistry:

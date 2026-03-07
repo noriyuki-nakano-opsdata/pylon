@@ -6,7 +6,8 @@ Supports chat() and stream() with TokenUsage tracking.
 
 from __future__ import annotations
 
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 try:
     import anthropic
@@ -14,7 +15,7 @@ except ImportError:
     anthropic = None  # type: ignore[assignment]
 
 from pylon.errors import ProviderError
-from pylon.providers.base import Chunk, LLMProvider, Message, Response, TokenUsage
+from pylon.providers.base import Chunk, Message, Response, TokenUsage
 
 
 def _to_anthropic_messages(messages: list[Message]) -> tuple[str | None, list[dict]]:

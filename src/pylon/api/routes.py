@@ -6,17 +6,16 @@ Routes use in-memory stores for demonstration.
 
 from __future__ import annotations
 
-import uuid
 import time
-from typing import Any
+import uuid
 
-from pylon.api.server import APIServer, Request, Response
 from pylon.api.schemas import (
     CREATE_AGENT_SCHEMA,
     KILL_SWITCH_SCHEMA,
     WORKFLOW_RUN_SCHEMA,
     validate,
 )
+from pylon.api.server import APIServer, Request, Response
 
 
 class RouteStore:
@@ -65,12 +64,19 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
         agent = s.agents.get(agent_id)
         if agent is None:
             return Response(status_code=404, body={"error": f"Agent not found: {agent_id}"})
+        tenant_id = request.context.get("tenant_id", "default")
+        if agent.get("tenant_id") != tenant_id:
+            return Response(status_code=403, body={"error": "Access denied: agent belongs to another tenant"})
         return Response(body=agent)
 
     def delete_agent(request: Request) -> Response:
         agent_id = request.path_params.get("id", "")
-        if agent_id not in s.agents:
+        agent = s.agents.get(agent_id)
+        if agent is None:
             return Response(status_code=404, body={"error": f"Agent not found: {agent_id}"})
+        tenant_id = request.context.get("tenant_id", "default")
+        if agent.get("tenant_id") != tenant_id:
+            return Response(status_code=403, body={"error": "Access denied: agent belongs to another tenant"})
         del s.agents[agent_id]
         return Response(status_code=204, body=None)
 
@@ -88,9 +94,17 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
             "input": body.get("input", {}),
             "parameters": body.get("parameters", {}),
             "started_at": time.time(),
+            "tenant_id": request.context.get("tenant_id", "default"),
         }
         s.workflow_runs.setdefault(workflow_id, {})[run_id] = run
-        return Response(status_code=201, body=run)
+        return Response(
+            status_code=202,
+            body=run,
+            headers={
+                "content-type": "application/json",
+                "location": f"/api/v1/workflow-runs/{run_id}",
+            },
+        )
 
     def get_workflow_run(request: Request) -> Response:
         workflow_id = request.path_params.get("id", "")
@@ -99,6 +113,9 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
         run = runs.get(run_id)
         if run is None:
             return Response(status_code=404, body={"error": f"Run not found: {run_id}"})
+        tenant_id = request.context.get("tenant_id", "default")
+        if run.get("tenant_id") != tenant_id:
+            return Response(status_code=403, body={"error": "Access denied: workflow run belongs to another tenant"})
         return Response(body=run)
 
     def activate_kill_switch(request: Request) -> Response:
@@ -120,7 +137,7 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
     server.add_route("GET", "/agents", list_agents)
     server.add_route("GET", "/agents/{id}", get_agent)
     server.add_route("DELETE", "/agents/{id}", delete_agent)
-    server.add_route("POST", "/workflows/{id}/runs", start_workflow_run)
+    server.add_route("POST", "/workflows/{id}/run", start_workflow_run)
     server.add_route("GET", "/workflows/{id}/runs/{run_id}", get_workflow_run)
     server.add_route("POST", "/kill-switch", activate_kill_switch)
 

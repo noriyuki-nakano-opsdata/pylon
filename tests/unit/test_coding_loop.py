@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-import asyncio
-import re
 import pytest
 
+from pylon.coding.committer import (
+    CommitPlan,
+    FileContent,
+    GitCommitter,
+)
 from pylon.coding.loop import (
     CodingLoop,
     CodingLoopConfig,
@@ -22,17 +25,9 @@ from pylon.coding.reviewer import (
     CodeChange,
     CodeReviewer,
     QualityGateConfig,
-    ReviewComment,
     ReviewResult,
     Severity,
 )
-from pylon.coding.committer import (
-    CommitPlan,
-    FileContent,
-    GitCommitter,
-    SecretPattern,
-)
-
 
 # ======================================================================
 # Helpers

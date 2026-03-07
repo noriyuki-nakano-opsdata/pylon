@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import tempfile
 from pathlib import Path
 from unittest import mock
 
@@ -13,7 +12,6 @@ from pylon.sdk.client import (
     PylonClient,
     PylonClientError,
     RunStatus,
-    WorkflowResult,
     WorkflowRun,
 )
 from pylon.sdk.config import SDKConfig
@@ -25,7 +23,6 @@ from pylon.sdk.decorators import (
     tool,
     workflow,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -315,7 +312,8 @@ class TestWorkflowBuilder:
             b.add_node("a", agent="y")
 
     def test_conditional_edge(self):
-        cond = lambda result: result.get("ok")
+        def cond(result):
+            return result.get("ok")
         graph = (
             WorkflowBuilder("cond")
             .add_node("a", agent="x")
@@ -339,7 +337,8 @@ class TestWorkflowBuilder:
         assert "n1" in d["nodes"]
 
     def test_node_with_handler(self):
-        fn = lambda data: data
+        def fn(data):
+            return data
         graph = (
             WorkflowBuilder("handler")
             .add_node("n", agent="a", handler=fn)

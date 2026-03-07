@@ -5,12 +5,12 @@ from __future__ import annotations
 import fnmatch
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from enum import Enum
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 
-class StateOpType(str, Enum):
+class StateOpType(StrEnum):
     SET = "SET"
     DELETE = "DELETE"
     INCREMENT = "INCREMENT"

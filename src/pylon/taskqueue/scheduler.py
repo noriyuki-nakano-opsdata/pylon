@@ -5,8 +5,7 @@ from __future__ import annotations
 import enum
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from typing import Any
+from datetime import UTC, datetime, timedelta
 
 from pylon.errors import PylonError
 from pylon.taskqueue.queue import Task
@@ -138,7 +137,7 @@ class TaskScheduler:
 
     def get_due_tasks(self, now: datetime | None = None) -> list[ScheduledTask]:
         """Return all tasks that are due for execution."""
-        now = now or datetime.now(timezone.utc)
+        now = now or datetime.now(UTC)
         due: list[ScheduledTask] = []
 
         for entry in self._scheduled.values():
@@ -161,7 +160,7 @@ class TaskScheduler:
         entry = self._scheduled.get(scheduled_id)
         if entry is None:
             return
-        entry.last_run = run_time or datetime.now(timezone.utc)
+        entry.last_run = run_time or datetime.now(UTC)
         if entry.schedule_type == ScheduleType.ONCE:
             entry.enabled = False
 

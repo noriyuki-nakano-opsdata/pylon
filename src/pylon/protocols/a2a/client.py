@@ -7,11 +7,11 @@ from __future__ import annotations
 
 import asyncio
 import random
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
-from pylon.protocols.mcp.types import JsonRpcRequest
 from pylon.protocols.a2a.server import A2AServer
 from pylon.protocols.a2a.types import A2ATask, TaskEvent
+from pylon.protocols.mcp.types import JsonRpcRequest
 
 
 class A2AClient:

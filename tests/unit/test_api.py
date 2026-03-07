@@ -1,23 +1,20 @@
 """Tests for Pylon HTTP API server."""
 
-import pytest
 
-from pylon.api.server import APIServer, Request, Response
-from pylon.api.routes import RouteStore, register_routes
 from pylon.api.middleware import (
     AuthMiddleware,
     MiddlewareChain,
     RateLimitMiddleware,
     TenantMiddleware,
 )
+from pylon.api.routes import RouteStore, register_routes
 from pylon.api.schemas import (
     CREATE_AGENT_SCHEMA,
     KILL_SWITCH_SCHEMA,
     WORKFLOW_RUN_SCHEMA,
-    FieldRule,
     validate,
 )
-
+from pylon.api.server import APIServer, Request, Response
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -206,15 +203,17 @@ class TestWorkflowRoutes:
     def test_start_workflow_run(self):
         server, _ = _server_with_routes()
         resp = server.handle_request(
-            "POST", "/workflows/wf1/runs", body={"input": {"task": "build"}}
+            "POST", "/workflows/wf1/run", body={"input": {"task": "build"}}
         )
-        assert resp.status_code == 201
+        assert resp.status_code == 202
         assert resp.body["workflow_id"] == "wf1"
         assert resp.body["status"] == "running"
+        run_id = resp.body["id"]
+        assert resp.headers["location"] == f"/api/v1/workflow-runs/{run_id}"
 
     def test_get_workflow_run(self):
         server, _ = _server_with_routes()
-        create_resp = server.handle_request("POST", "/workflows/wf1/runs", body={})
+        create_resp = server.handle_request("POST", "/workflows/wf1/run", body={})
         run_id = create_resp.body["id"]
         resp = server.handle_request("GET", f"/workflows/wf1/runs/{run_id}")
         assert resp.status_code == 200
@@ -224,6 +223,69 @@ class TestWorkflowRoutes:
         server, _ = _server_with_routes()
         resp = server.handle_request("GET", "/workflows/wf1/runs/nope")
         assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Tenant ownership checks
+# ---------------------------------------------------------------------------
+
+class TestTenantOwnership:
+    """Cross-tenant access must be denied with 403."""
+
+    def test_get_agent_cross_tenant_returns_403(self):
+        server, store = _server_with_routes()
+        # Insert agent owned by a different tenant directly into the store
+        store.agents["foreign-agent"] = {
+            "id": "foreign-agent",
+            "name": "foreign",
+            "tenant_id": "other-tenant",
+            "status": "ready",
+        }
+        # Request without middleware -> context tenant_id defaults to "default"
+        resp = server.handle_request("GET", "/agents/foreign-agent")
+        assert resp.status_code == 403
+        assert "Access denied" in resp.body["error"]
+
+    def test_delete_agent_cross_tenant_returns_403(self):
+        server, store = _server_with_routes()
+        store.agents["foreign-agent"] = {
+            "id": "foreign-agent",
+            "name": "foreign",
+            "tenant_id": "other-tenant",
+            "status": "ready",
+        }
+        resp = server.handle_request("DELETE", "/agents/foreign-agent")
+        assert resp.status_code == 403
+        assert "Access denied" in resp.body["error"]
+        # Agent must NOT have been deleted
+        assert "foreign-agent" in store.agents
+
+    def test_get_workflow_run_cross_tenant_returns_403(self):
+        server, store = _server_with_routes()
+        # Insert a workflow run owned by a different tenant
+        store.workflow_runs["wf1"] = {
+            "run-abc": {
+                "id": "run-abc",
+                "workflow_id": "wf1",
+                "status": "running",
+                "tenant_id": "other-tenant",
+            }
+        }
+        resp = server.handle_request("GET", "/workflows/wf1/runs/run-abc")
+        assert resp.status_code == 403
+        assert "Access denied" in resp.body["error"]
+
+    def test_get_agent_same_tenant_succeeds(self):
+        server, store = _server_with_routes()
+        store.agents["my-agent"] = {
+            "id": "my-agent",
+            "name": "mine",
+            "tenant_id": "default",
+            "status": "ready",
+        }
+        resp = server.handle_request("GET", "/agents/my-agent")
+        assert resp.status_code == 200
+        assert resp.body["name"] == "mine"
 
 
 # ---------------------------------------------------------------------------

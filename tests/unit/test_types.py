@@ -7,8 +7,6 @@ from pylon.types import (
     AgentState,
     AutonomyLevel,
     PolicyViolation,
-    SandboxTier,
-    TrustLevel,
 )
 
 

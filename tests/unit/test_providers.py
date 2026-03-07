@@ -1,6 +1,5 @@
 """Tests for LLM provider abstraction."""
 
-import pytest
 
 from pylon.providers.base import (
     Chunk,

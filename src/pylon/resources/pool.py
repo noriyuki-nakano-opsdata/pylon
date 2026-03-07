@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Callable, Generic, TypeVar
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import TypeVar
 
 from pylon.errors import PylonError
 
@@ -38,7 +39,7 @@ class PoolConfig:
     validation_fn: Callable[[object], bool] | None = None
 
 
-class ResourcePool(Generic[T]):
+class ResourcePool[T]:
     """Bounded resource pool with acquire/release and context manager support."""
 
     def __init__(
@@ -130,7 +131,7 @@ class ResourcePool(Generic[T]):
         pass
 
 
-class _PoolContext(Generic[T]):
+class _PoolContext[T]:
     """Context manager for pool acquire/release."""
 
     def __init__(self, pool: ResourcePool[T]) -> None:
@@ -147,7 +148,7 @@ class _PoolContext(Generic[T]):
             self._item = None
 
 
-class PoolContextManager(Generic[T]):
+class PoolContextManager[T]:
     """Context manager that auto-acquires on enter and releases on exit."""
 
     def __init__(self, pool: ResourcePool[T]) -> None:

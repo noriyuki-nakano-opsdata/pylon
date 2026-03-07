@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any
+from enum import StrEnum
 
 from pylon.errors import PylonError
 
 
-class QuotaResource(str, Enum):
+class QuotaResource(StrEnum):
     AGENTS = "agents"
     WORKFLOWS = "workflows"
     STORAGE_MB = "storage_mb"

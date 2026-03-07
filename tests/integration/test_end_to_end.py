@@ -7,19 +7,14 @@ from typing import Any
 
 import pytest
 
-from pylon.dsl.parser import PylonProject, load_project
+from pylon.dsl.parser import load_project
 from pylon.errors import (
-    ApprovalRequiredError,
-    PolicyViolationError,
-    PromptInjectionError,
     WorkflowError,
 )
 from pylon.repository.audit import AuditRepository
 from pylon.repository.checkpoint import CheckpointRepository
 from pylon.repository.memory import EpisodicEntry, MemoryRepository, SemanticEntry
 from pylon.repository.workflow import RunStatus, WorkflowRepository, WorkflowRun
-from pylon.safety.autonomy import AutonomyEnforcer
-from pylon.safety.kill_switch import KillSwitch
 from pylon.safety.policy import ActionState, PolicyEngine
 from pylon.safety.prompt_guard import PromptGuard
 from pylon.types import (
@@ -32,7 +27,6 @@ from pylon.types import (
 )
 from pylon.workflow.executor import GraphExecutor
 from pylon.workflow.graph import END, WorkflowGraph
-
 
 _MINIMAL_YAML = """\
 version: "1"

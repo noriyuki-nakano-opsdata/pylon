@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 
 from pylon.errors import SandboxError
-from pylon.sandbox.manager import Sandbox, SandboxManager, SandboxStatus
+from pylon.sandbox.manager import SandboxManager, SandboxStatus
 from pylon.sandbox.policy import ResourceUsage
 
 

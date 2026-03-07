@@ -5,8 +5,8 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass, field
 
-from pylon.errors import PylonError
 from pylon.control_plane.tenant.quota import ResourceQuota
+from pylon.errors import PylonError
 
 
 class TenantError(PylonError):

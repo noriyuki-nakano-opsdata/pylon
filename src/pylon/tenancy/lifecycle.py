@@ -3,18 +3,19 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Callable
+from enum import StrEnum
+from typing import Any
 
 from pylon.errors import PylonError
-from pylon.tenancy.config import ConfigStore, TenantConfig, TenantLimits, TenantTier
+from pylon.tenancy.config import ConfigStore, TenantConfig, TenantTier
 from pylon.tenancy.context import TenantContext
-from pylon.tenancy.isolation import IsolationLevel, TenantIsolation
+from pylon.tenancy.isolation import TenantIsolation
 from pylon.tenancy.quota import QuotaManager, TenantQuota
 
 
-class TenantStatus(str, Enum):
+class TenantStatus(StrEnum):
     ACTIVE = "ACTIVE"
     SUSPENDED = "SUSPENDED"
     PENDING_DELETE = "PENDING_DELETE"

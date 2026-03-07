@@ -3,35 +3,26 @@
 import pytest
 
 from pylon.protocols.mcp.auth import (
-    ALL_SCOPES,
-    METHOD_SCOPES,
     OAuthClientConfig,
     OAuthProvider,
-    OAuthServerConfig,
     PKCEChallenge,
     check_scope,
     expand_scopes,
 )
 from pylon.protocols.mcp.client import McpClient
 from pylon.protocols.mcp.server import DEFAULT_PAGE_SIZE, FORBIDDEN, UNAUTHORIZED, McpServer
-from pylon.protocols.mcp.session import McpSession, SessionManager
+from pylon.protocols.mcp.session import SessionManager
 from pylon.protocols.mcp.types import (
     INTERNAL_ERROR,
     METHOD_NOT_FOUND,
-    InitializeResult,
     JsonRpcRequest,
-    JsonRpcResponse,
     PromptArgument,
     PromptDefinition,
     ResourceDefinition,
     ResourceTemplate,
-    SamplingMessage,
-    SamplingRequest,
     SamplingResponse,
-    ServerCapabilities,
     ToolDefinition,
 )
-
 
 # --- helpers ---
 
@@ -121,7 +112,8 @@ class TestInitialize:
         assert resp.result["capabilities"]["resources"] is True
         assert resp.result["capabilities"]["prompts"] is True
         assert resp.result["capabilities"]["sampling"] is True
-        assert "sessionId" in resp.result
+        assert "sessionId" not in resp.result
+        assert "Mcp-Session-Id" in resp.metadata
 
     def test_initialize_server_info(self):
         server = McpServer(name="my-server", version="1.0.0")

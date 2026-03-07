@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -155,7 +155,7 @@ class WORMAuditRepository:
             file_path=str(path),
             chain_valid=is_valid,
             hmac_valid=all(e.hmac_signature for e in entries),
-            exported_at=datetime.now(timezone.utc),
+            exported_at=datetime.now(UTC),
         )
 
     async def import_from_jsonl(self, path: str | Path) -> list[AuditEntry]:
@@ -224,7 +224,7 @@ class WORMAuditRepository:
         self, older_than_days: int
     ) -> list[AuditEntry]:
         """Return entries older than the specified number of days."""
-        cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+        cutoff = datetime.now(UTC) - timedelta(days=older_than_days)
         return [e for e in self._repo._entries if e.created_at < cutoff]
 
     @property

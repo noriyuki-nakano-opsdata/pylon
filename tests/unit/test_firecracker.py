@@ -3,12 +3,11 @@
 import pytest
 
 from pylon.errors import SandboxError
-from pylon.sandbox.manager import SandboxStatus
 from pylon.sandbox.firecracker import (
     FirecrackerBackend,
     FirecrackerConfig,
-    FirecrackerSandbox,
 )
+from pylon.sandbox.manager import SandboxStatus
 
 
 class TestFirecrackerConfig:

@@ -3,9 +3,9 @@
 import pytest
 
 from pylon.errors import PromptInjectionError
-from pylon.types import TrustLevel
-from pylon.safety.prompt_guard import PatternMatcher, PromptGuard
 from pylon.safety.input_sanitizer import InputSanitizer
+from pylon.safety.prompt_guard import PatternMatcher, PromptGuard
+from pylon.types import TrustLevel
 
 
 class TestPatternMatcher:

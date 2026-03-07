@@ -10,16 +10,15 @@ from pylon.errors import (
     ApprovalRequiredError,
     PolicyViolationError,
     PromptInjectionError,
-    WorkflowError,
 )
 from pylon.repository.audit import AuditRepository
 from pylon.repository.checkpoint import CheckpointRepository
-from pylon.repository.workflow import RunStatus, WorkflowRepository, WorkflowRun
+from pylon.repository.workflow import RunStatus, WorkflowRun
 from pylon.safety.autonomy import AutonomyEnforcer
 from pylon.safety.capability import CapabilityValidator
 from pylon.safety.kill_switch import KillSwitch
 from pylon.safety.policy import ActionState, PolicyEngine
-from pylon.safety.prompt_guard import PatternMatcher, PromptGuard
+from pylon.safety.prompt_guard import PromptGuard
 from pylon.types import (
     AgentCapability,
     AgentConfig,

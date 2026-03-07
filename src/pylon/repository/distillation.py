@@ -10,8 +10,8 @@ import re
 import uuid
 from abc import ABC, abstractmethod
 from collections import Counter
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from pylon.repository.memory import EpisodicEntry, MemoryRepository, SemanticEntry
@@ -178,7 +178,7 @@ class RecencyStrategy(DistillationStrategy):
         if not episodes:
             return []
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         weighted: list[tuple[EpisodicEntry, float]] = []
         for ep in episodes:
             age_days = (now - ep.created_at).total_seconds() / 86400
@@ -288,7 +288,7 @@ class MemoryDistiller:
                 metadata={
                     **pattern.get("metadata", {}),
                     "agent_id": agent_id,
-                    "distilled_at": datetime.now(timezone.utc).isoformat(),
+                    "distilled_at": datetime.now(UTC).isoformat(),
                 },
             )
 
@@ -314,7 +314,7 @@ class MemoryDistiller:
 
     async def distill_all(self) -> list[DistillationReport]:
         """Run distillation for all agents with episodic entries."""
-        episodes = await self._repo.list_episodic("", limit=0)
+        await self._repo.list_episodic("", limit=0)
 
         # Collect all unique agent IDs from the repo
         agent_ids: set[str] = set()

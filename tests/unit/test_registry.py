@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from pylon.types import TrustLevel
-from pylon.control_plane.registry.tools import ToolDefinition, ToolRegistry, ToolRegistryError, tool
 from pylon.control_plane.registry.skills import SkillDefinition, SkillRegistry, SkillRegistryError
-
+from pylon.control_plane.registry.tools import ToolDefinition, ToolRegistry, ToolRegistryError, tool
+from pylon.types import TrustLevel
 
 # --- Fixtures ---
 

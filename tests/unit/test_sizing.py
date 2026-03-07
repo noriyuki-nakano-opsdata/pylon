@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 
 from pylon.infrastructure.sizing import (
-    InfraProfile,
     SIZING_PROFILES,
+    InfraProfile,
     SizingCalculator,
 )
 

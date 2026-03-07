@@ -59,7 +59,7 @@ services:
 def init(ctx: click.Context, quickstart: bool, project_name: str | None) -> None:
     """Initialize a new Pylon project."""
     from pylon.cli.main import get_ctx
-    cli_ctx = get_ctx(ctx)
+    get_ctx(ctx)
 
     cwd = Path.cwd()
     name = project_name or cwd.name

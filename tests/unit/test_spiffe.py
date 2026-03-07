@@ -6,9 +6,9 @@ import pytest
 
 from pylon.identity.spiffe import (
     SVID,
-    SVIDType,
     SpiffeId,
     SpireRegistrationEntry,
+    SVIDType,
     WorkloadIdentityManager,
 )
 

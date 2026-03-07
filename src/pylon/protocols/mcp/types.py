@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-
 # JSON-RPC 2.0 error codes
 PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
@@ -49,6 +48,7 @@ class JsonRpcResponse:
     result: Any = None
     error: JsonRpcError | None = None
     id: str | int | None = None
+    metadata: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {"jsonrpc": self.jsonrpc, "id": self.id}

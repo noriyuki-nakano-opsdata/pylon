@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from pylon.protocols.mcp.types import ClientCapabilities, ServerCapabilities
 
@@ -12,7 +12,7 @@ from pylon.protocols.mcp.types import ClientCapabilities, ServerCapabilities
 @dataclass
 class McpSession:
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     server_capabilities: ServerCapabilities = field(default_factory=ServerCapabilities)
     client_capabilities: ClientCapabilities = field(default_factory=ClientCapabilities)
     access_token: str | None = None

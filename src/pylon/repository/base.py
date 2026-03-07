@@ -6,7 +6,7 @@ No direct SQL/NATS from L3.
 
 from __future__ import annotations
 
-from typing import Any, Generic, Protocol, TypeVar, runtime_checkable
+from typing import Any, Protocol, TypeVar, runtime_checkable
 
 T = TypeVar("T")
 

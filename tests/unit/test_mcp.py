@@ -5,7 +5,6 @@ import unittest
 from pylon.protocols.mcp import (
     INTERNAL_ERROR,
     METHOD_NOT_FOUND,
-    AuthorizationCode,
     InitializeResult,
     JsonRpcError,
     JsonRpcRequest,
@@ -21,7 +20,6 @@ from pylon.protocols.mcp import (
     PromptDefinition,
     ResourceDefinition,
     SessionManager,
-    ServerCapabilities,
     TokenResponse,
     ToolDefinition,
     route,
@@ -113,7 +111,8 @@ class TestMcpServer(unittest.TestCase):
         self.assertIsNone(resp.error)
         self.assertEqual(resp.result["protocolVersion"], "2025-11-25")
         self.assertEqual(resp.result["serverInfo"]["name"], "test-server")
-        self.assertIn("sessionId", resp.result)
+        self.assertNotIn("sessionId", resp.result)
+        self.assertIn("Mcp-Session-Id", resp.metadata)
 
     def test_tools_list_empty(self):
         req = JsonRpcRequest(method="tools/list", id=2)

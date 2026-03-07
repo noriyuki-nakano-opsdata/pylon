@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from pylon.plugins.loader import Plugin
-from pylon.plugins.types import PluginConfig, PluginManifest, PluginState
+from pylon.plugins.types import PluginConfig, PluginState
 
 logger = logging.getLogger(__name__)
 

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+
 import pytest
 
-from pylon.protocols.mcp.types import JsonRpcRequest, METHOD_NOT_FOUND, INVALID_PARAMS
+from pylon.protocols.a2a.card import AgentCardRegistry, generate_card
+from pylon.protocols.a2a.client import A2AClient, A2AConnectionPool
+from pylon.protocols.a2a.server import RATE_LIMITED, A2AServer
 from pylon.protocols.a2a.types import (
     A2AMessage,
     A2ATask,
@@ -19,10 +22,7 @@ from pylon.protocols.a2a.types import (
     TaskEvent,
     TaskState,
 )
-from pylon.protocols.a2a.server import A2AServer, RATE_LIMITED
-from pylon.protocols.a2a.client import A2AClient, A2AConnectionPool
-from pylon.protocols.a2a.card import AgentCardRegistry, generate_card
-
+from pylon.protocols.mcp.types import INVALID_PARAMS, METHOD_NOT_FOUND, JsonRpcRequest
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -236,6 +236,87 @@ class TestA2AServer:
             id="m3",
         )))
         assert resp.error is not None
+
+
+# ── Push Notification Tests ──────────────────────────────────────────
+
+class TestPushNotification:
+    def test_push_notification_set(self):
+        server = A2AServer()
+        task = _make_task("pn-set")
+        _run(server.handle_request(JsonRpcRequest(
+            method="tasks/send",
+            params={"sender": "", "task": task.to_dict()},
+            id="s-pn",
+        )))
+        config = {"url": "http://example.com/hook", "token": "abc"}
+        resp = _run(server.handle_request(JsonRpcRequest(
+            method="tasks/pushNotification/set",
+            params={"id": "pn-set", "pushNotificationConfig": config},
+            id="pn1",
+        )))
+        assert resp.error is None
+        assert resp.result["id"] == "pn-set"
+        assert resp.result["pushNotificationConfig"]["url"] == "http://example.com/hook"
+
+    def test_push_notification_get(self):
+        server = A2AServer()
+        task = _make_task("pn-get")
+        _run(server.handle_request(JsonRpcRequest(
+            method="tasks/send",
+            params={"sender": "", "task": task.to_dict()},
+            id="s-pn2",
+        )))
+        config = {"url": "http://example.com/hook", "events": ["completed"]}
+        _run(server.handle_request(JsonRpcRequest(
+            method="tasks/pushNotification/set",
+            params={"id": "pn-get", "pushNotificationConfig": config},
+            id="pn2",
+        )))
+        resp = _run(server.handle_request(JsonRpcRequest(
+            method="tasks/pushNotification/get",
+            params={"id": "pn-get"},
+            id="pn3",
+        )))
+        assert resp.error is None
+        assert resp.result["pushNotificationConfig"]["url"] == "http://example.com/hook"
+        assert resp.result["pushNotificationConfig"]["events"] == ["completed"]
+
+    def test_push_notification_get_returns_empty_when_not_set(self):
+        server = A2AServer()
+        task = _make_task("pn-empty")
+        _run(server.handle_request(JsonRpcRequest(
+            method="tasks/send",
+            params={"sender": "", "task": task.to_dict()},
+            id="s-pn3",
+        )))
+        resp = _run(server.handle_request(JsonRpcRequest(
+            method="tasks/pushNotification/get",
+            params={"id": "pn-empty"},
+            id="pn4",
+        )))
+        assert resp.error is None
+        assert resp.result["pushNotificationConfig"] == {}
+
+    def test_push_notification_set_unknown_task(self):
+        server = A2AServer()
+        resp = _run(server.handle_request(JsonRpcRequest(
+            method="tasks/pushNotification/set",
+            params={"id": "nonexistent", "pushNotificationConfig": {"url": "http://x.com"}},
+            id="pn5",
+        )))
+        assert resp.error is not None
+        assert "not found" in resp.error.message.lower()
+
+    def test_push_notification_get_unknown_task(self):
+        server = A2AServer()
+        resp = _run(server.handle_request(JsonRpcRequest(
+            method="tasks/pushNotification/get",
+            params={"id": "nonexistent"},
+            id="pn6",
+        )))
+        assert resp.error is not None
+        assert "not found" in resp.error.message.lower()
 
 
 # ── Peer Authentication Tests ────────────────────────────────────────
