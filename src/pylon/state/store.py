@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import time
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -98,7 +99,12 @@ class StateStore:
                         raise TypeError(f"Cannot increment non-numeric key: {op.key}")
                     self.set(op.key, current + (op.value if op.value is not None else 1))
             return True
-        except Exception:
+        except Exception as exc:
+            warnings.warn(
+                f"Transaction rolled back: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             self._data = backup_data
             self._ttls = backup_ttls
             return False

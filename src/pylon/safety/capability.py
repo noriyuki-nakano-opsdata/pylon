@@ -10,6 +10,8 @@ Validates at 4 points:
 from __future__ import annotations
 
 from pylon.errors import PolicyViolationError
+from pylon.safety.context import SafetyContext
+from pylon.safety.engine import SafetyEngine
 from pylon.types import AgentCapability, AgentConfig, TrustLevel
 
 
@@ -101,8 +103,28 @@ class CapabilityValidator:
         Receiver capabilities are verified against their agent-card declaration.
         Sender cannot escalate beyond its own capabilities.
         """
-        _enforce_rule_of_two_plus(
+        sender_context = SafetyContext(
+            agent_name="sender",
+            held_capability=sender_cap,
+            data_taint=TrustLevel.UNTRUSTED
+            if sender_cap.can_read_untrusted
+            else TrustLevel.TRUSTED,
+        )
+        decision = SafetyEngine.evaluate_delegation(
+            sender_context,
             receiver_declared_cap,
+            receiver_name=receiver_name,
+        )
+        if not decision.allowed:
+            raise PolicyViolationError(decision.reason)
+
+        merged = _make_cap(
+            untrusted=sender_cap.can_read_untrusted or receiver_declared_cap.can_read_untrusted,
+            secrets=sender_cap.can_access_secrets or receiver_declared_cap.can_access_secrets,
+            write=sender_cap.can_write_external or receiver_declared_cap.can_write_external,
+        )
+        _enforce_rule_of_two_plus(
+            merged,
             context=f"A2A peer '{receiver_name}'",
         )
 

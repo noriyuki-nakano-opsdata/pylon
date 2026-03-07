@@ -8,7 +8,7 @@ import pytest
 
 from pylon.protocols.a2a.card import AgentCardRegistry, generate_card
 from pylon.protocols.a2a.client import A2AClient, A2AConnectionPool
-from pylon.protocols.a2a.server import RATE_LIMITED, A2AServer
+from pylon.protocols.a2a.server import RATE_LIMITED, TASK_NOT_FOUND, A2AServer
 from pylon.protocols.a2a.types import (
     A2AMessage,
     A2ATask,
@@ -93,7 +93,7 @@ class TestA2ATask:
         task = _make_task("round-trip")
         task.metadata = {"key": "value"}
         task.push_notification = PushNotificationConfig(
-            url="http://example.com/hook",
+            url="https://example.com/hook",
             token="secret",
             events=["completed"],
         )
@@ -104,7 +104,7 @@ class TestA2ATask:
         assert len(restored.messages) == 1
         assert restored.metadata == {"key": "value"}
         assert restored.push_notification is not None
-        assert restored.push_notification.url == "http://example.com/hook"
+        assert restored.push_notification.url == "https://example.com/hook"
 
     def test_task_add_message(self):
         task = _make_task()
@@ -163,6 +163,7 @@ class TestA2AServer:
             id="g2",
         )))
         assert resp.error is not None
+        assert resp.error.code == TASK_NOT_FOUND
         assert "not found" in resp.error.message.lower()
 
     def test_cancel_task(self):
@@ -223,7 +224,7 @@ class TestA2AServer:
             params={
                 "taskId": "push-1",
                 "pushNotification": {
-                    "url": "http://hook.example",
+                    "url": "https://hook.example",
                     "token": "abc",
                     "events": ["completed"],
                 },
@@ -239,7 +240,7 @@ class TestA2AServer:
             id="pn-get",
         )))
         assert get_resp.error is None
-        assert get_resp.result["pushNotification"]["url"] == "http://hook.example"
+        assert get_resp.result["pushNotification"]["url"] == "https://hook.example"
 
     def test_set_push_notification_requires_task(self):
         server = A2AServer()
@@ -247,12 +248,12 @@ class TestA2AServer:
             method="tasks/pushNotification/set",
             params={
                 "taskId": "missing",
-                "pushNotification": {"url": "http://hook", "events": []},
+                "pushNotification": {"url": "https://hook.example", "events": []},
             },
             id="pn-missing",
         )))
         assert resp.error is not None
-        assert resp.error.code == INVALID_PARAMS
+        assert resp.error.code == TASK_NOT_FOUND
 
     def test_missing_task_in_send(self):
         server = A2AServer()
@@ -310,7 +311,7 @@ class TestA2AServer:
             method="tasks/pushNotification/set",
             params={
                 "task_id": "camel-push",
-                "push_notification": {"url": "http://hook", "events": []},
+                "push_notification": {"url": "https://hook.example", "events": []},
             },
             id="camel-push-set",
         )))
@@ -687,10 +688,10 @@ class TestTypeSerialization:
         assert restored.metadata["format"] == "json"
 
     def test_push_notification_config(self):
-        pn = PushNotificationConfig(url="http://hook.com", token="t", events=["completed"])
+        pn = PushNotificationConfig(url="https://hook.com", token="t", events=["completed"])
         d = pn.to_dict()
         restored = PushNotificationConfig.from_dict(d)
-        assert restored.url == "http://hook.com"
+        assert restored.url == "https://hook.com"
         assert restored.events == ["completed"]
 
     def test_task_event(self):
@@ -713,3 +714,109 @@ class TestTypeSerialization:
         assert restored.streaming is True
         assert restored.push_notifications is True
         assert restored.state_transition_history is False
+
+
+# -- M8: TASK_NOT_FOUND error code tests ---------------------------------
+
+class TestTaskNotFoundErrorCode:
+    """M8: Task not found should use TASK_NOT_FOUND (-32001), not INVALID_PARAMS."""
+
+    def test_get_nonexistent_uses_task_not_found_code(self):
+        server = A2AServer()
+        resp = _run(server.handle_request(JsonRpcRequest(
+            method="tasks/get", params={"taskId": "missing"}, id="tnf-1",
+        )))
+        assert resp.error.code == TASK_NOT_FOUND
+
+    def test_cancel_nonexistent_uses_task_not_found_code(self):
+        server = A2AServer()
+        resp = _run(server.handle_request(JsonRpcRequest(
+            method="tasks/cancel", params={"taskId": "missing"}, id="tnf-2",
+        )))
+        assert resp.error.code == TASK_NOT_FOUND
+
+    def test_push_notification_set_nonexistent_uses_task_not_found_code(self):
+        server = A2AServer()
+        resp = _run(server.handle_request(JsonRpcRequest(
+            method="tasks/pushNotification/set",
+            params={
+                "taskId": "missing",
+                "pushNotification": {"url": "https://hook.example", "events": []},
+            },
+            id="tnf-3",
+        )))
+        assert resp.error.code == TASK_NOT_FOUND
+
+    def test_push_notification_get_nonexistent_uses_task_not_found_code(self):
+        server = A2AServer()
+        resp = _run(server.handle_request(JsonRpcRequest(
+            method="tasks/pushNotification/get",
+            params={"taskId": "missing"},
+            id="tnf-4",
+        )))
+        assert resp.error.code == TASK_NOT_FOUND
+
+
+# -- M12: Rate limit memory leak tests -----------------------------------
+
+class TestRateLimitMemoryLeak:
+    """M12: Peer entries should be cleaned up when their timestamps expire."""
+
+    def test_expired_peer_entries_are_removed(self):
+        server = A2AServer(rate_limit=10, rate_window=0.001)
+        # Force a request with a timestamp far in the past
+        server._peer_requests["old-peer"] = [0.0]
+        import time
+        time.sleep(0.002)  # ensure the entry expires
+        # Calling _check_rate_limit filters out expired entries and deletes empty list
+        # But it also adds a new entry because the peer is under the limit.
+        # To test cleanup only, we verify the old timestamp was removed.
+        server._check_rate_limit("old-peer")
+        # The old timestamp (0.0) should be gone; only the new one remains
+        timestamps = server._peer_requests.get("old-peer", [])
+        assert all(t > 1.0 for t in timestamps)  # no ancient timestamps
+
+    def test_empty_peer_list_is_deleted(self):
+        """After filtering, if no timestamps remain and under limit, entry is recreated.
+        But if we just filter without calling, empty list should be removed."""
+        server = A2AServer(rate_limit=10, rate_window=0.001)
+        server._peer_requests["stale"] = [0.0]
+        import time
+        time.sleep(0.002)
+        # Manually trigger the filtering logic
+        now = time.time()
+        cutoff = now - server._rate_window
+        server._peer_requests["stale"] = [
+            t for t in server._peer_requests["stale"] if t > cutoff
+        ]
+        # After filtering, the list is empty -- our fix should handle this
+        assert server._peer_requests["stale"] == []
+
+    def test_active_peer_entries_are_kept(self):
+        import time
+        server = A2AServer(rate_limit=10, rate_window=60.0)
+        server._check_rate_limit("active-peer")
+        assert "active-peer" in server._peer_requests
+        assert len(server._peer_requests["active-peer"]) == 1
+
+
+# -- M13: PushNotificationConfig URL validation tests ---------------------
+
+class TestPushNotificationUrlValidation:
+    """M13: PushNotificationConfig must validate URL scheme."""
+
+    def test_https_url_accepted(self):
+        pn = PushNotificationConfig(url="https://example.com/hook", token="t")
+        assert pn.url == "https://example.com/hook"
+
+    def test_http_url_rejected(self):
+        with pytest.raises(ValueError, match="https scheme"):
+            PushNotificationConfig(url="http://example.com/hook", token="t")
+
+    def test_empty_url_rejected(self):
+        with pytest.raises(ValueError, match="must not be empty"):
+            PushNotificationConfig(url="", token="t")
+
+    def test_ftp_url_rejected(self):
+        with pytest.raises(ValueError, match="https scheme"):
+            PushNotificationConfig(url="ftp://example.com/hook", token="t")

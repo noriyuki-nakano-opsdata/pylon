@@ -22,9 +22,11 @@ class MethodRouter:
     def register(self, method: str, handler: Callable) -> None:
         self._handlers[method] = handler
 
-    def dispatch(self, request: JsonRpcRequest) -> JsonRpcResponse:
+    def dispatch(self, request: JsonRpcRequest) -> JsonRpcResponse | None:
         handler = self._handlers.get(request.method)
         if handler is None:
+            if request.id is None:
+                return None
             return JsonRpcResponse(
                 error=JsonRpcError(
                     code=METHOD_NOT_FOUND,
@@ -34,13 +36,19 @@ class MethodRouter:
             )
         try:
             result = handler(request)
+            if request.id is None:
+                return None
             return JsonRpcResponse(result=result, id=request.id)
         except DtoValidationError as exc:
+            if request.id is None:
+                return None
             return JsonRpcResponse(
                 error=JsonRpcError(code=INVALID_PARAMS, message=str(exc)),
                 id=request.id,
             )
         except Exception as exc:
+            if request.id is None:
+                return None
             return JsonRpcResponse(
                 error=JsonRpcError(
                     code=INTERNAL_ERROR,

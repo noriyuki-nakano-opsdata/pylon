@@ -7,7 +7,6 @@ Supports conditional transitions and fan-out/fan-in.
 from __future__ import annotations
 
 import ast
-import logging
 import operator
 from dataclasses import dataclass, field
 from typing import Any
@@ -15,9 +14,8 @@ from typing import Any
 from pylon.errors import WorkflowError
 from pylon.types import ConditionalEdge, WorkflowNode, WorkflowNodeType
 
-logger = logging.getLogger(__name__)
-
 END = "END"
+EdgeKey = tuple[str, int]
 
 
 @dataclass
@@ -132,6 +130,21 @@ class WorkflowGraph:
                     targeted.add(edge.target)
         return [nid for nid in self.nodes if nid not in targeted]
 
+    def get_outbound_edges(self, node_id: str) -> list[tuple[EdgeKey, ConditionalEdge]]:
+        """Return outbound edges with stable keys scoped to the source node."""
+        if node_id not in self.nodes:
+            raise WorkflowError(f"Node not found: {node_id}")
+        return [((node_id, index), edge) for index, edge in enumerate(self.nodes[node_id].next)]
+
+    def get_inbound_edges(self) -> dict[str, list[EdgeKey]]:
+        """Return inbound edges grouped by target node."""
+        inbound: dict[str, list[EdgeKey]] = {node_id: [] for node_id in self.nodes}
+        for node_id in self.nodes:
+            for edge_key, edge in self.get_outbound_edges(node_id):
+                if edge.target != END:
+                    inbound.setdefault(edge.target, []).append(edge_key)
+        return inbound
+
     def get_next_nodes(self, node_id: str, state: dict[str, Any] | None = None) -> list[str]:
         """Get next node IDs based on conditions and state."""
         if node_id not in self.nodes:
@@ -148,16 +161,8 @@ class WorkflowGraph:
             if edge.condition is None:
                 results.append(edge.target)
             elif state is not None:
-                try:
-                    if _safe_eval_condition(edge.condition, state):
-                        results.append(edge.target)
-                except Exception:
-                    logger.warning(
-                        "Condition evaluation failed for edge to '%s': %s",
-                        edge.target,
-                        edge.condition,
-                    )
-                    pass
+                if _safe_eval_condition(edge.condition, state):
+                    results.append(edge.target)
         return results
 
     def _detect_cycles(self) -> None:
@@ -220,7 +225,10 @@ def _safe_eval_condition(condition: str, state: dict[str, Any]) -> bool:
     except SyntaxError as exc:
         raise WorkflowError(f"Invalid condition syntax: {condition}") from exc
 
-    return bool(_eval_node(tree.body, state))
+    try:
+        return bool(_eval_node(tree.body, state))
+    except AttributeError as exc:
+        raise WorkflowError(f"Condition references missing state field: {exc}") from exc
 
 
 def _eval_node(node: ast.AST, state: dict[str, Any]) -> Any:  # noqa: PLR0911
@@ -236,7 +244,6 @@ def _eval_node(node: ast.AST, state: dict[str, Any]) -> Any:  # noqa: PLR0911
 
     # Attribute access: only state.xxx
     if isinstance(node, ast.Attribute):
-        obj = _eval_node(node.value, state)
         if not isinstance(node.value, ast.Name) or node.value.id != "state":
             raise WorkflowError(
                 f"Attribute access only allowed on 'state', got: {ast.dump(node.value)}"

@@ -25,7 +25,7 @@ class RunStatus(StrEnum):
 
 _VALID_RUN_TRANSITIONS: dict[RunStatus, set[RunStatus]] = {
     RunStatus.PENDING: {RunStatus.RUNNING},
-    RunStatus.RUNNING: {RunStatus.COMPLETED, RunStatus.FAILED},
+    RunStatus.RUNNING: {RunStatus.PAUSED, RunStatus.COMPLETED, RunStatus.FAILED},
     RunStatus.PAUSED: {RunStatus.RUNNING},
     RunStatus.COMPLETED: set(),
     RunStatus.FAILED: set(),
@@ -72,6 +72,12 @@ class WorkflowRun:
         self._validate_transition(RunStatus.COMPLETED)
         self.status = RunStatus.COMPLETED
         self.completed_at = datetime.now(UTC)
+
+    def pause(self, reason: str | None = None) -> None:
+        self._validate_transition(RunStatus.PAUSED)
+        self.status = RunStatus.PAUSED
+        if reason:
+            self.state["pause_reason"] = reason
 
     def fail(self, error: str | None = None) -> None:
         self._validate_transition(RunStatus.FAILED)

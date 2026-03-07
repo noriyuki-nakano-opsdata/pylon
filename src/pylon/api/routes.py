@@ -154,17 +154,39 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
         return Response(body=run)
 
     def activate_kill_switch(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
         body = request.body or {}
         valid, errors = validate(body, KILL_SWITCH_SCHEMA)
         if not valid:
             return Response(status_code=422, body={"errors": errors})
+
+        scope: str = body["scope"]
+
+        # Authorization: global scope requires admin tenant
+        if scope == "global" and tenant_id != "admin":
+            return Response(
+                status_code=403,
+                body={"error": "Only admin tenant can activate global kill switch"},
+            )
+
+        # Authorization: tenant-scoped switches only for own tenant
+        if scope.startswith("tenant:"):
+            scope_tenant = scope[len("tenant:"):]
+            if scope_tenant != tenant_id:
+                return Response(
+                    status_code=403,
+                    body={"error": "Cannot activate kill switch for another tenant"},
+                )
+
         event = {
-            "scope": body["scope"],
+            "scope": scope,
             "reason": body["reason"],
             "issued_by": body["issued_by"],
             "activated_at": time.time(),
         }
-        s.kill_switches[body["scope"]] = event
+        s.kill_switches[scope] = event
         return Response(status_code=201, body=event)
 
     server.add_route("GET", "/health", health)
@@ -173,7 +195,6 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
     server.add_route("GET", "/agents/{id}", get_agent)
     server.add_route("DELETE", "/agents/{id}", delete_agent)
     server.add_route("POST", "/workflows/{id}/run", start_workflow_run)
-    server.add_route("POST", "/workflows/{id}/runs", start_workflow_run)
     server.add_route("GET", "/workflows/{id}/runs/{run_id}", get_workflow_run)
     server.add_route("GET", "/api/v1/workflow-runs/{run_id}", get_workflow_run_by_id)
     server.add_route("POST", "/kill-switch", activate_kill_switch)

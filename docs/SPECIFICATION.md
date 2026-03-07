@@ -1,8 +1,9 @@
-# Pylon Platform Specification v1.1
+# Pylon Platform Specification v1.2
 
 **Revision History:**
 - v1.0 (2026-03-07): Initial specification
 - v1.1 (2026-03-07): Major revision incorporating 5-team review (Security, Architecture, Protocol, DX, Competitive)
+- v1.2 (2026-03-07): Formalized deterministic DAG execution semantics, safety context, and implementation plan for workflow/safety convergence
 
 ## 1. Vision
 
@@ -75,6 +76,37 @@ No single agent may simultaneously possess all three dangerous capabilities:
 - Rationale: An agent processing untrusted input with secret access enables indirect prompt injection to exfiltrate credentials, even without external write capability (e.g., via LLM response content).
 
 Violation → runtime error at agent creation and at every dynamic tool grant.
+
+### 2.3.1 Safety Context and Dynamic Boundary Enforcement (ADR-008)
+
+Static capability flags are necessary but not sufficient. Every execution frame is
+evaluated with a `SafetyContext` that combines static capability, runtime taint,
+requested side effects, and delegation ancestry.
+
+```python
+@dataclass(frozen=True)
+class SafetyContext:
+    agent_id: str
+    run_id: str
+    held_caps: AgentCapability
+    data_taint: TrustLevel  # trusted | internal | untrusted | model_generated
+    secret_scopes: frozenset[str]
+    effect_scopes: frozenset[str]  # git.push, db.write, api.call, network.egress, ...
+    call_chain: tuple[str, ...]  # parent -> child delegation ancestry
+    approval_token: ApprovalToken | None = None
+```
+
+**Hard invariants:**
+- `untrusted` or `model_generated` data may not coexist with secret-read access in the same execution frame
+- Approval may unlock soft policy gates, but never bypass a hard safety deny
+- Capability checks are transitive across the full delegation chain; the effective safety envelope is the union of parent context, child context, and requested effects
+- Remote declarations (A2A agent cards, MCP metadata, provider claims) are advisory only; local policy is always authoritative
+- Secret values must be scrubbed before checkpoint persistence, audit serialization, memory writes, or cross-agent delegation
+
+**Delegation rule:**
+- A2A/MCP/tool delegation is allowed only if `SafetyEngine.evaluate(parent_context, requested_child_context)` returns `allow`
+- If the union of parent taint and requested child effects crosses a guarded threshold, the result is `require_approval`
+- If the union violates Rule-of-Two+ or data exfiltration policy, the result is `deny`
 
 ### 2.4 Prompt Injection Defense
 
@@ -243,7 +275,13 @@ class AgentCapability:
 1. Agent creation (static check from pylon.yaml)
 2. Dynamic tool grant (every MCP tool discovery triggers re-validation)
 3. Subgraph inheritance (child inherits subset of parent capabilities only)
-4. A2A delegation (peer capabilities verified against agent-card before accepting task)
+4. A2A delegation (local policy evaluates sender context, receiver declaration, requested effects, and call-chain ancestry)
+
+**Dynamic safety evaluation:**
+- Every action is evaluated against a `SafetyContext`, not raw booleans alone
+- Tool definitions must declare structured effects: trust ingestion, secret access, external write scope, network egress, memory write class, and determinism
+- Peer/child agents receive a narrowed context, never an expanded one
+- Approval tokens are bound to plan hash, effect envelope, actor, expiry, and tenant scope
 
 **Provider Abstraction:**
 ```python
@@ -271,26 +309,87 @@ Pregel/Beam-inspired graph execution engine (ADR-001).
 - **Subgraph**: Composable nested graph
 - **Checkpoint**: Event log + state reference (not state snapshot)
 
+**Execution invariants (ADR-007):**
+- A node executes at most once per workflow run, unless an explicit retry policy creates a new attempt
+- Every edge is resolved to exactly one of `taken`, `not_taken`, or `blocked`
+- A node becomes runnable only when all inbound edges are resolved and its join policy is satisfied
+- Default join policy is `ALL_RESOLVED`; `ANY` and `FIRST` require explicit declaration
+- Runtime condition evaluation failures are terminal workflow errors, not silent skips
+- Parallel state writes must use an explicit reducer or disjoint namespaces; implicit last-write-wins is forbidden
+- A workflow run is `COMPLETED` only when no runnable nodes remain, all reachable nodes are terminal, and there are no pending approvals or unresolved edges
+
+**Compiled graph model:**
+```python
+@dataclass(frozen=True)
+class CompiledWorkflow:
+    nodes: dict[str, CompiledNode]
+    inbound_edges: dict[str, tuple[CompiledEdge, ...]]
+    outbound_edges: dict[str, tuple[CompiledEdge, ...]]
+    entry_nodes: tuple[str, ...]
+```
+
+```python
+@dataclass(frozen=True)
+class CompiledNode:
+    node_id: str
+    agent: str
+    join_policy: str = "ALL_RESOLVED"
+    state_write_policy: str = "namespace"
+    reducer: str | None = None
+```
+
 **Deterministic Replay Strategy (ADR-007):**
 
 Checkpoints are NOT state snapshots. They are event logs:
 ```
 Event Log = [
-  (node_id, input, llm_response_captured, tool_results_captured, output),
+  (
+    seq,
+    node_id,
+    attempt_id,
+    input_state_version,
+    llm_response_captured,
+    tool_results_captured,
+    output_patch,
+    edge_decisions,
+    state_hash_after_commit,
+  ),
   ...
 ]
 ```
 - Every LLM response is captured in the event log at execution time
 - Every tool call result is captured in the event log
-- Replay re-injects captured responses instead of calling LLM/tools again
+- Replay re-injects captured decisions and side-effect results instead of calling LLM/tools again
 - Large state (>1MB) is stored in S3/MinIO; checkpoint contains URI reference
-- Fan-out/fan-in execution order is recorded and replayed in same order
+- Fan-out/fan-in commit order is recorded and replayed in the same order
+- Optional snapshots may accelerate recovery, but correctness is defined solely by the append-only event log
+
+**Checkpoint record requirements:**
+- Checkpoints are node-attempt scoped, never anonymous frontier snapshots
+- Each record stores node input reference, emitted patch, artifacts, edge decisions, approval wait state, and secret-scrubbed metadata
+- Multi-node supersteps may exist for scheduling efficiency, but persistence remains per node attempt
+
+**Runtime state model:**
+```python
+@dataclass
+class WorkflowRuntimeState:
+    run_status: str  # pending | running | waiting_approval | paused | completed | failed | cancelled
+    node_status: dict[str, str]  # pending | runnable | running | succeeded | skipped | failed | blocked
+    edge_status: dict[str, str]  # pending | taken | not_taken | blocked
+    frontier: list[str]
+    state_version: int
+    state_hash: str
+```
 
 **Execution Model:**
 - Async-first, supports parallel node execution (fan-out/fan-in)
 - State serialized via L4 Repository (not direct SQL from engine)
 - NATS JetStream for event sourcing (ADR-002)
 - Retry policies: per-node configurable (exponential backoff, max_retries, circuit breaker)
+- `max_steps`, deadline, or external pause requests transition the run to `paused` or `failed(limit_exceeded)`; they never imply success
+- Conditional expressions must be compiled from a restricted DSL; arbitrary Python `eval` is prohibited
+- Conflict detection happens before commit; failed merge produces deterministic `failed(state_conflict)`
+- Join resolution must consider all inbound edges, not the first predecessor to finish
 
 **API response patterns:**
 - `POST /workflows/:id/run` → `202 Accepted` + `Location: /api/v1/workflow-runs/:run_id`
@@ -524,6 +623,12 @@ POST   /a2a                               # JSON-RPC 2.0 endpoint
 | A2 | Semi-autonomous | Agent executes within policy bounds, reports results |
 | A3 | Autonomous-guarded | Agent plans and executes; human approves plan |
 | A4 | Fully autonomous | Agent operates independently within safety envelope |
+
+**Approval token binding:**
+- A1 approvals are step-scoped and bound to a single node attempt
+- A3 approvals are plan-scoped and bound to `plan_hash + effect_envelope + tenant + expiry`
+- If the plan expands node set, tool set, secret scope, or external write scope after approval, the token is invalidated and a fresh approval is required
+- A4 autonomy removes soft approval gates, but not hard safety gates
 
 **Kill Switch (multi-path):**
 
@@ -1200,7 +1305,7 @@ PYLON_OIDC_CLIENT_ID=pylon
 
 **Pylon's core differentiation axis:** Not protocol support (competitors have caught up), but **Safety-by-Default integration depth** — the combination of Rule-of-Two+, Autonomy Ladder, Kill Switch, Prompt Guard, and Sandbox-by-Default as a unified, first-class safety architecture. No competing framework offers all five as built-in, policy-driven, OSS features.
 
-**Capability laundering prevention:** To prevent agents from circumventing Rule-of-Two+ by routing through intermediate agents, capability checks are applied transitively across the full agent call chain. An agent delegating to a child inherits the union of both capability sets for validation purposes.
+**Capability laundering prevention:** To prevent agents from circumventing Rule-of-Two+ by routing through intermediate agents, capability checks are applied transitively across the full agent call chain. An execution frame delegating to a child inherits the union of parent context, child declared capability, current taint, and requested side effects for validation purposes. Remote peer cards are not trusted as authorization artifacts; they are only one input to local policy evaluation.
 
 ### Key competitive threats (2026)
 
@@ -1235,7 +1340,8 @@ The following detailed design documents must be written before implementation be
 | ADR-004 | Autonomy Ladder (A0-A4) | M0 | Accepted |
 | ADR-005 | Rule-of-Two Safety Constraint | M0 | Accepted |
 | ADR-006 | Sandbox-by-Default (gVisor + Firecracker) | M0 | Accepted |
-| ADR-007 | Deterministic Replay via Event Sourcing | M0 | **Required** |
+| ADR-007 | Deterministic DAG Execution Semantics | M0 | Accepted |
+| ADR-008 | Safety Context and Delegation Boundaries | M0 | Accepted |
 | RFC-001 | MCP 2025-11-25 Detailed Implementation | M1 | **Required** |
 | RFC-002 | A2A RC v1.0 Detailed Implementation | M2 | **Required** |
 | RFC-003 | SPIFFE/SPIRE Trust Domain Design | M3 | **Required** |

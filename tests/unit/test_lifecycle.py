@@ -14,6 +14,7 @@ from pylon.agents.supervisor import (
     SupervisorConfig,
 )
 from pylon.errors import AgentLifecycleError, PolicyViolationError
+from pylon.safety.capability import CapabilityValidator, _make_cap
 from pylon.types import AgentCapability, AgentConfig, AgentState, TrustLevel
 
 # --- Helper ---
@@ -372,3 +373,61 @@ class TestAgentSupervisor:
         sup.register(agent.id)
         sup.unregister(agent.id)
         assert len(sup.list_supervised()) == 0
+
+
+# === A2A Delegation Tests (M18) ===
+
+
+class TestA2ADelegation:
+    """Tests for CapabilityValidator.validate_a2a_delegation."""
+
+    def test_safe_delegation_both_no_untrusted(self):
+        """Delegation where receiver is subset of sender should pass."""
+        sender = _make_cap(write=True, secrets=True)
+        receiver = _make_cap(secrets=True)
+        # Should not raise — receiver is within sender's envelope
+        CapabilityValidator.validate_a2a_delegation(
+            sender, receiver, receiver_name="safe-peer"
+        )
+
+    def test_safe_delegation_minimal_caps(self):
+        """Delegation between agents with no dangerous capabilities."""
+        sender = _make_cap()
+        receiver = _make_cap()
+        CapabilityValidator.validate_a2a_delegation(
+            sender, receiver, receiver_name="minimal-peer"
+        )
+
+    def test_delegation_rejected_receiver_forbidden_pair(self):
+        """Receiver with untrusted + secrets violates Rule-of-Two+."""
+        sender = _make_cap()
+        receiver = _make_cap(untrusted=True, secrets=True)
+        with pytest.raises(PolicyViolationError, match="Forbidden pair"):
+            CapabilityValidator.validate_a2a_delegation(
+                sender, receiver, receiver_name="bad-peer"
+            )
+
+    def test_delegation_rejected_receiver_all_three(self):
+        """Receiver with all three flags violates Rule-of-Two+."""
+        receiver = _make_cap(untrusted=True, secrets=True, write=True)
+        sender = _make_cap()
+        with pytest.raises(PolicyViolationError, match="Rule-of-Two"):
+            CapabilityValidator.validate_a2a_delegation(
+                sender, receiver, receiver_name="triple-peer"
+            )
+
+    def test_delegation_allowed_untrusted_write_no_secrets(self):
+        """Untrusted + write (no secrets) is allowed by Rule-of-Two+."""
+        sender = _make_cap(untrusted=True, write=True)
+        receiver = _make_cap(untrusted=True, write=True)
+        CapabilityValidator.validate_a2a_delegation(
+            sender, receiver, receiver_name="rw-peer"
+        )
+
+    def test_delegation_allowed_secrets_write_no_untrusted(self):
+        """Secrets + write (no untrusted) is allowed by Rule-of-Two+."""
+        sender = _make_cap(secrets=True, write=True)
+        receiver = _make_cap(secrets=True, write=True)
+        CapabilityValidator.validate_a2a_delegation(
+            sender, receiver, receiver_name="sw-peer"
+        )

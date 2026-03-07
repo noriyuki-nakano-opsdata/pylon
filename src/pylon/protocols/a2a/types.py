@@ -114,6 +114,14 @@ class PushNotificationConfig:
     token: str = ""
     events: list[str] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        if not self.url:
+            raise ValueError("PushNotificationConfig url must not be empty")
+        if not self.url.startswith("https://"):
+            raise ValueError(
+                f"PushNotificationConfig url must use https scheme, got: {self.url}"
+            )
+
     def to_dict(self) -> dict:
         return {
             "url": self.url,

@@ -40,7 +40,8 @@ class TokenBucket:
         return self._tokens
 
     def _refill(self, now: float | None = None) -> None:
-        now = now or time.monotonic()
+        if now is None:
+            now = time.monotonic()
         if self._last_refill == 0.0:
             self._last_refill = now
             return
@@ -60,7 +61,8 @@ class SlidingWindow:
 
     def allow(self, now: float | None = None) -> bool:
         """Check if a request is allowed within the window."""
-        now = now or time.monotonic()
+        if now is None:
+            now = time.monotonic()
         cutoff = now - self.window_seconds
         self._timestamps = [t for t in self._timestamps if t > cutoff]
         if len(self._timestamps) < self.max_requests:
@@ -70,13 +72,15 @@ class SlidingWindow:
 
     def can_allow(self, now: float | None = None) -> bool:
         """Check if a request would be allowed without recording it."""
-        now = now or time.monotonic()
+        if now is None:
+            now = time.monotonic()
         cutoff = now - self.window_seconds
         active = sum(1 for t in self._timestamps if t > cutoff)
         return active < self.max_requests
 
     def count(self, now: float | None = None) -> int:
-        now = now or time.monotonic()
+        if now is None:
+            now = time.monotonic()
         cutoff = now - self.window_seconds
         return sum(1 for t in self._timestamps if t > cutoff)
 

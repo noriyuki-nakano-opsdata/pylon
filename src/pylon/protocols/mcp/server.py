@@ -157,6 +157,8 @@ class McpServer:
                         id=request.id,
                     )
         response = self._router.dispatch(request)
+        if response is None:
+            return None
         if request.method == "initialize" and response.error is None:
             session_id = ""
             if isinstance(response.result, dict):
@@ -247,9 +249,14 @@ class McpServer:
         return {"subscribed": True, "uri": params.uri}
 
     def _handle_resources_templates_list(self, request: JsonRpcRequest) -> dict:
-        return {
-            "resourceTemplates": [t.to_dict() for t in self._resource_templates.values()]
-        }
+        cursor = CursorParamsDTO.from_params(request.params).cursor
+        all_templates = list(self._resource_templates.values())
+        page, next_cursor = self._paginate(all_templates, cursor)
+        return paginated_payload(
+            field_name="resourceTemplates",
+            items=[t.to_dict() for t in page],
+            next_cursor=next_cursor,
+        )
 
     def _handle_prompts_list(self, request: JsonRpcRequest) -> dict:
         cursor = CursorParamsDTO.from_params(request.params).cursor

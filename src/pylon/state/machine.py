@@ -117,15 +117,16 @@ class StateMachine:
             prev = self._current
             self._current = t.to_state
 
-            new_state = self._states.get(self._current)
-            if new_state and new_state.on_enter:
-                new_state.on_enter(self._current)
-
             self._history.append(TransitionRecord(
                 from_state=prev,
                 to_state=self._current,
                 event=event,
             ))
+
+            new_state = self._states.get(self._current)
+            if new_state and new_state.on_enter:
+                new_state.on_enter(self._current)
+
             return self._current
 
         raise InvalidTransitionError(self._current, event)

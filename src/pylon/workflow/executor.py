@@ -1,11 +1,4 @@
-"""Workflow Graph Executor — Pregel-style superstep execution (FR-03, ADR-001).
-
-Executes workflow graphs with:
-- Fan-out/fan-in parallel node execution (asyncio.gather)
-- Conditional edge evaluation
-- Event log capture (LLM responses + tool results)
-- Checkpoint at each node completion
-"""
+"""Workflow Graph Executor with deterministic DAG scheduling semantics."""
 
 from __future__ import annotations
 
@@ -18,9 +11,8 @@ from typing import Any
 from pylon.errors import WorkflowError
 from pylon.repository.checkpoint import Checkpoint, CheckpointRepository
 from pylon.repository.workflow import WorkflowRun
-from pylon.workflow.graph import WorkflowGraph
+from pylon.workflow.graph import END, WorkflowGraph, _safe_eval_condition
 
-# Type alias for node execution functions
 NodeHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
@@ -35,19 +27,14 @@ class ExecutionContext:
     checkpoint_repo: CheckpointRepository | None = None
     max_steps: int = 100
     _step_count: int = 0
+    node_status: dict[str, str] = field(default_factory=dict)
+    edge_status: dict[tuple[str, int], str] = field(default_factory=dict)
+    inbound_edges: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
+    outbound_edges: dict[str, list[tuple[tuple[str, int], Any]]] = field(default_factory=dict)
 
 
 class GraphExecutor:
-    """Pregel-style superstep executor for workflow graphs.
-
-    Each superstep:
-    1. Identify ready nodes (entry points or nodes whose predecessors completed)
-    2. Execute ready nodes in parallel (fan-out)
-    3. Capture results in event log
-    4. Evaluate conditional edges to determine next nodes
-    5. Checkpoint state
-    6. Repeat until all paths reach END
-    """
+    """Deterministic executor for DAG workflows."""
 
     def __init__(
         self,
@@ -64,18 +51,7 @@ class GraphExecutor:
         initial_state: dict[str, Any] | None = None,
         max_steps: int = 100,
     ) -> WorkflowRun:
-        """Execute a workflow graph from start to completion.
-
-        Args:
-            graph: Validated workflow graph
-            run: WorkflowRun to track execution
-            node_handler: async function(node_id, state) -> result_dict
-            initial_state: Initial state dict
-            max_steps: Max supersteps to prevent infinite loops
-
-        Returns:
-            Updated WorkflowRun with final state and event log
-        """
+        """Execute a workflow graph from start to completion."""
         graph.validate()
 
         ctx = ExecutionContext(
@@ -85,44 +61,57 @@ class GraphExecutor:
             node_handler=node_handler,
             checkpoint_repo=self._checkpoint_repo,
             max_steps=max_steps,
+            node_status={node_id: "pending" for node_id in graph.nodes},
+            inbound_edges=graph.get_inbound_edges(),
+            outbound_edges={node_id: graph.get_outbound_edges(node_id) for node_id in graph.nodes},
         )
+        for outbound in ctx.outbound_edges.values():
+            for edge_key, _ in outbound:
+                ctx.edge_status[edge_key] = "pending"
 
         run.start()
-        current_nodes = graph.get_entry_nodes()
+        current_nodes = self._refresh_runnable_nodes(ctx)
 
         try:
-            while current_nodes and ctx._step_count < max_steps:
+            while current_nodes:
+                if ctx._step_count >= max_steps:
+                    run.state = ctx.state
+                    run.pause("max_steps_exceeded")
+                    return run
+
                 ctx._step_count += 1
+                for node_id in current_nodes:
+                    ctx.node_status[node_id] = "running"
 
-                # Execute current nodes in parallel (fan-out)
                 results = await self._execute_superstep(ctx, current_nodes)
+                self._detect_state_conflicts(results)
 
-                # Merge results into state
                 for node_id, result in results.items():
                     ctx.state.update(result)
-
-                # Record in event log
-                for node_id, result in results.items():
-                    event = {
+                    ctx.node_status[node_id] = "succeeded"
+                    run.event_log.append({
                         "step": ctx._step_count,
                         "node_id": node_id,
                         "agent": graph.nodes[node_id].agent,
                         "output": result,
                         "timestamp": datetime.now(UTC).isoformat(),
-                    }
-                    run.event_log.append(event)
+                    })
 
-                # Checkpoint
-                await self._checkpoint(ctx, current_nodes, results)
+                await self._checkpoint(ctx, results)
 
-                # Determine next nodes via conditional edges
-                next_nodes: list[str] = []
                 for node_id in current_nodes:
-                    targets = graph.get_next_nodes(node_id, ctx.state)
-                    next_nodes.extend(targets)
+                    self._resolve_outbound_edges(ctx, node_id)
 
-                # Deduplicate
-                current_nodes = list(dict.fromkeys(next_nodes))
+                current_nodes = self._refresh_runnable_nodes(ctx)
+
+            unresolved = [
+                node_id for node_id, status in ctx.node_status.items() if status == "pending"
+            ]
+            if unresolved:
+                raise WorkflowError(
+                    "Workflow stalled with unresolved nodes",
+                    details={"nodes": unresolved},
+                )
 
             run.state = ctx.state
             run.complete()
@@ -146,7 +135,7 @@ class GraphExecutor:
             result = await ctx.node_handler(node_id, dict(ctx.state))
             return node_id, result
 
-        tasks = [run_node(nid) for nid in node_ids]
+        tasks = [run_node(node_id) for node_id in node_ids]
         completed = await asyncio.gather(*tasks, return_exceptions=True)
 
         results: dict[str, dict[str, Any]] = {}
@@ -158,23 +147,80 @@ class GraphExecutor:
 
         return results
 
+    def _detect_state_conflicts(self, results: dict[str, dict[str, Any]]) -> None:
+        owners: dict[str, str] = {}
+        conflicts: dict[str, set[str]] = {}
+
+        for node_id, result in results.items():
+            for key in result:
+                owner = owners.get(key)
+                if owner is None:
+                    owners[key] = node_id
+                    continue
+                conflicts.setdefault(key, {owner})
+                conflicts[key].add(node_id)
+
+        if conflicts:
+            details = ", ".join(
+                f"{key}={sorted(nodes)}" for key, nodes in sorted(conflicts.items())
+            )
+            raise WorkflowError(f"State conflict detected for keys: {details}")
+
+    def _resolve_outbound_edges(self, ctx: ExecutionContext, node_id: str) -> None:
+        for edge_key, edge in ctx.outbound_edges.get(node_id, []):
+            taken = edge.condition is None
+            if edge.condition is not None:
+                taken = _safe_eval_condition(edge.condition, ctx.state)
+            ctx.edge_status[edge_key] = "taken" if taken else "not_taken"
+
+    def _refresh_runnable_nodes(self, ctx: ExecutionContext) -> list[str]:
+        changed = True
+        while changed:
+            changed = False
+            for node_id, status in list(ctx.node_status.items()):
+                if status != "pending":
+                    continue
+
+                inbound = ctx.inbound_edges.get(node_id, [])
+                if not inbound:
+                    ctx.node_status[node_id] = "runnable"
+                    changed = True
+                    continue
+
+                inbound_statuses = [ctx.edge_status[edge_key] for edge_key in inbound]
+                if any(state == "pending" for state in inbound_statuses):
+                    continue
+
+                if any(state == "taken" for state in inbound_statuses):
+                    ctx.node_status[node_id] = "runnable"
+                    changed = True
+                    continue
+
+                ctx.node_status[node_id] = "skipped"
+                for edge_key, edge in ctx.outbound_edges.get(node_id, []):
+                    if edge.target != END and ctx.edge_status[edge_key] == "pending":
+                        ctx.edge_status[edge_key] = "not_taken"
+                changed = True
+
+        return [node_id for node_id, status in ctx.node_status.items() if status == "runnable"]
+
     async def _checkpoint(
         self,
         ctx: ExecutionContext,
-        node_ids: list[str],
         results: dict[str, dict[str, Any]],
     ) -> None:
-        """Create checkpoint after superstep completion."""
-        checkpoint = Checkpoint(
-            workflow_run_id=ctx.run.id,
-            node_id=",".join(node_ids),
-        )
+        """Create node-scoped checkpoints after completion."""
         for node_id, result in results.items():
+            checkpoint = Checkpoint(
+                workflow_run_id=ctx.run.id,
+                node_id=node_id,
+            )
             checkpoint.add_event(
+                node_id=node_id,
                 input_data={"state_snapshot_keys": list(ctx.state.keys())},
                 output_data=result,
             )
-        await self._checkpoint_repo.create(checkpoint)
+            await self._checkpoint_repo.create(checkpoint)
 
     async def replay(
         self,
@@ -182,11 +228,7 @@ class GraphExecutor:
         run: WorkflowRun,
         node_handler: NodeHandler,
     ) -> WorkflowRun:
-        """Replay a workflow from its event log (deterministic replay).
-
-        Re-injects captured LLM responses and tool results instead of
-        calling the handler again.
-        """
+        """Replay a workflow from its event log."""
         replay_state: dict[str, Any] = {}
 
         for event in run.event_log:

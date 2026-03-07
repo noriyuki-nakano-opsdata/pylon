@@ -106,6 +106,8 @@ class TestGraphExecutor:
 
         checkpoints = await repo.list(workflow_run_id=run.id)
         assert len(checkpoints) == 2  # One per superstep
+        assert [cp.node_id for cp in checkpoints] == ["step1", "step2"]
+        assert [cp.event_log[0]["node_id"] for cp in checkpoints] == ["step1", "step2"]
 
     @pytest.mark.asyncio
     async def test_max_steps_limit(self, executor):
@@ -119,8 +121,70 @@ class TestGraphExecutor:
         run = WorkflowRun(workflow_id="wf-1")
         result = await executor.execute(g, run, mock_handler, max_steps=5)
 
-        # Should stop after 5 steps even though graph has 10
+        # Should pause after 5 steps even though graph has 10
+        assert result.status == RunStatus.PAUSED
         assert len(result.event_log) == 5
+        assert "pause_reason" in result.state
+
+    @pytest.mark.asyncio
+    async def test_join_node_executes_once_after_all_inbound_edges_resolve(self, executor):
+        g = WorkflowGraph(name="join")
+        g.add_node("start", "planner", next_nodes=[
+            ConditionalEdge(target="fast"),
+            ConditionalEdge(target="slow"),
+        ])
+        g.add_node("fast", "agent1", next_nodes=[ConditionalEdge(target="join")])
+        g.add_node("slow", "agent2", next_nodes=[ConditionalEdge(target="mid")])
+        g.add_node("mid", "agent3", next_nodes=[ConditionalEdge(target="join")])
+        g.add_node("join", "agent4", next_nodes=[ConditionalEdge(target=END)])
+
+        execution_order: list[str] = []
+
+        async def ordered_handler(node_id: str, state: dict) -> dict:
+            execution_order.append(node_id)
+            return {f"{node_id}_done": True}
+
+        run = WorkflowRun(workflow_id="wf-join")
+        result = await executor.execute(g, run, ordered_handler)
+
+        assert result.status == RunStatus.COMPLETED
+        assert execution_order == ["start", "fast", "slow", "mid", "join"]
+        assert sum(1 for event in result.event_log if event["node_id"] == "join") == 1
+
+    @pytest.mark.asyncio
+    async def test_parallel_conflicting_writes_fail(self, executor):
+        g = WorkflowGraph(name="conflict")
+        g.add_node("start", "planner", next_nodes=[
+            ConditionalEdge(target="worker1"),
+            ConditionalEdge(target="worker2"),
+        ])
+        g.add_node("worker1", "agent1", next_nodes=[ConditionalEdge(target=END)])
+        g.add_node("worker2", "agent2", next_nodes=[ConditionalEdge(target=END)])
+
+        async def conflicting_handler(node_id: str, state: dict) -> dict:
+            if node_id == "start":
+                return {"started": True}
+            return {"shared": node_id}
+
+        run = WorkflowRun(workflow_id="wf-conflict")
+        with pytest.raises(Exception, match="State conflict"):
+            await executor.execute(g, run, conflicting_handler)
+
+        assert run.status == RunStatus.FAILED
+
+    @pytest.mark.asyncio
+    async def test_invalid_condition_fails_run(self, executor):
+        g = WorkflowGraph(name="bad-condition")
+        g.add_node("start", "planner", next_nodes=[
+            ConditionalEdge(target="next", condition="state.missing > 0"),
+        ])
+        g.add_node("next", "agent1", next_nodes=[ConditionalEdge(target=END)])
+
+        run = WorkflowRun(workflow_id="wf-bad-condition")
+        with pytest.raises(Exception, match="missing"):
+            await executor.execute(g, run, mock_handler)
+
+        assert run.status == RunStatus.FAILED
 
     @pytest.mark.asyncio
     async def test_handler_error_fails_run(self, executor):

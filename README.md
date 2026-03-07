@@ -69,6 +69,8 @@ PYTHONPATH=src python -m pytest tests/unit/test_api.py -v
 - [Architecture Overview](docs/architecture.md)
 - [Getting Started Guide](docs/getting-started.md)
 - [API Reference](docs/api-reference.md)
+- [Platform Specification](docs/SPECIFICATION.md)
+- [Workflow/Safety Implementation Plan](docs/architecture/workflow-safety-implementation-plan.md)
 
 ## Project Configuration
 

@@ -100,8 +100,13 @@ class TestStateStore(unittest.TestCase):
             StateOp(op=StateOpType.SET, key="keep", value="changed"),
             StateOp(op=StateOpType.INCREMENT, key="keep", value=1),  # will fail: string
         ]
-        self.assertFalse(self.store.transaction(ops))
+        import warnings as _warnings
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            self.assertFalse(self.store.transaction(ops))
         self.assertEqual(self.store.get("keep"), "original")
+        # M4: rollback must emit a warning
+        self.assertTrue(any("Transaction rolled back" in str(x.message) for x in w))
 
     def test_on_change_notification(self):
         changes = []
@@ -354,6 +359,21 @@ class TestStateMachine(unittest.TestCase):
         sm = self._make_traffic_light()
         events = sm.get_available_events()
         self.assertEqual(events, ["go"])
+
+    def test_on_enter_exception_preserves_history(self):
+        """M6: If on_enter raises, state and history must remain consistent."""
+        sm = StateMachine(StateMachineConfig(initial_state="a"))
+        sm.add_state("a")
+        sm.add_state("b", on_enter=lambda s: (_ for _ in ()).throw(RuntimeError("on_enter failed")))
+        sm.add_transition("a", "b", "go")
+        sm.start()
+        with self.assertRaises(RuntimeError):
+            sm.trigger("go")
+        # State should be "b" (transition happened) and history should record it
+        self.assertEqual(sm.current_state, "b")
+        self.assertEqual(len(sm.history), 1)
+        self.assertEqual(sm.history[0].from_state, "a")
+        self.assertEqual(sm.history[0].to_state, "b")
 
 
 if __name__ == "__main__":

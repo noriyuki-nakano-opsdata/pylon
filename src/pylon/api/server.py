@@ -106,9 +106,19 @@ class APIServer:
         route = self._match_route(request.method, request.path)
         if route is None:
             # Check if path exists with different method
+            allowed_methods: list[str] = []
             for r in self._routes:
                 if r.pattern.match(request.path):
-                    return Response(status_code=405, body={"error": "Method not allowed"})
+                    allowed_methods.append(r.method)
+            if allowed_methods:
+                return Response(
+                    status_code=405,
+                    headers={
+                        "content-type": "application/json",
+                        "allow": ", ".join(sorted(set(allowed_methods))),
+                    },
+                    body={"error": "Method not allowed"},
+                )
             return Response(status_code=404, body={"error": "Not found"})
 
         # Extract path params

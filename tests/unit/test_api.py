@@ -5,6 +5,7 @@ from pylon.api.middleware import (
     AuthMiddleware,
     MiddlewareChain,
     RateLimitMiddleware,
+    SecurityHeadersMiddleware,
     TenantMiddleware,
 )
 from pylon.api.routes import RouteStore, register_routes
@@ -104,6 +105,23 @@ class TestServerRouting:
         server, _ = _server_with_routes()
         resp = server.handle_request("PATCH", "/agents")
         assert resp.status_code == 405
+
+    def test_method_not_allowed_has_allow_header(self):
+        """M10: 405 responses must include Allow header per HTTP spec."""
+        server, _ = _server_with_routes()
+        resp = server.handle_request("PATCH", "/agents")
+        assert resp.status_code == 405
+        assert "allow" in resp.headers
+        allowed = resp.headers["allow"]
+        assert "GET" in allowed
+        assert "POST" in allowed
+
+    def test_duplicate_runs_route_removed(self):
+        """M11: /workflows/{id}/runs POST should not be registered."""
+        server, _ = _server_with_routes()
+        resp = server.handle_request("POST", "/workflows/wf1/runs", body={})
+        # Should be 404 (not found) since the duplicate route was removed
+        assert resp.status_code == 404
 
     def test_path_param_extraction(self):
         server = APIServer()
@@ -238,20 +256,79 @@ class TestWorkflowRoutes:
 # ---------------------------------------------------------------------------
 
 class TestKillSwitchRoute:
-    def test_activate(self):
+    def test_activate_global_as_admin(self):
         server, store = _server_with_routes()
         resp = server.handle_request(
             "POST",
             "/kill-switch",
+            headers={"X-Tenant-ID": "admin"},
             body={"scope": "global", "reason": "emergency", "issued_by": "admin"},
         )
         assert resp.status_code == 201
         assert "global" in store.kill_switches
 
+    def test_activate_global_non_admin_forbidden(self):
+        server, _ = _server_with_routes()
+        resp = server.handle_request(
+            "POST",
+            "/kill-switch",
+            headers={"X-Tenant-ID": "tenant-a"},
+            body={"scope": "global", "reason": "test", "issued_by": "user"},
+        )
+        assert resp.status_code == 403
+
+    def test_activate_own_tenant_scope(self):
+        server, store = _server_with_routes()
+        resp = server.handle_request(
+            "POST",
+            "/kill-switch",
+            headers={"X-Tenant-ID": "tenant-a"},
+            body={"scope": "tenant:tenant-a", "reason": "test", "issued_by": "user"},
+        )
+        assert resp.status_code == 201
+        assert "tenant:tenant-a" in store.kill_switches
+
+    def test_activate_other_tenant_scope_forbidden(self):
+        server, _ = _server_with_routes()
+        resp = server.handle_request(
+            "POST",
+            "/kill-switch",
+            headers={"X-Tenant-ID": "tenant-a"},
+            body={"scope": "tenant:tenant-b", "reason": "test", "issued_by": "user"},
+        )
+        assert resp.status_code == 403
+
+    def test_activate_agent_scope_allowed(self):
+        """Non-tenant, non-global scopes (e.g. agent:xxx) are allowed."""
+        server, store = _server_with_routes()
+        resp = server.handle_request(
+            "POST",
+            "/kill-switch",
+            headers={"X-Tenant-ID": "tenant-a"},
+            body={"scope": "agent:123", "reason": "test", "issued_by": "user"},
+        )
+        assert resp.status_code == 201
+        assert "agent:123" in store.kill_switches
+
     def test_activate_validation_error(self):
         server, _ = _server_with_routes()
-        resp = server.handle_request("POST", "/kill-switch", body={"scope": "global"})
+        resp = server.handle_request(
+            "POST",
+            "/kill-switch",
+            headers={"X-Tenant-ID": "admin"},
+            body={"scope": "global"},
+        )
         assert resp.status_code == 422
+
+    def test_activate_without_tenant_returns_401(self):
+        server = APIServer()
+        register_routes(server)
+        resp = server.handle_request(
+            "POST",
+            "/kill-switch",
+            body={"scope": "global", "reason": "test", "issued_by": "admin"},
+        )
+        assert resp.status_code == 401
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +470,92 @@ class TestMiddlewareChain:
         chain = MiddlewareChain()
         chain.add(AuthMiddleware()).add(TenantMiddleware())
         assert len(chain.middlewares) == 2
+
+
+class TestTenantIdValidation:
+    """M15: tenant_id format validation."""
+
+    def test_valid_tenant_id(self):
+        server = APIServer()
+        server.add_middleware(TenantMiddleware(require_tenant=True))
+        server.add_route("GET", "/test", lambda r: Response(body={"ok": True}))
+        resp = server.handle_request("GET", "/test", headers={"X-Tenant-ID": "acme-corp"})
+        assert resp.status_code == 200
+
+    def test_valid_tenant_id_with_underscores(self):
+        server = APIServer()
+        server.add_middleware(TenantMiddleware(require_tenant=True))
+        server.add_route("GET", "/test", lambda r: Response(body={"ok": True}))
+        resp = server.handle_request("GET", "/test", headers={"X-Tenant-ID": "tenant_01"})
+        assert resp.status_code == 200
+
+    def test_invalid_tenant_id_sql_injection(self):
+        server = APIServer()
+        server.add_middleware(TenantMiddleware(require_tenant=True))
+        server.add_route("GET", "/test", lambda r: Response(body={"ok": True}))
+        resp = server.handle_request(
+            "GET", "/test", headers={"X-Tenant-ID": "'; DROP TABLE tenants;--"}
+        )
+        assert resp.status_code == 400
+        assert "Invalid tenant ID" in resp.body["error"]
+
+    def test_invalid_tenant_id_uppercase(self):
+        server = APIServer()
+        server.add_middleware(TenantMiddleware(require_tenant=True))
+        server.add_route("GET", "/test", lambda r: Response(body={"ok": True}))
+        resp = server.handle_request("GET", "/test", headers={"X-Tenant-ID": "ACME"})
+        assert resp.status_code == 400
+
+    def test_invalid_tenant_id_starts_with_hyphen(self):
+        server = APIServer()
+        server.add_middleware(TenantMiddleware(require_tenant=True))
+        server.add_route("GET", "/test", lambda r: Response(body={"ok": True}))
+        resp = server.handle_request("GET", "/test", headers={"X-Tenant-ID": "-bad"})
+        assert resp.status_code == 400
+
+    def test_invalid_tenant_id_too_long(self):
+        server = APIServer()
+        server.add_middleware(TenantMiddleware(require_tenant=True))
+        server.add_route("GET", "/test", lambda r: Response(body={"ok": True}))
+        long_id = "a" * 65
+        resp = server.handle_request("GET", "/test", headers={"X-Tenant-ID": long_id})
+        assert resp.status_code == 400
+
+    def test_invalid_tenant_id_empty_string(self):
+        server = APIServer()
+        server.add_middleware(TenantMiddleware(require_tenant=True))
+        server.add_route("GET", "/test", lambda r: Response(body={"ok": True}))
+        resp = server.handle_request("GET", "/test", headers={"X-Tenant-ID": ""})
+        assert resp.status_code == 400
+
+
+class TestSecurityHeadersMiddleware:
+    """M16: security response headers."""
+
+    def test_headers_present(self):
+        server = APIServer()
+        server.add_middleware(SecurityHeadersMiddleware())
+        server.add_route("GET", "/test", lambda r: Response(body={"ok": True}))
+        resp = server.handle_request("GET", "/test")
+        assert resp.headers["x-content-type-options"] == "nosniff"
+        assert resp.headers["x-frame-options"] == "DENY"
+        assert resp.headers["content-security-policy"] == "default-src 'none'"
+        assert resp.headers["x-xss-protection"] == "0"
+
+    def test_does_not_overwrite_existing_headers(self):
+        server = APIServer()
+        server.add_middleware(SecurityHeadersMiddleware())
+
+        def handler(r: Request) -> Response:
+            return Response(
+                body={"ok": True},
+                headers={"content-type": "application/json", "x-frame-options": "SAMEORIGIN"},
+            )
+
+        server.add_route("GET", "/test", handler)
+        resp = server.handle_request("GET", "/test")
+        assert resp.headers["x-frame-options"] == "SAMEORIGIN"
+        assert resp.headers["x-content-type-options"] == "nosniff"
 
 
 class TestResponse:

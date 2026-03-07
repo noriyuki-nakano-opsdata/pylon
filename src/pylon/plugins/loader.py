@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import json
+import warnings
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -95,8 +96,12 @@ class PluginLoader:
                 discovered.append(
                     PluginInfo(name=ep.name, description=f"Entry point: {ep.value}")
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            warnings.warn(
+                f"Failed to discover entry points for group '{group}': {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         return discovered
 
     def _load_manifest_file(self, path: Path) -> PluginManifest | None:

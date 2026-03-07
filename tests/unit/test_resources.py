@@ -73,6 +73,18 @@ class TestTokenBucket:
         assert bucket.can_consume(3.0) is False
 
 
+    def test_now_zero_is_respected(self):
+        """M1: now=0.0 must not be replaced by time.monotonic()."""
+        bucket = TokenBucket(capacity=10, refill_rate=10.0)
+        # Initialize with now=100.0 first (to set _last_refill past the sentinel)
+        bucket.consume(5.0, now=100.0)
+        assert bucket.available(now=100.0) == pytest.approx(5.0, abs=0.01)
+        # Now pass now=0.0 -- before the fix, this would call time.monotonic()
+        # and refill based on a huge elapsed time. With the fix, 0.0 < 100.0
+        # means elapsed < 0, so no refill occurs.
+        assert bucket.available(now=0.0) == pytest.approx(5.0, abs=0.01)
+
+
 # === SlidingWindow Tests ===
 
 
@@ -112,6 +124,15 @@ class TestSlidingWindow:
         sw.allow(now)
         sw.allow(now + 1)
         assert sw.count(now + 2) == 2
+
+    def test_now_zero_is_respected(self):
+        """M1: now=0.0 must not be replaced by time.monotonic()."""
+        sw = SlidingWindow(window_seconds=5.0, max_requests=2)
+        assert sw.allow(now=0.0) is True
+        assert sw.count(now=0.0) == 1
+        assert sw.can_allow(now=0.0) is True
+        assert sw.allow(now=0.0) is True
+        assert sw.allow(now=0.0) is False  # limit reached
 
 
 # === CompositeLimit Tests ===
@@ -473,6 +494,15 @@ class TestResourceMonitor:
         for i in range(10):
             mon.track("cpu", float(i), now=float(i))
         assert len(mon.get_history("cpu")) == 5
+
+    def test_now_zero_is_respected(self):
+        """M1: now=0.0 must not be replaced by time.monotonic()."""
+        mon = ResourceMonitor()
+        mon.track("cpu", 50.0, now=0.0)
+        mon.track("cpu", 60.0, now=1.0)
+        mon.track("cpu", 70.0, now=2.0)
+        history = mon.get_history("cpu", window_seconds=1.5, now=2.0)
+        assert len(history) == 2  # timestamps 1.0 and 2.0
 
 
 # === ResourcePool Thread Safety Tests ===

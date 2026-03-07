@@ -26,13 +26,14 @@ class Checkpoint:
     def add_event(
         self,
         *,
+        node_id: str | None = None,
         input_data: Any,
         llm_response: Any | None = None,
         tool_results: list[Any] | None = None,
         output_data: Any | None = None,
     ) -> None:
         self.event_log.append({
-            "node_id": self.node_id,
+            "node_id": node_id or self.node_id,
             "input": input_data,
             "llm_response": llm_response,
             "tool_results": tool_results or [],

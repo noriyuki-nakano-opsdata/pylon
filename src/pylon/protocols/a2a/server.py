@@ -38,6 +38,9 @@ StreamHandler = Callable[[A2ATask], AsyncIterator[TaskEvent]]
 # Rate limit error code (custom, outside JSON-RPC reserved range)
 RATE_LIMITED = -32000
 
+# Application-defined error code for missing tasks
+TASK_NOT_FOUND = -32001
+
 
 class A2AServer:
     """Async A2A JSON-RPC 2.0 server with full task lifecycle."""
@@ -187,9 +190,11 @@ class A2AServer:
         self._peer_requests[peer] = [
             t for t in self._peer_requests[peer] if t > cutoff
         ]
-        if len(self._peer_requests[peer]) >= self._rate_limit:
+        if not self._peer_requests[peer]:
+            del self._peer_requests[peer]
+        if len(self._peer_requests.get(peer, [])) >= self._rate_limit:
             return False
-        self._peer_requests[peer].append(now)
+        self._peer_requests.setdefault(peer, []).append(now)
         return True
 
     async def _handle_send(self, request: JsonRpcRequest) -> JsonRpcResponse:
@@ -241,7 +246,7 @@ class A2AServer:
             return JsonRpcResponse(
                 id=request.id,
                 error=JsonRpcError(
-                    code=INVALID_PARAMS,
+                    code=TASK_NOT_FOUND,
                     message=f"Task not found: {task_id}",
                 ),
             )
@@ -256,7 +261,7 @@ class A2AServer:
             return JsonRpcResponse(
                 id=request.id,
                 error=JsonRpcError(
-                    code=INVALID_PARAMS,
+                    code=TASK_NOT_FOUND,
                     message=f"Task not found: {task_id}",
                 ),
             )
@@ -282,7 +287,7 @@ class A2AServer:
             return JsonRpcResponse(
                 id=request.id,
                 error=JsonRpcError(
-                    code=INVALID_PARAMS,
+                    code=TASK_NOT_FOUND,
                     message=f"Task not found: {task_id}",
                 ),
             )
@@ -304,7 +309,7 @@ class A2AServer:
             return JsonRpcResponse(
                 id=request.id,
                 error=JsonRpcError(
-                    code=INVALID_PARAMS,
+                    code=TASK_NOT_FOUND,
                     message=f"Task not found: {task_id}",
                 ),
             )

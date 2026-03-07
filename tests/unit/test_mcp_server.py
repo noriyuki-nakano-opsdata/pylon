@@ -508,8 +508,68 @@ class TestPagination:
         assert len(resp.result["prompts"]) == DEFAULT_PAGE_SIZE
         assert resp.result["nextCursor"] is not None
 
+    def test_resource_templates_pagination(self):
+        """M7: resources/templates/list should support pagination."""
+        server = McpServer()
+        for i in range(15):
+            server.register_resource_template(
+                ResourceTemplate(
+                    uri_template=f"file:///docs/{{name}}-{i}",
+                    name=f"template-{i}",
+                    description=f"Template {i}",
+                )
+            )
+        req = JsonRpcRequest(method="resources/templates/list", id=1)
+        resp = server.handle_request(req)
+        assert len(resp.result["resourceTemplates"]) == DEFAULT_PAGE_SIZE
+        assert resp.result["nextCursor"] is not None
 
-# ===== 9. Error Handling =====
+        # get next page
+        req2 = JsonRpcRequest(
+            method="resources/templates/list",
+            params={"cursor": resp.result["nextCursor"]},
+            id=2,
+        )
+        resp2 = server.handle_request(req2)
+        assert len(resp2.result["resourceTemplates"]) == 5
+        assert resp2.result.get("nextCursor") is None
+
+    def test_resource_templates_no_pagination_when_few(self):
+        """M7: No nextCursor when items fit in one page."""
+        server = _make_server_with_all()
+        req = JsonRpcRequest(method="resources/templates/list", id=1)
+        resp = server.handle_request(req)
+        assert len(resp.result["resourceTemplates"]) == 1
+        assert "nextCursor" not in resp.result
+
+
+# ===== 9. JSON-RPC Notification Handling =====
+
+
+class TestNotificationHandling:
+    """M9: Notifications (id=None) must not return a response."""
+
+    def test_notification_returns_none(self):
+        server = _make_server_with_all()
+        req = JsonRpcRequest(method="tools/list", id=None)
+        resp = server.handle_request(req)
+        assert resp is None
+
+    def test_notification_unknown_method_returns_none(self):
+        server = McpServer()
+        req = JsonRpcRequest(method="nonexistent/method", id=None)
+        resp = server.handle_request(req)
+        assert resp is None
+
+    def test_regular_request_still_returns_response(self):
+        server = _make_server_with_all()
+        req = JsonRpcRequest(method="tools/list", id=1)
+        resp = server.handle_request(req)
+        assert resp is not None
+        assert resp.id == 1
+
+
+# ===== 10. Error Handling =====
 
 
 class TestErrorHandling:

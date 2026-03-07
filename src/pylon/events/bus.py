@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import uuid
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -34,9 +35,9 @@ class EventBus:
     Designed for replacement with NATS or similar broker.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_dead_letters: int = 10000) -> None:
         self._subscriptions: dict[str, _Subscription] = {}
-        self._dead_letters: list[DeadLetterEntry] = []
+        self._dead_letters: deque[DeadLetterEntry] = deque(maxlen=max_dead_letters)
         self._lock = threading.Lock()
 
     def subscribe(

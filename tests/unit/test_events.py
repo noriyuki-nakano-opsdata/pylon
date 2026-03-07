@@ -185,6 +185,37 @@ class TestEventBus:
         bus.subscribe(AGENT_FAILED, lambda e: None)
         assert bus.subscription_count == 2
 
+    def test_dead_letter_queue_bounded(self) -> None:
+        """M5: dead letter queue must not grow beyond max_dead_letters."""
+        bus = EventBus(max_dead_letters=3)
+
+        def failing_handler(e: Event) -> None:
+            raise RuntimeError("boom")
+
+        bus.subscribe(AGENT_CREATED, failing_handler)
+
+        for _ in range(5):
+            bus.publish(Event(type=AGENT_CREATED))
+
+        assert len(bus.dead_letters) == 3
+
+    def test_dead_letter_queue_evicts_oldest(self) -> None:
+        """M5: oldest entries are evicted when max is exceeded."""
+        bus = EventBus(max_dead_letters=2)
+
+        def failing_handler(e: Event) -> None:
+            raise RuntimeError(e.data.get("i", ""))
+
+        bus.subscribe(AGENT_CREATED, failing_handler)
+
+        for i in range(4):
+            bus.publish(Event(type=AGENT_CREATED, data={"i": str(i)}))
+
+        dl = bus.dead_letters
+        assert len(dl) == 2
+        assert dl[0].error == "2"
+        assert dl[1].error == "3"
+
     def test_publish_async(self) -> None:
         bus = EventBus()
         received: list[Event] = []

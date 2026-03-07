@@ -1,14 +1,17 @@
-"""API middleware: authentication, tenant isolation, rate limiting."""
+"""API middleware: authentication, tenant isolation, rate limiting, security headers."""
 
 from __future__ import annotations
 
 import hashlib
+import re
 import secrets as _secrets
 import time
 from dataclasses import dataclass
 from typing import Any
 
 from pylon.api.server import HandlerFunc, Request, Response
+
+_TENANT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 class AuthMiddleware:
@@ -56,7 +59,14 @@ class TenantMiddleware:
         if not tenant_id and self._require:
             return Response(status_code=400, body={"error": "X-Tenant-ID header is required"})
 
-        request.context["tenant_id"] = tenant_id or "default"
+        effective_id = tenant_id or "default"
+        if not _TENANT_ID_RE.match(effective_id):
+            return Response(
+                status_code=400,
+                body={"error": "Invalid tenant ID format"},
+            )
+
+        request.context["tenant_id"] = effective_id
         return next_handler(request)
 
 
@@ -116,6 +126,24 @@ class RateLimitMiddleware:
             )
 
         return next_handler(request)
+
+
+_SECURITY_HEADERS = {
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+    "content-security-policy": "default-src 'none'",
+    "x-xss-protection": "0",
+}
+
+
+class SecurityHeadersMiddleware:
+    """Injects standard security response headers."""
+
+    def __call__(self, request: Request, next_handler: HandlerFunc) -> Response:
+        response = next_handler(request)
+        for name, value in _SECURITY_HEADERS.items():
+            response.headers.setdefault(name, value)
+        return response
 
 
 class MiddlewareChain:

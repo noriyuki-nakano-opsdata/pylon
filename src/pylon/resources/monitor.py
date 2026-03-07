@@ -72,7 +72,8 @@ class ResourceMonitor:
         now: float | None = None,
     ) -> None:
         """Record a metric value."""
-        now = now or time.monotonic()
+        if now is None:
+            now = time.monotonic()
         point = DataPoint(timestamp=now, value=value, labels=labels or {})
 
         if resource not in self._history:
@@ -95,7 +96,8 @@ class ResourceMonitor:
         """Get historical data points, optionally within a time window."""
         points = self._history.get(resource, [])
         if window_seconds is not None:
-            now = now or time.monotonic()
+            if now is None:
+                now = time.monotonic()
             cutoff = now - window_seconds
             points = [p for p in points if p.timestamp >= cutoff]
         return list(points)

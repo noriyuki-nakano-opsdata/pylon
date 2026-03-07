@@ -195,8 +195,8 @@ class TestSafeConditionEvaluator:
         assert g.get_next_nodes("a", {"status": "ready"}) == ["b"]
         assert g.get_next_nodes("a", {"status": "blocked"}) == []
 
-    def test_get_next_nodes_malicious_condition_returns_empty(self):
-        """Malicious conditions should be caught and the edge skipped."""
+    def test_get_next_nodes_malicious_condition_raises(self):
+        """Malicious conditions should fail deterministically."""
         g = WorkflowGraph(name="test")
         g.add_node("a", "agent", next_nodes=[
             ConditionalEdge(target="b", condition="__import__('os')"),
@@ -204,5 +204,17 @@ class TestSafeConditionEvaluator:
         g.add_node("b", "agent", next_nodes=[ConditionalEdge(target=END)])
         g.validate()
 
-        # Should not raise; malicious condition is caught and edge is skipped
-        assert g.get_next_nodes("a", {"x": 1}) == []
+        with pytest.raises(WorkflowError, match="Unsupported"):
+            g.get_next_nodes("a", {"x": 1})
+
+    def test_get_next_nodes_missing_state_field_raises(self):
+        """Missing state field should fail deterministically."""
+        g = WorkflowGraph(name="test")
+        g.add_node("a", "agent", next_nodes=[
+            ConditionalEdge(target="b", condition="state.missing > 0"),
+        ])
+        g.add_node("b", "agent", next_nodes=[ConditionalEdge(target=END)])
+        g.validate()
+
+        with pytest.raises(WorkflowError, match="missing"):
+            g.get_next_nodes("a", {"x": 1})

@@ -75,6 +75,27 @@ class TestCapabilityValidator:
         with pytest.raises(PolicyViolationError, match="cannot have can_access_secrets"):
             CapabilityValidator.validate_subgraph_inheritance(parent, child, child_name="child")
 
+    def test_a2a_delegation_rejects_transitive_forbidden_union(self):
+        sender = AgentCapability(can_read_untrusted=True)
+        receiver = AgentCapability(can_access_secrets=True)
+
+        with pytest.raises(PolicyViolationError, match="Forbidden pair"):
+            CapabilityValidator.validate_a2a_delegation(
+                sender,
+                receiver,
+                receiver_name="peer",
+            )
+
+    def test_a2a_delegation_allows_narrower_receiver(self):
+        sender = AgentCapability(can_write_external=True, can_access_secrets=True)
+        receiver = AgentCapability(can_write_external=True)
+
+        CapabilityValidator.validate_a2a_delegation(
+            sender,
+            receiver,
+            receiver_name="peer",
+        )
+
 
 class TestAutonomyEnforcer:
     def test_a2_no_approval(self):
