@@ -1,0 +1,30 @@
+## Small profile: dev/test environments
+api:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+worker:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+postgresql:
+  primary:
+    persistence:
+      size: 5Gi
+
+redis:
+  master:
+    persistence:
+      size: 512Mi

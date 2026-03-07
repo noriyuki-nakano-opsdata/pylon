@@ -1,0 +1,82 @@
+"""Multi-path Kill Switch (FR-10).
+
+| Path      | Mechanism        | Latency |
+|-----------|------------------|---------|
+| Primary   | NATS publish     | <1s     |
+| Fallback  | ConfigMap poll   | <5s     |
+| Emergency | namespace delete | <10s    |
+
+This module provides the in-memory implementation.
+NATS and K8s backends are injected in production.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+
+from pylon.types import KillSwitchEvent
+
+
+@dataclass
+class _ActiveSwitch:
+    """Internal record of an active kill switch."""
+
+    event: KillSwitchEvent
+    activated_at: float
+
+
+class KillSwitch:
+    """In-memory kill switch for agent/workflow/tenant/global scopes."""
+
+    def __init__(self) -> None:
+        self._active: dict[str, _ActiveSwitch] = {}
+
+    def activate(self, scope: str, reason: str, issued_by: str) -> KillSwitchEvent:
+        """Activate kill switch for a given scope.
+
+        Args:
+            scope: "global", "tenant:{id}", "workflow:{id}", "agent:{id}"
+            reason: Human-readable reason for activation
+            issued_by: Identity of the person/system activating
+        """
+        event = KillSwitchEvent(scope=scope, reason=reason, issued_by=issued_by)
+        self._active[scope] = _ActiveSwitch(event=event, activated_at=time.monotonic())
+        return event
+
+    def is_active(self, scope: str) -> bool:
+        """Check if kill switch is active for a scope.
+
+        Checks parent scopes hierarchically:
+        - global affects all scopes
+        - tenant:{id} affects workflow:{id}/* and agent:{id}/*
+        """
+        if scope in self._active:
+            return True
+        if "global" in self._active and scope != "global":
+            return True
+        # Check hierarchical parent: extract tenant from scope like "agent:acme/x"
+        if ":" in scope:
+            parts = scope.split(":", 1)
+            if "/" in parts[1]:
+                tenant_id = parts[1].split("/", 1)[0]
+                if f"tenant:{tenant_id}" in self._active:
+                    return True
+        return False
+
+    def deactivate(self, scope: str) -> KillSwitchEvent | None:
+        """Deactivate kill switch for a scope.
+
+        Returns the original event if it was active, None otherwise.
+        """
+        entry = self._active.pop(scope, None)
+        return entry.event if entry else None
+
+    def get_active_scopes(self) -> list[str]:
+        """Return all currently active scopes."""
+        return list(self._active.keys())
+
+    def get_event(self, scope: str) -> KillSwitchEvent | None:
+        """Get the event for an active scope."""
+        entry = self._active.get(scope)
+        return entry.event if entry else None

@@ -1,0 +1,113 @@
+"""EventBus - In-memory pub/sub event bus."""
+
+from __future__ import annotations
+
+import asyncio
+import uuid
+from dataclasses import dataclass, field
+from typing import Callable
+
+from pylon.events.types import Event, EventFilter
+
+
+@dataclass
+class _Subscription:
+    id: str
+    event_type: str  # "*" for wildcard
+    handler: Callable[[Event], None]
+    event_filter: EventFilter | None = None
+
+
+@dataclass
+class DeadLetterEntry:
+    """Record of a failed handler invocation."""
+
+    event: Event
+    subscription_id: str
+    error: str
+
+
+class EventBus:
+    """In-memory pub/sub event bus.
+
+    Designed for replacement with NATS or similar broker.
+    """
+
+    def __init__(self) -> None:
+        self._subscriptions: dict[str, _Subscription] = {}
+        self._dead_letters: list[DeadLetterEntry] = []
+
+    def subscribe(
+        self,
+        event_type: str,
+        handler: Callable[[Event], None],
+        event_filter: EventFilter | None = None,
+    ) -> str:
+        """Subscribe to an event type. Use '*' for all events."""
+        sub_id = str(uuid.uuid4())
+        self._subscriptions[sub_id] = _Subscription(
+            id=sub_id,
+            event_type=event_type,
+            handler=handler,
+            event_filter=event_filter,
+        )
+        return sub_id
+
+    def unsubscribe(self, subscription_id: str) -> bool:
+        """Remove a subscription. Returns True if it existed."""
+        return self._subscriptions.pop(subscription_id, None) is not None
+
+    def publish(self, event: Event) -> int:
+        """Publish an event synchronously. Returns count of notified handlers."""
+        count = 0
+        for sub in list(self._subscriptions.values()):
+            if not self._matches(sub, event):
+                continue
+            try:
+                sub.handler(event)
+                count += 1
+            except Exception as e:
+                self._dead_letters.append(
+                    DeadLetterEntry(
+                        event=event,
+                        subscription_id=sub.id,
+                        error=str(e),
+                    )
+                )
+        return count
+
+    async def publish_async(self, event: Event) -> int:
+        """Publish an event, running handlers in the event loop."""
+        count = 0
+        for sub in list(self._subscriptions.values()):
+            if not self._matches(sub, event):
+                continue
+            try:
+                result = sub.handler(event)
+                if asyncio.iscoroutine(result):
+                    await result
+                count += 1
+            except Exception as e:
+                self._dead_letters.append(
+                    DeadLetterEntry(
+                        event=event,
+                        subscription_id=sub.id,
+                        error=str(e),
+                    )
+                )
+        return count
+
+    @property
+    def dead_letters(self) -> list[DeadLetterEntry]:
+        return list(self._dead_letters)
+
+    @property
+    def subscription_count(self) -> int:
+        return len(self._subscriptions)
+
+    def _matches(self, sub: _Subscription, event: Event) -> bool:
+        if sub.event_type != "*" and sub.event_type != event.type:
+            return False
+        if sub.event_filter and not sub.event_filter.matches(event):
+            return False
+        return True

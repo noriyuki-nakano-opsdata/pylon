@@ -1,0 +1,20 @@
+name: VEX Generation
+on:
+  schedule:
+    - cron: "0 6 * * 1"  # Weekly Monday
+  workflow_dispatch:
+
+jobs:
+  vex:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate VEX document
+        run: |
+          pip install pip-audit
+          pip-audit --format=json --output=audit.json || true
+          python scripts/generate_vex.py audit.json > vex.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vex
+          path: vex.json
