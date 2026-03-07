@@ -25,6 +25,28 @@ Pylon is a Python package with these major areas:
 
 Many subsystems are intentionally shipped as in-memory or local-first reference implementations.
 
+### 1.1 Responsibility Matrix
+
+| Package | Primary responsibility | Current implementation style |
+|---------|------------------------|------------------------------|
+| `pylon.workflow` | compiled DAG runtime, commit, replay | relatively rich, deterministic runtime |
+| `pylon.safety` | capability rules, runtime safety evaluation, guardrails | relatively rich, wired into protocol boundaries |
+| `pylon.agents` | lifecycle, registry, pool, supervisor | in-memory manager layer |
+| `pylon.protocols.mcp` | MCP JSON-RPC server/client/auth/types | functional reference implementation |
+| `pylon.protocols.a2a` | peer tasks, agent cards, delegation checks | functional reference implementation |
+| `pylon.api` | lightweight API server and routes | in-memory route store |
+| `pylon.cli` | local project commands and persisted run state | local filesystem implementation |
+| `pylon.sdk` | decorators, builder, in-memory client | local/in-memory convenience layer |
+| `pylon.repository` | workflow/checkpoint/audit/memory repositories | in-memory implementations |
+| `pylon.sandbox` | sandbox policy, lifecycle, execution helpers | policy-rich reference layer |
+| `pylon.secrets` | versioned secret storage, vault abstraction | in-memory implementations |
+| `pylon.tenancy` | tenant context, isolation, quota, lifecycle | in-memory/contextvar implementations |
+| `pylon.plugins` | plugin discovery, manifests, lifecycle, hooks | local plugin infrastructure |
+| `pylon.taskqueue` | queue, workers, retry, scheduler | in-memory queueing |
+| `pylon.resources` | pools, quotas, monitors, limiters | utility layer |
+| `pylon.resilience` | retry, fallback, circuit breaker, bulkhead | utility layer |
+| `pylon.observability` | metrics, tracing, logging, exporters | in-memory/reference instrumentation |
+
 ## 2. Core Types
 
 ### 2.1 Agent Model
@@ -297,6 +319,30 @@ If execution raises:
 - the run is marked `FAILED`
 - `state["error"]` is populated
 
+### 4.8 Event Log Record Shape
+
+Workflow run event records appended by `GraphExecutor` contain:
+
+- `seq`
+- `step`
+- `attempt_id`
+- `node_id`
+- `agent`
+- `input_state_version`
+- `input_state_hash`
+- `state_patch`
+- `output`
+- `artifacts`
+- `edge_decisions`
+- `llm_events`
+- `tool_events`
+- `metrics`
+- `state_version`
+- `state_hash`
+- `timestamp`
+
+This run-level event log is separate from, but closely aligned with, checkpoint event records.
+
 ## 5. Checkpoints and Replay
 
 Checkpoints are event logs, not snapshots.
@@ -452,6 +498,22 @@ Supported MCP protocol versions in the server:
 
 Incoming task metadata may contribute safety hints, but local receiver policy remains authoritative.
 
+### 8.3 Provider Interface
+
+`pylon.providers.base` defines:
+
+- `Message`
+- `Response`
+- `Chunk`
+- `TokenUsage`
+- `LLMProvider` protocol
+
+Built-in concrete provider in the repository:
+
+- `AnthropicProvider`
+
+The provider layer is intentionally small and does not depend on a larger agent framework abstraction.
+
 ## 9. API, CLI, and SDK
 
 ### 9.1 API
@@ -496,6 +558,26 @@ Current workflow-related CLI commands:
 - `pylon logs`
 - `pylon replay`
 - `pylon approve`
+- `pylon sandbox list`
+- `pylon sandbox clean`
+- `pylon agent list`
+- `pylon agent status`
+- `pylon agent kill`
+- `pylon config get`
+- `pylon config set`
+- `pylon config list`
+- `pylon login`
+- `pylon doctor`
+- `pylon dev`
+
+CLI run state currently stores:
+
+- `runs`
+- `checkpoints`
+- `approvals`
+- `sandboxes`
+
+in a single JSON document under `$PYLON_HOME/state.json`.
 
 ### 9.3 SDK
 
@@ -506,6 +588,18 @@ Current workflow-related CLI commands:
 - there is no HTTP transport yet
 
 `pylon.sdk.WorkflowBuilder` is a separate immutable builder abstraction and is not the same type as `pylon.workflow.WorkflowGraph`.
+
+### 9.4 API Middleware Contract
+
+`pylon.api.middleware` currently provides:
+
+- `AuthMiddleware`
+- `TenantMiddleware`
+- `RateLimitMiddleware`
+- `SecurityHeadersMiddleware`
+- `MiddlewareChain`
+
+The route layer assumes `tenant_id` has already been injected into request context.
 
 ## 10. Infrastructure and Supporting Modules
 
@@ -569,7 +663,67 @@ Plugin features:
 - hook system
 - extension protocols by plugin type
 
-## 11. Current Maturity and Known Gaps
+### 10.6 Config, Events, and Control Plane Helpers
+
+Additional implemented support modules:
+
+- `pylon.config.loader`: YAML/JSON/env merge helpers
+- `pylon.config.resolver`: `${ENV_VAR}` and `${secret:key}` resolution
+- `pylon.config.validator`: schema-style config validation
+- `pylon.events`: in-memory bus, handlers, event filters, dead-letter tracking
+- `pylon.control_plane.registry.tools`: async tool registry with trust levels
+- `pylon.control_plane.registry.skills`: skill-to-tool dependency resolution
+- `pylon.control_plane.scheduler`: priority scheduler for workflow tasks
+- `pylon.control_plane.tenant`: simpler tenant/quota helper layer separate from `pylon.tenancy`
+
+## 11. Runtime Flow Contracts
+
+### 11.1 Programmatic workflow path
+
+The canonical runtime path in the repository is:
+
+1. construct `WorkflowGraph`
+2. compile to `CompiledWorkflow`
+3. execute with `GraphExecutor`
+4. commit patches
+5. persist checkpoints
+6. replay from event log if needed
+
+### 11.2 MCP path
+
+The canonical MCP request path is:
+
+1. `JsonRpcRequest`
+2. OAuth scope check if configured
+3. DTO validation
+4. router request validation
+5. output validation for tools
+6. runtime safety evaluation
+7. tool/resource/prompt/sampling handler
+
+### 11.3 A2A path
+
+The canonical A2A task path is:
+
+1. peer identity / allowlist checks
+2. task DTO conversion
+3. sender context derivation
+4. delegation safety evaluation
+5. task lifecycle transition
+6. handler invocation or streaming events
+
+### 11.4 CLI path
+
+The canonical CLI run path is:
+
+1. load `pylon.yaml`
+2. derive local run metadata
+3. write local run/checkpoint/approval/sandbox records
+4. render output
+
+This is separate from the programmatic workflow engine path.
+
+## 12. Current Maturity and Known Gaps
 
 Strongest areas today:
 
@@ -585,7 +739,18 @@ Main gaps today:
 - sandbox runtime integrations are not yet wired to real gVisor/Firecracker backends
 - workflow approval wait states are not yet fully integrated with the programmatic executor
 
-## 12. Source of Truth
+## 13. Documentation Map
+
+Related docs:
+
+- `docs/architecture.md`
+- `docs/architecture/runtime-flows.md`
+- `docs/architecture/module-map.md`
+- `docs/api-reference.md`
+- `docs/getting-started.md`
+- ADR-001 through ADR-008
+
+## 14. Source of Truth
 
 For implementation details, the source of truth is the code under:
 

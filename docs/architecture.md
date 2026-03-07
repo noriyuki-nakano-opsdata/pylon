@@ -38,6 +38,21 @@ The important architectural split is:
 +------------------------------------------------------------------+
 ```
 
+## Package Map
+
+At a coarse level, the packages line up like this:
+
+| Concern | Primary Packages | Notes |
+|---------|------------------|-------|
+| Config and bootstrapping | `pylon.dsl`, `pylon.config`, `pylon.cli` | DSL parsing, local config/state, project bootstrap |
+| Execution runtime | `pylon.workflow`, `pylon.agents` | The most mature runtime path in the repository |
+| Safety | `pylon.safety`, `pylon.approval` | Static capability rules plus runtime boundary enforcement |
+| External protocol boundaries | `pylon.protocols.mcp`, `pylon.protocols.a2a`, `pylon.providers` | JSON-RPC surfaces, OAuth, peer/task routing, LLM abstraction |
+| Persistence and replay | `pylon.repository`, `pylon.state`, `pylon.events` | Workflow runs, checkpoints, memory repository, state machine/snapshots, event bus |
+| Operational infrastructure | `pylon.sandbox`, `pylon.secrets`, `pylon.tenancy` | Mostly reference implementations with real policy models |
+| Cross-cutting utilities | `pylon.resources`, `pylon.resilience`, `pylon.observability` | Limits, retries, metrics, tracing, exporters |
+| Extension and scheduling | `pylon.plugins`, `pylon.taskqueue`, `pylon.control_plane`, `pylon.coding` | Plugin system, queues, registry/scheduler helpers, coding loop |
+
 ## Current Execution Model
 
 ### Programmatic Workflow Runtime
@@ -68,6 +83,65 @@ These surfaces are intentionally lighter than the workflow core:
 - `pylon.sdk.PylonClient` is an in-memory client, not an HTTP transport
 
 That means the public surfaces do not yet expose every runtime nuance of `pylon.workflow`.
+
+## Runtime Flow Summary
+
+There are four important execution paths in the current codebase.
+
+### 1. Programmatic workflow execution
+
+```text
+WorkflowGraph
+  -> validate()
+  -> compile()
+  -> GraphExecutor.execute(...)
+  -> node handler returns dict | NodeResult
+  -> CommitEngine.apply_patches(...)
+  -> WorkflowRun.event_log append
+  -> CheckpointRepository.create(...)
+  -> ReplayEngine.replay_event_log(...)
+```
+
+This is the path where deterministic execution semantics are strongest.
+
+### 2. MCP tool invocation
+
+```text
+JsonRpcRequest
+  -> MethodRouter request validator
+  -> DTO validation
+  -> OutputValidator.validate_tool_call_detailed(...)
+  -> resolve ToolDescriptor
+  -> SafetyEngine.evaluate_tool_use(...)
+  -> tool handler invocation
+```
+
+The safety decision happens before the handler is called.
+
+### 3. A2A delegation
+
+```text
+incoming task/send or sendSubscribe
+  -> peer allowlist / authenticated sender checks
+  -> rate-limit check
+  -> build or load sender SafetyContext
+  -> SafetyEngine.evaluate_delegation(...)
+  -> accept task and transition lifecycle
+```
+
+Remote metadata can contribute hints, but local policy stays authoritative.
+
+### 4. CLI local run flow
+
+```text
+pylon run
+  -> load_project(".")
+  -> inspect workflow/agent definitions
+  -> write local run/checkpoint/sandbox/approval records
+  -> render CLI output
+```
+
+This is not the same execution path as `pylon.workflow.GraphExecutor`.
 
 ## Safety Architecture
 
@@ -182,6 +256,18 @@ Checkpoint event records currently include:
 
 Persisted metadata is secret-scrubbed before storage. Replay recomputes state hashes and raises on mismatch.
 
+## Public Surface Boundaries
+
+The repository currently exposes three user-facing surfaces with different maturity levels:
+
+| Surface | Backing implementation | Current character |
+|---------|------------------------|-------------------|
+| CLI | `pylon.cli` + local JSON/YAML state | local developer workflow and demos |
+| API | `pylon.api` + in-memory `RouteStore` | lightweight embedded HTTP-style contract |
+| SDK | `pylon.sdk` | in-memory client/builder/decorator convenience layer |
+
+The workflow core lives behind those surfaces rather than being uniformly wired through them.
+
 ## Sandbox, Secrets, and Tenancy
 
 These subsystems are present as reference implementations:
@@ -194,6 +280,35 @@ Important current constraint:
 
 - concrete gVisor / Firecracker runtime integrations are not implemented yet
 - current sandbox lifecycle is an in-memory manager plus policy model
+
+## Maturity Boundaries
+
+The cleanest way to reason about the system today is to split it into three maturity bands.
+
+### Mature and internally coherent
+
+- compiled workflow execution
+- join semantics
+- checkpoint and replay model
+- runtime safety evaluation at MCP/A2A boundaries
+- approval binding and drift detection
+
+### Useful reference implementations
+
+- sandbox lifecycle and policy
+- secret management
+- event bus
+- API route store
+- SDK client
+- CLI persisted state model
+- tenancy, plugins, taskqueue, coding loop
+
+### Designed but not fully wired end-to-end
+
+- public API/CLI/SDK exposure of workflow runtime richness
+- workflow approval wait-state integration in the executor
+- non-memory infrastructure backends
+- concrete high-isolation sandbox backends
 
 ## Observability and Supporting Systems
 
@@ -219,3 +334,9 @@ The main gap is not absence of modules, but uneven maturity between:
 
 - the rich programmatic workflow engine
 - the simpler public API / CLI / SDK surfaces
+
+## Further Reading
+
+- [Runtime Flows](architecture/runtime-flows.md)
+- [Module Map](architecture/module-map.md)
+- [Workflow/Safety Implementation Plan](architecture/workflow-safety-implementation-plan.md)

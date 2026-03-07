@@ -2,37 +2,90 @@
 
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
-![Tests](https://img.shields.io/badge/tests-passing-brightgreen)
+![Tests: 1275 passing](https://img.shields.io/badge/tests-1275%20passing-brightgreen)
 
-**Pylon** is a Python-first autonomous agent orchestration platform with deterministic workflow execution, runtime safety enforcement, local/in-memory reference surfaces, and protocol integrations for MCP and A2A.
+**Pylon** is a Python-first autonomous agent orchestration platform with deterministic workflow execution, runtime safety enforcement, and protocol integrations for MCP and A2A.
 
 ## Key Features
 
-- **Deterministic DAG Workflow Engine** -- graph compilation, join policies, patch-based commits, checkpoints, and replay
-- **Rule-of-Two+ Enforcement** -- no single execution frame may combine untrusted input, secret access, and external writes
-- **Runtime Safety Context** -- `SafetyContext` and `ToolDescriptor` enforce dynamic checks for MCP and A2A calls
-- **Approval Binding** -- plan/effect approvals are invalidated on drift
-- **Prompt Guard Pipeline** -- pattern matching, classifier-style heuristics, input sanitization, and tool-call output validation
-- **Protocol Support** -- MCP server/client with OAuth scopes and A2A task routing with peer checks
-- **Reference Infrastructure Modules** -- sandbox policy/manager, secrets, repository, tenancy, plugins, task queues, observability, resilience
+| Category | Highlights |
+|----------|------------|
+| **Workflow Engine** | Compiled DAG execution, `ALL_RESOLVED` / `ANY` / `FIRST` join policies, patch-based commits, node-scoped checkpoints, and deterministic replay with state hash verification |
+| **Safety** | Rule-of-Two+ enforcement (no frame may combine untrusted input + secret access + external writes), `SafetyContext` / `ToolDescriptor` dynamic checks, prompt guard pipeline |
+| **Approval** | Plan/effect binding with drift detection — approvals are invalidated if the action scope changes after sign-off |
+| **Protocols** | MCP JSON-RPC server with OAuth 2.1 + PKCE scopes; A2A task routing with peer delegation checks |
+| **Infrastructure** | Sandbox policy, versioned secrets, multi-tenant isolation, rate limiting, circuit breaker, plugin system — all shipped as local-first reference implementations |
 
 ## Quick Start
 
 ```bash
-# Install
 pip install pylon-ai
 
-# Create a project directory and initialize pylon.yaml in it
-mkdir my-project
-cd my-project
+mkdir my-project && cd my-project
 pylon init --name my-project
-
-# Run the local CLI workflow flow
 pylon run
 ```
 
-`pylon init` writes `pylon.yaml` into the current directory.
-`pylon run` currently uses the CLI's local persisted state in `$PYLON_HOME` / `~/.pylon`; it does not yet invoke the full programmatic workflow engine directly.
+## Programmatic API
+
+```python
+import asyncio
+from pylon.workflow import WorkflowGraph, GraphExecutor, END, NodeResult
+from pylon.types import ConditionalEdge
+from pylon.repository.workflow import WorkflowRun
+
+async def main():
+    # 1. Build graph
+    graph = WorkflowGraph(name="example")
+    graph.add_node("plan", "planner", next_nodes=[
+        ConditionalEdge(target="review"),
+    ])
+    graph.add_node("review", "reviewer", next_nodes=[
+        ConditionalEdge(target="apply", condition="state.approved == True"),
+        ConditionalEdge(target=END, condition="state.approved == False"),
+    ])
+    graph.add_node("apply", "applier", next_nodes=[
+        ConditionalEdge(target=END),
+    ])
+
+    # 2. Define handlers
+    async def handler(node_id: str, state: dict) -> dict:
+        if node_id == "plan":
+            return {"plan": "refactor auth module"}
+        elif node_id == "review":
+            return {"approved": True}
+        return {"applied": True}
+
+    # 3. Execute
+    run = WorkflowRun(workflow_id="example")
+    executor = GraphExecutor()
+    result = await executor.execute(
+        graph, run, node_handler=handler,
+        initial_state={"task": "refactor"},
+    )
+    print(f"Status: {result.status.value}")
+    print(f"Final state: {result.state}")
+
+asyncio.run(main())
+```
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Developer Surfaces: cli / api / sdk / dsl              │
+├─────────────────────────────────────────────────────────┤
+│  Execution Core: workflow / agents / safety / approval  │
+├─────────────────────────────────────────────────────────┤
+│  Protocol Boundaries: mcp / a2a / providers             │
+├─────────────────────────────────────────────────────────┤
+│  State & Infra: repository / state / events / sandbox   │
+│                 secrets / tenancy / resources            │
+├─────────────────────────────────────────────────────────┤
+│  Support: taskqueue / plugins / resilience / config     │
+│           observability / coding / control_plane        │
+└─────────────────────────────────────────────────────────┘
+```
 
 ## Module Structure
 
@@ -40,42 +93,18 @@ pylon run
 |------|---------|-------------|
 | Core | `pylon.types`, `pylon.errors` | Shared enums, dataclasses, and error hierarchy |
 | Workflow | `pylon.workflow` | Compiled DAG execution, conditions, patch commits, replay, structured node results |
-| Safety | `pylon.safety` | Capability validation, autonomy gates, prompt guard, input/output validation, runtime safety context |
+| Safety | `pylon.safety` | Capability validation, autonomy gates, prompt guard, input/output validation, secret scrubbing |
 | Agents | `pylon.agents` | Agent lifecycle, registry, pool, supervisor |
-| Protocols | `pylon.protocols.mcp`, `pylon.protocols.a2a` | MCP JSON-RPC surfaces, OAuth, A2A tasks, agent cards |
-| API / CLI / SDK | `pylon.api`, `pylon.cli`, `pylon.sdk` | Lightweight API server, local CLI flows, in-memory SDK client/builder/decorators |
-| Persistence | `pylon.repository`, `pylon.state`, `pylon.events` | Workflow runs, checkpoints, memory repository, state store, snapshots, event bus |
-| Infra | `pylon.sandbox`, `pylon.secrets`, `pylon.tenancy`, `pylon.resources`, `pylon.resilience` | Sandbox policy, secret storage, tenant context/isolation, limits, retry/circuit breaker |
-| Extensibility | `pylon.plugins`, `pylon.control_plane`, `pylon.taskqueue`, `pylon.observability`, `pylon.config`, `pylon.coding` | Plugins, registries, schedulers, metrics, config, coding loop |
-| DSL / Providers | `pylon.dsl`, `pylon.providers` | YAML/JSON workflow parser, LLM provider abstraction |
 | Approval | `pylon.approval` | Approval manager with plan/effect binding verification |
+| Protocols | `pylon.protocols.mcp`, `pylon.protocols.a2a` | MCP JSON-RPC server with OAuth, A2A tasks with peer delegation |
+| API / CLI / SDK | `pylon.api`, `pylon.cli`, `pylon.sdk` | Lightweight API server, local CLI, in-memory SDK client |
+| DSL / Providers | `pylon.dsl`, `pylon.providers` | YAML/JSON workflow parser, LLM provider abstraction |
+| Persistence | `pylon.repository`, `pylon.state`, `pylon.events` | Workflow runs, checkpoints, audit log, state store, event bus |
+| Infra | `pylon.sandbox`, `pylon.secrets`, `pylon.tenancy` | Sandbox policy, secret storage, tenant context/isolation |
+| Resources | `pylon.resources`, `pylon.resilience` | Rate limiting, pooling, retry, circuit breaker, bulkhead |
+| Extensibility | `pylon.plugins`, `pylon.control_plane`, `pylon.taskqueue`, `pylon.observability`, `pylon.config`, `pylon.coding` | Plugins, registries, schedulers, metrics, config, coding loop |
 
-Current source layout: 31 Python packages, 160 Python modules, 40 test files.
-
-## Running Tests
-
-```bash
-PYTHONPATH=src python -m pytest -q
-python -m ruff check src tests
-```
-
-## Documentation
-
-- [Architecture Overview](docs/architecture.md)
-- [Getting Started Guide](docs/getting-started.md)
-- [API Reference](docs/api-reference.md)
-- [Implemented Specification](docs/SPECIFICATION.md)
-- [ADR-007: Deterministic DAG Execution Semantics](docs/adr/007-deterministic-dag-execution-semantics.md)
-- [ADR-008: Safety Context and Delegation Boundaries](docs/adr/008-safety-context-and-delegation-boundaries.md)
-- [Workflow/Safety Implementation Plan](docs/architecture/workflow-safety-implementation-plan.md)
-
-## Current Implementation Status
-
-- The programmatic workflow engine implements compiled graphs, restricted condition compilation, `ALL_RESOLVED` / `ANY` / `FIRST` join policies, patch commits, node-scoped checkpoints, and replay with state hash verification.
-- Runtime safety is enforced at MCP `tools/call`, A2A `tasks/send`, A2A `tasks/sendSubscribe`, and router pre-dispatch validation boundaries.
-- Approval binding is implemented in both `pylon.approval` and `pylon.safety.autonomy`.
-- Many subsystems intentionally ship as in-memory or local-first reference implementations today: repository backends, API route store, SDK client, CLI run state, sandbox manager, secret manager, and plugin loading surfaces.
-- Public API/CLI/SDK terminology is not yet fully aligned with the richer runtime states of the workflow engine.
+Current source: 129 modules across 31 packages, 37 test files (1,275 test cases).
 
 ## Project Configuration
 
@@ -124,6 +153,50 @@ policy:
   compliance:
     audit_log: required
 ```
+
+## CLI Commands
+
+```bash
+pylon init --name <name>       # Initialize project with pylon.yaml
+pylon run [--input <json>]     # Execute workflow
+pylon inspect <run-id>         # Show run details
+pylon logs <run-id> [--follow] # Stream run logs
+pylon replay <checkpoint-id>   # Replay from checkpoint
+pylon approve <id> [--deny]    # Approve or deny an action
+pylon doctor                   # Check project health
+pylon dev                      # Start development mode
+pylon config get|set|list      # Manage configuration
+pylon sandbox list|clean       # Manage sandboxes
+pylon login                    # Authenticate
+```
+
+## Running Tests
+
+```bash
+make install     # pip install -e ".[dev]"
+make test        # pytest tests/unit/ -v
+make test-all    # pytest tests/ -v
+make lint        # ruff check src tests
+make typecheck   # mypy src/pylon/
+make format      # ruff format src tests
+```
+
+## Documentation
+
+- [Architecture Overview](docs/architecture.md) — layered module structure
+- [Runtime Flows](docs/architecture/runtime-flows.md) — execution paths for workflow, MCP, A2A, CLI, and approval
+- [Module Map](docs/architecture/module-map.md) — package-by-package reference with maturity guide
+- [Getting Started Guide](docs/getting-started.md) — installation, first project, programmatic API
+- [API Reference](docs/api-reference.md) — REST routes and middleware
+- [Implemented Specification](docs/SPECIFICATION.md) — full technical specification
+- [ADR Index](docs/adr/) — architecture decision records (001–008)
+- [Workflow/Safety Implementation Plan](docs/architecture/workflow-safety-implementation-plan.md)
+
+## Current Status
+
+The workflow engine and safety system are the most mature components — they provide compiled deterministic execution, runtime boundary enforcement at MCP/A2A protocol edges, and approval binding with drift detection.
+
+Many infrastructure subsystems (repository, sandbox, secrets, tenancy, plugins) are intentionally shipped as in-memory reference implementations suitable for local development and testing. Production deployments would swap these for persistent backends.
 
 ## License
 
