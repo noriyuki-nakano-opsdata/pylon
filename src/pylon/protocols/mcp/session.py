@@ -15,14 +15,15 @@ class McpSession:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     server_capabilities: ServerCapabilities = field(default_factory=ServerCapabilities)
     client_capabilities: ClientCapabilities = field(default_factory=ClientCapabilities)
+    access_token: str | None = None
 
 
 class SessionManager:
     def __init__(self) -> None:
         self._sessions: dict[str, McpSession] = {}
 
-    def create_session(self) -> McpSession:
-        session = McpSession()
+    def create_session(self, access_token: str | None = None) -> McpSession:
+        session = McpSession(access_token=access_token)
         self._sessions[session.session_id] = session
         return session
 

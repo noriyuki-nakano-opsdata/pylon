@@ -90,6 +90,22 @@ class ResourceDefinition:
 
 
 @dataclass
+class ResourceTemplate:
+    uriTemplate: str = ""
+    name: str = ""
+    description: str = ""
+    mimeType: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "uriTemplate": self.uriTemplate,
+            "name": self.name,
+            "description": self.description,
+            "mimeType": self.mimeType,
+        }
+
+
+@dataclass
 class PromptArgument:
     name: str = ""
     description: str = ""
@@ -115,6 +131,67 @@ class PromptDefinition:
             "description": self.description,
             "arguments": [a.to_dict() for a in self.arguments],
         }
+
+
+@dataclass
+class SamplingMessage:
+    role: str = ""
+    content: str = ""
+
+    def to_dict(self) -> dict:
+        return {"role": self.role, "content": self.content}
+
+
+@dataclass
+class SamplingRequest:
+    messages: list[SamplingMessage] = field(default_factory=list)
+    modelPreferences: dict = field(default_factory=dict)
+    systemPrompt: str = ""
+    maxTokens: int = 1024
+
+    def to_dict(self) -> dict:
+        return {
+            "messages": [m.to_dict() for m in self.messages],
+            "modelPreferences": self.modelPreferences,
+            "systemPrompt": self.systemPrompt,
+            "maxTokens": self.maxTokens,
+        }
+
+
+@dataclass
+class SamplingResponse:
+    role: str = "assistant"
+    content: str = ""
+    model: str = ""
+    stopReason: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "role": self.role,
+            "content": self.content,
+            "model": self.model,
+            "stopReason": self.stopReason,
+        }
+
+
+@dataclass
+class PaginationCursor:
+    cursor: str = ""
+
+    def to_dict(self) -> dict:
+        return {"cursor": self.cursor}
+
+
+@dataclass
+class PaginatedResult:
+    items: list[Any] = field(default_factory=list)
+    nextCursor: str | None = None
+
+    def to_dict(self) -> dict:
+        d: dict[str, Any] = {}
+        if self.nextCursor is not None:
+            d["nextCursor"] = self.nextCursor
+        return d
 
 
 @dataclass

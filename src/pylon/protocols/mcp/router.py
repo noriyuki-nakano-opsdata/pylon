@@ -10,6 +10,7 @@ from pylon.protocols.mcp.types import (
     JsonRpcRequest,
     JsonRpcResponse,
     METHOD_NOT_FOUND,
+    INTERNAL_ERROR,
 )
 
 
@@ -34,7 +35,6 @@ class MethodRouter:
             result = handler(request)
             return JsonRpcResponse(result=result, id=request.id)
         except Exception as exc:
-            from pylon.protocols.mcp.types import INTERNAL_ERROR
             return JsonRpcResponse(
                 error=JsonRpcError(code=INTERNAL_ERROR, message=str(exc)),
                 id=request.id,

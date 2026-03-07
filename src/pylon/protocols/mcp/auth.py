@@ -1,4 +1,4 @@
-"""OAuth 2.1 + PKCE authentication for MCP (DCR disabled by default)."""
+"""OAuth 2.1 + PKCE authentication for MCP with scoped access control."""
 
 from __future__ import annotations
 
@@ -8,6 +8,65 @@ import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Any
+
+
+# Scope hierarchy: admin > write > read
+SCOPE_HIERARCHY: dict[str, list[str]] = {
+    "admin": [
+        "tools:read", "tools:call",
+        "resources:read", "resources:write", "resources:subscribe",
+        "prompts:read", "prompts:execute",
+        "sampling:create",
+    ],
+    "write": [
+        "tools:read", "tools:call",
+        "resources:read", "resources:write",
+        "prompts:read", "prompts:execute",
+        "sampling:create",
+    ],
+    "read": [
+        "tools:read",
+        "resources:read",
+        "prompts:read",
+    ],
+}
+
+ALL_SCOPES = [
+    "tools:read", "tools:call",
+    "resources:read", "resources:write", "resources:subscribe",
+    "prompts:read", "prompts:execute",
+    "sampling:create",
+]
+
+# Map MCP methods to required scopes
+METHOD_SCOPES: dict[str, str] = {
+    "tools/list": "tools:read",
+    "tools/call": "tools:call",
+    "resources/list": "resources:read",
+    "resources/read": "resources:read",
+    "resources/subscribe": "resources:subscribe",
+    "resources/templates/list": "resources:read",
+    "prompts/list": "prompts:read",
+    "prompts/get": "prompts:execute",
+    "sampling/createMessage": "sampling:create",
+}
+
+
+def expand_scopes(scopes: list[str]) -> set[str]:
+    """Expand hierarchical scopes into their constituent permissions."""
+    result: set[str] = set()
+    for scope in scopes:
+        if scope in SCOPE_HIERARCHY:
+            result.update(SCOPE_HIERARCHY[scope])
+        else:
+            result.add(scope)
+    return result
+
+
+def check_scope(required: str, granted: list[str]) -> bool:
+    """Check if the required scope is covered by the granted scopes."""
+    expanded = expand_scopes(granted)
+    return required in expanded
 
 
 @dataclass
@@ -50,7 +109,7 @@ class AuthorizationCode:
     code_challenge: str = ""
     code_challenge_method: str = "S256"
     created_at: float = field(default_factory=time.time)
-    expires_in: int = 300  # 5 minutes
+    expires_in: int = 300
 
 
 @dataclass
@@ -67,27 +126,27 @@ class OAuthServerConfig:
     issuer: str = ""
     authorization_endpoint: str = "/oauth/authorize"
     token_endpoint: str = "/oauth/token"
-    registration_endpoint: str | None = None  # DCR disabled by default
-    scopes_supported: list[str] = field(default_factory=lambda: ["mcp:read", "mcp:write"])
+    registration_endpoint: str | None = None
+    scopes_supported: list[str] = field(default_factory=lambda: list(ALL_SCOPES))
     response_types_supported: list[str] = field(default_factory=lambda: ["code"])
-    grant_types_supported: list[str] = field(default_factory=lambda: ["authorization_code", "refresh_token"])
+    grant_types_supported: list[str] = field(
+        default_factory=lambda: ["authorization_code", "refresh_token"]
+    )
     code_challenge_methods_supported: list[str] = field(default_factory=lambda: ["S256"])
     dcr_enabled: bool = False
 
 
 class OAuthProvider:
-    """OAuth 2.1 + PKCE provider for MCP server authentication."""
+    """OAuth 2.1 + PKCE provider with scope-based access control."""
 
     def __init__(self, config: OAuthServerConfig | None = None) -> None:
         self.config = config or OAuthServerConfig()
         self._clients: dict[str, OAuthClientConfig] = {}
         self._auth_codes: dict[str, AuthorizationCode] = {}
         self._tokens: dict[str, dict[str, Any]] = {}
-        self._refresh_tokens: dict[str, str] = {}  # refresh_token -> access_token
+        self._refresh_tokens: dict[str, str] = {}
 
     def register_client(self, client: OAuthClientConfig) -> None:
-        if not self.config.dcr_enabled and self._clients:
-            pass  # allow pre-registration regardless of DCR setting
         self._clients[client.client_id] = client
 
     def get_client(self, client_id: str) -> OAuthClientConfig | None:
@@ -105,7 +164,7 @@ class OAuthProvider:
         if client is None:
             return None
         if code_challenge_method != "S256":
-            return None  # only S256 supported per OAuth 2.1
+            return None
 
         code = secrets.token_urlsafe(32)
         self._auth_codes[code] = AuthorizationCode(
@@ -135,7 +194,6 @@ class OAuthProvider:
         if time.time() - auth_code.created_at > auth_code.expires_in:
             return None
 
-        # Verify PKCE
         digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
         expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
         if not secrets.compare_digest(expected, auth_code.code_challenge):
@@ -198,10 +256,20 @@ class OAuthProvider:
             return None
         return meta
 
+    def validate_token_scope(
+        self, access_token: str, required_scope: str
+    ) -> dict[str, Any] | None:
+        """Validate token and check that it has the required scope."""
+        meta = self.validate_token(access_token)
+        if meta is None:
+            return None
+        if not check_scope(required_scope, meta["scopes"]):
+            return None
+        return meta
+
     def revoke_token(self, access_token: str) -> bool:
         if access_token in self._tokens:
             del self._tokens[access_token]
-            # Also remove associated refresh tokens
             to_remove = [k for k, v in self._refresh_tokens.items() if v == access_token]
             for k in to_remove:
                 del self._refresh_tokens[k]

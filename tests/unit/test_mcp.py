@@ -290,30 +290,33 @@ class TestMcpClientServerIntegration(unittest.TestCase):
 
     def test_list_and_call_tool(self):
         self.client.initialize()
-        tools = self.client.list_tools()
+        result = self.client.list_tools()
+        tools = result["tools"]
         self.assertEqual(len(tools), 1)
-        self.assertEqual(tools[0].name, "multiply")
+        self.assertEqual(tools[0]["name"], "multiply")
 
-        result = self.client.call_tool("multiply", {"x": 6, "y": 7})
-        self.assertEqual(result, 42)
+        call_result = self.client.call_tool("multiply", {"x": 6, "y": 7})
+        self.assertEqual(call_result, 42)
 
     def test_list_and_read_resource(self):
         self.client.initialize()
-        resources = self.client.list_resources()
+        result = self.client.list_resources()
+        resources = result["resources"]
         self.assertEqual(len(resources), 1)
-        self.assertEqual(resources[0].uri, "config://app")
+        self.assertEqual(resources[0]["uri"], "config://app")
 
-        result = self.client.read_resource("config://app")
-        self.assertEqual(result["debug"], True)
+        read_result = self.client.read_resource("config://app")
+        self.assertEqual(read_result["debug"], True)
 
     def test_list_and_get_prompt(self):
         self.client.initialize()
-        prompts = self.client.list_prompts()
+        result = self.client.list_prompts()
+        prompts = result["prompts"]
         self.assertEqual(len(prompts), 1)
         self.assertEqual(prompts[0]["name"], "summarize")
 
-        result = self.client.get_prompt("summarize", {"text": "hello world"})
-        self.assertIn("Summarize: hello world", result["messages"][0]["content"])
+        get_result = self.client.get_prompt("summarize", {"text": "hello world"})
+        self.assertIn("Summarize: hello world", get_result["messages"][0]["content"])
 
     def test_call_nonexistent_tool(self):
         self.client.initialize()
@@ -323,6 +326,7 @@ class TestMcpClientServerIntegration(unittest.TestCase):
     def test_client_close(self):
         self.client.initialize()
         self.client.close()
+        self.client._auto_reconnect = False
         with self.assertRaises(RuntimeError):
             self.client.list_tools()
 

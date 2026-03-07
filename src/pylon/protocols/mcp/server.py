@@ -1,11 +1,16 @@
-"""MCP Server (JSON-RPC 2.0)."""
+"""MCP Server (JSON-RPC 2.0) with all 4 primitives and OAuth 2.1 scoped access."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from typing import Any
 
-from pylon.protocols.mcp.router import MethodRouter, route
+from pylon.protocols.mcp.auth import (
+    METHOD_SCOPES,
+    OAuthProvider,
+    check_scope,
+)
+from pylon.protocols.mcp.router import MethodRouter
 from pylon.protocols.mcp.session import McpSession, SessionManager
 from pylon.protocols.mcp.types import (
     INTERNAL_ERROR,
@@ -17,23 +22,43 @@ from pylon.protocols.mcp.types import (
     JsonRpcResponse,
     PromptDefinition,
     ResourceDefinition,
+    ResourceTemplate,
+    SamplingMessage,
+    SamplingRequest,
+    SamplingResponse,
     ServerCapabilities,
     ToolDefinition,
 )
 
+# Custom JSON-RPC error code for auth failures
+UNAUTHORIZED = -32001
+FORBIDDEN = -32003
+
+DEFAULT_PAGE_SIZE = 10
+
 
 class McpServer:
-    def __init__(self, name: str = "pylon-mcp", version: str = "0.1.0") -> None:
+    def __init__(
+        self,
+        name: str = "pylon-mcp",
+        version: str = "0.1.0",
+        oauth_provider: OAuthProvider | None = None,
+    ) -> None:
         self.name = name
         self.version = version
         self._tools: dict[str, ToolDefinition] = {}
         self._tool_handlers: dict[str, Callable] = {}
         self._resources: dict[str, ResourceDefinition] = {}
         self._resource_handlers: dict[str, Callable] = {}
+        self._resource_templates: dict[str, ResourceTemplate] = {}
+        self._resource_subscribers: dict[str, list[str]] = {}
         self._prompts: dict[str, PromptDefinition] = {}
         self._prompt_handlers: dict[str, Callable] = {}
+        self._sampling_handler: Callable | None = None
         self._session_manager = SessionManager()
         self._router = MethodRouter()
+        self._oauth: OAuthProvider | None = oauth_provider
+        self._notifications: list[dict[str, Any]] = []
         self._register_builtin_methods()
 
     def _register_builtin_methods(self) -> None:
@@ -42,15 +67,19 @@ class McpServer:
         self._router.register("tools/call", self._handle_tools_call)
         self._router.register("resources/list", self._handle_resources_list)
         self._router.register("resources/read", self._handle_resources_read)
+        self._router.register("resources/subscribe", self._handle_resources_subscribe)
+        self._router.register("resources/templates/list", self._handle_resources_templates_list)
         self._router.register("prompts/list", self._handle_prompts_list)
         self._router.register("prompts/get", self._handle_prompts_get)
+        self._router.register("sampling/createMessage", self._handle_sampling_create)
 
     @property
     def capabilities(self) -> ServerCapabilities:
         return ServerCapabilities(
             tools=len(self._tools) > 0,
-            resources=len(self._resources) > 0,
+            resources=len(self._resources) > 0 or len(self._resource_templates) > 0,
             prompts=len(self._prompts) > 0,
+            sampling=self._sampling_handler is not None,
         )
 
     def register_tool(
@@ -59,6 +88,7 @@ class McpServer:
         self._tools[tool.name] = tool
         if handler is not None:
             self._tool_handlers[tool.name] = handler
+        self._emit_notification("notifications/tools/list_changed", {})
 
     def register_resource(
         self, resource: ResourceDefinition, handler: Callable | None = None
@@ -66,6 +96,10 @@ class McpServer:
         self._resources[resource.uri] = resource
         if handler is not None:
             self._resource_handlers[resource.uri] = handler
+        self._emit_notification("notifications/resources/list_changed", {})
+
+    def register_resource_template(self, template: ResourceTemplate) -> None:
+        self._resource_templates[template.uriTemplate] = template
 
     def register_prompt(
         self, prompt: PromptDefinition, handler: Callable | None = None
@@ -74,8 +108,65 @@ class McpServer:
         if handler is not None:
             self._prompt_handlers[prompt.name] = handler
 
-    def handle_request(self, request: JsonRpcRequest) -> JsonRpcResponse:
+    def register_sampling_handler(self, handler: Callable) -> None:
+        self._sampling_handler = handler
+
+    def _emit_notification(self, method: str, params: dict[str, Any]) -> None:
+        self._notifications.append({"method": method, "params": params})
+
+    def drain_notifications(self) -> list[dict[str, Any]]:
+        notifications = list(self._notifications)
+        self._notifications.clear()
+        return notifications
+
+    def handle_request(
+        self, request: JsonRpcRequest, access_token: str | None = None
+    ) -> JsonRpcResponse:
+        if self._oauth is not None and request.method != "initialize":
+            required_scope = METHOD_SCOPES.get(request.method)
+            if required_scope is not None:
+                if access_token is None:
+                    return JsonRpcResponse(
+                        error=JsonRpcError(
+                            code=UNAUTHORIZED,
+                            message="Authentication required",
+                        ),
+                        id=request.id,
+                    )
+                meta = self._oauth.validate_token(access_token)
+                if meta is None:
+                    return JsonRpcResponse(
+                        error=JsonRpcError(
+                            code=UNAUTHORIZED,
+                            message="Invalid or expired token",
+                        ),
+                        id=request.id,
+                    )
+                if not check_scope(required_scope, meta["scopes"]):
+                    return JsonRpcResponse(
+                        error=JsonRpcError(
+                            code=FORBIDDEN,
+                            message=f"Insufficient scope: requires {required_scope}",
+                        ),
+                        id=request.id,
+                    )
         return self._router.dispatch(request)
+
+    # --- pagination helper ---
+
+    def _paginate(
+        self, items: list[Any], cursor: str | None, page_size: int = DEFAULT_PAGE_SIZE
+    ) -> tuple[list[Any], str | None]:
+        start = 0
+        if cursor is not None:
+            try:
+                start = int(cursor)
+            except ValueError:
+                start = 0
+        end = start + page_size
+        page = items[start:end]
+        next_cursor = str(end) if end < len(items) else None
+        return page, next_cursor
 
     # --- built-in handlers ---
 
@@ -83,7 +174,7 @@ class McpServer:
         session = self._session_manager.create_session()
         session.server_capabilities = self.capabilities
         if request.params and "capabilities" in request.params:
-            pass  # store client capabilities if needed
+            pass
         result = InitializeResult(
             capabilities=self.capabilities,
             serverInfo={"name": self.name, "version": self.version},
@@ -91,7 +182,14 @@ class McpServer:
         return {**result.to_dict(), "sessionId": session.session_id}
 
     def _handle_tools_list(self, request: JsonRpcRequest) -> dict:
-        return {"tools": [t.to_dict() for t in self._tools.values()]}
+        params = request.params or {}
+        cursor = params.get("cursor")
+        all_tools = list(self._tools.values())
+        page, next_cursor = self._paginate(all_tools, cursor)
+        result: dict[str, Any] = {"tools": [t.to_dict() for t in page]}
+        if next_cursor is not None:
+            result["nextCursor"] = next_cursor
+        return result
 
     def _handle_tools_call(self, request: JsonRpcRequest) -> Any:
         params = request.params or {}
@@ -103,7 +201,14 @@ class McpServer:
         return handler(arguments)
 
     def _handle_resources_list(self, request: JsonRpcRequest) -> dict:
-        return {"resources": [r.to_dict() for r in self._resources.values()]}
+        params = request.params or {}
+        cursor = params.get("cursor")
+        all_resources = list(self._resources.values())
+        page, next_cursor = self._paginate(all_resources, cursor)
+        result: dict[str, Any] = {"resources": [r.to_dict() for r in page]}
+        if next_cursor is not None:
+            result["nextCursor"] = next_cursor
+        return result
 
     def _handle_resources_read(self, request: JsonRpcRequest) -> Any:
         params = request.params or {}
@@ -113,8 +218,32 @@ class McpServer:
             raise ValueError(f"Resource not found: {uri}")
         return handler(uri)
 
+    def _handle_resources_subscribe(self, request: JsonRpcRequest) -> dict:
+        params = request.params or {}
+        uri = params.get("uri", "")
+        if uri not in self._resources:
+            raise ValueError(f"Resource not found: {uri}")
+        session_id = params.get("sessionId", "")
+        if uri not in self._resource_subscribers:
+            self._resource_subscribers[uri] = []
+        if session_id and session_id not in self._resource_subscribers[uri]:
+            self._resource_subscribers[uri].append(session_id)
+        return {"subscribed": True, "uri": uri}
+
+    def _handle_resources_templates_list(self, request: JsonRpcRequest) -> dict:
+        return {
+            "resourceTemplates": [t.to_dict() for t in self._resource_templates.values()]
+        }
+
     def _handle_prompts_list(self, request: JsonRpcRequest) -> dict:
-        return {"prompts": [p.to_dict() for p in self._prompts.values()]}
+        params = request.params or {}
+        cursor = params.get("cursor")
+        all_prompts = list(self._prompts.values())
+        page, next_cursor = self._paginate(all_prompts, cursor)
+        result: dict[str, Any] = {"prompts": [p.to_dict() for p in page]}
+        if next_cursor is not None:
+            result["nextCursor"] = next_cursor
+        return result
 
     def _handle_prompts_get(self, request: JsonRpcRequest) -> Any:
         params = request.params or {}
@@ -124,3 +253,22 @@ class McpServer:
             raise ValueError(f"Prompt not found: {name}")
         arguments = params.get("arguments", {})
         return handler(name, arguments)
+
+    def _handle_sampling_create(self, request: JsonRpcRequest) -> Any:
+        if self._sampling_handler is None:
+            raise ValueError("Sampling not supported")
+        params = request.params or {}
+        messages = [
+            SamplingMessage(role=m.get("role", ""), content=m.get("content", ""))
+            for m in params.get("messages", [])
+        ]
+        sampling_req = SamplingRequest(
+            messages=messages,
+            modelPreferences=params.get("modelPreferences", {}),
+            systemPrompt=params.get("systemPrompt", ""),
+            maxTokens=params.get("maxTokens", 1024),
+        )
+        result = self._sampling_handler(sampling_req)
+        if isinstance(result, SamplingResponse):
+            return result.to_dict()
+        return result
