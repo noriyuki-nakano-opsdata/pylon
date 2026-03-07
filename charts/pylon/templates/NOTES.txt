@@ -1,0 +1,24 @@
+Pylon has been deployed successfully!
+
+{{- if .Values.ingress.enabled }}
+
+Access the application at:
+{{- range .Values.ingress.hosts }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host }}
+{{- end }}
+
+{{- else }}
+
+Get the application URL by running:
+  export POD_NAME=$(kubectl get pods --namespace {{ .Release.Namespace }} -l "{{ include "pylon.apiSelectorLabels" . | replace "\n" "," }}" -o jsonpath="{.items[0].metadata.name}")
+  kubectl port-forward $POD_NAME {{ .Values.api.port }}:{{ .Values.api.port }}
+  echo "Visit http://127.0.0.1:{{ .Values.api.port }}"
+
+{{- end }}
+
+Components:
+  - API:     {{ .Values.api.replicaCount }} replica(s)
+  - Worker:  {{ .Values.worker.replicaCount }} replica(s)
+  - PostgreSQL: {{ if .Values.postgresql.enabled }}enabled{{ else }}disabled{{ end }}
+  - Redis:      {{ if .Values.redis.enabled }}enabled{{ else }}disabled{{ end }}
+  - NATS:       {{ if .Values.nats.enabled }}enabled{{ else }}disabled{{ end }}

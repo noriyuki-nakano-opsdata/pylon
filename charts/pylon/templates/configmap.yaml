@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pylon.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pylon.labels" . | nindent 4 }}
+data:
+  pylon.yaml: |
+    server:
+      port: {{ .Values.api.port }}
+      metricsPort: {{ .Values.api.metricsPort }}
+    log:
+      level: {{ .Values.config.logLevel }}
+    environment: {{ .Values.config.environment }}
+    database:
+      host: {{ include "pylon.postgresql.host" . }}
+      port: 5432
+      name: {{ .Values.postgresql.auth.database }}
+      user: {{ .Values.postgresql.auth.username }}
+    redis:
+      host: {{ include "pylon.redis.host" . }}
+      port: 6379
+    nats:
+      url: {{ include "pylon.nats.url" . }}
+    {{- if .Values.vault.address }}
+    vault:
+      address: {{ .Values.vault.address }}
+    {{- end }}
