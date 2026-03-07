@@ -11,6 +11,7 @@ from typing import Any
 from pylon.errors import WorkflowError
 from pylon.repository.checkpoint import Checkpoint, CheckpointRepository
 from pylon.repository.workflow import WorkflowRun
+from pylon.workflow.compiled import CompiledWorkflow
 from pylon.workflow.graph import END, WorkflowGraph, _safe_eval_condition
 
 NodeHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -20,7 +21,7 @@ NodeHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
 class ExecutionContext:
     """Context for a single workflow execution."""
 
-    graph: WorkflowGraph
+    compiled: CompiledWorkflow
     run: WorkflowRun
     state: dict[str, Any] = field(default_factory=dict)
     node_handler: NodeHandler | None = None
@@ -53,17 +54,23 @@ class GraphExecutor:
     ) -> WorkflowRun:
         """Execute a workflow graph from start to completion."""
         graph.validate()
+        compiled = graph.compile()
 
         ctx = ExecutionContext(
-            graph=graph,
+            compiled=compiled,
             run=run,
             state=initial_state or {},
             node_handler=node_handler,
             checkpoint_repo=self._checkpoint_repo,
             max_steps=max_steps,
-            node_status={node_id: "pending" for node_id in graph.nodes},
-            inbound_edges=graph.get_inbound_edges(),
-            outbound_edges={node_id: graph.get_outbound_edges(node_id) for node_id in graph.nodes},
+            node_status={node_id: "pending" for node_id in compiled.nodes},
+            inbound_edges={
+                node_id: list(compiled.get_inbound_edges(node_id)) for node_id in compiled.nodes
+            },
+            outbound_edges={
+                node_id: [(edge.key, edge) for edge in compiled.get_outbound_edges(node_id)]
+                for node_id in compiled.nodes
+            },
         )
         for outbound in ctx.outbound_edges.values():
             for edge_key, _ in outbound:
@@ -92,7 +99,7 @@ class GraphExecutor:
                     run.event_log.append({
                         "step": ctx._step_count,
                         "node_id": node_id,
-                        "agent": graph.nodes[node_id].agent,
+                        "agent": compiled.nodes[node_id].agent,
                         "output": result,
                         "timestamp": datetime.now(UTC).isoformat(),
                     })

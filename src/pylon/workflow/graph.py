@@ -13,6 +13,7 @@ from typing import Any
 
 from pylon.errors import WorkflowError
 from pylon.types import ConditionalEdge, WorkflowNode, WorkflowNodeType
+from pylon.workflow.compiled import CompiledEdge, CompiledNode, CompiledWorkflow
 
 END = "END"
 EdgeKey = tuple[str, int]
@@ -144,6 +145,36 @@ class WorkflowGraph:
                 if edge.target != END:
                     inbound.setdefault(edge.target, []).append(edge_key)
         return inbound
+
+    def compile(self) -> CompiledWorkflow:
+        """Validate and compile the graph into stable execution structures."""
+        self.validate()
+
+        inbound = self.get_inbound_edges()
+        compiled_nodes: dict[str, CompiledNode] = {}
+        for node_id, node in self.nodes.items():
+            outbound_edges = tuple(
+                CompiledEdge(
+                    key=edge_key,
+                    source=node_id,
+                    target=edge.target,
+                    condition=edge.condition,
+                )
+                for edge_key, edge in self.get_outbound_edges(node_id)
+            )
+            compiled_nodes[node_id] = CompiledNode(
+                node_id=node_id,
+                agent=node.agent,
+                node_type=node.node_type,
+                inbound_edge_keys=tuple(inbound.get(node_id, [])),
+                outbound_edges=outbound_edges,
+            )
+
+        return CompiledWorkflow(
+            name=self.name,
+            nodes=compiled_nodes,
+            entry_nodes=tuple(self.get_entry_nodes()),
+        )
 
     def get_next_nodes(self, node_id: str, state: dict[str, Any] | None = None) -> list[str]:
         """Get next node IDs based on conditions and state."""

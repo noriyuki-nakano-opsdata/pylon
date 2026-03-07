@@ -94,6 +94,22 @@ class TestWorkflowGraph:
         warnings = g.validate()
         assert len(warnings) == 0
 
+    def test_compile_returns_stable_execution_structures(self):
+        g = WorkflowGraph(name="compiled")
+        g.add_node("start", "planner", next_nodes=[
+            ConditionalEdge(target="review"),
+            ConditionalEdge(target="audit"),
+        ])
+        g.add_node("review", "reviewer", next_nodes=[ConditionalEdge(target=END)])
+        g.add_node("audit", "auditor", next_nodes=[ConditionalEdge(target=END)])
+
+        compiled = g.compile()
+
+        assert compiled.entry_nodes == ("start",)
+        assert compiled.nodes["start"].agent == "planner"
+        assert {edge.target for edge in compiled.get_outbound_edges("start")} == {"review", "audit"}
+        assert len(compiled.get_inbound_edges("review")) == 1
+
 
 class TestSafeConditionEvaluator:
     """Tests for the AST-based safe condition evaluator replacing eval()."""
