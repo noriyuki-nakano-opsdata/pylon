@@ -1,159 +1,221 @@
 # Architecture Overview
 
-## 5-Layer Architecture
+## What Exists Today
 
-```
+Pylon is a Python codebase composed of reference implementations plus a richer programmatic workflow runtime.
+
+The important architectural split is:
+
+- **Developer surfaces**: `pylon.cli`, `pylon.sdk`, `pylon.api`
+- **Execution core**: `pylon.workflow`, `pylon.agents`, `pylon.safety`
+- **Protocol boundaries**: `pylon.protocols.mcp`, `pylon.protocols.a2a`, `pylon.providers`
+- **State and infrastructure**: `pylon.repository`, `pylon.state`, `pylon.events`, `pylon.sandbox`, `pylon.secrets`, `pylon.tenancy`
+- **Supporting subsystems**: `pylon.taskqueue`, `pylon.plugins`, `pylon.control_plane`, `pylon.resources`, `pylon.resilience`, `pylon.observability`, `pylon.config`, `pylon.coding`
+
+## Layered View
+
+```text
 +------------------------------------------------------------------+
-|                        Layer 5: API                               |
-|  server.py | routes.py | middleware.py | schemas.py               |
-|  HTTP endpoints, auth, tenant isolation, rate limiting            |
+| Developer Surfaces                                                |
+| cli/ | sdk/ | api/                                                |
+| Local CLI state, in-memory SDK client, lightweight API routes     |
 +------------------------------------------------------------------+
-|                      Layer 4: Safety                              |
-|  capability.py | autonomy.py | prompt_guard.py | kill_switch.py  |
-|  input_sanitizer.py | output_validator.py | policy.py            |
-|  Rule-of-Two+, Autonomy Ladder, Prompt Guard, Kill Switch        |
+| Execution Core                                                    |
+| workflow/ | agents/ | dsl/ | coding/                              |
+| Compiled DAG runtime, agent lifecycle, pylon.yaml, coding loop    |
 +------------------------------------------------------------------+
-|                   Layer 3: Orchestration                          |
-|  agents/   | workflow/  | dsl/                                   |
-|  runtime, lifecycle, pool, supervisor | graph, executor | parser |
-|  Agent management, DAG workflows, config parsing                 |
+| Safety and Protocol Boundaries                                    |
+| safety/ | protocols/mcp/ | protocols/a2a/ | providers/            |
+| Capability rules, runtime safety, MCP/A2A servers, LLM providers  |
 +------------------------------------------------------------------+
-|                    Layer 2: Protocols                             |
-|  protocols/mcp/  | protocols/a2a/  | providers/                  |
-|  MCP JSON-RPC    | Agent-to-Agent  | LLM providers               |
+| State and Infrastructure                                          |
+| repository/ | state/ | events/ | sandbox/ | secrets/ | tenancy/  |
+| Runs, checkpoints, snapshots, event bus, sandbox policy, tenancy  |
 +------------------------------------------------------------------+
-|                  Layer 1: Infrastructure                          |
-|  sandbox/  | secrets/  | repository/                             |
-|  Isolation tiers, resource limits | Vault, rotation, audit       |
-|  Event sourcing, checkpoints, persistence                        |
+| Cross-Cutting Support                                             |
+| taskqueue/ | plugins/ | control_plane/ | observability/           |
+| resources/ | resilience/ | config/                                |
 +------------------------------------------------------------------+
 ```
 
-## Data Flow
+## Current Execution Model
 
+### Programmatic Workflow Runtime
+
+The most developed runtime is the programmatic workflow engine in `pylon.workflow`:
+
+1. `WorkflowGraph` defines nodes and edges
+2. `compile()` validates the DAG and produces `CompiledWorkflow`
+3. `GraphExecutor` executes runnable nodes under explicit join semantics
+4. node handlers return either a raw `dict` or a structured `NodeResult`
+5. `CommitEngine` applies `StatePatch` updates deterministically
+6. `CheckpointRepository` stores node-scoped event logs
+7. `ReplayEngine` reconstructs state and verifies `state_hash`
+
+This runtime is deterministic in the sense that:
+
+- graph topology is validated before execution
+- conditions are compiled from a restricted AST, not `eval`
+- parallel writes to the same state key fail fast
+- join policies are explicit: `ALL_RESOLVED`, `ANY`, `FIRST`
+
+### CLI / API / SDK Surfaces
+
+These surfaces are intentionally lighter than the workflow core:
+
+- `pylon.cli` stores local state in `$PYLON_HOME` / `~/.pylon`
+- `pylon.api` uses an in-memory `RouteStore`
+- `pylon.sdk.PylonClient` is an in-memory client, not an HTTP transport
+
+That means the public surfaces do not yet expose every runtime nuance of `pylon.workflow`.
+
+## Safety Architecture
+
+### Static Capability Envelope
+
+`AgentCapability` expresses three dangerous capabilities:
+
+- `can_read_untrusted`
+- `can_access_secrets`
+- `can_write_external`
+
+Rule-of-Two+ forbids:
+
+- all three together
+- the pair `untrusted + secrets`
+
+### Runtime Safety Context
+
+Static capability is not the full decision point. `SafetyContext` adds:
+
+- current data taint
+- effect scopes
+- secret scopes
+- delegation ancestry
+- optional approval token
+
+`ToolDescriptor` describes dynamic effects of tool usage:
+
+- untrusted input handling
+- secret access
+- external writes
+- effect and secret scopes
+- approval requirement
+
+### Enforcement Points
+
+Safety is currently enforced in code at:
+
+1. agent creation and dynamic tool grants via `CapabilityValidator`
+2. workflow and autonomy approval checks
+3. MCP `tools/call` request validation
+4. A2A `tasks/send` and `tasks/sendSubscribe`
+5. router pre-dispatch validation hooks
+
+## Protocol Boundaries
+
+### MCP
+
+`pylon.protocols.mcp` implements:
+
+- JSON-RPC request/response types
+- a method router
+- session management
+- OAuth 2.1 + PKCE scoped access control
+- tools, resources, prompts, and sampling handlers
+
+The MCP server validates:
+
+- DTO shape
+- output-validator safety on tool arguments
+- `SafetyEngine.evaluate_tool_use(...)`
+
+before invoking a tool handler.
+
+### A2A
+
+`pylon.protocols.a2a` implements:
+
+- task lifecycle state machine
+- agent cards and peer registry
+- async server handling for send/get/cancel/push-notification
+- optional allowed-peer and rate-limit checks
+
+The A2A server derives sender context from local policy or task metadata, then evaluates delegation safety before accepting work.
+
+## Persistence and Replay
+
+Workflow persistence is event-log oriented:
+
+```text
+WorkflowRun
+  status
+  state
+  state_version
+  state_hash
+  event_log[]
+
+Checkpoint
+  workflow_run_id
+  node_id
+  state_version
+  state_hash
+  event_log[]
 ```
-                     External Request
-                           |
-                           v
-                    +------+------+
-                    |  API Server |  (Layer 5)
-                    |  Auth + Rate|
-                    +------+------+
-                           |
-                           v
-                    +------+------+
-                    | Safety Layer|  (Layer 4)
-                    | Prompt Guard|
-                    | Policy Check|
-                    +------+------+
-                           |
-                           v
-              +------------+------------+
-              |                         |
-              v                         v
-      +-------+-------+       +--------+--------+
-      | Agent Runtime  |       | Workflow Engine |  (Layer 3)
-      | Lifecycle Mgmt |       | DAG Execution  |
-      +-------+-------+       +--------+--------+
-              |                         |
-              v                         v
-      +-------+-------+       +--------+--------+
-      | MCP / A2A     |       | LLM Providers   |  (Layer 2)
-      | Tool Calls    |       | Anthropic, etc. |
-      +-------+-------+       +--------+--------+
-              |                         |
-              v                         v
-      +-------+--------+      +--------+--------+
-      | Sandbox        |      | Secrets / Repo  |  (Layer 1)
-      | gVisor/Docker  |      | Vault, Events   |
-      +----------------+      +-----------------+
-```
 
-## Core Design Principles
+Checkpoint event records currently include:
 
-### Rule-of-Two+ (Section 2.3)
+- `seq`
+- `attempt_id`
+- `node_id`
+- `input`
+- `input_state_version`
+- `input_state_hash`
+- `state_patch`
+- `edge_decisions`
+- `llm_events`
+- `tool_events`
+- `artifacts`
+- `metrics`
+- `state_version`
+- `state_hash`
 
-No single agent may simultaneously hold all three capabilities:
+Persisted metadata is secret-scrubbed before storage. Replay recomputes state hashes and raises on mismatch.
 
-| Capability | Description |
-|------------|-------------|
-| `can_read_untrusted` | Process input from external sources (MCP, A2A, GitHub) |
-| `can_access_secrets` | Read from Vault, env vars, or secret stores |
-| `can_write_external` | Push to GitHub, write to DB, call external APIs |
+## Sandbox, Secrets, and Tenancy
 
-Additionally, the pair `can_read_untrusted + can_access_secrets` is forbidden
-(prompt injection exfiltration risk).
+These subsystems are present as reference implementations:
 
-Validation occurs at 4 checkpoints:
-1. Agent creation (static, from pylon.yaml)
-2. Dynamic tool grant (every MCP tool discovery)
-3. Subgraph inheritance (child subset of parent)
-4. A2A delegation (peer agent-card verification)
+- `sandbox/`: sandbox manager, executor, registry, policy defaults, resource/network checks
+- `secrets/`: in-memory versioned secret manager, Vault protocol, audit, rotation helpers
+- `tenancy/`: tenant context propagation, lifecycle manager, quota manager, isolation enforcement
 
-### Autonomy Ladder (ADR-004)
+Important current constraint:
 
-| Level | Name | Behavior |
-|-------|------|----------|
-| A0 | Manual | Agent suggests, human executes |
-| A1 | Supervised | Human approves each step |
-| A2 | Semi-autonomous | Within policy bounds, no approval |
-| A3 | Autonomous-guarded | Human approves plan, then autonomous |
-| A4 | Fully autonomous | Within safety envelope only |
+- concrete gVisor / Firecracker runtime integrations are not implemented yet
+- current sandbox lifecycle is an in-memory manager plus policy model
 
-### Prompt Guard Pipeline (Section 2.4)
+## Observability and Supporting Systems
 
-```
-Input --> [Trust Level Check]
-            |
-            +--> TRUSTED: pass through
-            |
-            +--> INTERNAL: Pattern Matcher --> pass/reject
-            |
-            +--> UNTRUSTED: Pattern Matcher --> Classifier LLM --> pass/reject
-```
+Supporting modules already exist and are usable independently:
 
-18 built-in regex patterns detect:
-- Instruction override ("ignore previous instructions")
-- System prompt extraction ("reveal your system prompt")
-- Role hijacking ("you are now", "pretend you are")
-- Format injection (XML tags, INST markers)
-- Jailbreak attempts ("DAN mode")
+- `events/`: in-memory pub/sub and dead letters
+- `observability/`: metrics, tracing, structured logging, exporters
+- `taskqueue/`: priority queue, workers, retry, scheduler
+- `plugins/`: plugin manifests, loader, registry, hook system, extension protocols
+- `resources/`: rate limiting, quotas, pools, monitoring
+- `resilience/`: retry, fallback, circuit breaker, bulkhead
+- `state/`: key-value store, generic state machine, snapshots, diffs
 
-### Multi-path Kill Switch (FR-10)
+## Architectural Reality
 
-| Path | Mechanism | Target Latency |
-|------|-----------|---------------|
-| Primary | NATS publish | < 1s |
-| Fallback | ConfigMap poll | < 5s |
-| Emergency | Namespace delete | < 10s |
+The codebase is strongest today in:
 
-Scopes: `global`, `tenant:{id}`, `workflow:{id}`, `agent:{id}`
-Global activation blocks all sub-scopes automatically.
+- deterministic workflow execution
+- safety evaluation at runtime boundaries
+- local/in-memory reference implementations for surrounding systems
 
-### Sandbox Isolation (FR-06)
+The main gap is not absence of modules, but uneven maturity between:
 
-| Tier | Isolation | Startup | Platform |
-|------|-----------|---------|----------|
-| Firecracker | microVM | < 2s | Linux KVM |
-| gVisor | User-space kernel | < 500ms | Linux |
-| Docker | Container | < 1s | All |
-| None | Host process | 0 | SuperAdmin only |
-
-Each tier has default resource limits (CPU, memory, network, execution time)
-and network policies (host allowlist, port blocking, internet access).
-
-## Event Sourcing
-
-All state changes are captured as `EventLogEntry` records. Checkpoints are
-event logs, not state snapshots. This enables deterministic replay for
-debugging and audit.
-
-```
-EventLogEntry:
-  node_id: str
-  input_data: Any
-  llm_response: Any
-  tool_results: list[Any]
-  output_data: Any
-  state_ref: str  # URI for large state (>1MB) in S3/MinIO
-```
+- the rich programmatic workflow engine
+- the simpler public API / CLI / SDK surfaces

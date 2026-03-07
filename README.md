@@ -4,19 +4,17 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 ![Tests](https://img.shields.io/badge/tests-passing-brightgreen)
 
-**Pylon** is an autonomous AI agent orchestration platform that enables safe, multi-agent workflows with built-in safety guardrails, sandbox isolation, and secret management.
+**Pylon** is a Python-first autonomous agent orchestration platform with deterministic workflow execution, runtime safety enforcement, local/in-memory reference surfaces, and protocol integrations for MCP and A2A.
 
 ## Key Features
 
-- **5-Layer Architecture** -- API, Safety, Orchestration, Protocols, Infrastructure
-- **Rule-of-Two+ Enforcement** -- No agent can simultaneously read untrusted input, access secrets, and write externally
-- **Autonomy Ladder (A0-A4)** -- Graduated autonomy with human approval gates
-- **Prompt Guard Pipeline** -- Pattern matching + classifier LLM for injection detection
-- **Multi-path Kill Switch** -- Emergency halt via NATS, ConfigMap poll, or namespace delete
-- **Sandbox Isolation** -- gVisor, Firecracker, Docker, or host-process tiers
-- **Secret Management** -- Versioned secrets with rotation, Vault integration, and audit logging
-- **MCP + A2A Protocols** -- JSON-RPC 2.0 tool server and agent-to-agent communication
-- **Workflow Engine** -- DAG-based execution with conditional routing and checkpoints
+- **Deterministic DAG Workflow Engine** -- graph compilation, join policies, patch-based commits, checkpoints, and replay
+- **Rule-of-Two+ Enforcement** -- no single execution frame may combine untrusted input, secret access, and external writes
+- **Runtime Safety Context** -- `SafetyContext` and `ToolDescriptor` enforce dynamic checks for MCP and A2A calls
+- **Approval Binding** -- plan/effect approvals are invalidated on drift
+- **Prompt Guard Pipeline** -- pattern matching, classifier-style heuristics, input sanitization, and tool-call output validation
+- **Protocol Support** -- MCP server/client with OAuth scopes and A2A task routing with peer checks
+- **Reference Infrastructure Modules** -- sandbox policy/manager, secrets, repository, tenancy, plugins, task queues, observability, resilience
 
 ## Quick Start
 
@@ -24,44 +22,41 @@
 # Install
 pip install pylon-ai
 
-# Initialize a project
-pylon init my-project
+# Create a project directory and initialize pylon.yaml in it
+mkdir my-project
 cd my-project
+pylon init --name my-project
 
-# Run the default workflow
+# Run the local CLI workflow flow
 pylon run
 ```
 
+`pylon init` writes `pylon.yaml` into the current directory.
+`pylon run` currently uses the CLI's local persisted state in `$PYLON_HOME` / `~/.pylon`; it does not yet invoke the full programmatic workflow engine directly.
+
 ## Module Structure
 
-| Layer | Package | Modules | Description |
-|-------|---------|---------|-------------|
-| **API** | `pylon.api` | server, routes, middleware, schemas | HTTP API server with auth and rate limiting |
-| **Safety** | `pylon.safety` | capability, autonomy, prompt_guard, input_sanitizer, output_validator, kill_switch, policy | Rule-of-Two+, prompt guard, kill switch, policy engine |
-| **Agents** | `pylon.agents` | runtime, lifecycle, pool, registry, supervisor | Agent lifecycle, pooling, and supervision |
-| **Workflow** | `pylon.workflow` | graph, executor | DAG workflow definition and execution |
-| **DSL** | `pylon.dsl` | parser | pylon.yaml configuration parser |
-| **Protocols** | `pylon.protocols.mcp` | types | MCP JSON-RPC 2.0 protocol types |
-| | `pylon.protocols.a2a` | card, client, server, types | Agent-to-Agent communication |
-| **Providers** | `pylon.providers` | base, anthropic | LLM provider abstraction |
-| **Sandbox** | `pylon.sandbox` | manager, executor, policy, registry | Sandbox isolation and resource limits |
-| **Secrets** | `pylon.secrets` | manager, vault, rotation, audit | Secret storage, Vault, rotation, audit |
-| **Repository** | `pylon.repository` | base, memory, workflow, checkpoint, audit | Event sourcing and persistence |
-| **Core** | `pylon` | types, errors | Shared types and error hierarchy |
+| Area | Package | Description |
+|------|---------|-------------|
+| Core | `pylon.types`, `pylon.errors` | Shared enums, dataclasses, and error hierarchy |
+| Workflow | `pylon.workflow` | Compiled DAG execution, conditions, patch commits, replay, structured node results |
+| Safety | `pylon.safety` | Capability validation, autonomy gates, prompt guard, input/output validation, runtime safety context |
+| Agents | `pylon.agents` | Agent lifecycle, registry, pool, supervisor |
+| Protocols | `pylon.protocols.mcp`, `pylon.protocols.a2a` | MCP JSON-RPC surfaces, OAuth, A2A tasks, agent cards |
+| API / CLI / SDK | `pylon.api`, `pylon.cli`, `pylon.sdk` | Lightweight API server, local CLI flows, in-memory SDK client/builder/decorators |
+| Persistence | `pylon.repository`, `pylon.state`, `pylon.events` | Workflow runs, checkpoints, memory repository, state store, snapshots, event bus |
+| Infra | `pylon.sandbox`, `pylon.secrets`, `pylon.tenancy`, `pylon.resources`, `pylon.resilience` | Sandbox policy, secret storage, tenant context/isolation, limits, retry/circuit breaker |
+| Extensibility | `pylon.plugins`, `pylon.control_plane`, `pylon.taskqueue`, `pylon.observability`, `pylon.config`, `pylon.coding` | Plugins, registries, schedulers, metrics, config, coding loop |
+| DSL / Providers | `pylon.dsl`, `pylon.providers` | YAML/JSON workflow parser, LLM provider abstraction |
+| Approval | `pylon.approval` | Approval manager with plan/effect binding verification |
 
-**Total: 21 packages, 40+ modules**
+Current source layout: 31 Python packages, 160 Python modules, 40 test files.
 
 ## Running Tests
 
 ```bash
-# Run all tests
-PYTHONPATH=src python -m pytest tests/ -v
-
-# Run specific module tests
-PYTHONPATH=src python -m pytest tests/unit/test_prompt_guard.py -v
-PYTHONPATH=src python -m pytest tests/unit/test_sandbox.py -v
-PYTHONPATH=src python -m pytest tests/unit/test_secrets.py -v
-PYTHONPATH=src python -m pytest tests/unit/test_api.py -v
+PYTHONPATH=src python -m pytest -q
+python -m ruff check src tests
 ```
 
 ## Documentation
@@ -69,8 +64,18 @@ PYTHONPATH=src python -m pytest tests/unit/test_api.py -v
 - [Architecture Overview](docs/architecture.md)
 - [Getting Started Guide](docs/getting-started.md)
 - [API Reference](docs/api-reference.md)
-- [Platform Specification](docs/SPECIFICATION.md)
+- [Implemented Specification](docs/SPECIFICATION.md)
+- [ADR-007: Deterministic DAG Execution Semantics](docs/adr/007-deterministic-dag-execution-semantics.md)
+- [ADR-008: Safety Context and Delegation Boundaries](docs/adr/008-safety-context-and-delegation-boundaries.md)
 - [Workflow/Safety Implementation Plan](docs/architecture/workflow-safety-implementation-plan.md)
+
+## Current Implementation Status
+
+- The programmatic workflow engine implements compiled graphs, restricted condition compilation, `ALL_RESOLVED` / `ANY` / `FIRST` join policies, patch commits, node-scoped checkpoints, and replay with state hash verification.
+- Runtime safety is enforced at MCP `tools/call`, A2A `tasks/send`, A2A `tasks/sendSubscribe`, and router pre-dispatch validation boundaries.
+- Approval binding is implemented in both `pylon.approval` and `pylon.safety.autonomy`.
+- Many subsystems intentionally ship as in-memory or local-first reference implementations today: repository backends, API route store, SDK client, CLI run state, sandbox manager, secret manager, and plugin loading surfaces.
+- Public API/CLI/SDK terminology is not yet fully aligned with the richer runtime states of the workflow engine.
 
 ## Project Configuration
 
@@ -85,14 +90,16 @@ agents:
     model: anthropic/claude-sonnet-4-20250514
     role: "Write clean, tested code"
     autonomy: A2
-    tools: [file-read, file-write, shell]
-    sandbox: gvisor
+    tools: [file-read, file-write]
+    sandbox: docker
+    input_trust: untrusted
 
   reviewer:
     model: anthropic/claude-sonnet-4-20250514
     role: "Review code for quality and security"
-    autonomy: A1
+    autonomy: A3
     tools: [file-read]
+    sandbox: docker
 
 workflow:
   type: graph
@@ -104,14 +111,18 @@ workflow:
       agent: reviewer
       next:
         - target: plan
-          condition: "needs_revision"
+          condition: "state.needs_revision == True"
         - target: END
 
 policy:
   max_cost_usd: 10.0
-  max_duration_seconds: 3600
-  max_file_changes: 50
-  blocked_actions: [git-push, db-write]
+  max_duration: 60m
+  require_approval_above: A3
+  safety:
+    blocked_actions: [git-push, db-write]
+    max_file_changes: 50
+  compliance:
+    audit_log: required
 ```
 
 ## License

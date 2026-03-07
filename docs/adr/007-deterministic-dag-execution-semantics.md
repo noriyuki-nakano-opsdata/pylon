@@ -3,6 +3,15 @@
 ## Status
 Accepted
 
+## Implementation Status
+Implemented in the current codebase:
+
+- compiled graph structures and restricted condition compilation
+- explicit join policies: `ALL_RESOLVED`, `ANY`, `FIRST`
+- structured `NodeResult` with `state_patch`, `edge_decisions`, `artifacts`, and tool/LLM events
+- node-scoped checkpoints with state version/hash
+- replay that reconstructs state from event logs and verifies state hashes
+
 ## Context
 The current graph engine intent is strong, but the semantics are underspecified in the places that matter most:
 

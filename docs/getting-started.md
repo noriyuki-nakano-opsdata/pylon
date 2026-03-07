@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - Python 3.12 or later
-- pip or uv package manager
+- `pip` or `uv`
 
 ## Installation
 
@@ -11,34 +11,41 @@
 pip install pylon-ai
 ```
 
-Or for development:
+Development install:
 
 ```bash
-git clone https://github.com/your-org/pylon.git
+git clone https://github.com/noriyuki-nakano-opsdata/pylon.git
 cd pylon
 pip install -e ".[dev]"
 ```
 
 ## Initialize a Project
 
+`pylon init` writes files into the current directory. Create a project folder first:
+
 ```bash
-pylon init my-project
+mkdir my-project
 cd my-project
+pylon init --name my-project
 ```
 
-This creates:
+Optional quickstart mode also writes `docker-compose.yaml`:
 
+```bash
+pylon init --name my-project --quickstart
 ```
+
+What gets created today:
+
+```text
 my-project/
-  pylon.yaml       # Project configuration
-  agents/          # Custom agent definitions
-  workflows/       # Workflow templates
-  .pylon/          # Runtime state (gitignored)
+  pylon.yaml
+  docker-compose.yaml   # only with --quickstart
 ```
 
-## Configuration
+CLI runtime state is stored separately under `$PYLON_HOME` or `~/.pylon`.
 
-Edit `pylon.yaml` to define agents, workflows, and policies:
+## Configure `pylon.yaml`
 
 ```yaml
 version: "1"
@@ -50,13 +57,13 @@ agents:
     role: "Research topics and gather information"
     autonomy: A2
     tools: [web-search, file-read]
-    sandbox: gvisor
+    sandbox: docker
     input_trust: untrusted
 
   writer:
     model: anthropic/claude-sonnet-4-20250514
     role: "Write clear documentation"
-    autonomy: A2
+    autonomy: A3
     tools: [file-read, file-write]
     sandbox: docker
 
@@ -68,63 +75,91 @@ workflow:
       next: [write]
     write:
       agent: writer
-      next: [END]
+      next: END
 
 policy:
   max_cost_usd: 5.0
-  max_duration_seconds: 1800
-  max_file_changes: 20
+  max_duration: 30m
   require_approval_above: A3
+  safety:
+    blocked_actions: [git-push]
+    max_file_changes: 20
+  compliance:
+    audit_log: required
 ```
+
+Notes:
+
+- `policy.max_duration` accepts values like `30m`, `1h`, or integer seconds.
+- `workflow.nodes.*.next` accepts `END`, a list of target names, or conditional edges with `target` and `condition`.
+- The DSL validates that every workflow node references a defined agent and every edge target references a defined node or `END`.
 
 ## Run a Workflow
 
 ```bash
-# Run the default workflow
+# Default workflow from the current directory
 pylon run
 
-# Run with input
+# With JSON input
 pylon run --input '{"topic": "distributed systems"}'
 
-# Run a specific workflow
-pylon run research-pipeline
+# Inspect local run state
+pylon inspect <run_id>
+pylon logs <run_id>
 ```
 
-## Agent Autonomy Levels
+Current CLI behavior:
 
-Choose the right autonomy level for each agent:
+- `pylon run` is a local CLI flow backed by `$PYLON_HOME/state.json`
+- it records runs, checkpoints, approvals, and sandboxes in that local state file
+- A3+ agents produce a `waiting_approval` CLI run status
 
-| Level | When to Use |
-|-------|-------------|
-| **A0** | Sensitive operations (production deployments) |
-| **A1** | New or untested agents (step-by-step approval) |
-| **A2** | Trusted agents within clear policy bounds (default) |
-| **A3** | Complex tasks (approve plan, then autonomous) |
-| **A4** | Fully trusted agents in controlled environments |
+Approve or deny a pending CLI approval:
+
+```bash
+pylon approve <approval_id>
+pylon approve <approval_id> --deny --reason "policy violation"
+```
+
+Replay a stored CLI checkpoint:
+
+```bash
+pylon replay <checkpoint_id>
+```
+
+## Programmatic Workflow Engine
+
+The richer deterministic DAG runtime lives in `pylon.workflow` and is used programmatically:
+
+- `WorkflowGraph`
+- `GraphExecutor`
+- `NodeResult`
+- `ReplayEngine`
+
+That engine supports compiled conditions, join policies, patch-based state commits, node-scoped checkpoints, and replay with state hash verification.
 
 ## Safety Features
 
-Pylon enforces safety at multiple levels:
+Pylon currently enforces safety in several layers:
 
-1. **Rule-of-Two+**: Agents cannot simultaneously process untrusted input and access secrets
-2. **Prompt Guard**: Automatic detection of prompt injection attempts
-3. **Input Sanitization**: HTML/script stripping for untrusted input
-4. **Output Validation**: Shell injection and path traversal detection before tool execution
-5. **Kill Switch**: Emergency halt at global, tenant, workflow, or agent scope
-6. **Sandbox Isolation**: Resource limits and network policies per execution tier
+1. Rule-of-Two+ capability checks for static agent envelopes and dynamic tool/delegation unions
+2. Prompt guard pattern matching plus heuristic classifier for untrusted input
+3. Input sanitization by trust level
+4. Output validation for tool calls
+5. Approval binding by `plan_hash` and `effect_hash`
+6. Runtime safety decisions for MCP `tools/call` and A2A task submission
 
 ## Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `PYLON_DEFAULT_MODEL` | Default LLM model | `anthropic/claude-sonnet-4-20250514` |
-| `PYLON_LOG_LEVEL` | Logging level | `info` |
-| `PYLON_SANDBOX_TIER` | Default sandbox tier | `gvisor` |
-| `PYLON_VAULT_ADDR` | Vault server address | `http://127.0.0.1:8200` |
-| `PYLON_VAULT_TOKEN` | Vault authentication token | (none) |
+| `PYLON_DEFAULT_MODEL` | Default DSL model when not specified | `anthropic/claude-sonnet-4-20250514` |
+| `PYLON_HOME` | CLI state/config directory | `~/.pylon` |
+| `PYLON_VAULT_ADDR` | Vault address for external integrations | `http://127.0.0.1:8200` |
+| `PYLON_VAULT_TOKEN` | Vault auth token | unset |
 
 ## Next Steps
 
-- Read the [Architecture Overview](architecture.md) to understand Pylon's design
-- See the [API Reference](api-reference.md) for HTTP endpoint documentation
-- Explore sandbox tiers and resource limits in the architecture docs
+- Read the [Architecture Overview](architecture.md)
+- Read the [Implemented Specification](SPECIFICATION.md)
+- See the [API Reference](api-reference.md) for the lightweight API route contract

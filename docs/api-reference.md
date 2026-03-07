@@ -1,30 +1,49 @@
 # API Reference
 
-## Authentication
+This document describes the lightweight route contract implemented by `pylon.api`.
 
-All endpoints except `/health` require a Bearer token:
+## Scope
 
-```
-Authorization: Bearer <token>
-```
+`pylon.api.server.APIServer` is a small in-process HTTP-style router.
+`pylon.api.routes.register_routes()` installs route handlers backed by an in-memory `RouteStore`.
 
-Multi-tenant requests include a tenant header:
+There is no built-in network daemon in this package. You compose:
 
-```
-X-Tenant-ID: <tenant-id>
-```
+- `APIServer`
+- optional middlewares from `pylon.api.middleware`
+- route handlers from `pylon.api.routes`
 
-Rate limiting is applied per tenant using a token bucket algorithm.
+## Typical Middleware Stack
 
-## Endpoints
+The common stack is:
 
-### Health
+1. `AuthMiddleware`
+2. `TenantMiddleware`
+3. `RateLimitMiddleware`
+4. `SecurityHeadersMiddleware`
 
-#### `GET /health`
+Important details:
 
-Returns server health status. No authentication required.
+- authentication is optional and only enforced if `AuthMiddleware` is installed
+- route handlers expect `tenant_id` in `request.context`
+- `TenantMiddleware` normally provides that context from `X-Tenant-ID`
+- `/health` bypasses auth and tenant checks
 
-**Response** `200 OK`
+## Request Context Expectations
+
+When the standard middlewares are installed:
+
+- `Authorization: Bearer <token>` is required for non-health routes
+- `X-Tenant-ID: <tenant-id>` is required unless `TenantMiddleware(require_tenant=False)` is used
+- rate limits are applied per tenant via token bucket
+
+## Routes
+
+### `GET /health`
+
+Always available.
+
+Response `200 OK`
 
 ```json
 {
@@ -33,42 +52,22 @@ Returns server health status. No authentication required.
 }
 ```
 
----
+### `POST /agents`
 
-### Agents
+Create an agent record for the current tenant.
 
-#### `POST /agents`
+Request body:
 
-Create a new agent.
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `name` | string | Yes | 1-128 chars |
+| `model` | string | No | defaults to empty string |
+| `role` | string | No | defaults to empty string |
+| `autonomy` | string or int | No | `A0`-`A4` or `0`-`4` |
+| `tools` | array | No | defaults to `[]` |
+| `sandbox` | string | No | `gvisor`, `firecracker`, `docker`, `none` |
 
-**Request Body**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `name` | string | Yes | Agent name (1-128 chars) |
-| `model` | string | No | LLM model identifier |
-| `role` | string | No | Agent role description |
-| `autonomy` | string | No | Autonomy level: A0-A4 (default: A2) |
-| `tools` | array | No | List of tool names |
-| `sandbox` | string | No | Sandbox tier: gvisor, firecracker, docker, none (default: gvisor) |
-
-**Example**
-
-```bash
-curl -X POST http://localhost:8080/agents \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "coder",
-    "model": "anthropic/claude-sonnet-4-20250514",
-    "role": "Write production-quality code",
-    "autonomy": "A2",
-    "tools": ["file-read", "file-write", "shell"],
-    "sandbox": "gvisor"
-  }'
-```
-
-**Response** `201 Created`
+Response `201 Created`
 
 ```json
 {
@@ -77,114 +76,115 @@ curl -X POST http://localhost:8080/agents \
   "model": "anthropic/claude-sonnet-4-20250514",
   "role": "Write production-quality code",
   "autonomy": "A2",
-  "tools": ["file-read", "file-write", "shell"],
-  "sandbox": "gvisor",
+  "tools": ["file-read", "file-write"],
+  "sandbox": "docker",
   "status": "ready",
   "tenant_id": "default"
 }
 ```
 
-#### `GET /agents`
+### `GET /agents`
 
-List all agents for the current tenant.
+List agents for the current tenant.
 
-**Response** `200 OK`
+Response `200 OK`
 
 ```json
 {
-  "agents": [...],
-  "count": 2
+  "agents": [],
+  "count": 0
 }
 ```
 
-#### `GET /agents/{id}`
+### `GET /agents/{id}`
 
-Get a specific agent by ID.
+Fetch a tenant-scoped agent by ID.
 
-**Response** `200 OK` or `404 Not Found`
+Responses:
 
-#### `DELETE /agents/{id}`
+- `200 OK`
+- `403 Forbidden`
+- `404 Not Found`
 
-Delete an agent.
+### `DELETE /agents/{id}`
 
-**Response** `204 No Content` or `404 Not Found`
+Delete a tenant-scoped agent.
 
----
+Responses:
 
-### Workflows
+- `204 No Content`
+- `403 Forbidden`
+- `404 Not Found`
 
-#### `POST /workflows/{id}/runs`
+### `POST /workflows/{id}/run`
 
-Start a new workflow run.
+Create a workflow run request record for the current tenant.
 
-**Request Body**
+Request body:
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `input` | object | No | Input data for the workflow |
-| `parameters` | object | No | Runtime parameters |
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `input` | object | No | defaults to `{}` |
+| `parameters` | object | No | defaults to `{}` |
 
-**Example**
+Response `202 Accepted`
 
-```bash
-curl -X POST http://localhost:8080/workflows/build-pipeline/runs \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "input": {"repo": "my-app", "branch": "main"},
-    "parameters": {"max_retries": 3}
-  }'
-```
+Headers:
 
-**Response** `201 Created`
+- `Location: /api/v1/workflow-runs/{run_id}`
+
+Example body:
 
 ```json
 {
   "id": "r1a2b3c4d5e6",
   "workflow_id": "build-pipeline",
-  "status": "running",
+  "status": "pending",
   "input": {"repo": "my-app", "branch": "main"},
   "parameters": {"max_retries": 3},
-  "started_at": 1709827200.0
+  "started_at": 1709827200.0,
+  "tenant_id": "default"
 }
 ```
 
-#### `GET /workflows/{id}/runs/{run_id}`
+### `GET /workflows/{id}/runs/{run_id}`
 
-Get the status of a workflow run.
+Fetch a workflow run by workflow ID plus run ID.
 
-**Response** `200 OK` or `404 Not Found`
+Responses:
 
----
+- `200 OK`
+- `403 Forbidden`
+- `404 Not Found`
 
-### Kill Switch
+### `GET /api/v1/workflow-runs/{run_id}`
 
-#### `POST /kill-switch`
+Fetch a workflow run by run ID only.
 
-Activate the emergency kill switch.
+Responses:
 
-**Request Body**
+- `200 OK`
+- `403 Forbidden`
+- `404 Not Found`
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `scope` | string | Yes | Scope: global, tenant:{id}, workflow:{id}, agent:{id} |
-| `reason` | string | Yes | Reason for activation |
-| `issued_by` | string | Yes | Identity of the person activating |
+### `POST /kill-switch`
 
-**Example**
+Activate a kill switch event.
 
-```bash
-curl -X POST http://localhost:8080/kill-switch \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "scope": "agent:coder-123",
-    "reason": "Agent producing unsafe output",
-    "issued_by": "admin@example.com"
-  }'
-```
+Request body:
 
-**Response** `201 Created`
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `scope` | string | Yes | `global`, `tenant:{id}`, `workflow:{id}`, `agent:{id}` |
+| `reason` | string | Yes | human-readable reason |
+| `issued_by` | string | Yes | actor identity |
+
+Authorization logic in the route handler:
+
+- `global` scope requires tenant `admin`
+- `tenant:{id}` requires the current tenant to match `{id}`
+
+Response `201 Created`
 
 ```json
 {
@@ -195,11 +195,11 @@ curl -X POST http://localhost:8080/kill-switch \
 }
 ```
 
----
+## Errors
 
-## Error Responses
+Error payloads are simple JSON objects.
 
-All errors follow a consistent format:
+Generic error:
 
 ```json
 {
@@ -207,45 +207,57 @@ All errors follow a consistent format:
 }
 ```
 
-Validation errors include a list:
+Validation error:
 
 ```json
 {
   "errors": [
-    "Field 'name' is required",
-    "Field 'sandbox' must be one of ['gvisor', 'firecracker', 'docker', 'none']"
+    "Field 'name' is required"
   ]
 }
 ```
 
-### Status Codes
+Common status codes:
 
 | Code | Meaning |
 |------|---------|
 | 200 | Success |
 | 201 | Created |
-| 204 | No Content (successful delete) |
-| 400 | Bad Request (missing headers) |
-| 401 | Unauthorized (invalid or missing token) |
+| 202 | Accepted |
+| 204 | No Content |
+| 400 | Bad Request |
+| 401 | Missing auth or tenant context depending on composition |
+| 403 | Forbidden |
 | 404 | Not Found |
 | 405 | Method Not Allowed |
 | 422 | Validation Error |
 | 429 | Rate Limit Exceeded |
 
-## Rate Limiting
+## Middleware Details
 
-Requests are rate-limited per tenant using a token bucket algorithm:
+### `AuthMiddleware`
 
-- **Default rate**: 10 requests/second
-- **Burst capacity**: 20 requests
+- skips `/health`
+- expects `Authorization: Bearer <token>`
+- validates tokens against an in-memory set
 
-When rate-limited, the response includes a `Retry-After` header.
+### `TenantMiddleware`
 
-## Middleware Stack
+- skips `/health`
+- injects `tenant_id` into `request.context`
+- validates tenant IDs against `^[a-z0-9][a-z0-9_-]{0,63}$`
 
-Requests pass through middleware in order:
+### `RateLimitMiddleware`
 
-1. **AuthMiddleware** -- Validates Bearer token
-2. **TenantMiddleware** -- Extracts X-Tenant-ID
-3. **RateLimitMiddleware** -- Per-tenant rate limiting
-4. **Route Handler** -- Business logic
+- default rate: `10` requests/sec
+- default burst: `20`
+- emits `retry-after` header on `429`
+
+### `SecurityHeadersMiddleware`
+
+Adds:
+
+- `x-content-type-options: nosniff`
+- `x-frame-options: DENY`
+- `content-security-policy: default-src 'none'`
+- `x-xss-protection: 0`

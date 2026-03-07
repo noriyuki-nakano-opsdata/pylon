@@ -22,6 +22,8 @@ The target is a deterministic DAG engine with dynamic safety evaluation, without
 
 ## Phase 0: Guardrail Tests First
 
+Status: completed
+
 Add failing tests before refactoring behavior.
 
 ### Test additions
@@ -44,6 +46,8 @@ Add failing tests before refactoring behavior.
 
 ## Phase 1: Compile the Workflow Graph
 
+Status: completed
+
 ### Deliverables
 
 - Introduce `CompiledWorkflow`, `CompiledNode`, `CompiledEdge`
@@ -62,6 +66,8 @@ Add failing tests before refactoring behavior.
 - Runtime no longer calls Python `eval`
 
 ## Phase 2: Replace Mutable Dict Execution with Patch Commit Semantics
+
+Status: completed
 
 ### Deliverables
 
@@ -84,6 +90,8 @@ Add failing tests before refactoring behavior.
 
 ## Phase 3: Rebuild Checkpoint and Replay
 
+Status: completed
+
 ### Deliverables
 
 - Persist node-attempt scoped checkpoint records
@@ -103,6 +111,8 @@ Add failing tests before refactoring behavior.
 - Secret scrubbing is enforced before persistence
 
 ## Phase 4: Introduce SafetyContext and SafetyEngine
+
+Status: completed
 
 ### Deliverables
 
@@ -126,6 +136,8 @@ Add failing tests before refactoring behavior.
 
 ## Phase 5: Wire Safety Through A2A, MCP, and Approval Flow
 
+Status: mostly completed
+
 ### Deliverables
 
 - Add structured tool descriptors
@@ -146,7 +158,21 @@ Add failing tests before refactoring behavior.
 - Approval invalidates on scope drift
 - Workflow pause/resume integrates with approval wait states
 
+Implemented now:
+
+- local-policy-first A2A delegation checks at `tasks/send` and `tasks/sendSubscribe`
+- MCP `tools/call` safety enforcement via `ToolDescriptor`, `SafetyContext`, and output validation
+- router pre-dispatch safety validation hooks
+- approval drift detection via `plan_hash` and `effect_hash`
+
+Remaining from this phase:
+
+- workflow pause/resume integration with approval wait states
+- broader registry/discovery propagation of structured tool descriptors
+
 ## Phase 6: Cleanup and API Surface Alignment
+
+Status: in progress
 
 ### Deliverables
 
@@ -167,6 +193,15 @@ Add failing tests before refactoring behavior.
 
 - Public API can report `waiting_approval`, `paused`, `failed(limit_exceeded)`, `failed(state_conflict)`
 - Metrics include node attempt count, join wait time, replay count, safety denial count
+
+Implemented now:
+
+- README, architecture, specification, getting-started, API reference, and ADR notes have been refreshed against the actual codebase
+
+Remaining from this phase:
+
+- align API / CLI / SDK runtime state models with the programmatic workflow engine
+- expose richer metrics and runtime statuses through public surfaces
 
 ## Cross-Cutting Rules
 
@@ -192,3 +227,15 @@ Add failing tests before refactoring behavior.
 - Is every secret-bearing boundary scrubbed before persistence or delegation?
 - Can any approval be reused after plan or effect expansion?
 - Can any parent-child delegation combine into an unsafe union without being denied?
+
+## Current Snapshot
+
+The implementation has reached a coherent midpoint:
+
+- deterministic DAG execution semantics are live
+- replay and checkpoint persistence are event-log based
+- secret-scrubbed persistence is live
+- approval binding and drift invalidation are live
+- A2A/MCP/router safety enforcement is live
+
+The next clean boundary is Phase 6: public API/CLI/runtime observability alignment.

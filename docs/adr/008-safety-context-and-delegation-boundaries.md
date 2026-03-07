@@ -3,6 +3,15 @@
 ## Status
 Accepted
 
+## Implementation Status
+Implemented in the current codebase:
+
+- `SafetyContext` and `SafetyEngine` for dynamic tool use and delegation checks
+- structured `ToolDescriptor` resolution for local policy-based tool metadata
+- approval binding via `plan_hash` and `effect_hash`
+- secret scrubbing before workflow checkpoint persistence
+- A2A and MCP runtime boundary checks that keep remote declarations advisory-only
+
 ## Context
 Static agent capability flags are not enough to secure an agentic system.
 
