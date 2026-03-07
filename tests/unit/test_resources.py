@@ -111,6 +111,18 @@ class TestCompositeLimit:
         comp.allow()  # consume the 1 token
         assert comp.allow() is False
 
+    def test_no_partial_consumption_on_reject(self):
+        """When one limiter rejects, no limiter should consume tokens."""
+        tb = TokenBucket(capacity=5, refill_rate=0)
+        sw = SlidingWindow(window_seconds=60, max_requests=1)
+        comp = CompositeLimit(tb, sw)
+        # First call: both pass
+        assert comp.allow() is True
+        # Second call: SlidingWindow should reject, TokenBucket should NOT consume
+        initial_tokens = tb.available()
+        assert comp.allow() is False
+        assert tb.available() == initial_tokens  # no consumption
+
 
 # === KeyedRateLimiter Tests ===
 

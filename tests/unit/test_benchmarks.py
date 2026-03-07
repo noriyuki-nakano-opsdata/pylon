@@ -136,3 +136,11 @@ class TestBenchmarkRunner:
         assert BenchmarkRunner._percentile([5.0], 50) == 5.0
         assert BenchmarkRunner._percentile([1.0, 2.0], 0) == 1.0
         assert BenchmarkRunner._percentile([1.0, 2.0], 100) == 2.0
+
+    @pytest.mark.asyncio
+    async def test_zero_iterations_raises(self, runner: BenchmarkRunner) -> None:
+        async def noop() -> None:
+            pass
+
+        with pytest.raises(ValueError, match="iterations must be >= 1"):
+            await runner.run("zero", noop, iterations=0)

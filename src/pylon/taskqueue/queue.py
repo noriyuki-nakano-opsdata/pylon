@@ -152,5 +152,8 @@ class TaskQueue:
             return False
         task.transition_to(TaskStatus.PENDING)
         task.retries += 1
-        heapq.heappush(self._heap, task)
+        # Rebuild heap: remove stale entries, ensure task is present exactly once
+        self._heap = [t for t in self._heap if t.status == TaskStatus.PENDING and t.id != task.id]
+        self._heap.append(task)
+        heapq.heapify(self._heap)
         return True

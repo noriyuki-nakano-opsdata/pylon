@@ -168,6 +168,46 @@ class TestTaskQueue:
         q.enqueue(task)
         assert q.requeue(task.id) is False  # still PENDING
 
+    def test_requeue_respects_max_retries(self):
+        q = TaskQueue()
+        task = Task(name="limited", max_retries=2)
+        q.enqueue(task)
+        # Cycle 1: dequeue -> fail -> requeue
+        d = q.dequeue()
+        d.transition_to(TaskStatus.FAILED)
+        assert q.requeue(d.id) is True
+        assert d.retries == 1
+        # Cycle 2: dequeue -> fail -> requeue
+        d = q.dequeue()
+        assert d is not None
+        d.transition_to(TaskStatus.FAILED)
+        assert q.requeue(d.id) is True
+        assert d.retries == 2
+        # Cycle 3: dequeue -> fail -> requeue refused (max_retries=2)
+        d = q.dequeue()
+        assert d is not None
+        d.transition_to(TaskStatus.FAILED)
+        assert q.requeue(d.id) is False
+
+    def test_requeue_cleans_heap(self):
+        """requeue should not leave stale entries in heap."""
+        q = TaskQueue()
+        task = _task()
+        q.enqueue(task)
+        t = q.dequeue()
+        t.transition_to(TaskStatus.FAILED)
+        q.requeue(t.id)
+        # Heap should only contain PENDING tasks
+        assert all(t.status == TaskStatus.PENDING for t in q._heap)
+
+    def test_enqueue_rejects_running_task(self):
+        q = TaskQueue()
+        task = _task()
+        q.enqueue(task)
+        q.dequeue()  # now RUNNING
+        with pytest.raises(TaskQueueError):
+            q.enqueue(task)
+
 
 class TestTaskFSM:
     def test_valid_transition(self):
@@ -297,6 +337,24 @@ class TestCronExpression:
     def test_step_zero_in_other_fields(self):
         with pytest.raises(SchedulerError):
             CronExpression("* */0 * * *")
+
+    def test_weekday_sunday_is_zero(self):
+        """Cron weekday 0 = Sunday (not Monday as in Python's weekday())."""
+        cron = CronExpression("0 0 * * 0")  # every Sunday at midnight
+        # 2026-03-08 is a Sunday
+        sat = datetime(2026, 3, 7, 12, 0, 0, tzinfo=timezone.utc)  # Saturday
+        nxt = cron.next_run_after(sat)
+        assert nxt.weekday() == 6  # Python: Sunday = 6
+        assert nxt == datetime(2026, 3, 8, 0, 0, 0, tzinfo=timezone.utc)
+
+    def test_weekday_monday_is_one(self):
+        """Cron weekday 1 = Monday."""
+        cron = CronExpression("0 0 * * 1")  # every Monday at midnight
+        # 2026-03-08 is Sunday, next Monday is 2026-03-09
+        sun = datetime(2026, 3, 8, 12, 0, 0, tzinfo=timezone.utc)
+        nxt = cron.next_run_after(sun)
+        assert nxt.weekday() == 0  # Python: Monday = 0
+        assert nxt == datetime(2026, 3, 9, 0, 0, 0, tzinfo=timezone.utc)
 
 
 class TestTaskScheduler:

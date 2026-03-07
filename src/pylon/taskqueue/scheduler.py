@@ -72,12 +72,15 @@ class CronExpression:
         )
 
     def _matches(self, dt: datetime) -> bool:
+        # cron weekday: 0=Sunday, 6=Saturday
+        # Python weekday(): 0=Monday, 6=Sunday
+        cron_weekday = (dt.weekday() + 1) % 7
         return (
             self._field_matches(self._minute, dt.minute)
             and self._field_matches(self._hour, dt.hour)
             and self._field_matches(self._day, dt.day)
             and self._field_matches(self._month, dt.month)
-            and self._field_matches(self._weekday, dt.weekday())
+            and self._field_matches(self._weekday, cron_weekday)
         )
 
     @staticmethod

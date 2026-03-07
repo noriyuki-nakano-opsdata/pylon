@@ -7,6 +7,7 @@ Production implementation would communicate with the SPIRE Agent API.
 from __future__ import annotations
 
 import enum
+import hmac
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -135,7 +136,10 @@ class WorkloadIdentityManager:
         stored = self._svids.get(svid.spiffe_id.uri)
         if stored is None:
             return False
-        return stored.issued_at == svid.issued_at
+        return hmac.compare_digest(
+            str(stored.issued_at).encode(),
+            str(svid.issued_at).encode(),
+        )
 
     def rotate_svid(self, svid: SVID) -> SVID:
         """Rotate an SVID — issue a new one with the same SPIFFE ID."""

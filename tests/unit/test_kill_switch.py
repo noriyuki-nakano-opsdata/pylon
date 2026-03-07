@@ -67,3 +67,14 @@ class TestKillSwitch:
         assert event.scope == "global"
         assert event.reason == "drill"
         assert event.issued_by == "sre"
+
+    def test_tenant_scope_blocks_child_agents(self):
+        """Activating tenant kill switch should block all agents under that tenant."""
+        ks = KillSwitch()
+        ks.activate("tenant:acme", reason="breach", issued_by="admin")
+        assert ks.is_active("tenant:acme")
+        assert ks.is_active("tenant:acme/agent:a1")
+        assert ks.is_active("tenant:acme/workflow:w1")
+        # Other tenants should not be affected
+        assert not ks.is_active("tenant:other/agent:a1")
+        assert not ks.is_active("tenant:other")

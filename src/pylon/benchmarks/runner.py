@@ -42,6 +42,9 @@ class BenchmarkRunner:
         iterations: int = 100,
         warmup: int = 10,
     ) -> BenchmarkResult:
+        if iterations < 1:
+            raise ValueError(f"iterations must be >= 1, got {iterations}")
+
         # Warmup
         for _ in range(warmup):
             await fn()
