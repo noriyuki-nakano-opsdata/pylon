@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from pylon.errors import PylonError
+
 
 class QuotaResource(str, Enum):
     AGENTS = "agents"
@@ -16,8 +18,10 @@ class QuotaResource(str, Enum):
     COST_USD = "cost_usd"
 
 
-class QuotaExceededError(Exception):
+class QuotaExceededError(PylonError):
     """Raised when a tenant exceeds their resource quota."""
+    code = "QUOTA_EXCEEDED"
+    status_code = 429
 
     def __init__(self, tenant_id: str, resource: QuotaResource, current: float, limit: float) -> None:
         self.tenant_id = tenant_id

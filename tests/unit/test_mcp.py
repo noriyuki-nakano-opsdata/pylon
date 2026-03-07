@@ -532,12 +532,12 @@ class TestOAuthProvider(unittest.TestCase):
         provider = OAuthProvider(config=config)
         client = provider.dynamic_client_registration(
             redirect_uris=["http://localhost:9090/callback"],
-            scope="mcp:read mcp:write",
+            scope="tools:read resources:read",
         )
         self.assertIsNotNone(client)
         self.assertTrue(len(client.client_id) > 0)
         self.assertTrue(len(client.client_secret) > 0)
-        self.assertEqual(client.scopes, ["mcp:read", "mcp:write"])
+        self.assertEqual(client.scopes, ["tools:read", "resources:read"])
         # Should be retrievable
         self.assertIsNotNone(provider.get_client(client.client_id))
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
 
+from pylon.errors import PylonError
 from pylon.tenancy.config import ConfigStore, TenantConfig, TenantLimits, TenantTier
 from pylon.tenancy.context import TenantContext
 from pylon.tenancy.isolation import IsolationLevel, TenantIsolation
@@ -20,8 +21,10 @@ class TenantStatus(str, Enum):
     DELETED = "DELETED"
 
 
-class TenantStatusError(Exception):
+class TenantStatusError(PylonError):
     """Raised on invalid tenant status transition."""
+    code = "TENANT_STATUS_ERROR"
+    status_code = 409
 
     def __init__(self, tenant_id: str, current: TenantStatus, target: TenantStatus) -> None:
         self.tenant_id = tenant_id
@@ -32,13 +35,19 @@ class TenantStatusError(Exception):
         )
 
 
-class TenantNotFoundError(LookupError):
+class TenantNotFoundError(PylonError):
+    code = "TENANT_NOT_FOUND"
+    status_code = 404
+
     def __init__(self, tenant_id: str) -> None:
         self.tenant_id = tenant_id
         super().__init__(f"Tenant not found: {tenant_id}")
 
 
-class TenantAlreadyExistsError(ValueError):
+class TenantAlreadyExistsError(PylonError):
+    code = "TENANT_ALREADY_EXISTS"
+    status_code = 409
+
     def __init__(self, tenant_id: str) -> None:
         self.tenant_id = tenant_id
         super().__init__(f"Tenant already exists: {tenant_id}")

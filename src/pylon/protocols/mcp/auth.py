@@ -284,6 +284,12 @@ class OAuthProvider:
         client_id = secrets.token_urlsafe(16)
         client_secret = secrets.token_urlsafe(32)
         scopes = scope.split() if scope else []
+        # Validate requested scopes against server-supported scopes
+        if scopes and self.config.scopes_supported:
+            allowed = set(self.config.scopes_supported) | set(SCOPE_HIERARCHY.keys())
+            invalid = set(scopes) - allowed
+            if invalid:
+                return None
         client = OAuthClientConfig(
             client_id=client_id,
             client_secret=client_secret,

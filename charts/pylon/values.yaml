@@ -80,7 +80,8 @@ redis:
   enabled: true
   architecture: standalone
   auth:
-    enabled: false
+    enabled: true
+    existingSecret: ""
   master:
     persistence:
       size: 1Gi

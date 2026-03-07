@@ -8,7 +8,7 @@ metadata:
     {{- include "pylon.labels" . | nindent 4 }}
     app.kubernetes.io/component: api
 spec:
-  minAvailable: {{ .Values.api.podDisruptionBudget.minAvailable }}
+  maxUnavailable: 1
   selector:
     matchLabels:
       {{- include "pylon.apiSelectorLabels" . | nindent 6 }}
@@ -24,7 +24,7 @@ metadata:
     {{- include "pylon.labels" . | nindent 4 }}
     app.kubernetes.io/component: worker
 spec:
-  minAvailable: {{ .Values.worker.podDisruptionBudget.minAvailable }}
+  maxUnavailable: 1
   selector:
     matchLabels:
       {{- include "pylon.workerSelectorLabels" . | nindent 6 }}

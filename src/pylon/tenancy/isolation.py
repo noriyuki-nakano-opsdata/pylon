@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from pylon.errors import PylonError
+
 logger = logging.getLogger(__name__)
 
 
@@ -25,8 +27,10 @@ class ResourceType(str, Enum):
     CHECKPOINT = "CHECKPOINT"
 
 
-class CrossTenantAccessError(PermissionError):
+class CrossTenantAccessError(PylonError):
     """Raised when a tenant attempts to access another tenant's resources."""
+    code = "CROSS_TENANT_ACCESS"
+    status_code = 403
 
     def __init__(self, tenant_id: str, resource_type: str, resource_id: str) -> None:
         self.tenant_id = tenant_id
@@ -78,7 +82,7 @@ class TenantIsolation:
         key = f"{resource_type.value}:{resource_id}"
         ownership = self._ownership.get(key)
         if ownership is None:
-            return True
+            return False
         if ownership.owner_tenant_id == tenant_id:
             return True
         if (tenant_id, resource_type.value, resource_id) in self._cross_tenant_allowlist:

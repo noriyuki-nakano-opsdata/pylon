@@ -85,7 +85,7 @@ class A2AServer:
         except Exception as e:
             return JsonRpcResponse(
                 id=request.id,
-                error=JsonRpcError(code=INTERNAL_ERROR, message=str(e)),
+                error=JsonRpcError(code=INTERNAL_ERROR, message="Internal server error"),
             )
 
     async def handle_subscribe(
@@ -192,6 +192,15 @@ class A2AServer:
             )
 
         task = A2ATask.from_dict(task_data)
+        # Prevent overwrite of existing tasks
+        if task.id in self._tasks:
+            return JsonRpcResponse(
+                id=request.id,
+                error=JsonRpcError(
+                    code=INVALID_PARAMS,
+                    message=f"Task already exists: {task.id}",
+                ),
+            )
         task.transition_to(TaskState.WORKING)
         self._tasks[task.id] = task
 
