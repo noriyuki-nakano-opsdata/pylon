@@ -34,3 +34,9 @@ coverage.xml
 
 # Build
 *.whl
+
+# Logs
+logs/
+
+# Claude Flow cache
+.claude-flow/
