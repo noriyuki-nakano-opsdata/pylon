@@ -5,11 +5,12 @@ from __future__ import annotations
 import enum
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 from pylon.errors import PylonError
-from pylon.taskqueue.queue import Task, TaskQueue, TaskStatus
+from pylon.taskqueue.queue import Task, TaskStatus
 
 
 class WorkerError(PylonError):

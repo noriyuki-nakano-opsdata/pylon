@@ -6,11 +6,9 @@ Integrates CapabilityValidator and AutonomyEnforcer with resource limit checks
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
-from pylon.errors import ApprovalRequiredError, PolicyViolationError
-from pylon.types import AgentConfig, AutonomyLevel, PolicyConfig
+from pylon.types import AgentConfig, PolicyConfig
 
 
 @dataclass
@@ -93,7 +91,10 @@ class PolicyEngine:
         if agent_config.autonomy >= self._policy.require_approval_above:
             return PolicyDecision(
                 allowed=True,
-                reason=f"Action allowed but requires approval (autonomy={agent_config.autonomy.name})",
+                reason=(
+                    "Action allowed but requires approval "
+                    f"(autonomy={agent_config.autonomy.name})"
+                ),
                 requires_approval=True,
             )
 

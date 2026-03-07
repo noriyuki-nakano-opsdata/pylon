@@ -1,7 +1,7 @@
 """Tenant management and quota enforcement."""
 
 from pylon.control_plane.tenant.manager import TenantConfig, TenantManager, TenantStatus
-from pylon.control_plane.tenant.quota import ResourceQuota, QuotaEnforcer
+from pylon.control_plane.tenant.quota import QuotaEnforcer, ResourceQuota
 
 __all__ = [
     "TenantConfig",

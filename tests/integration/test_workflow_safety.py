@@ -10,23 +10,21 @@ from pylon.errors import (
     ApprovalRequiredError,
     PolicyViolationError,
     PromptInjectionError,
-    WorkflowError,
 )
 from pylon.repository.audit import AuditRepository
 from pylon.repository.checkpoint import CheckpointRepository
-from pylon.repository.workflow import RunStatus, WorkflowRepository, WorkflowRun
+from pylon.repository.workflow import RunStatus, WorkflowRun
 from pylon.safety.autonomy import AutonomyEnforcer
 from pylon.safety.capability import CapabilityValidator
 from pylon.safety.kill_switch import KillSwitch
 from pylon.safety.policy import ActionState, PolicyEngine
-from pylon.safety.prompt_guard import PatternMatcher, PromptGuard
+from pylon.safety.prompt_guard import PromptGuard
 from pylon.types import (
     AgentCapability,
     AgentConfig,
     AutonomyLevel,
     ConditionalEdge,
     PolicyConfig,
-    PolicyViolation,
     TrustLevel,
 )
 from pylon.workflow.executor import GraphExecutor
@@ -84,13 +82,13 @@ async def test_kill_switch_get_active_scopes():
 
 async def test_rule_of_two_blocks_untrusted_plus_secrets():
     """AgentCapability forbids untrusted input + secret access."""
-    with pytest.raises(PolicyViolation, match="Forbidden pair"):
+    with pytest.raises(PolicyViolationError, match="Forbidden pair"):
         AgentCapability(can_read_untrusted=True, can_access_secrets=True)
 
 
 async def test_rule_of_two_blocks_all_three():
     """AgentCapability forbids all three flags simultaneously."""
-    with pytest.raises(PolicyViolation, match="Rule-of-Two"):
+    with pytest.raises(PolicyViolationError, match="Rule-of-Two"):
         AgentCapability(
             can_read_untrusted=True,
             can_access_secrets=True,

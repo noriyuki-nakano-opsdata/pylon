@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-
 # JSON-RPC 2.0 error codes
 PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
@@ -49,6 +48,7 @@ class JsonRpcResponse:
     result: Any = None
     error: JsonRpcError | None = None
     id: str | int | None = None
+    headers: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {"jsonrpc": self.jsonrpc, "id": self.id}
@@ -63,13 +63,13 @@ class JsonRpcResponse:
 class ToolDefinition:
     name: str = ""
     description: str = ""
-    inputSchema: dict = field(default_factory=dict)
+    input_schema: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
             "name": self.name,
             "description": self.description,
-            "inputSchema": self.inputSchema,
+            "inputSchema": self.input_schema,
         }
 
 
@@ -78,30 +78,30 @@ class ResourceDefinition:
     uri: str = ""
     name: str = ""
     description: str = ""
-    mimeType: str = ""
+    mime_type: str = ""
 
     def to_dict(self) -> dict:
         return {
             "uri": self.uri,
             "name": self.name,
             "description": self.description,
-            "mimeType": self.mimeType,
+            "mimeType": self.mime_type,
         }
 
 
 @dataclass
 class ResourceTemplate:
-    uriTemplate: str = ""
+    uri_template: str = ""
     name: str = ""
     description: str = ""
-    mimeType: str = ""
+    mime_type: str = ""
 
     def to_dict(self) -> dict:
         return {
-            "uriTemplate": self.uriTemplate,
+            "uriTemplate": self.uri_template,
             "name": self.name,
             "description": self.description,
-            "mimeType": self.mimeType,
+            "mimeType": self.mime_type,
         }
 
 
@@ -145,16 +145,16 @@ class SamplingMessage:
 @dataclass
 class SamplingRequest:
     messages: list[SamplingMessage] = field(default_factory=list)
-    modelPreferences: dict = field(default_factory=dict)
-    systemPrompt: str = ""
-    maxTokens: int = 1024
+    model_preferences: dict = field(default_factory=dict)
+    system_prompt: str = ""
+    max_tokens: int = 1024
 
     def to_dict(self) -> dict:
         return {
             "messages": [m.to_dict() for m in self.messages],
-            "modelPreferences": self.modelPreferences,
-            "systemPrompt": self.systemPrompt,
-            "maxTokens": self.maxTokens,
+            "modelPreferences": self.model_preferences,
+            "systemPrompt": self.system_prompt,
+            "maxTokens": self.max_tokens,
         }
 
 
@@ -163,14 +163,14 @@ class SamplingResponse:
     role: str = "assistant"
     content: str = ""
     model: str = ""
-    stopReason: str = ""
+    stop_reason: str = ""
 
     def to_dict(self) -> dict:
         return {
             "role": self.role,
             "content": self.content,
             "model": self.model,
-            "stopReason": self.stopReason,
+            "stopReason": self.stop_reason,
         }
 
 
@@ -185,12 +185,12 @@ class PaginationCursor:
 @dataclass
 class PaginatedResult:
     items: list[Any] = field(default_factory=list)
-    nextCursor: str | None = None
+    next_cursor: str | None = None
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {}
-        if self.nextCursor is not None:
-            d["nextCursor"] = self.nextCursor
+        if self.next_cursor is not None:
+            d["nextCursor"] = self.next_cursor
         return d
 
 
@@ -220,13 +220,13 @@ class ClientCapabilities:
 
 @dataclass
 class InitializeResult:
-    protocolVersion: str = "2025-11-25"
+    protocol_version: str = "2025-11-25"
     capabilities: ServerCapabilities = field(default_factory=ServerCapabilities)
-    serverInfo: dict = field(default_factory=lambda: {"name": "pylon-mcp", "version": "0.1.0"})
+    server_info: dict = field(default_factory=lambda: {"name": "pylon-mcp", "version": "0.1.0"})
 
     def to_dict(self) -> dict:
         return {
-            "protocolVersion": self.protocolVersion,
+            "protocolVersion": self.protocol_version,
             "capabilities": self.capabilities.to_dict(),
-            "serverInfo": self.serverInfo,
+            "serverInfo": self.server_info,
         }

@@ -42,13 +42,18 @@ def get_ctx(ctx: click.Context) -> CliContext:
 
 
 # Register commands
-from pylon.cli.commands.init_cmd import init  # noqa: E402
-from pylon.cli.commands.run import run  # noqa: E402
-from pylon.cli.commands.dev import dev  # noqa: E402
-from pylon.cli.commands.inspect_cmd import inspect  # noqa: E402
-from pylon.cli.commands.doctor import doctor  # noqa: E402
-from pylon.cli.commands.approve import approve  # noqa: E402
 from pylon.cli.commands.agent import agent  # noqa: E402
+from pylon.cli.commands.approve import approve  # noqa: E402
+from pylon.cli.commands.config_cmd import config  # noqa: E402
+from pylon.cli.commands.dev import dev  # noqa: E402
+from pylon.cli.commands.doctor import doctor  # noqa: E402
+from pylon.cli.commands.init_cmd import init  # noqa: E402
+from pylon.cli.commands.inspect_cmd import inspect  # noqa: E402
+from pylon.cli.commands.login import login  # noqa: E402
+from pylon.cli.commands.logs import logs  # noqa: E402
+from pylon.cli.commands.replay import replay  # noqa: E402
+from pylon.cli.commands.run import run  # noqa: E402
+from pylon.cli.commands.sandbox import sandbox  # noqa: E402
 
 cli.add_command(init)
 cli.add_command(run)
@@ -57,6 +62,11 @@ cli.add_command(inspect)
 cli.add_command(doctor)
 cli.add_command(approve)
 cli.add_command(agent)
+cli.add_command(logs)
+cli.add_command(replay)
+cli.add_command(login)
+cli.add_command(config)
+cli.add_command(sandbox)
 
 
 def main() -> None:

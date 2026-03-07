@@ -17,10 +17,6 @@ class PluginState(enum.Enum):
     STOPPED = "stopped"
     ERROR = "error"
 
-    # Aliases for backward compatibility with existing code
-    ACTIVE = "started"
-    DISABLED = "stopped"
-
 
 class PluginType(enum.Enum):
     """Types of plugins supported by the system."""

@@ -4,17 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from pylon.protocols.mcp.dto import InitializeResponseDTO, SamplingCreateParamsDTO
 from pylon.protocols.mcp.server import McpServer
 from pylon.protocols.mcp.types import (
     InitializeResult,
     JsonRpcRequest,
-    PromptDefinition,
-    PromptArgument,
-    ResourceDefinition,
-    ResourceTemplate,
-    SamplingResponse,
     ServerCapabilities,
-    ToolDefinition,
 )
 
 
@@ -63,15 +58,25 @@ class McpClient:
         return response.result
 
     def initialize(self) -> InitializeResult:
-        result = self._call("initialize", {"capabilities": {}})
-        self._session_id = result.get("sessionId")
-        caps = ServerCapabilities(**result["capabilities"])
-        self._server_capabilities = caps
-        return InitializeResult(
-            protocolVersion=result["protocolVersion"],
-            capabilities=caps,
-            serverInfo=result["serverInfo"],
+        self._ensure_connected()
+        assert self._server is not None
+        request = JsonRpcRequest(
+            method="initialize",
+            params={"capabilities": {}},
+            id=self._next_id(),
         )
+        response = self._server.handle_request(request, access_token=self._access_token)
+        if response.error is not None:
+            raise RuntimeError(
+                f"RPC error {response.error.code}: {response.error.message}"
+            )
+        init_dto = InitializeResponseDTO.from_wire(response.result)
+        result = init_dto.result
+        header_session = response.headers.get("Mcp-Session-Id", "")
+        self._session_id = header_session or init_dto.session_id
+        caps = result.capabilities
+        self._server_capabilities = caps
+        return result
 
     # --- Tools ---
 
@@ -98,7 +103,7 @@ class McpClient:
     def subscribe_resource(self, uri: str) -> Any:
         params: dict[str, Any] = {"uri": uri}
         if self._session_id:
-            params["sessionId"] = self._session_id
+            params["mcpSessionId"] = self._session_id
         return self._call("resources/subscribe", params)
 
     def list_resource_templates(self) -> dict[str, Any]:
@@ -124,14 +129,15 @@ class McpClient:
         max_tokens: int = 1024,
         model_preferences: dict | None = None,
     ) -> Any:
+        dto = SamplingCreateParamsDTO.from_client_inputs(
+            messages=messages,
+            system_prompt=system_prompt,
+            max_tokens=max_tokens,
+            model_preferences=model_preferences,
+        )
         return self._call(
             "sampling/createMessage",
-            {
-                "messages": messages,
-                "systemPrompt": system_prompt,
-                "maxTokens": max_tokens,
-                "modelPreferences": model_preferences or {},
-            },
+            dto.to_wire(),
         )
 
     def close(self) -> None:

@@ -10,6 +10,8 @@ import enum
 from dataclasses import dataclass, field
 from typing import Any
 
+from pylon.errors import PolicyViolationError
+
 
 class AutonomyLevel(enum.IntEnum):
     """Autonomy Ladder (ADR-004). A3+ requires human approval."""
@@ -69,10 +71,6 @@ class SandboxTier(enum.Enum):
     NONE = "none"  # Host process: requires SuperAdmin
 
 
-class PolicyViolation(Exception):
-    """Raised when a safety policy is violated."""
-
-
 @dataclass(frozen=True)
 class AgentCapability:
     """Agent capability model with Rule-of-Two+ enforcement (Section 2.3).
@@ -91,9 +89,9 @@ class AgentCapability:
     def validate(self) -> None:
         flags = [self.can_read_untrusted, self.can_access_secrets, self.can_write_external]
         if all(flags):
-            raise PolicyViolation("Rule-of-Two: agent cannot have all three capabilities")
+            raise PolicyViolationError("Rule-of-Two: agent cannot have all three capabilities")
         if self.can_read_untrusted and self.can_access_secrets:
-            raise PolicyViolation("Forbidden pair: untrusted input + secret access")
+            raise PolicyViolationError("Forbidden pair: untrusted input + secret access")
 
     def can_grant(self, additional: AgentCapability) -> bool:
         """Check if granting additional capabilities would violate Rule-of-Two+."""

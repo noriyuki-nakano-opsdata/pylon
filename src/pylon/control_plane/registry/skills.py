@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from pylon.errors import PylonError
 from pylon.control_plane.registry.tools import ToolDefinition, ToolRegistry
+from pylon.errors import PylonError
 
 
 class SkillRegistryError(PylonError):

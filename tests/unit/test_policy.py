@@ -1,7 +1,7 @@
 """Tests for policy engine."""
 
+from pylon.safety.policy import ActionState, PolicyEngine
 from pylon.types import AgentConfig, AutonomyLevel, PolicyConfig
-from pylon.safety.policy import ActionState, PolicyDecision, PolicyEngine
 
 
 def _default_policy(**overrides) -> PolicyConfig:

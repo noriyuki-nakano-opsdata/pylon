@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 
@@ -20,9 +20,9 @@ class EpisodicEntry:
     embedding: list[float] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     expires_at: datetime = field(
-        default_factory=lambda: datetime.now(timezone.utc) + timedelta(days=30)
+        default_factory=lambda: datetime.now(UTC) + timedelta(days=30)
     )
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 @dataclass
@@ -32,8 +32,8 @@ class SemanticEntry:
     content: str = ""
     embedding: list[float] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 @dataclass
@@ -44,8 +44,8 @@ class ProceduralEntry:
     success_rate: float = 0.0
     execution_count: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 class MemoryRepository:
@@ -67,13 +67,13 @@ class MemoryRepository:
 
     async def get_episodic(self, id: str) -> EpisodicEntry | None:
         entry = self._episodic.get(id)
-        if entry and entry.expires_at < datetime.now(timezone.utc):
+        if entry and entry.expires_at < datetime.now(UTC):
             del self._episodic[id]
             return None
         return entry
 
     async def list_episodic(self, agent_id: str, *, limit: int = 50) -> list[EpisodicEntry]:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         results = [
             e for e in self._episodic.values()
             if e.agent_id == agent_id and e.expires_at >= now
@@ -83,7 +83,7 @@ class MemoryRepository:
 
     async def cleanup_expired(self) -> int:
         """Remove expired episodic entries. Returns count removed."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         expired = [k for k, v in self._episodic.items() if v.expires_at < now]
         for k in expired:
             del self._episodic[k]
@@ -129,7 +129,7 @@ class MemoryRepository:
             entry.success_rate = (entry.success_rate * (total - 1) + 1.0) / total
         else:
             entry.success_rate = (entry.success_rate * (total - 1)) / total
-        entry.updated_at = datetime.now(timezone.utc)
+        entry.updated_at = datetime.now(UTC)
         return entry
 
     async def list_procedural(self, *, limit: int = 50) -> list[ProceduralEntry]:

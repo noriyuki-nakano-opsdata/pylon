@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pylon.approval.store import ApprovalStore
@@ -47,7 +47,7 @@ class ApprovalManager:
         autonomy_level: AutonomyLevel,
         context: dict[str, Any] | None = None,
     ) -> ApprovalRequest:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         request = ApprovalRequest(
             agent_id=agent_id,
             action=action,
@@ -127,7 +127,7 @@ class ApprovalManager:
             status=ApprovalStatus.PENDING,
             agent_id=agent_id,
         )
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         still_pending: list[ApprovalRequest] = []
         for req in pending:
             if req.expires_at and now >= req.expires_at:
@@ -139,7 +139,7 @@ class ApprovalManager:
     async def get_request(self, request_id: str) -> ApprovalRequest | None:
         request = await self._store.get(request_id)
         if request and request.status == ApprovalStatus.PENDING:
-            if request.expires_at and datetime.now(timezone.utc) >= request.expires_at:
+            if request.expires_at and datetime.now(UTC) >= request.expires_at:
                 await self._expire_request(request)
         return request
 
@@ -152,7 +152,7 @@ class ApprovalManager:
             )
         # Check expiry first
         if request.status == ApprovalStatus.PENDING and request.expires_at:
-            if datetime.now(timezone.utc) >= request.expires_at:
+            if datetime.now(UTC) >= request.expires_at:
                 await self._expire_request(request)
                 raise ApprovalAlreadyDecidedError(
                     f"Approval request expired: {request_id}",

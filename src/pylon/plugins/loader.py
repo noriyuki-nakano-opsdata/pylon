@@ -6,7 +6,7 @@ import importlib
 import importlib.metadata
 import json
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from pylon.plugins.types import (
     PluginConfig,

@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any
+from enum import StrEnum
 
 from pylon.errors import PylonError
 
 
-class QuotaResource(str, Enum):
+class QuotaResource(StrEnum):
     AGENTS = "agents"
     WORKFLOWS = "workflows"
     STORAGE_MB = "storage_mb"
@@ -23,7 +22,13 @@ class QuotaExceededError(PylonError):
     code = "QUOTA_EXCEEDED"
     status_code = 429
 
-    def __init__(self, tenant_id: str, resource: QuotaResource, current: float, limit: float) -> None:
+    def __init__(
+        self,
+        tenant_id: str,
+        resource: QuotaResource,
+        current: float,
+        limit: float,
+    ) -> None:
         self.tenant_id = tenant_id
         self.resource = resource
         self.current = current

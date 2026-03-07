@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager, contextmanager
-from contextvars import ContextVar, copy_context
-from dataclasses import asdict, dataclass, field
-from typing import Any, AsyncGenerator, Generator
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from typing import Any
 
 from pylon.tenancy.config import TenantLimits, TenantTier
 
@@ -69,8 +70,6 @@ async def async_tenant_scope(ctx: TenantContext) -> AsyncGenerator[TenantContext
 
 async def run_in_tenant_context(ctx: TenantContext, coro: Any) -> Any:
     """Run a coroutine with tenant context propagated across async tasks."""
-    context = copy_context()
-
     async def _wrapper() -> Any:
         _current_tenant.set(ctx)
         return await coro

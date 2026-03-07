@@ -18,7 +18,6 @@ from pylon.resilience import (
     ConstantBackoff,
     ExponentialBackoff,
     FallbackChain,
-    FallbackResult,
     JitteredBackoff,
     LinearBackoff,
     RetryExhaustedError,
@@ -26,7 +25,6 @@ from pylon.resilience import (
     retry,
     with_retry,
 )
-
 
 # --- CircuitBreaker ---
 

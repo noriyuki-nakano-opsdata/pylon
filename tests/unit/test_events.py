@@ -7,6 +7,15 @@ import time
 
 import pytest
 
+from pylon.events.bus import EventBus
+from pylon.events.handlers import (
+    BatchHandler,
+    FilteredHandler,
+    FunctionHandler,
+    LoggingHandler,
+    RetryHandler,
+)
+from pylon.events.store import EventStore
 from pylon.events.types import (
     AGENT_CREATED,
     AGENT_FAILED,
@@ -23,16 +32,6 @@ from pylon.events.types import (
     Event,
     EventFilter,
 )
-from pylon.events.bus import EventBus
-from pylon.events.store import EventStore
-from pylon.events.handlers import (
-    BatchHandler,
-    FilteredHandler,
-    FunctionHandler,
-    LoggingHandler,
-    RetryHandler,
-)
-
 
 # --- Event types ---
 

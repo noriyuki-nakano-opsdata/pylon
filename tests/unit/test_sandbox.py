@@ -3,9 +3,8 @@
 import pytest
 
 from pylon.errors import SandboxError
-from pylon.types import SandboxTier
-from pylon.sandbox.manager import Sandbox, SandboxConfig, SandboxManager, SandboxStatus
-from pylon.sandbox.executor import ExecutionResult, SandboxExecutor
+from pylon.sandbox.executor import SandboxExecutor
+from pylon.sandbox.manager import SandboxConfig, SandboxManager, SandboxStatus
 from pylon.sandbox.policy import (
     DEFAULT_POLICIES,
     NetworkPolicy,
@@ -14,7 +13,7 @@ from pylon.sandbox.policy import (
     SandboxPolicy,
 )
 from pylon.sandbox.registry import SandboxRegistry
-
+from pylon.types import SandboxTier
 
 # ---------------------------------------------------------------------------
 # SandboxManager CRUD

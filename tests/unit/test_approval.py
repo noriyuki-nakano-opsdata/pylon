@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -238,7 +237,7 @@ class TestApprovalManagerTimeout:
         mgr = ApprovalManager(store, audit, timeout_seconds=0)
         req = await mgr.submit_request("agent-1", "deploy", AutonomyLevel.A3)
         # Force expiry by setting expires_at in the past
-        req.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        req.expires_at = datetime.now(UTC) - timedelta(seconds=1)
         await store.update(req)
         pending = await mgr.get_pending()
         assert len(pending) == 0
@@ -249,7 +248,7 @@ class TestApprovalManagerTimeout:
     ) -> None:
         mgr = ApprovalManager(store, audit, timeout_seconds=0)
         req = await mgr.submit_request("agent-1", "deploy", AutonomyLevel.A3)
-        req.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        req.expires_at = datetime.now(UTC) - timedelta(seconds=1)
         await store.update(req)
         await mgr.get_pending()
         entries = await audit.list(event_type="approval.expired")
@@ -261,7 +260,7 @@ class TestApprovalManagerTimeout:
     ) -> None:
         mgr = ApprovalManager(store, audit, timeout_seconds=0)
         req = await mgr.submit_request("agent-1", "deploy", AutonomyLevel.A3)
-        req.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        req.expires_at = datetime.now(UTC) - timedelta(seconds=1)
         await store.update(req)
         with pytest.raises(ApprovalAlreadyDecidedError, match="expired"):
             await mgr.approve(req.id, "admin")
@@ -272,7 +271,7 @@ class TestApprovalManagerTimeout:
     ) -> None:
         mgr = ApprovalManager(store, audit, timeout_seconds=0)
         req = await mgr.submit_request("agent-1", "deploy", AutonomyLevel.A3)
-        req.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        req.expires_at = datetime.now(UTC) - timedelta(seconds=1)
         await store.update(req)
         result = await mgr.get_request(req.id)
         assert result is not None

@@ -10,12 +10,10 @@ from pylon.resources.limiter import (
     SlidingWindow,
     TokenBucket,
 )
-from pylon.resources.quota import (
-    QuotaDefinition,
-    QuotaManager,
-    QuotaPeriod,
-    ResourceType,
-    UsageInfo,
+from pylon.resources.monitor import (
+    Alert,
+    Comparator,
+    ResourceMonitor,
 )
 from pylon.resources.pool import (
     PoolConfig,
@@ -23,13 +21,11 @@ from pylon.resources.pool import (
     PoolExhaustedError,
     ResourcePool,
 )
-from pylon.resources.monitor import (
-    Alert,
-    Comparator,
-    DataPoint,
-    ResourceMonitor,
+from pylon.resources.quota import (
+    QuotaDefinition,
+    QuotaManager,
+    ResourceType,
 )
-
 
 # === TokenBucket Tests ===
 

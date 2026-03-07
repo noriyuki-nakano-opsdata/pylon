@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
 
 from pylon.config.loader import ConfigLoader, ConfigSource
+from pylon.config.registry import (
+    ConfigRegistry,
+    FrozenConfigError,
+    get_registry,
+    reset_registry,
+)
+from pylon.config.resolver import ConfigResolver, InMemorySecretProvider
 from pylon.config.validator import (
     AgentConfigSchema,
     ConfigSchema,
@@ -17,14 +23,6 @@ from pylon.config.validator import (
     ServerConfigSchema,
     WorkflowConfigSchema,
 )
-from pylon.config.resolver import ConfigResolver, InMemorySecretProvider
-from pylon.config.registry import (
-    ConfigRegistry,
-    FrozenConfigError,
-    get_registry,
-    reset_registry,
-)
-
 
 # --- ConfigLoader ---
 

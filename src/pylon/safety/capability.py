@@ -17,11 +17,28 @@ class CapabilityValidator:
     """Validates agent capabilities against Rule-of-Two+ constraints."""
 
     @staticmethod
+    def resolve_agent_capability(config: AgentConfig) -> AgentCapability:
+        """Resolve effective capability from explicit + inferred flags.
+
+        Effective capability is the union of:
+        - Explicit capability in AgentConfig.capability
+        - Inferred capability from input_trust and tool set
+        """
+        inferred_untrusted, inferred_secrets, inferred_write = _infer_capability_flags(config)
+
+        merged = _make_cap(
+            untrusted=config.capability.can_read_untrusted or inferred_untrusted,
+            secrets=config.capability.can_access_secrets or inferred_secrets,
+            write=config.capability.can_write_external or inferred_write,
+        )
+
+        _enforce_rule_of_two_plus(merged, context=f"agent '{config.name}'")
+        return merged
+
+    @staticmethod
     def validate_agent_config(config: AgentConfig) -> None:
         """Validate at agent creation time (checkpoint 1)."""
-        flags = _infer_capability_flags(config)
-        cap = _make_cap(untrusted=flags[0], secrets=flags[1], write=flags[2])
-        _enforce_rule_of_two_plus(cap, context=f"agent '{config.name}'")
+        CapabilityValidator.resolve_agent_capability(config)
 
     @staticmethod
     def validate_tool_grant(
@@ -90,7 +107,12 @@ class CapabilityValidator:
         )
 
 
-def _make_cap(*, untrusted: bool = False, secrets: bool = False, write: bool = False) -> AgentCapability:
+def _make_cap(
+    *,
+    untrusted: bool = False,
+    secrets: bool = False,
+    write: bool = False,
+) -> AgentCapability:
     """Create AgentCapability without triggering __post_init__ validation."""
     cap = AgentCapability.__new__(AgentCapability)
     object.__setattr__(cap, "can_read_untrusted", untrusted)

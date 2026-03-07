@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+
 import pytest
 
-from pylon.protocols.mcp.types import JsonRpcRequest, METHOD_NOT_FOUND, INVALID_PARAMS
+from pylon.protocols.a2a.card import AgentCardRegistry, generate_card
+from pylon.protocols.a2a.client import A2AClient, A2AConnectionPool
+from pylon.protocols.a2a.server import RATE_LIMITED, A2AServer
 from pylon.protocols.a2a.types import (
     A2AMessage,
     A2ATask,
@@ -19,10 +22,7 @@ from pylon.protocols.a2a.types import (
     TaskEvent,
     TaskState,
 )
-from pylon.protocols.a2a.server import A2AServer, RATE_LIMITED
-from pylon.protocols.a2a.client import A2AClient, A2AConnectionPool
-from pylon.protocols.a2a.card import AgentCardRegistry, generate_card
-
+from pylon.protocols.mcp.types import INVALID_PARAMS, METHOD_NOT_FOUND, JsonRpcRequest
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -149,7 +149,7 @@ class TestA2AServer:
         )))
         resp = _run(server.handle_request(JsonRpcRequest(
             method="tasks/get",
-            params={"task_id": "t-get"},
+            params={"taskId": "t-get"},
             id="g1",
         )))
         assert resp.error is None
@@ -159,7 +159,7 @@ class TestA2AServer:
         server = A2AServer()
         resp = _run(server.handle_request(JsonRpcRequest(
             method="tasks/get",
-            params={"task_id": "nope"},
+            params={"taskId": "nope"},
             id="g2",
         )))
         assert resp.error is not None
@@ -175,7 +175,7 @@ class TestA2AServer:
         )))
         resp = _run(server.handle_request(JsonRpcRequest(
             method="tasks/cancel",
-            params={"task_id": "t-cancel"},
+            params={"taskId": "t-cancel"},
             id="c1",
         )))
         assert resp.error is None
@@ -193,7 +193,7 @@ class TestA2AServer:
         server._tasks["t-comp"].transition_to(TaskState.COMPLETED)
         resp = _run(server.handle_request(JsonRpcRequest(
             method="tasks/cancel",
-            params={"task_id": "t-comp"},
+            params={"taskId": "t-comp"},
             id="c2",
         )))
         assert resp.error is not None
@@ -208,6 +208,51 @@ class TestA2AServer:
         )))
         assert resp.error is not None
         assert resp.error.code == METHOD_NOT_FOUND
+
+    def test_set_and_get_push_notification(self):
+        server = A2AServer()
+        task = _make_task("push-1")
+        _run(server.handle_request(JsonRpcRequest(
+            method="tasks/send",
+            params={"sender": "peer-a", "task": task.to_dict()},
+            id="pn-send",
+        )))
+
+        set_resp = _run(server.handle_request(JsonRpcRequest(
+            method="tasks/pushNotification/set",
+            params={
+                "taskId": "push-1",
+                "pushNotification": {
+                    "url": "http://hook.example",
+                    "token": "abc",
+                    "events": ["completed"],
+                },
+            },
+            id="pn-set",
+        )))
+        assert set_resp.error is None
+        assert set_resp.result["taskId"] == "push-1"
+
+        get_resp = _run(server.handle_request(JsonRpcRequest(
+            method="tasks/pushNotification/get",
+            params={"taskId": "push-1"},
+            id="pn-get",
+        )))
+        assert get_resp.error is None
+        assert get_resp.result["pushNotification"]["url"] == "http://hook.example"
+
+    def test_set_push_notification_requires_task(self):
+        server = A2AServer()
+        resp = _run(server.handle_request(JsonRpcRequest(
+            method="tasks/pushNotification/set",
+            params={
+                "taskId": "missing",
+                "pushNotification": {"url": "http://hook", "events": []},
+            },
+            id="pn-missing",
+        )))
+        assert resp.error is not None
+        assert resp.error.code == INVALID_PARAMS
 
     def test_missing_task_in_send(self):
         server = A2AServer()
@@ -236,6 +281,41 @@ class TestA2AServer:
             id="m3",
         )))
         assert resp.error is not None
+
+    def test_get_rejects_snake_case_task_id(self):
+        server = A2AServer()
+        task = _make_task("camel-only")
+        _run(server.handle_request(JsonRpcRequest(
+            method="tasks/send",
+            params={"sender": "peer-a", "task": task.to_dict()},
+            id="camel-send",
+        )))
+        resp = _run(server.handle_request(JsonRpcRequest(
+            method="tasks/get",
+            params={"task_id": "camel-only"},
+            id="camel-get",
+        )))
+        assert resp.error is not None
+        assert resp.error.code == INVALID_PARAMS
+
+    def test_push_notification_set_rejects_snake_case_fields(self):
+        server = A2AServer()
+        task = _make_task("camel-push")
+        _run(server.handle_request(JsonRpcRequest(
+            method="tasks/send",
+            params={"sender": "peer-a", "task": task.to_dict()},
+            id="camel-push-send",
+        )))
+        resp = _run(server.handle_request(JsonRpcRequest(
+            method="tasks/pushNotification/set",
+            params={
+                "task_id": "camel-push",
+                "push_notification": {"url": "http://hook", "events": []},
+            },
+            id="camel-push-set",
+        )))
+        assert resp.error is not None
+        assert resp.error.code == INVALID_PARAMS
 
 
 # ── Peer Authentication Tests ────────────────────────────────────────
@@ -316,7 +396,9 @@ class TestTaskHandler:
 
         @server.on_task
         async def handle(task: A2ATask) -> A2ATask:
-            task.add_artifact(Artifact(name="output", parts=[Part(type="text", content="processed")]))
+            task.add_artifact(
+                Artifact(name="output", parts=[Part(type="text", content="processed")])
+            )
             task.transition_to(TaskState.COMPLETED)
             return task
 

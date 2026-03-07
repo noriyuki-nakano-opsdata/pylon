@@ -2,13 +2,11 @@
 
 import pytest
 
+from pylon.errors import PolicyViolationError
 from pylon.types import (
     AgentCapability,
     AgentState,
     AutonomyLevel,
-    PolicyViolation,
-    SandboxTier,
-    TrustLevel,
 )
 
 
@@ -38,7 +36,7 @@ class TestAgentCapability:
 
     def test_all_three_violation(self):
         """All three capabilities violates Rule-of-Two."""
-        with pytest.raises(PolicyViolation, match="Rule-of-Two"):
+        with pytest.raises(PolicyViolationError, match="Rule-of-Two"):
             AgentCapability(
                 can_read_untrusted=True,
                 can_access_secrets=True,
@@ -47,7 +45,7 @@ class TestAgentCapability:
 
     def test_forbidden_pair_violation(self):
         """Untrusted input + secret access is a forbidden pair."""
-        with pytest.raises(PolicyViolation, match="Forbidden pair"):
+        with pytest.raises(PolicyViolationError, match="Forbidden pair"):
             AgentCapability(can_read_untrusted=True, can_access_secrets=True)
 
     def test_can_grant_safe(self):

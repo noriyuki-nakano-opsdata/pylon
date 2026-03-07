@@ -5,7 +5,6 @@ import unittest
 from pylon.protocols.mcp import (
     INTERNAL_ERROR,
     METHOD_NOT_FOUND,
-    AuthorizationCode,
     InitializeResult,
     JsonRpcError,
     JsonRpcRequest,
@@ -21,7 +20,6 @@ from pylon.protocols.mcp import (
     PromptDefinition,
     ResourceDefinition,
     SessionManager,
-    ServerCapabilities,
     TokenResponse,
     ToolDefinition,
     route,
@@ -114,6 +112,7 @@ class TestMcpServer(unittest.TestCase):
         self.assertEqual(resp.result["protocolVersion"], "2025-11-25")
         self.assertEqual(resp.result["serverInfo"]["name"], "test-server")
         self.assertIn("sessionId", resp.result)
+        self.assertEqual(resp.headers.get("Mcp-Session-Id"), resp.result["sessionId"])
 
     def test_tools_list_empty(self):
         req = JsonRpcRequest(method="tools/list", id=2)
@@ -124,7 +123,7 @@ class TestMcpServer(unittest.TestCase):
         tool = ToolDefinition(
             name="echo",
             description="Echo tool",
-            inputSchema={"type": "object", "properties": {"msg": {"type": "string"}}},
+            input_schema={"type": "object", "properties": {"msg": {"type": "string"}}},
         )
         self.server.register_tool(tool, handler=lambda args: args["msg"])
 
@@ -162,7 +161,7 @@ class TestMcpServer(unittest.TestCase):
             uri="file:///readme.md",
             name="README",
             description="Project readme",
-            mimeType="text/markdown",
+            mime_type="text/markdown",
         )
         self.server.register_resource(
             resource, handler=lambda uri: {"content": "# Hello"}
@@ -267,7 +266,7 @@ class TestMcpClientServerIntegration(unittest.TestCase):
                 uri="config://app",
                 name="App Config",
                 description="Application configuration",
-                mimeType="application/json",
+                mime_type="application/json",
             ),
             handler=lambda uri: {"debug": True, "version": "1.0"},
         )
@@ -285,7 +284,7 @@ class TestMcpClientServerIntegration(unittest.TestCase):
     def test_initialize(self):
         result = self.client.initialize()
         self.assertIsInstance(result, InitializeResult)
-        self.assertEqual(result.protocolVersion, "2025-11-25")
+        self.assertEqual(result.protocol_version, "2025-11-25")
         self.assertTrue(result.capabilities.tools)
 
     def test_list_and_call_tool(self):

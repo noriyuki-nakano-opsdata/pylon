@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -48,14 +48,13 @@ class Bulkhead:
 
     def execute(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         with self._lock:
-            total_waiting = self._max_concurrent - self._semaphore._value + self._stats.queued
             if not self._semaphore._value and self._stats.queued >= self._max_queue:
                 self._stats.rejected += 1
                 raise BulkheadFullError(self._max_concurrent, self._max_queue)
             if not self._semaphore._value:
                 self._stats.queued += 1
 
-        acquired = self._semaphore.acquire(blocking=True)
+        self._semaphore.acquire(blocking=True)
         with self._lock:
             if self._stats.queued > 0:
                 self._stats.queued -= 1

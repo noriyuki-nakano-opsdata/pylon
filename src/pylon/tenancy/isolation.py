@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
-from enum import Enum
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 from pylon.errors import PylonError
@@ -13,13 +13,13 @@ from pylon.errors import PylonError
 logger = logging.getLogger(__name__)
 
 
-class IsolationLevel(str, Enum):
+class IsolationLevel(StrEnum):
     SHARED = "SHARED"
     SCHEMA = "SCHEMA"
     DATABASE = "DATABASE"
 
 
-class ResourceType(str, Enum):
+class ResourceType(StrEnum):
     AGENT = "AGENT"
     WORKFLOW = "WORKFLOW"
     MEMORY = "MEMORY"

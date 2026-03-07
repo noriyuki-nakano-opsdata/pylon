@@ -41,7 +41,12 @@ class LinearBackoff(BackoffStrategy):
 
 
 class ExponentialBackoff(BackoffStrategy):
-    def __init__(self, base: float = 1.0, multiplier: float = 2.0, max_delay: float = 60.0) -> None:
+    def __init__(
+        self,
+        base: float = 1.0,
+        multiplier: float = 2.0,
+        max_delay: float = 60.0,
+    ) -> None:
         self._base = base
         self._multiplier = multiplier
         self._max_delay = max_delay
@@ -51,7 +56,11 @@ class ExponentialBackoff(BackoffStrategy):
 
 
 class JitteredBackoff(BackoffStrategy):
-    def __init__(self, base_strategy: BackoffStrategy | None = None, jitter_range: float = 0.5) -> None:
+    def __init__(
+        self,
+        base_strategy: BackoffStrategy | None = None,
+        jitter_range: float = 0.5,
+    ) -> None:
         self._base = base_strategy or ExponentialBackoff()
         self._jitter_range = jitter_range
 
@@ -69,7 +78,12 @@ class RetryPolicy:
     on_retry: Callable[[int, Exception], None] | None = None
 
 
-def retry(fn: Callable[..., Any], policy: RetryPolicy | None = None, *args: Any, **kwargs: Any) -> Any:
+def retry(
+    fn: Callable[..., Any],
+    policy: RetryPolicy | None = None,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
     p = policy or RetryPolicy()
     errors: list[Exception] = []
 
@@ -83,7 +97,7 @@ def retry(fn: Callable[..., Any], policy: RetryPolicy | None = None, *args: Any,
                     p.on_retry(attempt + 1, exc)
                 delay = p.backoff.delay(attempt)
                 time.sleep(delay)
-        except Exception as exc:
+        except Exception:
             # Non-retryable exception
             raise
 

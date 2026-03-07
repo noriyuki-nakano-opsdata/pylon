@@ -9,18 +9,15 @@ from pylon.state import (
     DiffEntry,
     DiffOp,
     InvalidTransitionError,
-    Snapshot,
     SnapshotManager,
     StateMachine,
     StateMachineConfig,
     StateOp,
     StateOpType,
     StateStore,
-    TransitionRecord,
     apply_diff,
     compute_diff,
 )
-
 
 # --- StateStore ---
 

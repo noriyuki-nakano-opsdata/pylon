@@ -5,12 +5,12 @@ from __future__ import annotations
 import fnmatch
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from enum import Enum
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 
-class StateOpType(str, Enum):
+class StateOpType(StrEnum):
     SET = "SET"
     DELETE = "DELETE"
     INCREMENT = "INCREMENT"
@@ -103,7 +103,11 @@ class StateStore:
             self._ttls = backup_ttls
             return False
 
-    def on_change(self, key_pattern: str, callback: Callable[[str, Any, Any], None]) -> Callable[[], None]:
+    def on_change(
+        self,
+        key_pattern: str,
+        callback: Callable[[str, Any, Any], None],
+    ) -> Callable[[], None]:
         self._sub_counter += 1
         sub_id = self._sub_counter
         self._subscribers[sub_id] = (key_pattern, callback)

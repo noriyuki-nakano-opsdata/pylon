@@ -2,6 +2,7 @@
 
 import pytest
 
+from pylon.repository.audit import AuditRepository
 from pylon.repository.checkpoint import Checkpoint, CheckpointRepository
 from pylon.repository.memory import (
     EpisodicEntry,
@@ -15,7 +16,6 @@ from pylon.repository.workflow import (
     WorkflowRepository,
     WorkflowRun,
 )
-from pylon.repository.audit import AuditRepository
 
 
 class TestCheckpointRepository:

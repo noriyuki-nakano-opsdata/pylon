@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import asyncio
 import random
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
-from pylon.protocols.mcp.types import JsonRpcRequest
+from pylon.protocols.a2a.dto import TaskIdParamsDTO
 from pylon.protocols.a2a.server import A2AServer
 from pylon.protocols.a2a.types import A2ATask, TaskEvent
+from pylon.protocols.mcp.types import JsonRpcRequest
 
 
 class A2AClient:
@@ -47,9 +48,10 @@ class A2AClient:
 
     async def get_task(self, task_id: str) -> A2ATask:
         """Get the current state of a task."""
+        params = TaskIdParamsDTO.from_client_input(task_id).to_wire()
         request = JsonRpcRequest(
             method="tasks/get",
-            params={"task_id": task_id},
+            params=params,
             id=f"get-{task_id}",
         )
         response = await self._send_with_retry(request)
@@ -61,9 +63,10 @@ class A2AClient:
 
     async def cancel_task(self, task_id: str) -> bool:
         """Cancel a task. Returns True if canceled successfully."""
+        params = TaskIdParamsDTO.from_client_input(task_id).to_wire()
         request = JsonRpcRequest(
             method="tasks/cancel",
-            params={"task_id": task_id},
+            params=params,
             id=f"cancel-{task_id}",
         )
         response = await self._send_with_retry(request)

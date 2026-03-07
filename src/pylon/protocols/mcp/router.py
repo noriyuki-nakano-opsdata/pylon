@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
 
+from pylon.protocols.mcp.dto import DtoValidationError
 from pylon.protocols.mcp.types import (
+    INTERNAL_ERROR,
+    INVALID_PARAMS,
+    METHOD_NOT_FOUND,
     JsonRpcError,
     JsonRpcRequest,
     JsonRpcResponse,
-    METHOD_NOT_FOUND,
-    INTERNAL_ERROR,
 )
 
 
@@ -34,6 +35,11 @@ class MethodRouter:
         try:
             result = handler(request)
             return JsonRpcResponse(result=result, id=request.id)
+        except DtoValidationError as exc:
+            return JsonRpcResponse(
+                error=JsonRpcError(code=INVALID_PARAMS, message=str(exc)),
+                id=request.id,
+            )
         except Exception as exc:
             return JsonRpcResponse(
                 error=JsonRpcError(code=INTERNAL_ERROR, message=str(exc)),

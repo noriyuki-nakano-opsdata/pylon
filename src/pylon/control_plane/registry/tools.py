@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
-from typing import Any, Callable, Coroutine
+from typing import Any
 
 from pylon.errors import PylonError
 from pylon.types import TrustLevel
@@ -77,7 +78,9 @@ def tool(
         async def read_pr(...): ...
     """
 
-    def decorator(fn: Callable[..., Coroutine[Any, Any, Any]]) -> Callable[..., Coroutine[Any, Any, Any]]:
+    def decorator(
+        fn: Callable[..., Coroutine[Any, Any, Any]],
+    ) -> Callable[..., Coroutine[Any, Any, Any]]:
         fn._tool_definition = ToolDefinition(  # type: ignore[attr-defined]
             name=name,
             description=description,

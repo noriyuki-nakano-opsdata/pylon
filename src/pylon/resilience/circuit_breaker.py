@@ -5,12 +5,12 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from enum import Enum
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 
-class CircuitState(str, Enum):
+class CircuitState(StrEnum):
     CLOSED = "CLOSED"
     OPEN = "OPEN"
     HALF_OPEN = "HALF_OPEN"
@@ -89,7 +89,10 @@ class CircuitBreaker:
                     self._transition(CircuitState.HALF_OPEN)
                     current = self._state
                 else:
-                    remaining = max(0.0, self._config.timeout - (time.monotonic() - self._opened_at))
+                    remaining = max(
+                        0.0,
+                        self._config.timeout - (time.monotonic() - self._opened_at),
+                    )
                     raise CircuitOpenError(remaining)
 
             self._metrics.total_calls += 1

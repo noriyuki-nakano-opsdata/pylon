@@ -7,7 +7,6 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-
 # Event type constants
 AGENT_CREATED = "agent.created"
 AGENT_STARTED = "agent.started"

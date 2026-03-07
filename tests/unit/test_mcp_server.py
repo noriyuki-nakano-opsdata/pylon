@@ -3,35 +3,27 @@
 import pytest
 
 from pylon.protocols.mcp.auth import (
-    ALL_SCOPES,
-    METHOD_SCOPES,
     OAuthClientConfig,
     OAuthProvider,
-    OAuthServerConfig,
     PKCEChallenge,
     check_scope,
     expand_scopes,
 )
 from pylon.protocols.mcp.client import McpClient
 from pylon.protocols.mcp.server import DEFAULT_PAGE_SIZE, FORBIDDEN, UNAUTHORIZED, McpServer
-from pylon.protocols.mcp.session import McpSession, SessionManager
+from pylon.protocols.mcp.session import SessionManager
 from pylon.protocols.mcp.types import (
     INTERNAL_ERROR,
+    INVALID_PARAMS,
     METHOD_NOT_FOUND,
-    InitializeResult,
     JsonRpcRequest,
-    JsonRpcResponse,
     PromptArgument,
     PromptDefinition,
     ResourceDefinition,
     ResourceTemplate,
-    SamplingMessage,
-    SamplingRequest,
     SamplingResponse,
-    ServerCapabilities,
     ToolDefinition,
 )
-
 
 # --- helpers ---
 
@@ -41,21 +33,26 @@ def _make_server_with_all() -> McpServer:
     server = McpServer()
 
     server.register_tool(
-        ToolDefinition(name="echo", description="Echo input", inputSchema={"type": "object"}),
+        ToolDefinition(name="echo", description="Echo input", input_schema={"type": "object"}),
         handler=lambda args: {"echo": args.get("text", "")},
     )
     server.register_tool(
-        ToolDefinition(name="add", description="Add numbers", inputSchema={"type": "object"}),
+        ToolDefinition(name="add", description="Add numbers", input_schema={"type": "object"}),
         handler=lambda args: {"result": args.get("a", 0) + args.get("b", 0)},
     )
 
     server.register_resource(
-        ResourceDefinition(uri="file:///readme", name="readme", description="README", mimeType="text/plain"),
+        ResourceDefinition(
+            uri="file:///readme",
+            name="readme",
+            description="README",
+            mime_type="text/plain",
+        ),
         handler=lambda uri: {"contents": [{"uri": uri, "text": "Hello World"}]},
     )
 
     server.register_resource_template(
-        ResourceTemplate(uriTemplate="file:///docs/{name}", name="docs", description="Doc files")
+        ResourceTemplate(uri_template="file:///docs/{name}", name="docs", description="Doc files")
     )
 
     server.register_prompt(
@@ -74,7 +71,7 @@ def _make_server_with_all() -> McpServer:
             role="assistant",
             content=f"Response to: {req.messages[0].content if req.messages else 'empty'}",
             model="test-model",
-            stopReason="end_turn",
+            stop_reason="end_turn",
         )
     )
 
@@ -122,6 +119,7 @@ class TestInitialize:
         assert resp.result["capabilities"]["prompts"] is True
         assert resp.result["capabilities"]["sampling"] is True
         assert "sessionId" in resp.result
+        assert resp.headers.get("Mcp-Session-Id") == resp.result["sessionId"]
 
     def test_initialize_server_info(self):
         server = McpServer(name="my-server", version="1.0.0")
@@ -363,7 +361,14 @@ class TestOAuthScopes:
 
     def test_admin_scope_grants_all(self):
         server, token = self._make_oauth_server(["admin"])
-        for method in ["tools/list", "tools/call", "resources/list", "prompts/list", "sampling/createMessage"]:
+        methods = [
+            "tools/list",
+            "tools/call",
+            "resources/list",
+            "prompts/list",
+            "sampling/createMessage",
+        ]
+        for method in methods:
             params = None
             if method == "tools/call":
                 params = {"name": "echo", "arguments": {"text": "hi"}}
@@ -513,6 +518,41 @@ class TestErrorHandling:
         assert resp.id == 42
 
 
+class TestDtoBoundaryValidation:
+    def test_initialize_rejects_non_object_capabilities(self):
+        server = McpServer()
+        req = JsonRpcRequest(
+            method="initialize",
+            params={"capabilities": []},
+            id=1,
+        )
+        resp = server.handle_request(req)
+        assert resp.error is not None
+        assert resp.error.code == INVALID_PARAMS
+
+    def test_tools_call_rejects_non_object_arguments(self):
+        server = _make_server_with_all()
+        req = JsonRpcRequest(
+            method="tools/call",
+            params={"name": "echo", "arguments": "bad"},
+            id=1,
+        )
+        resp = server.handle_request(req)
+        assert resp.error is not None
+        assert resp.error.code == INVALID_PARAMS
+
+    def test_sampling_rejects_invalid_messages_shape(self):
+        server = _make_server_with_all()
+        req = JsonRpcRequest(
+            method="sampling/createMessage",
+            params={"messages": [{"role": "user"}]},
+            id=1,
+        )
+        resp = server.handle_request(req)
+        assert resp.error is not None
+        assert resp.error.code == INVALID_PARAMS
+
+
 # ===== 10. Notifications =====
 
 
@@ -556,7 +596,7 @@ class TestClientIntegration:
         client.connect(server)
         result = client.initialize()
         assert result.capabilities.tools is True
-        assert result.serverInfo["name"] == "pylon-mcp"
+        assert result.server_info["name"] == "pylon-mcp"
 
     def test_client_list_and_call_tools(self):
         server = _make_server_with_all()

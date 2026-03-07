@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Callable, Generic, TypeVar
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from pylon.errors import PylonError
-
-T = TypeVar("T")
 
 
 class PoolExhaustedError(PylonError):
@@ -38,7 +36,7 @@ class PoolConfig:
     validation_fn: Callable[[object], bool] | None = None
 
 
-class ResourcePool(Generic[T]):
+class ResourcePool[T]:
     """Bounded resource pool with acquire/release and context manager support."""
 
     def __init__(
@@ -101,7 +99,7 @@ class ResourcePool(Generic[T]):
         item_id = id(item)
         self._active.discard(item_id)
         # Remove from idle if present
-        self._idle = deque(i for i in self._idle if id(i) is not item_id)
+        self._idle = deque(i for i in self._idle if id(i) != item_id)
         self._all.pop(item_id, None)
 
     def fill(self) -> int:
@@ -130,7 +128,7 @@ class ResourcePool(Generic[T]):
         pass
 
 
-class _PoolContext(Generic[T]):
+class _PoolContext[T]:
     """Context manager for pool acquire/release."""
 
     def __init__(self, pool: ResourcePool[T]) -> None:
@@ -147,7 +145,7 @@ class _PoolContext(Generic[T]):
             self._item = None
 
 
-class PoolContextManager(Generic[T]):
+class PoolContextManager[T]:
     """Context manager that auto-acquires on enter and releases on exit."""
 
     def __init__(self, pool: ResourcePool[T]) -> None:

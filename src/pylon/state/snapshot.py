@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from pylon.state.diff import DiffEntry, apply_diff, compute_diff
@@ -29,7 +29,7 @@ class Snapshot:
     data: dict[str, Any] = field(default_factory=dict)
     diff: list[DiffEntry] | None = None
     parent_id: str | None = None
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     size_bytes: int = 0
 
     def meta(self) -> SnapshotMeta:

@@ -13,8 +13,8 @@ import uuid
 from dataclasses import dataclass, field
 
 from pylon.errors import SandboxError
-from pylon.types import SandboxTier
 from pylon.sandbox.policy import NetworkPolicy, ResourceLimits, ResourceUsage, SandboxPolicy
+from pylon.types import SandboxTier
 
 
 class SandboxStatus(enum.Enum):
@@ -63,10 +63,13 @@ class SandboxManager:
         Returns the sandbox in RUNNING status.
         Raises SandboxError if tier is NONE and no SuperAdmin context.
         """
-        policy = SandboxPolicy(
-            resource_limits=config.resource_limits,
-            network_policy=config.network_policy,
-        ) if config.resource_limits or config.network_policy else SandboxPolicy.for_tier(config.tier)
+        if config.resource_limits or config.network_policy:
+            policy = SandboxPolicy(
+                resource_limits=config.resource_limits,
+                network_policy=config.network_policy,
+            )
+        else:
+            policy = SandboxPolicy.for_tier(config.tier)
 
         sandbox_id = uuid.uuid4().hex[:12]
         sandbox = Sandbox(

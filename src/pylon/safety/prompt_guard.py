@@ -13,13 +13,11 @@ Trust-level-based guard application:
 from __future__ import annotations
 
 import re
-import warnings
-from dataclasses import dataclass, field
-from typing import Callable
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from pylon.errors import PromptInjectionError
 from pylon.types import TrustLevel
-
 
 _DEFAULT_PATTERNS: list[tuple[str, str]] = [
     (r"ignore\s+(all\s+)?previous\s+instructions", "ignore_previous"),
@@ -81,8 +79,34 @@ ClassifierFunc = Callable[[str], bool]
 
 
 def _default_classifier(text: str) -> bool:
-    """Stub classifier. In production, this calls a secondary LLM."""
-    return False
+    """Heuristic secondary classifier for suspicious prompt intent.
+
+    This is intentionally conservative and only flags text when multiple
+    high-risk indicators are present.
+    """
+    lowered = text.lower()
+
+    indicators = [
+        r"follow\s+only\s+these\s+instructions",
+        r"disregard\s+safety\s+polic",
+        r"bypass\s+guard(?:rail|s)",
+        r"exfiltrat(e|ion)",
+        r"leak\s+(api\s+)?key",
+        r"decode\s+(this\s+)?base64",
+        r"from\s+now\s+on",
+        r"developer\s+message",
+        r"hidden\s+instructions",
+    ]
+
+    score = 0
+    for pattern in indicators:
+        if re.search(pattern, lowered):
+            score += 1
+
+    if re.search(r"[a-z0-9+/]{80,}={0,2}", lowered):
+        score += 1
+
+    return score >= 2
 
 
 class PromptGuard:
@@ -102,7 +126,6 @@ class PromptGuard:
     ) -> None:
         self._matcher = pattern_matcher or PatternMatcher()
         self._classifier = classifier or _default_classifier
-        self._using_default_classifier = classifier is None
 
     def check(self, text: str, trust_level: TrustLevel) -> str:
         """Run the prompt guard pipeline.
@@ -129,13 +152,6 @@ class PromptGuard:
 
         # Stage 2: Classifier LLM (untrusted only)
         if trust_level == TrustLevel.UNTRUSTED:
-            if self._using_default_classifier:
-                warnings.warn(
-                    "PromptGuard is using the default stub classifier which always "
-                    "returns False. Configure a real classifier for production use.",
-                    UserWarning,
-                    stacklevel=2,
-                )
             if self._classifier(text):
                 raise PromptInjectionError(
                     "Prompt injection detected by classifier",

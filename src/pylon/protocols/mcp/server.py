@@ -10,12 +10,20 @@ from pylon.protocols.mcp.auth import (
     OAuthProvider,
     check_scope,
 )
+from pylon.protocols.mcp.dto import (
+    CursorParamsDTO,
+    InitializeParamsDTO,
+    InitializeResponseDTO,
+    PromptGetParamsDTO,
+    ResourceReadParamsDTO,
+    ResourceSubscribeParamsDTO,
+    SamplingCreateParamsDTO,
+    ToolCallParamsDTO,
+    paginated_payload,
+)
 from pylon.protocols.mcp.router import MethodRouter
-from pylon.protocols.mcp.session import McpSession, SessionManager
+from pylon.protocols.mcp.session import SessionManager
 from pylon.protocols.mcp.types import (
-    INTERNAL_ERROR,
-    INVALID_PARAMS,
-    METHOD_NOT_FOUND,
     InitializeResult,
     JsonRpcError,
     JsonRpcRequest,
@@ -23,8 +31,6 @@ from pylon.protocols.mcp.types import (
     PromptDefinition,
     ResourceDefinition,
     ResourceTemplate,
-    SamplingMessage,
-    SamplingRequest,
     SamplingResponse,
     ServerCapabilities,
     ToolDefinition,
@@ -99,7 +105,7 @@ class McpServer:
         self._emit_notification("notifications/resources/list_changed", {})
 
     def register_resource_template(self, template: ResourceTemplate) -> None:
-        self._resource_templates[template.uriTemplate] = template
+        self._resource_templates[template.uri_template] = template
 
     def register_prompt(
         self, prompt: PromptDefinition, handler: Callable | None = None
@@ -150,7 +156,14 @@ class McpServer:
                         ),
                         id=request.id,
                     )
-        return self._router.dispatch(request)
+        response = self._router.dispatch(request)
+        if request.method == "initialize" and response.error is None:
+            session_id = ""
+            if isinstance(response.result, dict):
+                session_id = str(response.result.get("sessionId", ""))
+            if session_id:
+                response.headers["Mcp-Session-Id"] = session_id
+        return response
 
     # --- pagination helper ---
 
@@ -171,64 +184,58 @@ class McpServer:
     # --- built-in handlers ---
 
     def _handle_initialize(self, request: JsonRpcRequest) -> dict:
+        InitializeParamsDTO.from_params(request.params)
         session = self._session_manager.create_session()
         session.server_capabilities = self.capabilities
-        if request.params and "capabilities" in request.params:
-            pass
         result = InitializeResult(
             capabilities=self.capabilities,
-            serverInfo={"name": self.name, "version": self.version},
+            server_info={"name": self.name, "version": self.version},
         )
-        return {**result.to_dict(), "sessionId": session.session_id}
+        return InitializeResponseDTO(result=result, session_id=session.session_id).to_wire()
 
     def _handle_tools_list(self, request: JsonRpcRequest) -> dict:
-        params = request.params or {}
-        cursor = params.get("cursor")
+        cursor = CursorParamsDTO.from_params(request.params).cursor
         all_tools = list(self._tools.values())
         page, next_cursor = self._paginate(all_tools, cursor)
-        result: dict[str, Any] = {"tools": [t.to_dict() for t in page]}
-        if next_cursor is not None:
-            result["nextCursor"] = next_cursor
-        return result
+        return paginated_payload(
+            field_name="tools",
+            items=[t.to_dict() for t in page],
+            next_cursor=next_cursor,
+        )
 
     def _handle_tools_call(self, request: JsonRpcRequest) -> Any:
-        params = request.params or {}
-        name = params.get("name", "")
-        arguments = params.get("arguments", {})
-        handler = self._tool_handlers.get(name)
+        params = ToolCallParamsDTO.from_params(request.params)
+        handler = self._tool_handlers.get(params.name)
         if handler is None:
-            raise ValueError(f"Tool not found: {name}")
-        return handler(arguments)
+            raise ValueError(f"Tool not found: {params.name}")
+        return handler(params.arguments)
 
     def _handle_resources_list(self, request: JsonRpcRequest) -> dict:
-        params = request.params or {}
-        cursor = params.get("cursor")
+        cursor = CursorParamsDTO.from_params(request.params).cursor
         all_resources = list(self._resources.values())
         page, next_cursor = self._paginate(all_resources, cursor)
-        result: dict[str, Any] = {"resources": [r.to_dict() for r in page]}
-        if next_cursor is not None:
-            result["nextCursor"] = next_cursor
-        return result
+        return paginated_payload(
+            field_name="resources",
+            items=[r.to_dict() for r in page],
+            next_cursor=next_cursor,
+        )
 
     def _handle_resources_read(self, request: JsonRpcRequest) -> Any:
-        params = request.params or {}
-        uri = params.get("uri", "")
-        handler = self._resource_handlers.get(uri)
+        params = ResourceReadParamsDTO.from_params(request.params)
+        handler = self._resource_handlers.get(params.uri)
         if handler is None:
-            raise ValueError(f"Resource not found: {uri}")
-        return handler(uri)
+            raise ValueError(f"Resource not found: {params.uri}")
+        return handler(params.uri)
 
     def _handle_resources_subscribe(self, request: JsonRpcRequest) -> dict:
-        params = request.params or {}
-        uri = params.get("uri", "")
-        if uri not in self._resources:
-            raise ValueError(f"Resource not found: {uri}")
-        session_id = params.get("sessionId", "")
-        if uri not in self._resource_subscribers:
-            self._resource_subscribers[uri] = []
-        if session_id and session_id not in self._resource_subscribers[uri]:
-            self._resource_subscribers[uri].append(session_id)
-        return {"subscribed": True, "uri": uri}
+        params = ResourceSubscribeParamsDTO.from_params(request.params)
+        if params.uri not in self._resources:
+            raise ValueError(f"Resource not found: {params.uri}")
+        if params.uri not in self._resource_subscribers:
+            self._resource_subscribers[params.uri] = []
+        if params.session_id and params.session_id not in self._resource_subscribers[params.uri]:
+            self._resource_subscribers[params.uri].append(params.session_id)
+        return {"subscribed": True, "uri": params.uri}
 
     def _handle_resources_templates_list(self, request: JsonRpcRequest) -> dict:
         return {
@@ -236,38 +243,26 @@ class McpServer:
         }
 
     def _handle_prompts_list(self, request: JsonRpcRequest) -> dict:
-        params = request.params or {}
-        cursor = params.get("cursor")
+        cursor = CursorParamsDTO.from_params(request.params).cursor
         all_prompts = list(self._prompts.values())
         page, next_cursor = self._paginate(all_prompts, cursor)
-        result: dict[str, Any] = {"prompts": [p.to_dict() for p in page]}
-        if next_cursor is not None:
-            result["nextCursor"] = next_cursor
-        return result
+        return paginated_payload(
+            field_name="prompts",
+            items=[p.to_dict() for p in page],
+            next_cursor=next_cursor,
+        )
 
     def _handle_prompts_get(self, request: JsonRpcRequest) -> Any:
-        params = request.params or {}
-        name = params.get("name", "")
-        handler = self._prompt_handlers.get(name)
+        params = PromptGetParamsDTO.from_params(request.params)
+        handler = self._prompt_handlers.get(params.name)
         if handler is None:
-            raise ValueError(f"Prompt not found: {name}")
-        arguments = params.get("arguments", {})
-        return handler(name, arguments)
+            raise ValueError(f"Prompt not found: {params.name}")
+        return handler(params.name, params.arguments)
 
     def _handle_sampling_create(self, request: JsonRpcRequest) -> Any:
         if self._sampling_handler is None:
             raise ValueError("Sampling not supported")
-        params = request.params or {}
-        messages = [
-            SamplingMessage(role=m.get("role", ""), content=m.get("content", ""))
-            for m in params.get("messages", [])
-        ]
-        sampling_req = SamplingRequest(
-            messages=messages,
-            modelPreferences=params.get("modelPreferences", {}),
-            systemPrompt=params.get("systemPrompt", ""),
-            maxTokens=params.get("maxTokens", 1024),
-        )
+        sampling_req = SamplingCreateParamsDTO.from_params(request.params).to_domain()
         result = self._sampling_handler(sampling_req)
         if isinstance(result, SamplingResponse):
             return result.to_dict()

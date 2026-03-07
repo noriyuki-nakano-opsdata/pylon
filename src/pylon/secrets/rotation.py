@@ -7,7 +7,7 @@ and records rotation events.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from pylon.secrets.manager import SecretManager, SecretMeta
 
@@ -65,7 +65,11 @@ class SecretRotation:
             if secret is None:
                 continue
 
-            check_threshold = threshold_seconds if threshold_seconds is not None else policy.notify_before_seconds
+            check_threshold = (
+                threshold_seconds
+                if threshold_seconds is not None
+                else policy.notify_before_seconds
+            )
             age = now - secret.created_at
             remaining = policy.max_age_seconds - age
 

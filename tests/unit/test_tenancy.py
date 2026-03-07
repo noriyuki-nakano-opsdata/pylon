@@ -2,18 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
-import time
-
 import pytest
 
 from pylon.tenancy.config import (
-    ConfigStore,
     TenantConfig,
     TenantLimits,
     TenantTier,
-    get_global_feature_flags,
     resolve_feature_flags,
     resolve_policies,
     set_global_feature_flags,
@@ -38,7 +32,6 @@ from pylon.tenancy.isolation import (
     TenantIsolation,
 )
 from pylon.tenancy.lifecycle import (
-    Tenant,
     TenantAlreadyExistsError,
     TenantLifecycleManager,
     TenantNotFoundError,
@@ -51,7 +44,6 @@ from pylon.tenancy.quota import (
     QuotaResource,
     TenantQuota,
 )
-
 
 # --- Context Propagation Tests ---
 

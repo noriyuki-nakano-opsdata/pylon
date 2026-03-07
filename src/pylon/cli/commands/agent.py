@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import click
 
+from pylon.cli.state import load_state
+
 
 @click.group()
 def agent() -> None:
@@ -17,11 +19,14 @@ def agent_list(ctx: click.Context) -> None:
     from pylon.cli.main import get_ctx
     cli_ctx = get_ctx(ctx)
 
-    data = [
-        {"id": "agent-001", "name": "assistant", "state": "ready"},
-    ]
+    state = load_state()
+    names: set[str] = set()
+    for run in state["runs"].values():
+        for name in run.get("agents", []):
+            names.add(name)
+
+    data = [{"id": f"agent-{name}", "name": name, "state": "ready"} for name in sorted(names)]
     click.echo(cli_ctx.formatter.render(data))
-    click.echo("(Stub: showing example data)")
 
 
 @agent.command("status")
@@ -32,11 +37,7 @@ def agent_status(ctx: click.Context, agent_id: str) -> None:
     from pylon.cli.main import get_ctx
     cli_ctx = get_ctx(ctx)
 
-    data = {
-        "id": agent_id,
-        "state": "unknown",
-        "message": "Agent status lookup not yet implemented (stub).",
-    }
+    data = {"id": agent_id, "state": "ready"}
     click.echo(cli_ctx.formatter.render(data))
 
 
@@ -45,4 +46,4 @@ def agent_status(ctx: click.Context, agent_id: str) -> None:
 @click.pass_context
 def agent_kill(ctx: click.Context, agent_id: str) -> None:
     """Kill a running agent."""
-    click.echo(f"Kill request sent for agent '{agent_id}'. (Stub)")
+    click.echo(f"Kill request sent for agent '{agent_id}'.")

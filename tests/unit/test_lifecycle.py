@@ -13,9 +13,8 @@ from pylon.agents.supervisor import (
     HealthStatus,
     SupervisorConfig,
 )
-from pylon.errors import AgentLifecycleError
-from pylon.types import AgentCapability, AgentConfig, AgentState, PolicyViolation
-
+from pylon.errors import AgentLifecycleError, PolicyViolationError
+from pylon.types import AgentCapability, AgentConfig, AgentState, TrustLevel
 
 # --- Helper ---
 
@@ -40,13 +39,33 @@ class TestAgentLifecycleManager:
 
     def test_create_validates_capability(self):
         """AgentCapability validates in __post_init__, so forbidden pairs
-        raise PolicyViolation at construction time."""
-        mgr = AgentLifecycleManager()
-        with pytest.raises(PolicyViolation):
+        raise PolicyViolationError at construction time."""
+        with pytest.raises(PolicyViolationError):
             AgentCapability(
                 can_read_untrusted=True,
                 can_access_secrets=True,
             )
+
+    def test_create_infers_capability_from_config(self):
+        mgr = AgentLifecycleManager()
+        cfg = AgentConfig(
+            name="writer",
+            input_trust=TrustLevel.UNTRUSTED,
+            tools=["github-pr-approve"],
+        )
+        agent = mgr.create_agent(cfg)
+        assert agent.capability.can_read_untrusted is True
+        assert agent.capability.can_write_external is True
+
+    def test_create_rejects_inferred_forbidden_pair(self):
+        mgr = AgentLifecycleManager()
+        cfg = AgentConfig(
+            name="dangerous",
+            input_trust=TrustLevel.UNTRUSTED,
+            tools=["secret-read"],
+        )
+        with pytest.raises(PolicyViolationError, match="Forbidden pair"):
+            mgr.create_agent(cfg)
 
     def test_start_agent(self):
         mgr = AgentLifecycleManager()
@@ -296,7 +315,10 @@ class TestAgentSupervisor:
     def test_on_health_change_callback(self):
         changes: list[tuple[str, HealthStatus, HealthStatus]] = []
         mgr = AgentLifecycleManager()
-        sup = AgentSupervisor(mgr, on_health_change=lambda aid, old, new: changes.append((aid, old, new)))
+        sup = AgentSupervisor(
+            mgr,
+            on_health_change=lambda aid, old, new: changes.append((aid, old, new)),
+        )
         agent = mgr.create_agent(_config())
         mgr.start_agent(agent.id)
         sup.register(agent.id)

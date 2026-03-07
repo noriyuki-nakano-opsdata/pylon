@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from pylon.agents.registry import AgentRegistry
 from pylon.agents.runtime import Agent
-from pylon.errors import AgentLifecycleError, PylonError
-from pylon.types import AgentConfig, AgentState
+from pylon.errors import PylonError
+from pylon.safety.capability import CapabilityValidator
+from pylon.types import AgentConfig
 
 
 class AgentNotFoundError(PylonError):
@@ -30,8 +31,9 @@ class AgentLifecycleManager:
 
         The agent is created in INIT state, then transitioned to READY.
         """
-        config.capability.validate()
-        agent = Agent(config=config, capability=config.capability)
+        resolved_capability = CapabilityValidator.resolve_agent_capability(config)
+        config.capability = resolved_capability
+        agent = Agent(config=config, capability=resolved_capability)
         agent.initialize()
         self._registry.register(agent)
         return agent

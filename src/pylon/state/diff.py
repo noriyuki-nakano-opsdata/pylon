@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 
-class DiffOp(str, Enum):
+class DiffOp(StrEnum):
     ADD = "ADD"
     MODIFY = "MODIFY"
     DELETE = "DELETE"

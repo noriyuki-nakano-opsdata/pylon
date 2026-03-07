@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import secrets as _secrets
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from pylon.api.server import HandlerFunc, Request, Response
@@ -27,7 +27,10 @@ class AuthMiddleware:
 
         auth = request.headers.get("authorization", "")
         if not auth.startswith("Bearer "):
-            return Response(status_code=401, body={"error": "Missing or invalid Authorization header"})
+            return Response(
+                status_code=401,
+                body={"error": "Missing or invalid Authorization header"},
+            )
 
         token = auth[7:]
         if not any(_secrets.compare_digest(token, t) for t in self._valid_tokens):

@@ -5,7 +5,7 @@ import sys
 import threading
 from typing import Any, Protocol, runtime_checkable
 
-from pylon.observability.logging import LogEntry, LEVEL_NAMES
+from pylon.observability.logging import LEVEL_NAMES, LogEntry
 from pylon.observability.tracing import Span
 
 

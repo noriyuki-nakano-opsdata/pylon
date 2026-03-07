@@ -6,17 +6,16 @@ Routes use in-memory stores for demonstration.
 
 from __future__ import annotations
 
-import uuid
 import time
-from typing import Any
+import uuid
 
-from pylon.api.server import APIServer, Request, Response
 from pylon.api.schemas import (
     CREATE_AGENT_SCHEMA,
     KILL_SWITCH_SCHEMA,
     WORKFLOW_RUN_SCHEMA,
     validate,
 )
+from pylon.api.server import APIServer, Request, Response
 
 
 class RouteStore:
@@ -25,6 +24,7 @@ class RouteStore:
     def __init__(self) -> None:
         self.agents: dict[str, dict] = {}
         self.workflow_runs: dict[str, dict[str, dict]] = {}  # workflow_id -> {run_id -> run}
+        self.workflow_runs_by_id: dict[str, dict] = {}
         self.kill_switches: dict[str, dict] = {}  # scope -> event
 
 
@@ -62,20 +62,28 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
 
     def get_agent(request: Request) -> Response:
         agent_id = request.path_params.get("id", "")
+        tenant_id = request.context.get("tenant_id", "default")
         agent = s.agents.get(agent_id)
         if agent is None:
             return Response(status_code=404, body={"error": f"Agent not found: {agent_id}"})
+        if agent.get("tenant_id") != tenant_id:
+            return Response(status_code=403, body={"error": "Forbidden"})
         return Response(body=agent)
 
     def delete_agent(request: Request) -> Response:
         agent_id = request.path_params.get("id", "")
-        if agent_id not in s.agents:
+        tenant_id = request.context.get("tenant_id", "default")
+        agent = s.agents.get(agent_id)
+        if agent is None:
             return Response(status_code=404, body={"error": f"Agent not found: {agent_id}"})
+        if agent.get("tenant_id") != tenant_id:
+            return Response(status_code=403, body={"error": "Forbidden"})
         del s.agents[agent_id]
         return Response(status_code=204, body=None)
 
     def start_workflow_run(request: Request) -> Response:
         workflow_id = request.path_params.get("id", "")
+        tenant_id = request.context.get("tenant_id", "default")
         body = request.body or {}
         valid, errors = validate(body, WORKFLOW_RUN_SCHEMA)
         if not valid:
@@ -84,21 +92,41 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
         run = {
             "id": run_id,
             "workflow_id": workflow_id,
-            "status": "running",
+            "status": "pending",
             "input": body.get("input", {}),
             "parameters": body.get("parameters", {}),
             "started_at": time.time(),
+            "tenant_id": tenant_id,
         }
         s.workflow_runs.setdefault(workflow_id, {})[run_id] = run
-        return Response(status_code=201, body=run)
+        s.workflow_runs_by_id[run_id] = run
+        location = f"/api/v1/workflow-runs/{run_id}"
+        return Response(
+            status_code=202,
+            headers={"content-type": "application/json", "location": location},
+            body=run,
+        )
 
     def get_workflow_run(request: Request) -> Response:
         workflow_id = request.path_params.get("id", "")
         run_id = request.path_params.get("run_id", "")
+        tenant_id = request.context.get("tenant_id", "default")
         runs = s.workflow_runs.get(workflow_id, {})
         run = runs.get(run_id)
         if run is None:
             return Response(status_code=404, body={"error": f"Run not found: {run_id}"})
+        if run.get("tenant_id") != tenant_id:
+            return Response(status_code=403, body={"error": "Forbidden"})
+        return Response(body=run)
+
+    def get_workflow_run_by_id(request: Request) -> Response:
+        run_id = request.path_params.get("run_id", "")
+        tenant_id = request.context.get("tenant_id", "default")
+        run = s.workflow_runs_by_id.get(run_id)
+        if run is None:
+            return Response(status_code=404, body={"error": f"Run not found: {run_id}"})
+        if run.get("tenant_id") != tenant_id:
+            return Response(status_code=403, body={"error": "Forbidden"})
         return Response(body=run)
 
     def activate_kill_switch(request: Request) -> Response:
@@ -120,8 +148,10 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
     server.add_route("GET", "/agents", list_agents)
     server.add_route("GET", "/agents/{id}", get_agent)
     server.add_route("DELETE", "/agents/{id}", delete_agent)
+    server.add_route("POST", "/workflows/{id}/run", start_workflow_run)
     server.add_route("POST", "/workflows/{id}/runs", start_workflow_run)
     server.add_route("GET", "/workflows/{id}/runs/{run_id}", get_workflow_run)
+    server.add_route("GET", "/api/v1/workflow-runs/{run_id}", get_workflow_run_by_id)
     server.add_route("POST", "/kill-switch", activate_kill_switch)
 
     return s

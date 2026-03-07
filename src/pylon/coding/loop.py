@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import enum
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Awaitable
+from typing import Any
 
+from .committer import CommitPlan, FileContent, GitCommitter
 from .planner import Plan, TaskPlanner
 from .reviewer import CodeChange, CodeReviewer, ReviewResult
-from .committer import CommitPlan, FileContent, GitCommitter
 
 
 class LoopState(enum.Enum):
@@ -25,8 +26,18 @@ class LoopState(enum.Enum):
 _TRANSITIONS: dict[LoopState, set[LoopState]] = {
     LoopState.IDLE: {LoopState.PLANNING, LoopState.FAILED},
     LoopState.PLANNING: {LoopState.CODING, LoopState.FAILED},
-    LoopState.CODING: {LoopState.TESTING, LoopState.REVIEWING, LoopState.COMPLETED, LoopState.FAILED},
-    LoopState.TESTING: {LoopState.REVIEWING, LoopState.CODING, LoopState.COMPLETED, LoopState.FAILED},
+    LoopState.CODING: {
+        LoopState.TESTING,
+        LoopState.REVIEWING,
+        LoopState.COMPLETED,
+        LoopState.FAILED,
+    },
+    LoopState.TESTING: {
+        LoopState.REVIEWING,
+        LoopState.CODING,
+        LoopState.COMPLETED,
+        LoopState.FAILED,
+    },
     LoopState.REVIEWING: {
         LoopState.COMMITTING,
         LoopState.CODING,
@@ -220,7 +231,7 @@ class CodingLoop:
 
                 # Commit
                 if self.config.auto_commit:
-                    commit_plan = await self.commit(code_changes, f"feat: {task}")
+                    await self.commit(code_changes, f"feat: {task}")
                     await self._transition(LoopState.COMPLETED)
                 else:
                     await self._transition(LoopState.COMPLETED)
@@ -237,7 +248,7 @@ class CodingLoop:
 
         except InvalidTransitionError:
             raise
-        except Exception as exc:
+        except Exception:
             try:
                 await self._fail()
             except InvalidTransitionError:

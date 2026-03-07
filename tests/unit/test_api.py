@@ -1,23 +1,20 @@
 """Tests for Pylon HTTP API server."""
 
-import pytest
 
-from pylon.api.server import APIServer, Request, Response
-from pylon.api.routes import RouteStore, register_routes
 from pylon.api.middleware import (
     AuthMiddleware,
     MiddlewareChain,
     RateLimitMiddleware,
     TenantMiddleware,
 )
+from pylon.api.routes import RouteStore, register_routes
 from pylon.api.schemas import (
     CREATE_AGENT_SCHEMA,
     KILL_SWITCH_SCHEMA,
     WORKFLOW_RUN_SCHEMA,
-    FieldRule,
     validate,
 )
-
+from pylon.api.server import APIServer, Request, Response
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -206,19 +203,28 @@ class TestWorkflowRoutes:
     def test_start_workflow_run(self):
         server, _ = _server_with_routes()
         resp = server.handle_request(
-            "POST", "/workflows/wf1/runs", body={"input": {"task": "build"}}
+            "POST", "/workflows/wf1/run", body={"input": {"task": "build"}}
         )
-        assert resp.status_code == 201
+        assert resp.status_code == 202
         assert resp.body["workflow_id"] == "wf1"
-        assert resp.body["status"] == "running"
+        assert resp.body["status"] == "pending"
+        assert resp.headers["location"].startswith("/api/v1/workflow-runs/")
 
     def test_get_workflow_run(self):
         server, _ = _server_with_routes()
-        create_resp = server.handle_request("POST", "/workflows/wf1/runs", body={})
+        create_resp = server.handle_request("POST", "/workflows/wf1/run", body={})
         run_id = create_resp.body["id"]
         resp = server.handle_request("GET", f"/workflows/wf1/runs/{run_id}")
         assert resp.status_code == 200
         assert resp.body["id"] == run_id
+
+    def test_get_workflow_run_by_location_route(self):
+        server, _ = _server_with_routes()
+        create_resp = server.handle_request("POST", "/workflows/wf1/run", body={})
+        location = create_resp.headers["location"]
+        resp = server.handle_request("GET", location)
+        assert resp.status_code == 200
+        assert resp.body["id"] == create_resp.body["id"]
 
     def test_get_workflow_run_not_found(self):
         server, _ = _server_with_routes()
@@ -305,6 +311,38 @@ class TestTenantMiddleware:
         server.add_route("GET", "/test", lambda r: Response())
         resp = server.handle_request("GET", "/test")
         assert resp.status_code == 400
+
+
+class TestTenantIsolationOnRoutes:
+    def test_get_agent_cross_tenant_forbidden(self):
+        server = APIServer()
+        server.add_middleware(TenantMiddleware(require_tenant=True))
+        register_routes(server)
+
+        create = server.handle_request(
+            "POST", "/agents", headers={"X-Tenant-ID": "tenant-a"}, body={"name": "agent-a"}
+        )
+        agent_id = create.body["id"]
+
+        cross = server.handle_request(
+            "GET", f"/agents/{agent_id}", headers={"X-Tenant-ID": "tenant-b"}
+        )
+        assert cross.status_code == 403
+
+    def test_get_workflow_run_cross_tenant_forbidden(self):
+        server = APIServer()
+        server.add_middleware(TenantMiddleware(require_tenant=True))
+        register_routes(server)
+
+        create = server.handle_request(
+            "POST", "/workflows/wf1/run", headers={"X-Tenant-ID": "tenant-a"}, body={}
+        )
+        run_id = create.body["id"]
+
+        cross = server.handle_request(
+            "GET", f"/workflows/wf1/runs/{run_id}", headers={"X-Tenant-ID": "tenant-b"}
+        )
+        assert cross.status_code == 403
 
 
 class TestRateLimitMiddleware:

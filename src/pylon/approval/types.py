@@ -5,7 +5,7 @@ from __future__ import annotations
 import enum
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from pylon.types import AutonomyLevel
@@ -28,7 +28,7 @@ class ApprovalRequest:
     autonomy_level: AutonomyLevel = AutonomyLevel.A3
     context: dict[str, Any] = field(default_factory=dict)
     status: ApprovalStatus = ApprovalStatus.PENDING
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     expires_at: datetime | None = None
 
 
@@ -40,4 +40,4 @@ class ApprovalDecision:
     approved: bool = False
     decided_by: str = ""
     reason: str = ""
-    decided_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    decided_at: datetime = field(default_factory=lambda: datetime.now(UTC))

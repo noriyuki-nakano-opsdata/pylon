@@ -6,26 +6,30 @@ Supports task handler callbacks, peer authentication, and rate limiting.
 
 from __future__ import annotations
 
-import asyncio
 import time
 from collections import defaultdict
-from typing import Any, AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Any
 
+from pylon.protocols.a2a.dto import (
+    DtoValidationError,
+    PushNotificationSetParamsDTO,
+    SendTaskParamsDTO,
+    TaskIdParamsDTO,
+    push_notification_payload,
+)
+from pylon.protocols.a2a.types import (
+    A2ATask,
+    TaskEvent,
+    TaskState,
+)
 from pylon.protocols.mcp.types import (
+    INTERNAL_ERROR,
+    INVALID_PARAMS,
+    METHOD_NOT_FOUND,
     JsonRpcError,
     JsonRpcRequest,
     JsonRpcResponse,
-    METHOD_NOT_FOUND,
-    INVALID_PARAMS,
-    INTERNAL_ERROR,
-)
-from pylon.protocols.a2a.types import (
-    A2AMessage,
-    A2ATask,
-    Artifact,
-    Part,
-    TaskEvent,
-    TaskState,
 )
 
 TaskHandler = Callable[[A2ATask], Awaitable[A2ATask]]
@@ -68,6 +72,8 @@ class A2AServer:
             "tasks/send": self._handle_send,
             "tasks/get": self._handle_get,
             "tasks/cancel": self._handle_cancel,
+            "tasks/pushNotification/set": self._handle_push_notification_set,
+            "tasks/pushNotification/get": self._handle_push_notification_get,
         }
 
         handler = handlers.get(request.method)
@@ -82,7 +88,12 @@ class A2AServer:
 
         try:
             return await handler(request)
-        except Exception as e:
+        except DtoValidationError as exc:
+            return JsonRpcResponse(
+                id=request.id,
+                error=JsonRpcError(code=INVALID_PARAMS, message=str(exc)),
+            )
+        except Exception:
             return JsonRpcResponse(
                 id=request.id,
                 error=JsonRpcError(code=INTERNAL_ERROR, message="Internal server error"),
@@ -92,20 +103,16 @@ class A2AServer:
         self, request: JsonRpcRequest
     ) -> AsyncIterator[TaskEvent]:
         """Handle tasks/sendSubscribe for streaming updates."""
-        params = request.params or {}
+        params = SendTaskParamsDTO.from_params(request.params)
 
-        sender = params.get("sender", "")
+        sender = params.sender
         if self._allowed_peers and not self.is_peer_allowed(sender):
             raise PermissionError(f"Unknown peer: {sender}")
 
         if self._rate_limit and not self._check_rate_limit(sender):
             raise RuntimeError("Rate limit exceeded")
 
-        task_data = params.get("task")
-        if not task_data:
-            raise ValueError("Missing 'task' in params")
-
-        task = A2ATask.from_dict(task_data)
+        task = A2ATask.from_dict(params.task)
         task.transition_to(TaskState.WORKING)
         self._tasks[task.id] = task
 
@@ -160,9 +167,9 @@ class A2AServer:
         return True
 
     async def _handle_send(self, request: JsonRpcRequest) -> JsonRpcResponse:
-        params = request.params or {}
+        params = SendTaskParamsDTO.from_params(request.params)
 
-        sender = params.get("sender", "")
+        sender = params.sender
         if self._allowed_peers and not self.is_peer_allowed(sender):
             return JsonRpcResponse(
                 id=request.id,
@@ -181,17 +188,7 @@ class A2AServer:
                 ),
             )
 
-        task_data = params.get("task")
-        if not task_data:
-            return JsonRpcResponse(
-                id=request.id,
-                error=JsonRpcError(
-                    code=INVALID_PARAMS,
-                    message="Missing 'task' in params.",
-                ),
-            )
-
-        task = A2ATask.from_dict(task_data)
+        task = A2ATask.from_dict(params.task)
         # Prevent overwrite of existing tasks
         if task.id in self._tasks:
             return JsonRpcResponse(
@@ -211,16 +208,7 @@ class A2AServer:
         return JsonRpcResponse(id=request.id, result=task.to_dict())
 
     async def _handle_get(self, request: JsonRpcRequest) -> JsonRpcResponse:
-        params = request.params or {}
-        task_id = params.get("task_id")
-        if not task_id:
-            return JsonRpcResponse(
-                id=request.id,
-                error=JsonRpcError(
-                    code=INVALID_PARAMS,
-                    message="Missing 'task_id' in params.",
-                ),
-            )
+        task_id = TaskIdParamsDTO.from_params(request.params).task_id
 
         task = self._tasks.get(task_id)
         if task is None:
@@ -235,16 +223,7 @@ class A2AServer:
         return JsonRpcResponse(id=request.id, result=task.to_dict())
 
     async def _handle_cancel(self, request: JsonRpcRequest) -> JsonRpcResponse:
-        params = request.params or {}
-        task_id = params.get("task_id")
-        if not task_id:
-            return JsonRpcResponse(
-                id=request.id,
-                error=JsonRpcError(
-                    code=INVALID_PARAMS,
-                    message="Missing 'task_id' in params.",
-                ),
-            )
+        task_id = TaskIdParamsDTO.from_params(request.params).task_id
 
         task = self._tasks.get(task_id)
         if task is None:
@@ -267,3 +246,47 @@ class A2AServer:
 
         task.transition_to(TaskState.CANCELED)
         return JsonRpcResponse(id=request.id, result=task.to_dict())
+
+    async def _handle_push_notification_set(self, request: JsonRpcRequest) -> JsonRpcResponse:
+        params = PushNotificationSetParamsDTO.from_params(request.params)
+        task_id = params.task_id
+
+        task = self._tasks.get(task_id)
+        if task is None:
+            return JsonRpcResponse(
+                id=request.id,
+                error=JsonRpcError(
+                    code=INVALID_PARAMS,
+                    message=f"Task not found: {task_id}",
+                ),
+            )
+
+        task.push_notification = params.push_notification
+        return JsonRpcResponse(
+            id=request.id,
+            result=push_notification_payload(
+                task_id=task_id,
+                push_notification=task.push_notification,
+            ),
+        )
+
+    async def _handle_push_notification_get(self, request: JsonRpcRequest) -> JsonRpcResponse:
+        task_id = TaskIdParamsDTO.from_params(request.params).task_id
+
+        task = self._tasks.get(task_id)
+        if task is None:
+            return JsonRpcResponse(
+                id=request.id,
+                error=JsonRpcError(
+                    code=INVALID_PARAMS,
+                    message=f"Task not found: {task_id}",
+                ),
+            )
+
+        return JsonRpcResponse(
+            id=request.id,
+            result=push_notification_payload(
+                task_id=task_id,
+                push_notification=task.push_notification,
+            ),
+        )

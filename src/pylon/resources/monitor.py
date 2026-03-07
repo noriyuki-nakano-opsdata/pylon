@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import enum
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
 
 
 class Comparator(enum.Enum):
