@@ -170,10 +170,10 @@ def _collect_subclasses(cls: type[PylonError]) -> list[type[PylonError]]:
 def _build_registry() -> None:
     """Populate ERROR_REGISTRY by introspecting all PylonError subclasses.
 
-    Clears and rebuilds each time to pick up subclasses defined in other modules
-    that may have been imported after the initial module load.
+    Builds into a local dict first, then atomically swaps into the global
+    registry to avoid TOCTOU races in multi-threaded servers.
     """
-    ERROR_REGISTRY.clear()
+    new: dict[str, ErrorSpec] = {}
     for cls in _collect_subclasses(PylonError):
         spec = ErrorSpec(
             code=cls.code,
@@ -182,7 +182,9 @@ def _build_registry() -> None:
             retryable=cls.retryable,
             category=cls.category,
         )
-        ERROR_REGISTRY[cls.code] = spec
+        new[cls.code] = spec
+    ERROR_REGISTRY.clear()
+    ERROR_REGISTRY.update(new)
 
 
 def resolve_error(code: str) -> ErrorSpec | None:

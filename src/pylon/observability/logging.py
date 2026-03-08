@@ -57,6 +57,8 @@ class StructuredLogger:
         _lock: threading.Lock | None = None,
         _sinks: list[LogSink] | None = None,
     ) -> None:
+        if _entries is None and max_entries <= 0:
+            raise ValueError(f"max_entries must be positive, got {max_entries}")
         self._base_context: dict[str, Any] = dict(context) if context else {}
         # Shared mutable state -- child loggers point to the same deque/lock/sinks.
         self._entries: deque[LogEntry] = (

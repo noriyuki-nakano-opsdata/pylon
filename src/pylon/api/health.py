@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Union
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -18,7 +20,7 @@ class HealthCheckResult:
 
 
 # A check callable may return a result synchronously or as a coroutine.
-CheckCallable = Callable[[], Union[HealthCheckResult, Awaitable[HealthCheckResult]]]
+CheckCallable = Callable[[], HealthCheckResult | Awaitable[HealthCheckResult]]
 
 
 class HealthChecker:
@@ -37,7 +39,7 @@ class HealthChecker:
         for name, check_fn in self._checks:
             try:
                 result = check_fn()
-                if hasattr(result, "__await__"):
+                if inspect.isawaitable(result):
                     result = await result
                 results.append(result)  # type: ignore[arg-type]
             except Exception as exc:

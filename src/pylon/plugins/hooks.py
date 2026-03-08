@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 import uuid
@@ -73,9 +74,18 @@ class HookSystem:
         priority: int = 100,
         handler_name: str = "",
     ) -> str:
-        """Subscribe a handler to a hook. Lower priority runs first."""
+        """Subscribe a handler to a hook. Lower priority runs first.
+
+        Only synchronous handlers are accepted. Passing an async coroutine
+        function raises ``TypeError`` because ``trigger()`` cannot await it.
+        """
         if hook_name not in self._hooks:
             raise KeyError(f"Unknown hook: {hook_name}")
+        if inspect.iscoroutinefunction(handler):
+            raise TypeError(
+                f"Async handlers are not supported by trigger(); "
+                f"wrap '{getattr(handler, '__name__', handler)}' in a sync function."
+            )
         sub_id = str(uuid.uuid4())
         sub = _HookSubscription(
             id=sub_id,

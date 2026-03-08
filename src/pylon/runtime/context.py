@@ -46,7 +46,7 @@ def project_context(
 
 
 def _estimate_message_tokens(messages: list[Message]) -> int:
-    text = "\n".join(message.content for message in messages)
+    text = "\n".join(message.content or "" for message in messages)
     if not text:
         return 1
     if _HAS_TIKTOKEN:
