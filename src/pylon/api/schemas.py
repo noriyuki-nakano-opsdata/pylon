@@ -115,4 +115,5 @@ KILL_SWITCH_SCHEMA: Schema = {
     "scope": FieldRule(required=True, field_type=str, min_length=1),
     "reason": FieldRule(required=True, field_type=str, min_length=1),
     "issued_by": FieldRule(required=True, field_type=str, min_length=1),
+    "parent_scope": FieldRule(required=False, field_type=str, default=""),
 }

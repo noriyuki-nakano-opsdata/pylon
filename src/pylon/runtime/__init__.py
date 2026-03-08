@@ -12,18 +12,28 @@ from pylon.runtime.execution import (
     serialize_run,
 )
 from pylon.runtime.llm import LLMRuntime, ModelPricing, ProviderRegistry
+from pylon.runtime.planning import (
+    WorkflowDispatchPlan,
+    WorkflowDispatchTask,
+    build_dispatch_plan,
+    plan_project_dispatch,
+)
 
 __all__ = [
     "ExecutionArtifacts",
     "LLMRuntime",
     "ModelPricing",
     "ProviderRegistry",
+    "WorkflowDispatchPlan",
+    "WorkflowDispatchTask",
     "build_execution_summary",
+    "build_dispatch_plan",
     "compile_project_graph",
     "deserialize_run",
     "execute_project_sync",
     "execute_single_node_sync",
     "normalize_runtime_input",
+    "plan_project_dispatch",
     "resume_project_sync",
     "serialize_run",
 ]

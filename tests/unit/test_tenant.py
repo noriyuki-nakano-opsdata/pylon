@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from pylon.control_plane.scheduler.scheduler import TaskStatus, WorkflowScheduler, WorkflowTask
+from pylon.control_plane.scheduler.scheduler import (
+    SchedulerCapacityError,
+    SchedulerDependencyError,
+    TaskStatus,
+    WorkflowScheduler,
+    WorkflowTask,
+)
 from pylon.control_plane.tenant.manager import (
     TenantConfig,
     TenantError,
@@ -154,9 +160,18 @@ class TestQuotaEnforcer:
 
 
 class TestWorkflowScheduler:
-    def _make_task(self, task_id: str, priority: int = 5) -> WorkflowTask:
+    def _make_task(
+        self,
+        task_id: str,
+        priority: int = 5,
+        dependencies: set[str] | None = None,
+    ) -> WorkflowTask:
         return WorkflowTask(
-            id=task_id, workflow_id="wf1", tenant_id="t1", priority=priority
+            id=task_id,
+            workflow_id="wf1",
+            tenant_id="t1",
+            priority=priority,
+            dependencies=dependencies or set(),
         )
 
     def test_enqueue_and_dequeue(self):
@@ -221,3 +236,63 @@ class TestWorkflowScheduler:
         assert sched.size() == 2
         sched.dequeue()
         assert sched.size() == 1
+
+    def test_enqueue_respects_capacity(self):
+        sched = WorkflowScheduler(max_scheduled_tasks=1)
+        sched.enqueue(self._make_task("t1"))
+        with pytest.raises(SchedulerCapacityError, match="at capacity"):
+            sched.enqueue(self._make_task("t2"))
+
+    def test_dequeue_respects_dependencies(self):
+        sched = WorkflowScheduler()
+        sched.enqueue(self._make_task("build"))
+        sched.enqueue(self._make_task("test", priority=0, dependencies={"build"}))
+
+        first = sched.dequeue()
+        assert first is not None
+        assert first.id == "build"
+        assert sched.dequeue() is None
+
+        assert sched.complete("build") is True
+        second = sched.dequeue()
+        assert second is not None
+        assert second.id == "test"
+
+    def test_dequeue_wave_returns_all_ready_tasks(self):
+        sched = WorkflowScheduler()
+        sched.enqueue(self._make_task("a", priority=3))
+        sched.enqueue(self._make_task("b", priority=1))
+        sched.enqueue(self._make_task("c", priority=5, dependencies={"a"}))
+
+        wave = sched.dequeue_wave()
+        assert [task.id for task in wave] == ["b", "a"]
+        assert all(task.status == TaskStatus.RUNNING for task in wave)
+
+    def test_compute_waves_orders_dependency_dag(self):
+        sched = WorkflowScheduler()
+        sched.enqueue(self._make_task("plan"))
+        sched.enqueue(self._make_task("code", dependencies={"plan"}))
+        sched.enqueue(self._make_task("test", dependencies={"code"}))
+        sched.enqueue(self._make_task("docs", dependencies={"plan"}))
+
+        waves = sched.compute_waves()
+        assert [[task.id for task in wave] for wave in waves] == [
+            ["plan"],
+            ["code", "docs"],
+            ["test"],
+        ]
+
+    def test_compute_waves_rejects_unknown_dependency(self):
+        sched = WorkflowScheduler()
+        sched.enqueue(self._make_task("task", dependencies={"missing"}))
+
+        with pytest.raises(SchedulerDependencyError, match="unknown dependencies"):
+            sched.compute_waves()
+
+    def test_compute_waves_rejects_cycles(self):
+        sched = WorkflowScheduler()
+        sched.enqueue(self._make_task("a", dependencies={"b"}))
+        sched.enqueue(self._make_task("b", dependencies={"a"}))
+
+        with pytest.raises(SchedulerDependencyError, match="cycle"):
+            sched.compute_waves()

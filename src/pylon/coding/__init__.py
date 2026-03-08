@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from .committer import CommitPlan, GitCommitter, SecretPattern
 from .loop import CodingLoop, CodingLoopConfig, LoopResult, LoopState
-from .planner import CodingComplexity, FileAction, Plan, PlanStep, TaskPlanner
+from .planner import CodingComplexity, FileAction, HierarchyPolicy, Plan, PlanStep, TaskPlanner
 from .reviewer import CodeReviewer, QualityGateConfig, ReviewComment, ReviewResult, Severity
 
 __all__ = [
@@ -15,6 +15,7 @@ __all__ = [
     "PlanStep",
     "FileAction",
     "CodingComplexity",
+    "HierarchyPolicy",
     "CodeReviewer",
     "ReviewResult",
     "ReviewComment",

@@ -230,6 +230,7 @@ class KillSwitchEvent:
     scope: str  # "global", "tenant:{id}", "workflow:{id}", "agent:{id}"
     reason: str
     issued_by: str
+    parent_scope: str = ""
     require_dual_approval: bool = False
 
 

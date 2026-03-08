@@ -46,7 +46,8 @@ WorkflowGraph
 ### Important non-guarantees
 
 - no cyclic workflow support
-- no distributed execution
+- no built-in distributed runner yet
+- wave planning exists as a separate deployment view and does not replace inline execution
 - no arbitrary open-ended replanning outside declared refinement policy
 
 ## 2. MCP Tool Call Flow
@@ -150,6 +151,31 @@ pylon run
 ### Important note
 
 The CLI is still local-state-based, but workflow execution now uses the same runtime core as the API and SDK helpers.
+
+## 4.1 Dispatch Planning Flow
+
+### Components
+
+- `pylon.runtime.planning.plan_project_dispatch`
+- `pylon.control_plane.scheduler.WorkflowScheduler`
+- `pylon.workflow.compiled.CompiledWorkflow`
+
+### Flow
+
+```text
+PylonProject
+  -> compile_project_graph(...)
+  -> compile()
+  -> plan_project_dispatch(...)
+    -> WorkflowTask projection
+    -> WorkflowScheduler.compute_waves()
+    -> WorkflowDispatchPlan
+```
+
+### Important note
+
+This path is a scheduler-facing planning view for queued or distributed modes.
+It does not execute nodes and does not replace the inline `GraphExecutor` path.
 
 ## 5. SDK Workflow Authoring Flow
 

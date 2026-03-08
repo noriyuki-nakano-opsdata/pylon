@@ -50,8 +50,8 @@ At a coarse level, the packages line up like this:
 | External protocol boundaries | `pylon.protocols.mcp`, `pylon.protocols.a2a`, `pylon.providers` | JSON-RPC surfaces, OAuth, peer/task routing, LLM abstraction |
 | Persistence and replay | `pylon.repository`, `pylon.state`, `pylon.events` | Workflow runs, checkpoints, memory repository, state machine/snapshots, event bus |
 | Operational infrastructure | `pylon.sandbox`, `pylon.secrets`, `pylon.tenancy` | Mostly reference implementations with real policy models |
-| Cross-cutting utilities | `pylon.resources`, `pylon.resilience`, `pylon.observability` | Limits, retries, metrics, tracing, exporters |
-| Extension and scheduling | `pylon.plugins`, `pylon.taskqueue`, `pylon.control_plane`, `pylon.coding` | Plugin system, queues, registry/scheduler helpers, coding loop |
+| Cross-cutting utilities | `pylon.resources`, `pylon.resilience`, `pylon.observability` | Limits, retries, metrics, tracing, exporters, query-side read models |
+| Extension and scheduling | `pylon.plugins`, `pylon.taskqueue`, `pylon.control_plane`, `pylon.coding`, `pylon.runtime.planning` | Plugin system, queues, registry/scheduler helpers, coding loop, dispatch planning |
 
 ## Current Execution Model
 
@@ -83,6 +83,27 @@ These surfaces are still local-first and in-memory, but workflow execution now a
 - `pylon.sdk.PylonClient` remains an in-memory client, but workflow execution now uses registered canonical definitions and SDK authoring surfaces (`WorkflowBuilder`, `WorkflowGraph`, `@workflow`) that materialize into `PylonProject`, while ad hoc callables remain on a separate explicit helper surface
 
 That means the public surfaces are still not distributed transports, but they now expose the same workflow run-state model.
+
+### Dispatch Planning View
+
+Pylon now also exposes a scheduler-facing planning path:
+
+1. compile `PylonProject` into `CompiledWorkflow`
+2. project nodes into `WorkflowTask` records
+3. compute dependency waves with `WorkflowScheduler.compute_waves()`
+4. expose a stable `distributed_wave_plan` read model through runtime/API/SDK
+
+This is intentionally separate from execution. The canonical runtime remains the
+inline `GraphExecutor`; the wave plan is a deployment/planning surface for
+future queued or distributed runners.
+
+### Command vs Query Model
+
+Run persistence and operator-facing read models are now intentionally distinct.
+
+- command-side storage keeps raw run records
+- query-side builders derive `execution_summary`, `approval_summary`, and replay metadata
+- CLI/API/SDK all read through the same query projection layer
 
 ## Runtime Flow Summary
 

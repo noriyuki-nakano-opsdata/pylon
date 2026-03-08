@@ -9,20 +9,30 @@ from pathlib import Path
 from typing import Any
 
 from pylon.approval import ApprovalManager, ApprovalRequest, ApprovalStore
+from pylon.config.pipeline import build_validation_report, validate_project_definition
 from pylon.dsl.parser import PylonProject, load_project
-from pylon.observability.run_payload import build_public_run_payload
+from pylon.observability.query_service import (
+    build_replay_query_payload,
+    build_run_query_payload,
+)
+from pylon.observability.run_record import rebuild_run_record
 from pylon.repository.audit import AuditRepository, default_hmac_key
 from pylon.runtime import (
     execute_project_sync,
     execute_single_node_sync,
     normalize_runtime_input,
+    plan_project_dispatch,
     resume_project_sync,
     serialize_run,
 )
 from pylon.sdk.builder import WorkflowBuilder, WorkflowGraph
 from pylon.sdk.config import SDKConfig
 from pylon.sdk.decorators import AgentRegistry, WorkflowInfo
-from pylon.sdk.project import materialize_workflow_definition
+from pylon.sdk.project import (
+    WorkflowBuilderError,
+    WorkflowDefinitionValidationError,
+    materialize_workflow_definition,
+)
 from pylon.types import RunStatus, RunStopReason
 from pylon.workflow.replay import ReplayEngine, resolve_replay_view_state
 
@@ -98,6 +108,10 @@ class WorkflowRun:
 
 class PylonClientError(Exception):
     """Raised on client-level errors."""
+
+    def __init__(self, message: str, *, details: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.details = details or {}
 
 
 class PylonClient:
@@ -262,7 +276,8 @@ class PylonClient:
         artifacts: Any,
     ) -> WorkflowRun:
         run_id = str(payload["id"])
-        self._run_payloads[run_id] = dict(payload)
+        stored_payload = dict(payload)
+        self._run_payloads[run_id] = stored_payload
         for checkpoint in artifacts.checkpoints:
             checkpoint_payload = checkpoint.to_dict()
             checkpoint_payload["run_id"] = run_id
@@ -273,7 +288,7 @@ class PylonClient:
                 "context", {}
             ).get("run_id", run_id)
             self._approvals[approval_payload["id"]] = approval_payload
-        run = self._build_workflow_run(payload)
+        run = self._build_workflow_run(build_run_query_payload(stored_payload))
         self._runs[run_id] = run
         return run
 
@@ -332,38 +347,17 @@ class PylonClient:
         approval_request_id: str | None,
     ) -> dict[str, Any]:
         run_id = str(run_payload["id"])
-        updated = build_public_run_payload(
-            run_id=run_id,
-            workflow_id=str(run_payload.get("workflow_id", run_payload.get("workflow", ""))),
-            project_name=run_payload.get("project"),
-            workflow_name=run_payload.get("workflow"),
+        updated = rebuild_run_record(
+            run_payload,
             status=status,
             stop_reason=stop_reason,
             suspension_reason=suspension_reason,
-            input_data=run_payload.get("input"),
-            state=dict(run_payload.get("state", {})),
-            goal=run_payload.get("goal"),
-            autonomy=run_payload.get("autonomy"),
-            verification=run_payload.get("verification"),
-            runtime_metrics=run_payload.get("runtime_metrics"),
-            policy_resolution=run_payload.get("policy_resolution"),
-            refinement_context=run_payload.get("refinement_context"),
-            approval_context=run_payload.get("approval_context"),
-            termination_reason=run_payload.get("termination_reason"),
             active_approval=active_approval,
             approvals=self._approval_payloads_for_run(run_id),
             approval_request_id=approval_request_id,
-            state_version=int(run_payload.get("state_version", 0)),
-            state_hash=str(run_payload.get("state_hash", "")),
-            event_log=list(run_payload.get("event_log", [])),
-            checkpoint_ids=list(run_payload.get("checkpoint_ids", [])),
-            logs=list(run_payload.get("logs", [])),
-            created_at=run_payload.get("created_at"),
-            started_at=run_payload.get("started_at"),
-            completed_at=run_payload.get("completed_at"),
         )
         self._run_payloads[run_id] = updated
-        self._runs[run_id] = self._build_workflow_run(updated)
+        self._runs[run_id] = self._build_workflow_run(build_run_query_payload(updated))
         return updated
 
     def run_workflow(
@@ -474,13 +468,30 @@ class PylonClient:
         definition: PylonProject | dict[str, Any] | str | Path,
     ) -> None:
         """Register a canonical workflow definition."""
-        project, node_handlers, agent_handlers = materialize_workflow_definition(
-            definition,
-            workflow_name=name,
-            registry_agents=AgentRegistry.get_agents(),
-            client_agents=self._agents,
-            project_loader=load_project,
-        )
+        if isinstance(definition, dict):
+            validation_result = validate_project_definition(definition)
+            if not validation_result.valid:
+                report = build_validation_report(validation_result)
+                first_issue = validation_result.errors[0]
+                raise PylonClientError(
+                    f"Invalid workflow definition at {first_issue.field}: {first_issue.message}",
+                    details={"validation": report},
+                )
+        try:
+            project, node_handlers, agent_handlers = materialize_workflow_definition(
+                definition,
+                workflow_name=name,
+                registry_agents=AgentRegistry.get_agents(),
+                client_agents=self._agents,
+                project_loader=load_project,
+            )
+        except WorkflowDefinitionValidationError as exc:
+            raise PylonClientError(
+                str(exc),
+                details={"validation": exc.report},
+            ) from exc
+        except WorkflowBuilderError as exc:
+            raise PylonClientError(str(exc)) from exc
         self._workflow_projects[name] = project
         self._workflow_node_handlers[name] = dict(node_handlers)
         self._workflow_agent_handlers[name] = dict(agent_handlers)
@@ -506,6 +517,15 @@ class PylonClient:
         self._workflow_node_handlers.pop(name, None)
         self._workflow_agent_handlers.pop(name, None)
 
+    def plan_workflow(self, name: str, *, tenant_id: str = "default") -> dict[str, Any]:
+        """Return the scheduler-oriented dispatch plan for a workflow."""
+        project = self.get_workflow(name)
+        return plan_project_dispatch(
+            project,
+            workflow_id=name,
+            tenant_id=tenant_id,
+        ).to_dict()
+
     def register_callable(self, name: str, handler: Any) -> None:
         """Register an explicit ad hoc callable."""
         self._callables[name] = handler
@@ -527,13 +547,30 @@ class PylonClient:
                 "register_workflow() only accepts canonical workflow definitions. "
                 "Use register_callable() for ad hoc single-step handlers."
             )
-        project, node_handlers, agent_handlers = materialize_workflow_definition(
-            definition,
-            workflow_name=name,
-            registry_agents=AgentRegistry.get_agents(),
-            client_agents=self._agents,
-            project_loader=load_project,
-        )
+        if isinstance(definition, dict):
+            validation_result = validate_project_definition(definition)
+            if not validation_result.valid:
+                report = build_validation_report(validation_result)
+                first_issue = validation_result.errors[0]
+                raise PylonClientError(
+                    f"Invalid workflow definition at {first_issue.field}: {first_issue.message}",
+                    details={"validation": report},
+                )
+        try:
+            project, node_handlers, agent_handlers = materialize_workflow_definition(
+                definition,
+                workflow_name=name,
+                registry_agents=AgentRegistry.get_agents(),
+                client_agents=self._agents,
+                project_loader=load_project,
+            )
+        except WorkflowDefinitionValidationError as exc:
+            raise PylonClientError(
+                str(exc),
+                details={"validation": exc.report},
+            ) from exc
+        except WorkflowBuilderError as exc:
+            raise PylonClientError(str(exc)) from exc
         self._workflow_projects[name] = project
         self._workflow_node_handlers[name] = dict(node_handlers)
         self._workflow_agent_handlers[name] = dict(agent_handlers)
@@ -694,48 +731,16 @@ class PylonClient:
             active_approval=source_run.get("active_approval"),
             approval_request_id=source_run.get("approval_request_id"),
         )
-        return build_public_run_payload(
-            run_id=source_run_id,
-            workflow_id=str(source_run.get("workflow_id", source_run.get("workflow", ""))),
-            project_name=source_run.get("project"),
-            workflow_name=source_run.get("workflow"),
-            status=replay_view["status"],
-            stop_reason=replay_view["stop_reason"],
-            suspension_reason=replay_view["suspension_reason"],
-            input_data=source_input,
-            state=replayed.state,
-            goal=source_run.get("goal"),
-            autonomy=source_run.get("autonomy"),
-            verification=source_run.get("verification"),
-            runtime_metrics=source_run.get("runtime_metrics"),
-            policy_resolution=source_run.get("policy_resolution"),
-            refinement_context=source_run.get("refinement_context"),
-            approval_context=source_run.get("approval_context"),
-            termination_reason=source_run.get("termination_reason"),
-            active_approval=replay_view["active_approval"],
+        return build_replay_query_payload(
+            source_run=source_run,
+            checkpoint_id=checkpoint_id,
+            replayed=replayed,
+            replay_view=replay_view,
             approvals=(
                 self._approval_payloads_for_run(source_run_id)
                 if replay_view["is_terminal_replay"]
                 else []
             ),
-            approval_request_id=replay_view["approval_request_id"],
-            state_version=replayed.state_version,
-            state_hash=replayed.state_hash,
-            event_log=replayed.event_log,
-            checkpoint_ids=[checkpoint_id],
-            logs=list(source_run.get("logs", [])),
-            created_at=source_run.get("created_at"),
-            started_at=source_run.get("started_at"),
-            completed_at=source_run.get("completed_at"),
-            view_kind="replay",
-            replay={
-                "checkpoint_id": checkpoint_id,
-                "source_run": source_run_id,
-                "source_status": source_run.get("status"),
-                "source_stop_reason": source_run.get("stop_reason"),
-                "source_suspension_reason": source_run.get("suspension_reason"),
-                "state_hash_verified": replayed.state_hash_verified,
-            },
         )
 
     def get_run(self, run_id: str) -> WorkflowRun:
@@ -743,6 +748,8 @@ class PylonClient:
 
         Raises PylonClientError if the run ID is unknown.
         """
-        if run_id not in self._runs:
+        if run_id not in self._run_payloads:
             raise PylonClientError(f"Run {run_id!r} not found")
+        payload = build_run_query_payload(self._run_payloads[run_id])
+        self._runs[run_id] = self._build_workflow_run(payload)
         return self._runs[run_id]

@@ -32,6 +32,14 @@ class Plan:
     estimated_complexity: CodingComplexity
 
 
+@dataclass(frozen=True)
+class HierarchyPolicy:
+    """Limits on planning and decomposition breadth."""
+
+    max_subtasks: int = 20
+    max_plan_steps: int = 50
+
+
 class TaskPlanner:
     """Generates plans and decomposes tasks into actionable steps."""
 
@@ -40,27 +48,43 @@ class TaskPlanner:
         *,
         planner_fn: Callable[[str], Awaitable[Plan]] | None = None,
         decompose_fn: Callable[[str], Awaitable[list[str]]] | None = None,
+        hierarchy_policy: HierarchyPolicy | None = None,
     ) -> None:
         self._planner_fn = planner_fn
         self._decompose_fn = decompose_fn
+        self._policy = hierarchy_policy or HierarchyPolicy()
 
     async def plan(self, task_description: str) -> Plan:
         if not task_description or not task_description.strip():
             raise ValueError("task_description must be a non-empty string")
 
         if self._planner_fn is not None:
-            return await self._planner_fn(task_description)
+            result = await self._planner_fn(task_description)
+        else:
+            result = self._default_plan(task_description)
 
-        return self._default_plan(task_description)
+        if len(result.steps) > self._policy.max_plan_steps:
+            raise ValueError(
+                "Plan exceeds max steps: "
+                f"{len(result.steps)} > {self._policy.max_plan_steps}"
+            )
+        return result
 
     async def decompose(self, task: str) -> list[str]:
         if not task or not task.strip():
             raise ValueError("task must be a non-empty string")
 
         if self._decompose_fn is not None:
-            return await self._decompose_fn(task)
+            result = await self._decompose_fn(task)
+        else:
+            result = [task]
 
-        return [task]
+        if len(result) > self._policy.max_subtasks:
+            raise ValueError(
+                "Decomposition exceeds max subtasks: "
+                f"{len(result)} > {self._policy.max_subtasks}"
+            )
+        return result
 
     def estimate_complexity(self, task: str) -> CodingComplexity:
         if not task or not task.strip():

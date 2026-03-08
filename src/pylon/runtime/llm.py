@@ -263,5 +263,6 @@ def messages_from_input(value: Any) -> list[Message]:
 
 def estimate_message_tokens(messages: list[Message]) -> int:
     """Cheap token estimate for routing heuristics."""
-    text = "\n".join(message.content for message in messages)
-    return max(1, len(text) // 4)
+    from pylon.runtime.context import _estimate_message_tokens
+
+    return _estimate_message_tokens(messages)

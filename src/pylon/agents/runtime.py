@@ -13,6 +13,18 @@ from pylon.errors import AgentLifecycleError
 from pylon.types import AgentCapability, AgentConfig, AgentState, AutonomyLevel
 
 
+@dataclass(frozen=True)
+class HandoffData:
+    """Context preserved across agent restarts."""
+
+    agent_id: str
+    config_name: str
+    working_memory: dict[str, Any]
+    state_before_kill: str
+    restart_count: int
+    note: str = ""
+
+
 @dataclass
 class Agent:
     """Agent instance with lifecycle management."""
@@ -22,6 +34,7 @@ class Agent:
     state: AgentState = AgentState.INIT
     capability: AgentCapability = field(default_factory=AgentCapability)
     working_memory: dict[str, Any] = field(default_factory=dict)
+    last_handoff: HandoffData | None = None
 
     def transition_to(self, target: AgentState) -> None:
         """Transition to target state, enforcing valid transitions."""
@@ -30,6 +43,8 @@ class Agent:
                 f"Invalid transition: {self.state.value} -> {target.value}",
                 details={"agent_id": self.id, "agent_name": self.config.name},
             )
+        if target in (AgentState.COMPLETED, AgentState.FAILED, AgentState.KILLED):
+            self.last_handoff = self.generate_handoff()
         self.state = target
         if target in (AgentState.COMPLETED, AgentState.FAILED, AgentState.KILLED):
             self.working_memory.clear()
@@ -61,6 +76,21 @@ class Agent:
     def kill(self) -> None:
         """Move to KILLED (terminal). Clears working memory."""
         self.transition_to(AgentState.KILLED)
+
+    def generate_handoff(self, *, restart_count: int = 0, note: str = "") -> HandoffData:
+        """Capture current context before a terminal transition."""
+        return HandoffData(
+            agent_id=self.id,
+            config_name=self.config.name,
+            working_memory=dict(self.working_memory),
+            state_before_kill=self.state.value,
+            restart_count=restart_count,
+            note=note,
+        )
+
+    def restore_from_handoff(self, handoff: HandoffData) -> None:
+        """Restore working memory from a prior handoff."""
+        self.working_memory.update(handoff.working_memory)
 
     @property
     def is_terminal(self) -> bool:

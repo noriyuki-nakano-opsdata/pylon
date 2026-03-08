@@ -14,7 +14,7 @@ from pylon.autonomy.goals import GoalSpec
 from pylon.autonomy.routing import ModelRouter, ModelRouteRequest
 from pylon.dsl.parser import ConditionalNext, GoalDef, PylonProject
 from pylon.observability.metrics import MetricsCollector
-from pylon.observability.run_payload import build_public_run_payload
+from pylon.observability.run_record import build_run_record
 from pylon.providers.base import Message
 from pylon.repository.audit import AuditRepository, default_hmac_key
 from pylon.repository.checkpoint import Checkpoint, CheckpointRepository
@@ -554,7 +554,7 @@ def serialize_run(
     workflow_name: str | None = None,
     input_data: Any = None,
 ) -> dict[str, Any]:
-    """Serialize runtime execution artifacts for CLI/API persistence."""
+    """Serialize runtime execution artifacts into the canonical stored run record."""
     run = artifacts.run
     approvals = [dict(approval) for approval in artifacts.approvals]
     approval_id = next(
@@ -578,7 +578,7 @@ def serialize_run(
     ]
     if approval_id is not None:
         logs.append(f"approval_required:{approval_id}")
-    return build_public_run_payload(
+    return build_run_record(
         run_id=run.id,
         workflow_id=run.workflow_id,
         project_name=project_name,

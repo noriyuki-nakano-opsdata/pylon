@@ -37,6 +37,9 @@ dev = [
 anthropic = [
     "anthropic>=0.30",
 ]
+tokenizer = [
+    "tiktoken>=0.7.0",
+]
 
 [project.scripts]
 pylon = "pylon.cli.main:cli"

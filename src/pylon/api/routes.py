@@ -12,8 +12,6 @@ import time
 import uuid
 from typing import Any
 
-logger = logging.getLogger(__name__)
-
 from pylon.api.schemas import (
     APPROVAL_DECISION_SCHEMA,
     CREATE_AGENT_SCHEMA,
@@ -24,17 +22,25 @@ from pylon.api.schemas import (
 )
 from pylon.api.server import APIServer, Request, Response
 from pylon.approval import ApprovalManager, ApprovalRequest, ApprovalStore
+from pylon.config.pipeline import build_validation_report, validate_project_definition
 from pylon.dsl.parser import PylonProject
-from pylon.observability.run_payload import build_public_run_payload
+from pylon.observability.query_service import (
+    build_replay_query_payload,
+    build_run_query_payload,
+)
+from pylon.observability.run_record import rebuild_run_record
 from pylon.repository.audit import AuditRepository, default_hmac_key
 from pylon.runtime import (
     execute_project_sync,
     normalize_runtime_input,
+    plan_project_dispatch,
     resume_project_sync,
     serialize_run,
 )
 from pylon.types import RunStatus, RunStopReason
 from pylon.workflow.replay import ReplayEngine, resolve_replay_view_state
+
+logger = logging.getLogger(__name__)
 
 
 def _run_sync(coro: object) -> object:
@@ -191,11 +197,12 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
         parameters: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         run_id = str(run_payload["id"])
-        run_payload["workflow_id"] = workflow_id
-        run_payload["tenant_id"] = tenant_id
-        run_payload["parameters"] = dict(parameters or {})
-        s.workflow_runs.setdefault((tenant_id, workflow_id), {})[run_id] = run_payload
-        s.workflow_runs_by_id[run_id] = run_payload
+        stored_run = dict(run_payload)
+        stored_run["workflow_id"] = workflow_id
+        stored_run["tenant_id"] = tenant_id
+        stored_run["parameters"] = dict(parameters or {})
+        s.workflow_runs.setdefault((tenant_id, workflow_id), {})[run_id] = stored_run
+        s.workflow_runs_by_id[run_id] = stored_run
         for checkpoint in artifacts.checkpoints:
             checkpoint_payload = checkpoint.to_dict()
             checkpoint_payload["run_id"] = run_id
@@ -206,7 +213,7 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
                 "context", {}
             ).get("run_id", run_id)
             s.approvals[approval_payload["id"]] = approval_payload
-        return run_payload
+        return stored_run
 
     def health(request: Request) -> Response:
         return Response(body={"status": "ok", "timestamp": time.time()})
@@ -281,6 +288,18 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
                 status_code=409,
                 body={"error": f"Workflow already exists: {workflow_id}"},
             )
+        validation_result = validate_project_definition(body["project"])
+        validation_report = build_validation_report(validation_result)
+        if not validation_result.valid:
+            return Response(
+                status_code=422,
+                body={
+                    "error": "Workflow project validation failed",
+                    "validation": validation_report,
+                    "issues": [issue.to_dict() for issue in validation_result.issues],
+                    "stages_passed": validation_result.stages_passed,
+                },
+            )
         try:
             project = s.register_workflow_project(
                 workflow_id,
@@ -293,7 +312,12 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
         payload = {
             **_workflow_summary(workflow_id, project, tenant_id=tenant_id),
             "project": project.model_dump(mode="json"),
+            "validation": validation_report,
         }
+        if validation_result.warnings:
+            payload["validation_warnings"] = [
+                issue.to_dict() for issue in validation_result.warnings
+            ]
         return Response(status_code=201, body=payload)
 
     def list_workflows(request: Request) -> Response:
@@ -321,6 +345,24 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
                 **_workflow_summary(workflow_id, project, tenant_id=tenant_id),
                 "project": project.model_dump(mode="json"),
             }
+        )
+
+    def get_workflow_plan(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        workflow_id = request.path_params.get("id", "")
+        access_error = _ensure_workflow_access(workflow_id, tenant_id)
+        if access_error is not None:
+            return access_error
+        project = s.get_workflow_project(workflow_id, tenant_id=tenant_id)
+        assert project is not None
+        return Response(
+            body=plan_project_dispatch(
+                project,
+                workflow_id=workflow_id,
+                tenant_id=tenant_id,
+            ).to_dict()
         )
 
     def delete_workflow(request: Request) -> Response:
@@ -354,25 +396,25 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
             input_data=normalize_runtime_input(raw_input),
             workflow_id=workflow_id,
         )
-        run = serialize_run(
+        run_record = serialize_run(
             artifacts,
             project_name=project.name,
             workflow_name=workflow_id,
             input_data=raw_input,
         )
-        run = _persist_execution(
+        stored_run = _persist_execution(
             workflow_id=workflow_id,
             tenant_id=tenant_id,
-            run_payload=run,
+            run_payload=run_record,
             artifacts=artifacts,
             parameters=body.get("parameters", {}),
         )
-        run_id = run["id"]
+        run_id = stored_run["id"]
         location = f"/api/v1/workflow-runs/{run_id}"
         return Response(
             status_code=202,
             headers={"content-type": "application/json", "location": location},
-            body=run,
+            body=build_run_query_payload(stored_run),
         )
 
     def get_workflow_run(request: Request) -> Response:
@@ -393,7 +435,7 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
             ):
                 return Response(status_code=403, body={"error": "Forbidden"})
             return Response(status_code=404, body={"error": f"Run not found: {run_id}"})
-        return Response(body=run)
+        return Response(body=build_run_query_payload(run))
 
     def get_workflow_run_by_id(request: Request) -> Response:
         tenant_id = _require_tenant_id(request)
@@ -405,7 +447,7 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
             return Response(status_code=404, body={"error": f"Run not found: {run_id}"})
         if run.get("tenant_id") != tenant_id:
             return Response(status_code=403, body={"error": "Forbidden"})
-        return Response(body=run)
+        return Response(body=build_run_query_payload(run))
 
     def resume_workflow_run(request: Request) -> Response:
         tenant_id = _require_tenant_id(request)
@@ -440,21 +482,20 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
             )
         except ValueError as exc:
             return Response(status_code=409, body={"error": str(exc)})
-        run_payload = serialize_run(
+        run_record = serialize_run(
             artifacts,
             project_name=project.name,
             workflow_name=workflow_id,
             input_data=raw_input,
         )
-        return Response(
-            body=_persist_execution(
-                workflow_id=workflow_id,
-                tenant_id=tenant_id,
-                run_payload=run_payload,
-                artifacts=artifacts,
-                parameters=run.get("parameters", {}),
-            )
+        stored_run = _persist_execution(
+            workflow_id=workflow_id,
+            tenant_id=tenant_id,
+            run_payload=run_record,
+            artifacts=artifacts,
+            parameters=run.get("parameters", {}),
         )
+        return Response(body=build_run_query_payload(stored_run))
 
     def approve_request(request: Request) -> Response:
         tenant_id = _require_tenant_id(request)
@@ -520,21 +561,20 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
                 status_code=500,
                 body={"error": f"Failed to resume run after approval: {run_id}"},
             )
-        run_payload = serialize_run(
+        run_record = serialize_run(
             artifacts,
             project_name=project.name,
             workflow_name=workflow_id,
             input_data=run.get("input"),
         )
-        return Response(
-            body=_persist_execution(
-                workflow_id=workflow_id,
-                tenant_id=tenant_id,
-                run_payload=run_payload,
-                artifacts=artifacts,
-                parameters=run.get("parameters", {}),
-            )
+        stored_run = _persist_execution(
+            workflow_id=workflow_id,
+            tenant_id=tenant_id,
+            run_payload=run_record,
+            artifacts=artifacts,
+            parameters=run.get("parameters", {}),
         )
+        return Response(body=build_run_query_payload(stored_run))
 
     def reject_request(request: Request) -> Response:
         tenant_id = _require_tenant_id(request)
@@ -572,35 +612,15 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
         if reason:
             decided["reason"] = reason
 
-        updated = build_public_run_payload(
-            run_id=str(run["id"]),
-            workflow_id=str(run.get("workflow_id", run.get("workflow", ""))),
-            project_name=run.get("project"),
-            workflow_name=run.get("workflow"),
+        updated = rebuild_run_record(
+            run,
             status=RunStatus.CANCELLED,
             stop_reason=RunStopReason.APPROVAL_DENIED,
             suspension_reason=RunStopReason.NONE,
-            input_data=run.get("input"),
-            state=dict(run.get("state", {})),
-            goal=run.get("goal"),
-            autonomy=run.get("autonomy"),
-            verification=run.get("verification"),
-            runtime_metrics=run.get("runtime_metrics"),
-            policy_resolution=run.get("policy_resolution"),
-            refinement_context=run.get("refinement_context"),
-            approval_context=run.get("approval_context"),
-            termination_reason=run.get("termination_reason"),
             active_approval=None,
             approvals=s.list_run_approvals(run_id),
             approval_request_id=None,
-            state_version=int(run.get("state_version", 0)),
-            state_hash=str(run.get("state_hash", "")),
-            event_log=list(run.get("event_log", [])),
-            checkpoint_ids=list(run.get("checkpoint_ids", [])),
             logs=[*list(run.get("logs", [])), f"approval_rejected:{approval_id}"],
-            created_at=run.get("created_at"),
-            started_at=run.get("started_at"),
-            completed_at=run.get("completed_at"),
         )
         updated["workflow_id"] = str(run.get("workflow_id", run.get("workflow", "")))
         updated["tenant_id"] = tenant_id
@@ -608,7 +628,7 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
         workflow_id = updated["workflow_id"]
         s.workflow_runs.setdefault((tenant_id, workflow_id), {})[run_id] = updated
         s.workflow_runs_by_id[run_id] = updated
-        return Response(body=updated)
+        return Response(body=build_run_query_payload(updated))
 
     def replay_checkpoint(request: Request) -> Response:
         tenant_id = _require_tenant_id(request)
@@ -677,48 +697,16 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
             approval_request_id=source_run.get("approval_request_id"),
         )
         return Response(
-            body=build_public_run_payload(
-                run_id=source_run_id,
-                workflow_id=str(source_run.get("workflow_id", source_run.get("workflow", ""))),
-                project_name=source_run.get("project"),
-                workflow_name=source_run.get("workflow"),
-                status=replay_view["status"],
-                stop_reason=replay_view["stop_reason"],
-                suspension_reason=replay_view["suspension_reason"],
-                input_data=source_input,
-                state=replayed.state,
-                goal=source_run.get("goal"),
-                autonomy=source_run.get("autonomy"),
-                verification=source_run.get("verification"),
-                runtime_metrics=source_run.get("runtime_metrics"),
-                policy_resolution=source_run.get("policy_resolution"),
-                refinement_context=source_run.get("refinement_context"),
-                approval_context=source_run.get("approval_context"),
-                termination_reason=source_run.get("termination_reason"),
-                active_approval=replay_view["active_approval"],
+            body=build_replay_query_payload(
+                source_run=source_run,
+                checkpoint_id=checkpoint_id,
+                replayed=replayed,
+                replay_view=replay_view,
                 approvals=(
                     s.list_run_approvals(source_run_id)
                     if replay_view["is_terminal_replay"]
                     else []
                 ),
-                approval_request_id=replay_view["approval_request_id"],
-                state_version=replayed.state_version,
-                state_hash=replayed.state_hash,
-                event_log=replayed.event_log,
-                checkpoint_ids=[checkpoint_id],
-                logs=list(source_run.get("logs", [])),
-                created_at=source_run.get("created_at"),
-                started_at=source_run.get("started_at"),
-                completed_at=source_run.get("completed_at"),
-                view_kind="replay",
-                replay={
-                    "checkpoint_id": checkpoint_id,
-                    "source_run": source_run_id,
-                    "source_status": source_run.get("status"),
-                    "source_stop_reason": source_run.get("stop_reason"),
-                    "source_suspension_reason": source_run.get("suspension_reason"),
-                    "state_hash_verified": replayed.state_hash_verified,
-                },
             )
         )
 
@@ -753,6 +741,7 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
             "scope": scope,
             "reason": body["reason"],
             "issued_by": body["issued_by"],
+            "parent_scope": body.get("parent_scope", ""),
             "activated_at": time.time(),
         }
         s.kill_switches[scope] = event
@@ -766,6 +755,7 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
     server.add_route("POST", "/workflows", create_workflow)
     server.add_route("GET", "/workflows", list_workflows)
     server.add_route("GET", "/workflows/{id}", get_workflow)
+    server.add_route("GET", "/workflows/{id}/plan", get_workflow_plan)
     server.add_route("DELETE", "/workflows/{id}", delete_workflow)
     server.add_route("POST", "/workflows/{id}/run", start_workflow_run)
     server.add_route("GET", "/workflows/{id}/runs/{run_id}", get_workflow_run)

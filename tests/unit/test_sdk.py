@@ -232,6 +232,17 @@ class TestPylonClientWorkflows:
         with pytest.raises(PylonClientError, match="not found"):
             client.get_workflow("echo")
 
+    def test_plan_workflow_returns_dispatch_plan(self, client: PylonClient):
+        client.register_project("echo", _workflow_project("echo-project"))
+        plan = client.plan_workflow("echo", tenant_id="tenant-a")
+        assert plan["workflow_id"] == "echo"
+        assert plan["tenant_id"] == "tenant-a"
+        assert plan["execution_mode"] == "distributed_wave_plan"
+        assert plan["waves"] == [
+            {"index": 0, "node_ids": ["start"], "task_ids": ["echo:start"]},
+            {"index": 1, "node_ids": ["finish"], "task_ids": ["echo:finish"]},
+        ]
+
     def test_run_workflow_uses_canonical_graph_runtime(self, client: PylonClient):
         client.register_project("echo", _workflow_project("echo-project"))
         result = client.run_workflow("echo", input_data={"msg": "hi"})
@@ -253,6 +264,10 @@ class TestPylonClientWorkflows:
     def test_get_run(self, client: PylonClient):
         client.register_project("w", _workflow_project("workflow-w"))
         result = client.run_workflow("w")
+        stored_run = client._run_payloads[result.run_id]
+        assert "approval_summary" not in stored_run
+        assert "execution_summary" not in stored_run
+        assert "approval_id" not in stored_run
         run = client.get_run(result.run_id)
         assert isinstance(run, WorkflowRun)
         assert run.workflow_id == "w"
@@ -413,8 +428,29 @@ class TestPylonClientWorkflows:
             .set_entry("start")
             .build()
         )
-        with pytest.raises(WorkflowBuilderError, match="Callable edge conditions"):
+        with pytest.raises(PylonClientError, match="Callable edge conditions"):
             client.register_workflow("conditional", graph)
+
+    def test_register_project_rejects_invalid_definition_with_structured_field(
+        self,
+        client: PylonClient,
+    ):
+        with pytest.raises(PylonClientError, match="workflow.nodes.start.agent") as exc_info:
+            client.register_project(
+                "broken",
+                {
+                    "version": "1",
+                    "name": "broken",
+                    "agents": {"writer": {"role": "write"}},
+                    "workflow": {
+                        "nodes": {"start": {"agent": "missing", "next": "END"}},
+                    },
+                },
+            )
+        assert exc_info.value.details["validation"]["valid"] is False
+        assert exc_info.value.details["validation"]["errors"][0]["field"] == (
+            "workflow.nodes.start.agent"
+        )
 
     def test_resume_run_continues_paused_workflow(self, client: PylonClient):
         client.register_project("limited", _limited_workflow_project())

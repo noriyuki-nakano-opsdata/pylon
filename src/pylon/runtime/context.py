@@ -6,10 +6,25 @@ from dataclasses import dataclass, field
 
 from pylon.providers.base import Message
 
+try:
+    import tiktoken
+
+    _ENCODER = tiktoken.get_encoding("cl100k_base")
+    _HAS_TIKTOKEN = True
+except ImportError:
+    _HAS_TIKTOKEN = False
+
 
 def _estimate_message_tokens(messages: list[Message]) -> int:
     text = "\n".join(message.content for message in messages)
-    return max(1, len(text) // 4)
+    if not text:
+        return 1
+    if _HAS_TIKTOKEN:
+        return max(1, len(_ENCODER.encode(text)))
+    # Fallback: 日本語対応の簡易推定
+    ascii_chars = sum(1 for c in text if ord(c) < 128)
+    non_ascii_chars = len(text) - ascii_chars
+    return max(1, ascii_chars // 4 + int(non_ascii_chars / 1.5))
 
 
 @dataclass(frozen=True)

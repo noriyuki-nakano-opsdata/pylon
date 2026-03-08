@@ -169,6 +169,44 @@ Responses:
 - `403 Forbidden`
 - `404 Not Found`
 
+### `GET /workflows/{id}/plan`
+
+Return the scheduler-oriented dispatch plan for a canonical workflow definition.
+
+This is a planning view, not an execution endpoint. It projects the compiled DAG
+into dependency waves suitable for queued or distributed runners while leaving
+the canonical inline runtime unchanged.
+
+Response `200 OK`
+
+```json
+{
+  "workflow_id": "build-pipeline",
+  "tenant_id": "default",
+  "execution_mode": "distributed_wave_plan",
+  "entry_nodes": ["start"],
+  "task_count": 2,
+  "wave_count": 2,
+  "waves": [
+    {"index": 0, "node_ids": ["start"], "task_ids": ["build-pipeline:start"]},
+    {"index": 1, "node_ids": ["finish"], "task_ids": ["build-pipeline:finish"]}
+  ],
+  "tasks": [
+    {
+      "task_id": "build-pipeline:start",
+      "node_id": "start",
+      "wave_index": 0,
+      "depends_on": [],
+      "dependency_task_ids": [],
+      "node_type": "agent",
+      "join_policy": "all_resolved",
+      "conditional_inbound": false,
+      "conditional_outbound": false
+    }
+  ]
+}
+```
+
 ### `DELETE /workflows/{id}`
 
 Delete one tenant-scoped workflow definition.
@@ -191,6 +229,11 @@ Request body:
 | `parameters` | object | No | defaults to `{}` |
 
 The route compiles the registered `PylonProject`, executes it through the shared runtime, and returns the normalized public run payload.
+
+Important persistence note:
+
+- the server stores raw run records as the command-side source of truth
+- public responses rebuild `execution_summary`, `approval_summary`, and replay metadata through the shared query service
 
 Response `202 Accepted`
 

@@ -1,8 +1,11 @@
 """Tests for repository layer (L4)."""
 
+from __future__ import annotations
+
 import pytest
 
 from pylon.repository.audit import AuditRepository
+from pylon.repository.base import ReadRepository, Repository, SearchableRepository, WriteRepository
 from pylon.repository.checkpoint import Checkpoint, CheckpointRepository
 from pylon.repository.memory import (
     EpisodicEntry,
@@ -18,6 +21,56 @@ from pylon.repository.workflow import (
     WorkflowRun,
 )
 from pylon.workflow.replay import ReplayEngine
+
+
+class _ReadOnlyRepo:
+    async def get(self, id: str) -> dict | None:
+        return {"id": id}
+
+    async def list(self, *, limit: int = 100, offset: int = 0, **filters: object) -> list[dict]:
+        return [{"id": "x"}]
+
+
+class _ReadWriteRepo(_ReadOnlyRepo):
+    async def create(self, entity: dict) -> dict:
+        return entity
+
+    async def update(self, id: str, **updates: object) -> dict | None:
+        return {"id": id, **updates}
+
+    async def delete(self, id: str) -> bool:
+        return True
+
+
+class _SearchRepo(_ReadOnlyRepo):
+    async def search(
+        self,
+        query_embedding: list[float],
+        *,
+        limit: int = 10,
+        threshold: float = 0.7,
+        **filters: object,
+    ) -> list[tuple[dict, float]]:
+        return [({"id": "x"}, 0.9)]
+
+
+class TestRepositoryProtocols:
+    def test_read_repository_protocol(self):
+        assert isinstance(_ReadOnlyRepo(), ReadRepository)
+
+    def test_write_repository_protocol(self):
+        assert isinstance(_ReadWriteRepo(), WriteRepository)
+
+    def test_full_repository_protocol(self):
+        repo = _ReadWriteRepo()
+        assert isinstance(repo, ReadRepository)
+        assert isinstance(repo, WriteRepository)
+        assert isinstance(repo, Repository)
+
+    def test_searchable_repository_protocol(self):
+        repo = _SearchRepo()
+        assert isinstance(repo, ReadRepository)
+        assert isinstance(repo, SearchableRepository)
 
 
 class TestCheckpointRepository:

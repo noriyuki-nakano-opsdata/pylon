@@ -56,9 +56,9 @@ def test_context_manager_compacts_long_inputs() -> None:
     prepared = manager.prepare(
         [
             Message(role="system", content="You are precise."),
-            Message(role="user", content="A" * 80),
-            Message(role="assistant", content="B" * 80),
-            Message(role="user", content="C" * 80),
+            Message(role="user", content="A" * 400),
+            Message(role="assistant", content="B" * 400),
+            Message(role="user", content="C" * 400),
         ]
     )
 
@@ -266,9 +266,9 @@ def test_execute_project_sync_compacts_long_prompt_context() -> None:
         project,
         input_data={
             "messages": [
-                {"role": "user", "content": "A" * 120},
-                {"role": "assistant", "content": "B" * 120},
-                {"role": "user", "content": "C" * 120},
+                {"role": "user", "content": "A" * 400},
+                {"role": "assistant", "content": "B" * 400},
+                {"role": "user", "content": "C" * 400},
             ]
         },
         provider_registry=registry,

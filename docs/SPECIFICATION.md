@@ -789,6 +789,7 @@ Additional implemented support modules:
 - `pylon.control_plane.registry.skills`: skill-to-tool dependency resolution
 - `pylon.control_plane.scheduler`: priority scheduler for workflow tasks
 - `pylon.control_plane.tenant`: simpler tenant/quota helper layer separate from `pylon.tenancy`
+- `pylon.runtime.planning`: compiled-workflow to scheduler-wave projection for distributed planning views
 
 ## 11. Runtime Flow Contracts
 
@@ -836,6 +837,18 @@ The canonical CLI run path is:
 4. serialize the normalized run payload
 5. write local run/checkpoint/approval/sandbox records
 6. render output
+
+### 11.5 Dispatch planning path
+
+The scheduler-oriented planning path is:
+
+1. compile `PylonProject` to `CompiledWorkflow`
+2. project nodes into `WorkflowTask` instances
+3. compute dependency waves with `WorkflowScheduler.compute_waves()`
+4. expose a `distributed_wave_plan` through API/SDK/runtime helpers
+
+This path is a planning/deployment view only. It does not execute nodes and does
+not replace `GraphExecutor`.
 
 ## 12. Current Maturity and Known Gaps
 

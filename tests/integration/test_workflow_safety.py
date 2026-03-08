@@ -55,13 +55,19 @@ async def test_kill_switch_blocks_workflow_nodes():
 
 
 async def test_kill_switch_scope_hierarchy():
-    """Global kill switch affects all sub-scopes; scoped switch does not affect others."""
+    """Global and registered parent scopes affect descendants."""
     ks = KillSwitch()
     ks.activate(scope="workflow:wf-1", reason="bad workflow", issued_by="ops")
 
     assert ks.is_active("workflow:wf-1")
     assert not ks.is_active("workflow:wf-2")
     assert not ks.is_active("global")
+
+    ks.register_scope("workflow:wf-2", parent_scope="tenant:acme")
+    ks.register_scope("agent:a-2", parent_scope="workflow:wf-2")
+    ks.activate(scope="tenant:acme", reason="tenant stop", issued_by="admin")
+    assert ks.is_active("workflow:wf-2")
+    assert ks.is_active("agent:a-2")
 
     ks.activate(scope="global", reason="full stop", issued_by="admin")
     assert ks.is_active("workflow:wf-2")

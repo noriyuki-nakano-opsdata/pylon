@@ -10,10 +10,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from pylon.errors import PylonError
+from pylon.errors import ExitCode, PylonError, resolve_exit_code
+from pylon.taskqueue.queue import Task, TaskStatus
 
 logger = logging.getLogger(__name__)
-from pylon.taskqueue.queue import Task, TaskStatus
 
 
 class WorkerError(PylonError):
@@ -21,6 +21,7 @@ class WorkerError(PylonError):
 
     code = "WORKER_ERROR"
     status_code = 500
+    exit_code = ExitCode.WORKER_ERROR
 
 
 class WorkerStatus(enum.Enum):
@@ -36,6 +37,8 @@ class TaskResult:
     task_id: str
     output: Any = None
     error: str | None = None
+    error_code: str | None = None
+    exit_code: int = int(ExitCode.SUCCESS)
     duration_seconds: float = 0.0
 
     @property
@@ -74,6 +77,18 @@ class Worker:
             return TaskResult(
                 task_id=task.id,
                 output=output,
+                exit_code=int(ExitCode.SUCCESS),
+                duration_seconds=duration,
+            )
+        except PylonError as exc:
+            logger.exception("Task %s execution failed in worker %s", task.id, self.id)
+            duration = time.monotonic() - start
+            task.transition_to(TaskStatus.FAILED)
+            return TaskResult(
+                task_id=task.id,
+                error=exc.message,
+                error_code=exc.code,
+                exit_code=int(resolve_exit_code(exc)),
                 duration_seconds=duration,
             )
         except Exception:
@@ -83,6 +98,8 @@ class Worker:
             return TaskResult(
                 task_id=task.id,
                 error="Task execution failed",
+                error_code="PYLON_INTERNAL_ERROR",
+                exit_code=int(ExitCode.INTERNAL_ERROR),
                 duration_seconds=duration,
             )
         finally:

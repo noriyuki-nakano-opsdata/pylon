@@ -6,6 +6,9 @@ from pathlib import Path
 
 import click
 
+from pylon.cli.errors import fail_command
+from pylon.errors import ExitCode
+
 _PYLON_YAML_TEMPLATE = """\
 version: "1"
 name: {name}
@@ -60,15 +63,14 @@ services:
 )
 @click.option("--name", "project_name", default=None, help="Project name.")
 @click.pass_context
-def init(_ctx: click.Context, quickstart: bool, project_name: str | None) -> None:
+def init(ctx: click.Context, quickstart: bool, project_name: str | None) -> None:
     """Initialize a new Pylon project."""
     cwd = Path.cwd()
     name = project_name or cwd.name
 
     pylon_yaml = cwd / "pylon.yaml"
     if pylon_yaml.exists():
-        click.echo("pylon.yaml already exists. Aborting.")
-        raise SystemExit(1)
+        fail_command(ctx, "pylon.yaml already exists. Aborting.", exit_code=ExitCode.CONFIG_INVALID)
 
     pylon_yaml.write_text(_PYLON_YAML_TEMPLATE.format(name=name))
     click.echo(f"Created pylon.yaml for project '{name}'")

@@ -31,8 +31,23 @@ class KillSwitch:
 
     def __init__(self) -> None:
         self._active: dict[str, _ActiveSwitch] = {}
+        self._parent_scopes: dict[str, str] = {}
 
-    def activate(self, scope: str, reason: str, issued_by: str) -> KillSwitchEvent:
+    def register_scope(self, scope: str, *, parent_scope: str = "") -> None:
+        """Register a scope relationship for inheritance checks."""
+        if scope == "global":
+            self._parent_scopes.pop(scope, None)
+            return
+        self._parent_scopes[scope] = parent_scope
+
+    def activate(
+        self,
+        scope: str,
+        reason: str,
+        issued_by: str,
+        *,
+        parent_scope: str = "",
+    ) -> KillSwitchEvent:
         """Activate kill switch for a given scope.
 
         Args:
@@ -40,20 +55,26 @@ class KillSwitch:
             reason: Human-readable reason for activation
             issued_by: Identity of the person/system activating
         """
-        event = KillSwitchEvent(scope=scope, reason=reason, issued_by=issued_by)
+        if parent_scope:
+            self.register_scope(scope, parent_scope=parent_scope)
+        event = KillSwitchEvent(
+            scope=scope,
+            reason=reason,
+            issued_by=issued_by,
+            parent_scope=parent_scope,
+        )
         self._active[scope] = _ActiveSwitch(event=event, activated_at=time.monotonic())
         return event
 
     def is_active(self, scope: str) -> bool:
         """Check if kill switch is active for a scope.
 
-        Also checks parent scopes: if "global" is active,
-        all sub-scopes are considered active.
+        Also checks registered parent scopes: if an ancestor scope is active,
+        descendants are considered active.
         """
-        if scope in self._active:
-            return True
-        if "global" in self._active and scope != "global":
-            return True
+        for candidate in self._lineage(scope):
+            if candidate in self._active:
+                return True
         return False
 
     def deactivate(self, scope: str) -> KillSwitchEvent | None:
@@ -72,3 +93,24 @@ class KillSwitch:
         """Get the event for an active scope."""
         entry = self._active.get(scope)
         return entry.event if entry else None
+
+    def get_parent_scope(self, scope: str) -> str:
+        """Return the registered parent scope for a scope."""
+        return self._parent_scopes.get(scope, "")
+
+    def _lineage(self, scope: str) -> list[str]:
+        lineage = [scope]
+        seen = {scope}
+        current = scope
+
+        while True:
+            parent = self._parent_scopes.get(current, "")
+            if not parent or parent in seen:
+                break
+            lineage.append(parent)
+            seen.add(parent)
+            current = parent
+
+        if "global" not in seen:
+            lineage.append("global")
+        return lineage

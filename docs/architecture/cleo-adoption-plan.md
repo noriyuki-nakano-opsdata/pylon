@@ -567,6 +567,11 @@ class Repository(ReadRepository[T], WriteRepository[T], Protocol[T]):
 
 具象クラスへの適用は段階的。
 
+#### 実装状況メモ
+
+- B2 は `WorkflowScheduler.compute_waves()` に加えて `pylon.runtime.planning.plan_project_dispatch()` が入り、compiled DAG を scheduler wave に投影できる
+- B4 は read/write repository protocol 分離に加えて、run persistence を raw record、operator-facing payload を query projection に分離済み
+
 ---
 
 ## Tier C: 後期検討（中価値 or 高工数）

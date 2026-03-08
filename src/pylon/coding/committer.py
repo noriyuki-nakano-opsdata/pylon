@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -28,6 +28,7 @@ class CommitPlan:
     files_to_modify: list[str]
     files_to_delete: list[str]
     message: str
+    authored_by: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,7 @@ class FileContent:
     path: str
     content: str
     size_bytes: int = 0
+    authored_by: str | None = None
 
 
 class GitCommitter:
@@ -64,8 +66,11 @@ class GitCommitter:
         files_to_add: list[str] = []
         files_to_modify: list[str] = []
         files_to_delete: list[str] = []
+        authored_by: list[str] = []
 
         for change in changes:
+            if change.authored_by and change.authored_by not in authored_by:
+                authored_by.append(change.authored_by)
             if not change.content and change.size_bytes == 0:
                 files_to_delete.append(change.path)
             elif change.path.startswith("new:"):
@@ -78,6 +83,7 @@ class GitCommitter:
             files_to_modify=files_to_modify,
             files_to_delete=files_to_delete,
             message=message.strip(),
+            authored_by=authored_by,
         )
 
     async def validate_commit(

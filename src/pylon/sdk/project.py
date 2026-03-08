@@ -5,9 +5,18 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from pylon.config.pipeline import build_validation_report, validate_project_definition
 from pylon.dsl.parser import AgentDef, PylonProject
 from pylon.sdk.builder import WorkflowBuilder, WorkflowBuilderError, WorkflowGraph
 from pylon.sdk.decorators import AgentInfo, WorkflowInfo
+
+
+class WorkflowDefinitionValidationError(WorkflowBuilderError):
+    """Raised when a raw workflow definition fails canonical validation."""
+
+    def __init__(self, message: str, *, report: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.report = report
 
 
 def _agent_def_from_metadata(metadata: Any) -> AgentDef:
@@ -160,6 +169,13 @@ def materialize_workflow_definition(
             client_agents=client_agents,
         )
     if isinstance(definition, dict):
+        validation_result = validate_project_definition(definition)
+        if not validation_result.valid:
+            first_issue = validation_result.errors[0]
+            raise WorkflowDefinitionValidationError(
+                f"Invalid workflow definition at {first_issue.field}: {first_issue.message}",
+                report=build_validation_report(validation_result),
+            )
         project = PylonProject.model_validate(definition)
         return project, {}, _agent_handlers_for_project(
             project,

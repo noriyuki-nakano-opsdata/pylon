@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pylon.runtime.planning import WorkflowDispatchPlan, WorkflowDispatchTask
 from pylon.sdk.builder import WorkflowBuilder
 from pylon.sdk.client import PylonClient
 from pylon.sdk.config import SDKConfig
@@ -15,6 +16,8 @@ __all__ = [
     "ToolRegistry",
     "WorkflowBuilder",
     "SDKConfig",
+    "WorkflowDispatchPlan",
+    "WorkflowDispatchTask",
     "materialize_workflow_definition",
     "workflow_graph_to_project",
 ]

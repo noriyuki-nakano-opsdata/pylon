@@ -8,15 +8,17 @@ from pathlib import Path
 
 import click
 
-logger = logging.getLogger(__name__)
-
 from pylon.approval import ApprovalManager, ApprovalRequest, ApprovalStore
+from pylon.cli.errors import fail_command
 from pylon.cli.state import load_state, now_ts, save_state
 from pylon.dsl.parser import load_project
-from pylon.observability.run_payload import build_public_run_payload
+from pylon.errors import ExitCode
+from pylon.observability.run_record import rebuild_run_record
 from pylon.repository.audit import AuditRepository, default_hmac_key
 from pylon.runtime import resume_project_sync, serialize_run
 from pylon.types import RunStatus, RunStopReason
+
+logger = logging.getLogger(__name__)
 
 
 def _run_sync(coro: object) -> object:
@@ -37,12 +39,18 @@ def approve(ctx: click.Context, approval_id: str, deny: bool, reason: str | None
     state = load_state()
     request = state["approvals"].get(approval_id)
     if request is None:
-        click.echo(f"Approval request not found: {approval_id}")
-        raise SystemExit(1)
+        fail_command(
+            ctx,
+            f"Approval request not found: {approval_id}",
+            exit_code=ExitCode.WORKFLOW_ERROR,
+        )
 
     if request.get("status") != "pending":
-        click.echo(f"Approval request already decided: {approval_id}")
-        raise SystemExit(1)
+        fail_command(
+            ctx,
+            f"Approval request already decided: {approval_id}",
+            exit_code=ExitCode.WORKFLOW_ERROR,
+        )
 
     run_id = request.get("run_id", "")
     run = state["runs"].get(run_id)
@@ -88,8 +96,11 @@ def approve(ctx: click.Context, approval_id: str, deny: bool, reason: str | None
         if run is not None:
             project_path = run.get("project_path")
             if not project_path:
-                click.echo(f"Run is missing project path metadata: {run_id}")
-                raise SystemExit(1)
+                fail_command(
+                    ctx,
+                    f"Run is missing project path metadata: {run_id}",
+                    exit_code=ExitCode.WORKFLOW_ERROR,
+                )
             project = load_project(Path(project_path))
             checkpoint_payloads = [
                 checkpoint
@@ -151,37 +162,16 @@ def approve(ctx: click.Context, approval_id: str, deny: bool, reason: str | None
 
     if deny and run is not None:
         updated_approvals = list(state["approvals"].values())
-        updated_run = build_public_run_payload(
-            run_id=str(run["id"]),
-            workflow_id=str(run.get("workflow_id", run.get("workflow", "default"))),
-            project_name=run.get("project"),
-            workflow_name=run.get("workflow"),
+        updated_run = rebuild_run_record(
+            run,
             status=RunStatus(str(run["status"])),
             stop_reason=RunStopReason(str(run.get("stop_reason", RunStopReason.NONE.value))),
             suspension_reason=RunStopReason(
                 str(run.get("suspension_reason", RunStopReason.NONE.value))
             ),
-            input_data=run.get("input"),
-            state=dict(run.get("state", {})),
-            goal=run.get("goal"),
-            autonomy=run.get("autonomy"),
-            verification=run.get("verification"),
-            runtime_metrics=run.get("runtime_metrics"),
-            policy_resolution=run.get("policy_resolution"),
-            refinement_context=run.get("refinement_context"),
-            approval_context=run.get("approval_context"),
-            termination_reason=run.get("termination_reason"),
             active_approval=None,
             approvals=updated_approvals,
             approval_request_id=None,
-            state_version=int(run.get("state_version", 0)),
-            state_hash=str(run.get("state_hash", "")),
-            event_log=list(run.get("event_log", [])),
-            checkpoint_ids=list(run.get("checkpoint_ids", [])),
-            logs=list(run.get("logs", [])),
-            created_at=run.get("created_at"),
-            started_at=run.get("started_at"),
-            completed_at=run.get("completed_at"),
         )
         for key in ("project_path", "sandbox_id", "agents", "nodes", "updated_at"):
             if key in run:

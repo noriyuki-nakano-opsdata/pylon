@@ -7,7 +7,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from pylon.errors import PylonError
+from pylon.errors import ExitCode, PylonError
 from pylon.taskqueue.queue import Task
 
 
@@ -16,6 +16,7 @@ class SchedulerError(PylonError):
 
     code = "SCHEDULER_ERROR"
     status_code = 400
+    exit_code = ExitCode.SCHEDULER_ERROR
 
 
 class ScheduleType(enum.Enum):

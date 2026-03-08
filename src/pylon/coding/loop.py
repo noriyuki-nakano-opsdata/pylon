@@ -157,6 +157,7 @@ class CodingLoop:
                 content=c.get("content", ""),
                 line_count=c.get("line_count", 0),
                 has_tests=c.get("has_tests", False),
+                authored_by=c.get("authored_by"),
             )
             for c in changes
         ]
@@ -168,6 +169,7 @@ class CodingLoop:
             FileContent(
                 path=c.get("file_path", "unknown"),
                 content=c.get("content", ""),
+                authored_by=c.get("authored_by"),
             )
             for c in changes
         ]

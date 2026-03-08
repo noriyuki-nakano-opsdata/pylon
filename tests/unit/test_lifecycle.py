@@ -11,9 +11,10 @@ from pylon.agents.runtime import Agent
 from pylon.agents.supervisor import (
     AgentSupervisor,
     HealthStatus,
+    RecoveryAction,
     SupervisorConfig,
 )
-from pylon.errors import AgentLifecycleError, PolicyViolationError
+from pylon.errors import AgentLifecycleError, ExitCode, PolicyViolationError
 from pylon.safety.capability import CapabilityValidator, _make_cap
 from pylon.types import AgentCapability, AgentConfig, AgentState, TrustLevel
 
@@ -302,7 +303,7 @@ class TestAgentPool:
         pool = AgentPool(mgr, AgentPoolConfig(max_size=10))
         a1 = pool.acquire("worker")
         a2 = pool.acquire("worker")
-        a3 = pool.acquire("worker")
+        pool.acquire("worker")
         assert pool.stats.active_count == 3
         assert pool.stats.total_created == 3
 
@@ -388,6 +389,7 @@ class TestAgentSupervisor:
         sup = AgentSupervisor(mgr, SupervisorConfig(max_restarts=3))
         agent = mgr.create_agent(_config())
         mgr.start_agent(agent.id)
+        agent.working_memory["active_task"] = "repair"
         sup.register(agent.id)
         mgr.kill_agent(agent.id)
 
@@ -395,6 +397,24 @@ class TestAgentSupervisor:
         assert new_agent is not None
         assert new_agent.id != agent.id
         assert new_agent.state == AgentState.RUNNING
+        assert new_agent.working_memory["active_task"] == "repair"
+
+    def test_recover_unhealthy_returns_structured_success(self):
+        mgr = AgentLifecycleManager()
+        sup = AgentSupervisor(mgr, SupervisorConfig(max_restarts=3))
+        agent = mgr.create_agent(_config())
+        mgr.start_agent(agent.id)
+        agent.working_memory["active_task"] = "repair"
+        sup.register(agent.id)
+        mgr.kill_agent(agent.id)
+
+        result = sup.recover_unhealthy(agent.id)
+        assert result.success is True
+        assert result.action is RecoveryAction.RESTARTED
+        assert result.exit_code is ExitCode.SUCCESS
+        assert result.restarted_agent_id is not None
+        assert result.agent is not None
+        assert result.agent.working_memory["active_task"] == "repair"
 
     def test_handle_unhealthy_max_restarts(self):
         mgr = AgentLifecycleManager()
@@ -414,6 +434,25 @@ class TestAgentSupervisor:
         # Second restart exceeds max_restarts
         result = sup.handle_unhealthy(new_agent.id)
         assert result is None
+
+    def test_recover_unhealthy_max_restarts_returns_structured_skip(self):
+        mgr = AgentLifecycleManager()
+        sup = AgentSupervisor(mgr, SupervisorConfig(max_restarts=1))
+        agent = mgr.create_agent(_config())
+        mgr.start_agent(agent.id)
+        sup.register(agent.id)
+        mgr.kill_agent(agent.id)
+
+        first = sup.recover_unhealthy(agent.id)
+        assert first.action is RecoveryAction.RESTARTED
+        assert first.agent is not None
+        mgr.kill_agent(first.agent.id)
+
+        second = sup.recover_unhealthy(first.agent.id)
+        assert second.success is False
+        assert second.action is RecoveryAction.SKIPPED
+        assert second.exit_code is ExitCode.AGENT_LIFECYCLE_ERROR
+        assert second.reason == "restart limit exceeded"
 
     def test_list_supervised(self):
         mgr = AgentLifecycleManager()
@@ -463,18 +502,19 @@ class TestAgentSupervisor:
         assert sup.get_supervised(agent.id).health_check_interval == 20.0
 
     def test_handle_unhealthy_for_healthy_agent(self):
-        """handle_unhealthy on a healthy (running) agent returns None because
-        restart_count == 0 < max_restarts, but the agent is not terminal so
-        it still goes through the restart path. We test with max_restarts=0
-        to ensure None is returned."""
+        """Healthy agents are skipped rather than restarted."""
         mgr = AgentLifecycleManager()
-        sup = AgentSupervisor(mgr, SupervisorConfig(max_restarts=0))
+        sup = AgentSupervisor(mgr, SupervisorConfig(max_restarts=3))
         agent = mgr.create_agent(_config())
         mgr.start_agent(agent.id)
         sup.register(agent.id)
-        # max_restarts=0 means restart_count(0) >= max_restarts(0), returns None
         result = sup.handle_unhealthy(agent.id)
         assert result is None
+
+        structured = sup.recover_unhealthy(agent.id)
+        assert structured.action is RecoveryAction.SKIPPED
+        assert structured.exit_code is ExitCode.SUCCESS
+        assert structured.reason == "agent is not unhealthy (healthy)"
 
     def test_handle_unhealthy_unregistered(self):
         """handle_unhealthy for unregistered agent returns None."""
@@ -482,6 +522,11 @@ class TestAgentSupervisor:
         sup = AgentSupervisor(mgr)
         result = sup.handle_unhealthy("nonexistent-agent")
         assert result is None
+
+        structured = sup.recover_unhealthy("nonexistent-agent")
+        assert structured.action is RecoveryAction.SKIPPED
+        assert structured.exit_code is ExitCode.AGENT_LIFECYCLE_ERROR
+        assert structured.reason == "agent is not registered with supervisor"
 
     def test_health_callback_not_called_when_no_change(self):
         """Second check_health with same state doesn't fire callback."""

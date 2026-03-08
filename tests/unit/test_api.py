@@ -135,6 +135,16 @@ class TestSchemaValidation:
         ok, errors = validate(data, KILL_SWITCH_SCHEMA)
         assert ok is True
 
+    def test_valid_kill_switch_with_parent_scope(self):
+        data = {
+            "scope": "workflow:wf-1",
+            "reason": "test",
+            "issued_by": "admin",
+            "parent_scope": "tenant:acme",
+        }
+        ok, errors = validate(data, KILL_SWITCH_SCHEMA)
+        assert ok is True
+
     def test_non_dict_body(self):
         ok, errors = validate("not a dict", CREATE_AGENT_SCHEMA)  # type: ignore[arg-type]
         assert ok is False
@@ -299,6 +309,53 @@ class TestWorkflowRoutes:
         assert resp.body["node_count"] == 2
         assert store.get_workflow_project("wf1", tenant_id="default").name == "wf1-project"
 
+    def test_create_workflow_definition_returns_structured_validation_issues(self):
+        server, _ = _server_with_routes()
+        resp = server.handle_request(
+            "POST",
+            "/workflows",
+            body={
+                "id": "wf1",
+                "project": {
+                    "version": "1",
+                    "name": "wf1-project",
+                    "agents": {"writer": {"role": "write"}},
+                    "workflow": {"nodes": {"start": {"agent": "missing", "next": "END"}}},
+                },
+            },
+        )
+        assert resp.status_code == 422
+        assert resp.body["error"] == "Workflow project validation failed"
+        assert resp.body["validation"]["valid"] is False
+        assert resp.body["validation"]["source"] == "project_definition"
+        assert resp.body["issues"][0]["stage"] == "referential"
+        assert resp.body["issues"][0]["field"] == "workflow.nodes.start.agent"
+
+    def test_create_workflow_definition_exposes_validation_warnings(self):
+        server, _ = _server_with_routes()
+        resp = server.handle_request(
+            "POST",
+            "/workflows",
+            body={
+                "id": "wf1",
+                "project": {
+                    "version": "1",
+                    "name": "wf1-project",
+                    "agents": {"writer": {"role": "write"}},
+                    "workflow": {
+                        "nodes": {
+                            "start": {"agent": "writer", "next": "END"},
+                            "other": {"agent": "writer", "next": "END"},
+                        }
+                    },
+                },
+            },
+        )
+        assert resp.status_code == 201
+        assert resp.body["validation"]["valid"] is True
+        assert resp.body["validation"]["summary"]["warning_count"] == 1
+        assert resp.body["validation_warnings"][0]["stage"] == "protocol"
+
     def test_create_workflow_definition_allows_same_id_across_tenants(self):
         server, store = _server_with_routes()
         project = _workflow_project("wf-project").model_dump(mode="json")
@@ -349,6 +406,20 @@ class TestWorkflowRoutes:
         assert resp.body["project"]["name"] == "wf1-project"
         assert resp.body["project"]["workflow"]["nodes"]["start"]["agent"] == "researcher"
 
+    def test_get_workflow_plan(self):
+        server, store = _server_with_routes()
+        store.register_workflow_project("wf1", _workflow_project("wf1-project"))
+
+        resp = server.handle_request("GET", "/workflows/wf1/plan")
+        assert resp.status_code == 200
+        assert resp.body["workflow_id"] == "wf1"
+        assert resp.body["tenant_id"] == "default"
+        assert resp.body["execution_mode"] == "distributed_wave_plan"
+        assert resp.body["waves"] == [
+            {"index": 0, "node_ids": ["start"], "task_ids": ["wf1:start"]},
+            {"index": 1, "node_ids": ["finish"], "task_ids": ["wf1:finish"]},
+        ]
+
     def test_delete_workflow_definition(self):
         server, store = _server_with_routes()
         store.register_workflow_project("wf1", _workflow_project("wf1-project"))
@@ -379,6 +450,10 @@ class TestWorkflowRoutes:
             "POST", "/workflows/wf1/run", body={"input": {"task": "build"}}
         )
         assert resp.status_code == 202
+        stored_run = store.workflow_runs_by_id[resp.body["id"]]
+        assert "approval_summary" not in stored_run
+        assert "execution_summary" not in stored_run
+        assert "approval_id" not in stored_run
         assert resp.body["workflow_id"] == "wf1"
         assert resp.body["project"] == "wf1-project"
         assert resp.body["status"] == "completed"
@@ -630,6 +705,22 @@ class TestKillSwitchRoute:
         )
         assert resp.status_code == 201
         assert "agent:123" in store.kill_switches
+
+    def test_activate_with_parent_scope_persists_metadata(self):
+        server, store = _server_with_routes()
+        resp = server.handle_request(
+            "POST",
+            "/kill-switch",
+            headers={"X-Tenant-ID": "tenant-a"},
+            body={
+                "scope": "workflow:wf-1",
+                "reason": "test",
+                "issued_by": "user",
+                "parent_scope": "tenant:tenant-a",
+            },
+        )
+        assert resp.status_code == 201
+        assert store.kill_switches["workflow:wf-1"]["parent_scope"] == "tenant:tenant-a"
 
     def test_activate_validation_error(self):
         server, _ = _server_with_routes()

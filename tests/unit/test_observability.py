@@ -17,8 +17,15 @@ from pylon.observability.metrics import (
     PREDEFINED_METRICS,
     MetricsCollector,
 )
+from pylon.observability.query_service import (
+    build_replay_query_payload,
+    build_run_query_payload,
+    rebuild_run_query_payload,
+)
+from pylon.observability.run_record import build_run_record, rebuild_run_record
 from pylon.observability.tracing import Span, SpanStatus, Tracer
 from pylon.types import RunStatus, RunStopReason
+from pylon.workflow.replay import ReplayResult
 
 # ---------------------------------------------------------------------------
 # Metrics
@@ -280,6 +287,134 @@ class TestExecutionSummary:
         )
 
         assert summary["replan_count"] == 2
+
+
+class TestRunQueryPayloads:
+    def test_build_run_record_stores_only_command_model_fields(self) -> None:
+        record = build_run_record(
+            run_id="run_1",
+            workflow_id="wf1",
+            project_name="demo",
+            workflow_name="wf1",
+            status=RunStatus.COMPLETED,
+            stop_reason=RunStopReason.NONE,
+            suspension_reason=RunStopReason.NONE,
+            input_data={"task": "build"},
+            state={"output": "ok"},
+            event_log=[{"node_id": "start", "seq": 1}],
+        )
+        assert "approval_summary" not in record
+        assert "execution_summary" not in record
+        assert "approval_id" not in record
+
+    def test_build_run_query_payload_reprojects_summary_and_preserves_metadata(self) -> None:
+        payload = build_run_query_payload(
+            {
+                "id": "run_1",
+                "workflow_id": "wf1",
+                "project": "demo",
+                "workflow": "wf1",
+                "status": "completed",
+                "stop_reason": "none",
+                "suspension_reason": "none",
+                "state": {"output": "ok"},
+                "event_log": [{"node_id": "start", "seq": 1}],
+                "logs": ["run:run_1"],
+                "tenant_id": "acme",
+            }
+        )
+        assert payload["execution_summary"]["node_sequence"] == ["start"]
+        assert payload["tenant_id"] == "acme"
+
+    def test_build_replay_query_payload_sets_replay_view(self) -> None:
+        payload = build_replay_query_payload(
+            source_run={
+                "id": "run_1",
+                "workflow_id": "wf1",
+                "project": "demo",
+                "workflow": "wf1",
+                "status": "completed",
+                "stop_reason": "none",
+                "suspension_reason": "none",
+                "state": {"output": "ok"},
+                "event_log": [{"node_id": "start", "seq": 1}],
+                "logs": [],
+            },
+            checkpoint_id="cp_1",
+            replayed=ReplayResult(
+                state={"output": "ok"},
+                state_version=1,
+                state_hash="hash",
+                event_log=[{"node_id": "start", "seq": 1}],
+                execution_summary={},
+                state_hash_verified=True,
+            ),
+            replay_view={
+                "status": RunStatus.COMPLETED,
+                "stop_reason": RunStopReason.NONE,
+                "suspension_reason": RunStopReason.NONE,
+                "active_approval": None,
+                "approval_request_id": None,
+                "is_terminal_replay": True,
+            },
+        )
+        assert payload["view_kind"] == "replay"
+        assert payload["checkpoint_id"] == "cp_1"
+        assert payload["replay"]["state_hash_verified"] is True
+
+    def test_rebuild_run_record_keeps_raw_shape(self) -> None:
+        payload = rebuild_run_record(
+            {
+                "id": "run_1",
+                "workflow_id": "wf1",
+                "project": "demo",
+                "workflow": "wf1",
+                "status": "waiting_approval",
+                "stop_reason": "none",
+                "suspension_reason": "approval_required",
+                "state": {},
+                "event_log": [],
+                "logs": ["run:run_1"],
+            },
+            status=RunStatus.CANCELLED,
+            stop_reason=RunStopReason.APPROVAL_DENIED,
+            suspension_reason=RunStopReason.NONE,
+            active_approval=None,
+            approvals=[],
+            approval_request_id=None,
+            logs=["run:run_1", "approval_rejected:apr_1"],
+        )
+        assert payload["status"] == "cancelled"
+        assert payload["stop_reason"] == "approval_denied"
+        assert "approval_summary" not in payload
+        assert "execution_summary" not in payload
+
+    def test_rebuild_run_query_payload_updates_terminal_transition(self) -> None:
+        payload = rebuild_run_query_payload(
+            {
+                "id": "run_1",
+                "workflow_id": "wf1",
+                "project": "demo",
+                "workflow": "wf1",
+                "status": "waiting_approval",
+                "stop_reason": "none",
+                "suspension_reason": "approval_required",
+                "state": {},
+                "event_log": [],
+                "logs": ["run:run_1"],
+            },
+            status=RunStatus.CANCELLED,
+            stop_reason=RunStopReason.APPROVAL_DENIED,
+            suspension_reason=RunStopReason.NONE,
+            active_approval=None,
+            approvals=[],
+            approval_request_id=None,
+            logs=["run:run_1", "approval_rejected:apr_1"],
+        )
+        assert payload["status"] == "cancelled"
+        assert payload["stop_reason"] == "approval_denied"
+        assert payload["approval_summary"]["pending"] is False
+        assert payload["logs"][-1] == "approval_rejected:apr_1"
 
 
 # ---------------------------------------------------------------------------

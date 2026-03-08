@@ -12,8 +12,8 @@ T = TypeVar("T")
 
 
 @runtime_checkable
-class Repository(Protocol[T]):
-    """Generic repository interface for CRUD + search operations."""
+class ReadRepository(Protocol[T]):
+    """Read-side repository contract."""
 
     async def get(self, id: str) -> T | None:
         """Get entity by ID."""
@@ -22,6 +22,11 @@ class Repository(Protocol[T]):
     async def list(self, *, limit: int = 100, offset: int = 0, **filters: Any) -> list[T]:
         """List entities with optional filters."""
         ...
+
+
+@runtime_checkable
+class WriteRepository(Protocol[T]):
+    """Write-side repository contract."""
 
     async def create(self, entity: T) -> T:
         """Create a new entity."""
@@ -37,7 +42,12 @@ class Repository(Protocol[T]):
 
 
 @runtime_checkable
-class SearchableRepository(Repository[T], Protocol[T]):
+class Repository(ReadRepository[T], WriteRepository[T], Protocol[T]):
+    """Backward-compatible full repository contract."""
+
+
+@runtime_checkable
+class SearchableRepository(ReadRepository[T], Protocol[T]):
     """Repository with vector search capability."""
 
     async def search(

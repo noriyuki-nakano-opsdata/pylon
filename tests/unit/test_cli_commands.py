@@ -9,6 +9,7 @@ from pathlib import Path
 from click.testing import CliRunner
 
 from pylon.cli.main import cli
+from pylon.errors import ExitCode
 
 _PROJECT_YAML_A2 = """\
 version: "1"
@@ -176,6 +177,11 @@ def test_run_inspect_logs_and_replay_flow() -> None:
         ]
 
         checkpoint_id = run_data["checkpoint_ids"][0]
+        state = json.loads(Path(".pylon-home/state.json").read_text(encoding="utf-8"))
+        stored_run = state["runs"][run_id]
+        assert "approval_summary" not in stored_run
+        assert "execution_summary" not in stored_run
+        assert "approval_id" not in stored_run
 
         logs_result = runner.invoke(cli, ["logs", run_id])
         assert logs_result.exit_code == 0
@@ -545,8 +551,58 @@ def test_replay_missing_checkpoint_fails() -> None:
     with runner.isolated_filesystem():
         runner = CliRunner(env={"PYLON_HOME": ".pylon-home"})
         replay_result = runner.invoke(cli, ["replay", "cp_missing"])
-        assert replay_result.exit_code == 1
+        assert replay_result.exit_code == int(ExitCode.WORKFLOW_ERROR)
         assert "Checkpoint not found: cp_missing" in replay_result.output
+
+
+def test_doctor_missing_project_uses_config_invalid_exit_code() -> None:
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        runner = CliRunner(env={"PYLON_HOME": ".pylon-home"})
+        doctor_result = runner.invoke(cli, ["doctor"])
+        assert doctor_result.exit_code == int(ExitCode.CONFIG_INVALID)
+        assert "pylon.yaml: NOT FOUND" in doctor_result.output
+
+
+def test_doctor_invalid_project_uses_config_invalid_exit_code() -> None:
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        runner = CliRunner(env={"PYLON_HOME": ".pylon-home"})
+        with open("pylon.yaml", "w", encoding="utf-8") as f:
+            f.write(
+                "version: '1'\n"
+                "name: bad\n"
+                "agents:\n"
+                "  worker:\n"
+                "    role: invalid\n"
+                "    autonomy: A9\n"
+                "workflow:\n"
+                "  type: graph\n"
+                "  nodes:\n"
+                "    step:\n"
+                "      agent: worker\n"
+                "      next: END\n"
+            )
+
+        doctor_result = runner.invoke(cli, ["doctor"])
+        assert doctor_result.exit_code == int(ExitCode.CONFIG_INVALID)
+        assert "pylon.yaml: INVALID" in doctor_result.output
+
+
+def test_doctor_json_output_includes_validation_report() -> None:
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        runner = CliRunner(env={"PYLON_HOME": ".pylon-home"})
+        with open("pylon.yaml", "w", encoding="utf-8") as f:
+            f.write(_PROJECT_YAML_A2)
+
+        doctor_result = runner.invoke(cli, ["--output", "json", "doctor"])
+        assert doctor_result.exit_code == 0
+        payload = json.loads(doctor_result.output)
+        assert isinstance(payload["ok"], bool)
+        assert payload["validation"]["valid"] is True
+        assert payload["validation"]["source"] == "project_definition"
+        assert payload["checks"][1]["message"] == "pylon.yaml: OK (valid)"
 
 
 def test_approval_deny_updates_run_status_and_logs() -> None:

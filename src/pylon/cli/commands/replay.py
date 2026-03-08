@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import click
 
+from pylon.cli.errors import fail_command
 from pylon.cli.state import load_state
-from pylon.observability.run_payload import build_public_run_payload
+from pylon.errors import ExitCode
+from pylon.observability.query_service import build_replay_query_payload
 from pylon.types import RunStatus, RunStopReason
 from pylon.workflow.replay import ReplayEngine, resolve_replay_view_state
 
@@ -21,8 +23,11 @@ def replay(ctx: click.Context, checkpoint_id: str) -> None:
     state = load_state()
     checkpoint = state["checkpoints"].get(checkpoint_id)
     if checkpoint is None:
-        click.echo(f"Checkpoint not found: {checkpoint_id}")
-        raise SystemExit(1)
+        fail_command(
+            ctx,
+            f"Checkpoint not found: {checkpoint_id}",
+            exit_code=ExitCode.WORKFLOW_ERROR,
+        )
 
     source_run_id = checkpoint.get("run_id", "")
     source_run = state["runs"].get(source_run_id, {})
@@ -79,48 +84,16 @@ def replay(ctx: click.Context, checkpoint_id: str) -> None:
 
     click.echo(
         cli_ctx.formatter.render(
-            build_public_run_payload(
-                run_id=source_run_id,
-                workflow_id=str(source_run.get("workflow_id", source_run.get("workflow", ""))),
-                project_name=source_run.get("project"),
-                workflow_name=source_run.get("workflow"),
-                status=replay_view["status"],
-                stop_reason=replay_view["stop_reason"],
-                suspension_reason=replay_view["suspension_reason"],
-                input_data=source_run.get("input"),
-                state=replayed.state,
-                goal=source_run.get("goal"),
-                autonomy=source_run.get("autonomy"),
-                verification=source_run.get("verification"),
-                runtime_metrics=source_run.get("runtime_metrics"),
-                policy_resolution=source_run.get("policy_resolution"),
-                refinement_context=source_run.get("refinement_context"),
-                approval_context=source_run.get("approval_context"),
-                termination_reason=source_run.get("termination_reason"),
-                active_approval=replay_view["active_approval"],
+            build_replay_query_payload(
+                source_run=source_run,
+                checkpoint_id=checkpoint_id,
+                replayed=replayed,
+                replay_view=replay_view,
                 approvals=(
                     source_run.get("approvals", [])
                     if replay_view["is_terminal_replay"]
                     else []
                 ),
-                approval_request_id=replay_view["approval_request_id"],
-                state_version=replayed.state_version,
-                state_hash=replayed.state_hash,
-                event_log=replayed.event_log,
-                checkpoint_ids=[checkpoint_id],
-                logs=source_run.get("logs", []),
-                created_at=source_run.get("created_at"),
-                started_at=source_run.get("started_at"),
-                completed_at=source_run.get("completed_at"),
-                view_kind="replay",
-                replay={
-                    "checkpoint_id": checkpoint_id,
-                    "source_run": source_run_id,
-                    "source_status": source_run.get("status"),
-                    "source_stop_reason": source_run.get("stop_reason"),
-                    "source_suspension_reason": source_run.get("suspension_reason"),
-                    "state_hash_verified": replayed.state_hash_verified,
-                },
             )
         )
     )

@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from pylon.errors import PylonError
+from pylon.errors import ExitCode, PylonError
 
 
 class TaskQueueError(PylonError):
@@ -17,6 +17,7 @@ class TaskQueueError(PylonError):
 
     code = "TASK_QUEUE_ERROR"
     status_code = 400
+    exit_code = ExitCode.TASK_QUEUE_ERROR
 
 
 class TaskStatus(enum.Enum):

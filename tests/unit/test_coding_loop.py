@@ -17,6 +17,7 @@ from pylon.coding.loop import (
 from pylon.coding.planner import (
     CodingComplexity,
     FileAction,
+    HierarchyPolicy,
     Plan,
     PlanStep,
     TaskPlanner,
@@ -28,6 +29,7 @@ from pylon.coding.reviewer import (
     ReviewResult,
     Severity,
 )
+from pylon.errors import PolicyViolationError
 
 # ======================================================================
 # Helpers
@@ -237,6 +239,30 @@ class TestPlanner:
         result = await planner.decompose("big task")
         assert len(result) == 3
 
+    @pytest.mark.asyncio
+    async def test_plan_respects_hierarchy_policy(self) -> None:
+        async def custom_fn(desc: str) -> Plan:
+            return _make_plan(3)
+
+        planner = TaskPlanner(
+            planner_fn=custom_fn,
+            hierarchy_policy=HierarchyPolicy(max_plan_steps=2),
+        )
+        with pytest.raises(ValueError, match="Plan exceeds max steps"):
+            await planner.plan("too large")
+
+    @pytest.mark.asyncio
+    async def test_decompose_respects_hierarchy_policy(self) -> None:
+        async def decompose_fn(task: str) -> list[str]:
+            return ["sub1", "sub2", "sub3"]
+
+        planner = TaskPlanner(
+            decompose_fn=decompose_fn,
+            hierarchy_policy=HierarchyPolicy(max_subtasks=2),
+        )
+        with pytest.raises(ValueError, match="Decomposition exceeds max subtasks"):
+            await planner.decompose("too broad")
+
     def test_complexity_low(self) -> None:
         planner = TaskPlanner()
         assert planner.estimate_complexity("fix typo") == CodingComplexity.LOW
@@ -304,6 +330,24 @@ class TestReviewer:
         result = await reviewer.review([])
         assert result is expected
 
+    @pytest.mark.asyncio
+    async def test_review_rejects_self_authored_change(self) -> None:
+        reviewer = CodeReviewer(
+            quality_gates=QualityGateConfig(required_tests=False),
+            reviewer_agent_id="coder-1",
+        )
+        changes = [
+            CodeChange(
+                "app.py",
+                "code",
+                line_count=10,
+                has_tests=True,
+                authored_by="coder-1",
+            )
+        ]
+        with pytest.raises(PolicyViolationError, match="Reviewer cannot approve"):
+            await reviewer.review(changes)
+
 
 # ======================================================================
 # 20-23: Commit validation and secret detection
@@ -360,6 +404,17 @@ class TestCommitter:
         committer = GitCommitter()
         with pytest.raises(ValueError):
             await committer.prepare_commit([], "")
+
+    @pytest.mark.asyncio
+    async def test_prepare_commit_tracks_authors(self) -> None:
+        committer = GitCommitter()
+        changes = [
+            FileContent("src/app.py", "content", authored_by="coder-a"),
+            FileContent("src/worker.py", "content", authored_by="coder-b"),
+            FileContent("src/app.py", "more", authored_by="coder-a"),
+        ]
+        plan = await committer.prepare_commit(changes, "feat: preserve authors")
+        assert plan.authored_by == ["coder-a", "coder-b"]
 
 
 # ======================================================================
@@ -490,6 +545,30 @@ class TestIterationAndErrors:
         assert result.test_results == []
         assert result.review_comments == []
         assert result.iterations == 0
+
+    @pytest.mark.asyncio
+    async def test_loop_fails_self_review(self) -> None:
+        async def code_handler(plan: Plan) -> list[dict]:
+            return [
+                {
+                    "file_path": "src/app.py",
+                    "content": "print('x')",
+                    "has_tests": True,
+                    "authored_by": "coder-1",
+                }
+            ]
+
+        reviewer = CodeReviewer(
+            quality_gates=QualityGateConfig(required_tests=False),
+            reviewer_agent_id="coder-1",
+        )
+        loop = CodingLoop(
+            config=CodingLoopConfig(require_review=True, require_tests=False),
+            code_handler=code_handler,
+            reviewer=reviewer,
+        )
+        result = await loop.run("task")
+        assert result.status == LoopState.FAILED
 
 
 # ======================================================================

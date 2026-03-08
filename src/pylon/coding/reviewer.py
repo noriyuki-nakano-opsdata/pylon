@@ -4,6 +4,8 @@ import enum
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from pylon.errors import PolicyViolationError
+
 
 class Severity(enum.Enum):
     INFO = "info"
@@ -41,6 +43,7 @@ class CodeChange:
     content: str
     line_count: int = 0
     has_tests: bool = False
+    authored_by: str | None = None
 
 
 class CodeReviewer:
@@ -51,11 +54,14 @@ class CodeReviewer:
         *,
         quality_gates: QualityGateConfig | None = None,
         review_fn: Callable[[list[CodeChange]], Awaitable[ReviewResult]] | None = None,
+        reviewer_agent_id: str | None = None,
     ) -> None:
         self.quality_gates = quality_gates or QualityGateConfig()
         self._review_fn = review_fn
+        self._reviewer_agent_id = reviewer_agent_id
 
     async def review(self, changes: list[CodeChange]) -> ReviewResult:
+        self._enforce_reviewer_separation(changes)
         if self._review_fn is not None:
             return await self._review_fn(changes)
 
@@ -99,6 +105,20 @@ class CodeReviewer:
             comments=comments,
             severity=worst_severity,
         )
+
+    def _enforce_reviewer_separation(self, changes: list[CodeChange]) -> None:
+        if not self._reviewer_agent_id:
+            return
+
+        for change in changes:
+            if change.authored_by == self._reviewer_agent_id:
+                raise PolicyViolationError(
+                    "Reviewer cannot approve its own authored change",
+                    details={
+                        "reviewer_agent_id": self._reviewer_agent_id,
+                        "file_path": change.file_path,
+                    },
+                )
 
 
 _SEVERITY_ORDER = {Severity.INFO: 0, Severity.WARNING: 1, Severity.ERROR: 2}

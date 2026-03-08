@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from pylon.errors import ExitCode, WorkflowError
 from pylon.taskqueue.queue import Task, TaskQueue, TaskQueueError, TaskStatus
 from pylon.taskqueue.retry import (
     DeadLetterQueue,
@@ -321,6 +322,8 @@ class TestWorker:
         result = w.process(task, _ok_handler)
         assert result.success
         assert result.output == "done:test"
+        assert result.exit_code == int(ExitCode.SUCCESS)
+        assert result.error_code is None
         assert task.status == TaskStatus.COMPLETED
         assert w.status == WorkerStatus.IDLE
 
@@ -331,6 +334,23 @@ class TestWorker:
         result = w.process(task, _fail_handler)
         assert not result.success
         assert result.error == "Task execution failed"
+        assert result.error_code == "PYLON_INTERNAL_ERROR"
+        assert result.exit_code == int(ExitCode.INTERNAL_ERROR)
+        assert task.status == TaskStatus.FAILED
+
+    def test_process_pylon_error_uses_structured_exit_code(self):
+        w = Worker(name="w1")
+        task = _task()
+        task.transition_to(TaskStatus.RUNNING)
+
+        def _handler(_task: Task) -> str:
+            raise WorkflowError("workflow exploded")
+
+        result = w.process(task, _handler)
+        assert not result.success
+        assert result.error == "workflow exploded"
+        assert result.error_code == "WORKFLOW_ERROR"
+        assert result.exit_code == int(ExitCode.WORKFLOW_ERROR)
         assert task.status == TaskStatus.FAILED
 
     def test_process_stopped_worker_raises(self):

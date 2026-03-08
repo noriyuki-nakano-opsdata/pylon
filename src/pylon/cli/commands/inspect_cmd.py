@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import click
 
+from pylon.cli.errors import fail_command
 from pylon.cli.state import load_state
+from pylon.errors import ExitCode
+from pylon.observability.query_service import build_run_query_payload
 
 
 @click.command("inspect")
@@ -18,6 +21,5 @@ def inspect(ctx: click.Context, run_id: str) -> None:
     state = load_state()
     run = state["runs"].get(run_id)
     if run is None:
-        click.echo(f"Run not found: {run_id}")
-        raise SystemExit(1)
-    click.echo(cli_ctx.formatter.render(run))
+        fail_command(ctx, f"Run not found: {run_id}", exit_code=ExitCode.WORKFLOW_ERROR)
+    click.echo(cli_ctx.formatter.render(build_run_query_payload(run)))

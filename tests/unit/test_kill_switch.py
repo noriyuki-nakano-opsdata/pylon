@@ -40,6 +40,26 @@ class TestKillSwitch:
         assert not ks.is_active("agent:2")
         assert not ks.is_active("workflow:1")
 
+    def test_parent_scope_inheritance(self):
+        ks = KillSwitch()
+        ks.register_scope("workflow:wf-1", parent_scope="tenant:acme")
+        ks.register_scope("agent:a-1", parent_scope="workflow:wf-1")
+        ks.activate("tenant:acme", reason="tenant stop", issued_by="ops")
+
+        assert ks.is_active("workflow:wf-1")
+        assert ks.is_active("agent:a-1")
+        assert not ks.is_active("tenant:other")
+
+    def test_activate_registers_parent_scope(self):
+        ks = KillSwitch()
+        ks.activate(
+            "workflow:wf-1",
+            reason="pause workflow",
+            issued_by="ops",
+            parent_scope="tenant:acme",
+        )
+        assert ks.get_parent_scope("workflow:wf-1") == "tenant:acme"
+
     def test_get_active_scopes(self):
         ks = KillSwitch()
         ks.activate("agent:1", reason="a", issued_by="admin")
@@ -67,3 +87,7 @@ class TestKillSwitch:
         assert event.scope == "global"
         assert event.reason == "drill"
         assert event.issued_by == "sre"
+
+    def test_get_parent_scope_missing(self):
+        ks = KillSwitch()
+        assert ks.get_parent_scope("workflow:missing") == ""

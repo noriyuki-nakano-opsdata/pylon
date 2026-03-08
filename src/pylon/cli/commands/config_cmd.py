@@ -6,7 +6,9 @@ from typing import Any
 
 import click
 
+from pylon.cli.errors import fail_command
 from pylon.cli.state import load_config, save_config
+from pylon.errors import ExitCode
 
 
 def _coerce(value: str) -> Any:
@@ -50,13 +52,13 @@ def config() -> None:
 
 @config.command("get")
 @click.argument("key")
-def config_get(key: str) -> None:
+@click.pass_context
+def config_get(ctx: click.Context, key: str) -> None:
     """Get a config value by dot-path key."""
     cfg = load_config()
     value = _resolve(cfg, key)
     if value is None:
-        click.echo(f"Key not found: {key}")
-        raise SystemExit(1)
+        fail_command(ctx, f"Key not found: {key}", exit_code=ExitCode.CONFIG_INVALID)
     click.echo(value)
 
 
@@ -80,4 +82,3 @@ def config_list(ctx: click.Context) -> None:
     cli_ctx = get_ctx(ctx)
     cfg = load_config()
     click.echo(cli_ctx.formatter.render(cfg))
-

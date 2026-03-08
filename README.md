@@ -2,7 +2,7 @@
 
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
-![Tests: 1380 passing](https://img.shields.io/badge/tests-1380%20passing-brightgreen)
+![Tests: 1445 passing](https://img.shields.io/badge/tests-1445%20passing-brightgreen)
 
 **Pylon** is a Python-first autonomous agent orchestration platform with deterministic workflow execution, runtime safety enforcement, and protocol integrations for MCP and A2A.
 
@@ -14,7 +14,7 @@
 | **Safety** | Rule-of-Two+ enforcement (no frame may combine untrusted input + secret access + external writes), `SafetyContext` / `ToolDescriptor` dynamic checks, prompt guard pipeline |
 | **Approval** | Plan/effect binding with drift detection, executor-integrated approval waits, and replayable approval context |
 | **Protocols** | MCP JSON-RPC server with OAuth 2.1 + PKCE scopes; A2A task routing with peer delegation checks |
-| **Infrastructure** | Sandbox policy, versioned secrets, multi-tenant isolation, rate limiting, circuit breaker, plugin system — all shipped as local-first reference implementations |
+| **Infrastructure** | Sandbox policy, versioned secrets, multi-tenant isolation, rate limiting, circuit breaker, plugin system, scheduler wave planning — all shipped as local-first reference implementations |
 
 ## Quick Start
 
@@ -117,6 +117,18 @@ Current limitation:
 - callable edge conditions in `WorkflowBuilder` cannot be materialized into the
   canonical runtime; use string conditions in the DSL/runtime graph for those
   cases
+
+## Dispatch Planning
+
+Pylon now exposes a scheduler-oriented planning view without changing the
+canonical inline execution semantics.
+
+- `pylon.runtime.plan_project_dispatch(...)` derives dependency waves from the compiled DAG
+- `PylonClient.plan_workflow(...)` returns the same public dispatch plan
+- `GET /workflows/{id}/plan` exposes the plan through the lightweight API
+
+This planning view is meant for queued or distributed runners. Inline execution
+still uses `GraphExecutor` directly.
 
 ## Architecture
 
@@ -246,7 +258,7 @@ make format      # ruff format src tests
 
 ## Current Status
 
-The workflow engine and safety system are the most mature components. Workflow runs now use a shared runtime path across CLI/API/SDK helpers, API route definitions are registered as canonical `PylonProject` resources, and SDK workflow execution is separated from explicit ad hoc callable execution. Public run payloads expose machine-readable stop and suspension reasons plus normalized `execution_summary`, `approval_summary`, and replay metadata for operator inspection.
+The workflow engine and safety system are the most mature components. Workflow runs now use a shared runtime path across CLI/API/SDK helpers, API route definitions are registered as canonical `PylonProject` resources, and SDK workflow execution is separated from explicit ad hoc callable execution. Persisted runs are stored as raw command-side records, while public views rebuild normalized `execution_summary`, `approval_summary`, and replay metadata through shared query services. A scheduler-facing `distributed_wave_plan` is also available as a deployment-planning view over the same compiled DAG.
 
 Many infrastructure subsystems (repository, sandbox, secrets, tenancy, plugins) are intentionally shipped as in-memory reference implementations suitable for local development and testing. Production deployments would swap these for persistent backends.
 
