@@ -34,6 +34,8 @@ class Checkpoint:
         input_data: Any,
         seq: int | None = None,
         attempt_id: int | None = None,
+        replan_count: int | None = None,
+        loop_iteration: int | None = None,
         input_state_version: int | None = None,
         input_state_hash: str | None = None,
         llm_response: Any | None = None,
@@ -42,29 +44,47 @@ class Checkpoint:
         tool_events: list[Any] | None = None,
         artifacts: list[Any] | None = None,
         edge_decisions: dict[str, bool] | None = None,
+        edge_resolutions: list[dict[str, Any]] | None = None,
         metrics: dict[str, Any] | None = None,
+        evaluation_results: list[dict[str, Any]] | None = None,
+        verification: dict[str, Any] | None = None,
+        loop_evaluation: dict[str, Any] | None = None,
         state_patch: dict[str, Any] | None = None,
         output_data: Any | None = None,
         state_version: int | None = None,
         state_hash: str | None = None,
     ) -> None:
         patch = state_patch if state_patch is not None else output_data
+        if state_patch is not None and output_data is not None and state_patch != output_data:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Checkpoint event has both state_patch and output_data with different values; "
+                "using state_patch"
+            )
+        scrubbed_patch = scrub_secrets(patch)
         self.event_log.append({
             "seq": seq,
             "attempt_id": attempt_id,
+            "replan_count": replan_count,
+            "loop_iteration": loop_iteration,
             "node_id": node_id or self.node_id,
             "input": scrub_secrets(input_data),
             "input_state_version": input_state_version,
             "input_state_hash": input_state_hash,
             "llm_response": scrub_secrets(llm_response),
             "llm_events": scrub_secrets(llm_events or []),
-            "tool_results": scrub_secrets(tool_results or tool_events or []),
-            "tool_events": scrub_secrets(tool_events or tool_results or []),
+            "tool_results": scrub_secrets(tool_results or []),
+            "tool_events": scrub_secrets(tool_events or []),
             "artifacts": scrub_secrets(artifacts or []),
             "edge_decisions": edge_decisions or {},
+            "edge_resolutions": scrub_secrets(edge_resolutions or []),
             "metrics": scrub_secrets(metrics or {}),
-            "state_patch": patch,
-            "output": patch,
+            "evaluation_results": scrub_secrets(evaluation_results or []),
+            "verification": scrub_secrets(verification),
+            "loop_evaluation": scrub_secrets(loop_evaluation),
+            "state_patch": scrubbed_patch,
+            "output": scrubbed_patch,
+            "state_patch_scrubbed": scrubbed_patch != patch,
             "state_version": state_version if state_version is not None else self.state_version,
             "state_hash": state_hash if state_hash is not None else self.state_hash,
             "timestamp": datetime.now(UTC).isoformat(),

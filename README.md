@@ -2,7 +2,7 @@
 
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
-![Tests: 1275 passing](https://img.shields.io/badge/tests-1275%20passing-brightgreen)
+![Tests: 1380 passing](https://img.shields.io/badge/tests-1380%20passing-brightgreen)
 
 **Pylon** is a Python-first autonomous agent orchestration platform with deterministic workflow execution, runtime safety enforcement, and protocol integrations for MCP and A2A.
 
@@ -10,9 +10,9 @@
 
 | Category | Highlights |
 |----------|------------|
-| **Workflow Engine** | Compiled DAG execution, `ALL_RESOLVED` / `ANY` / `FIRST` join policies, patch-based commits, node-scoped checkpoints, and deterministic replay with state hash verification |
+| **Workflow Engine** | Compiled DAG execution, `ALL_RESOLVED` / `ANY` / `FIRST` join policies, patch-based commits, node-scoped checkpoints, pause/resume, and deterministic replay with state hash verification |
 | **Safety** | Rule-of-Two+ enforcement (no frame may combine untrusted input + secret access + external writes), `SafetyContext` / `ToolDescriptor` dynamic checks, prompt guard pipeline |
-| **Approval** | Plan/effect binding with drift detection — approvals are invalidated if the action scope changes after sign-off |
+| **Approval** | Plan/effect binding with drift detection, executor-integrated approval waits, and replayable approval context |
 | **Protocols** | MCP JSON-RPC server with OAuth 2.1 + PKCE scopes; A2A task routing with peer delegation checks |
 | **Infrastructure** | Sandbox policy, versioned secrets, multi-tenant isolation, rate limiting, circuit breaker, plugin system — all shipped as local-first reference implementations |
 
@@ -69,6 +69,55 @@ async def main():
 asyncio.run(main())
 ```
 
+## SDK Authoring Surfaces
+
+`pylon.sdk.PylonClient` keeps canonical workflow execution separate from
+explicit single-step callable execution.
+
+Canonical workflow definitions can come from:
+
+- `PylonProject`
+- `dict` or `pylon.yaml` path
+- `WorkflowBuilder`
+- `WorkflowGraph`
+- `@workflow`-decorated factory
+
+These are materialized into a canonical `PylonProject` before execution, so
+`run_workflow()` still uses the same compiled graph runtime as the CLI and API.
+Plain callables are not treated as workflows. Register them explicitly through
+`register_callable()` and run them through `run_callable()`.
+
+```python
+from pylon.sdk import PylonClient, agent, workflow
+
+client = PylonClient()
+
+@agent(name="researcher", role="research")
+def researcher(state):
+    return {"topic": str(state["topic"]).upper()}
+
+@agent(name="writer", role="write")
+def writer(state):
+    return {"summary": f"summary:{state['topic']}"}
+
+@workflow(name="pipeline")
+def define(builder):
+    builder.add_node("research", agent="researcher")
+    builder.add_node("write", agent="writer")
+    builder.add_edge("research", "write")
+    builder.set_entry("research")
+
+client.register_workflow("pipeline", define)
+result = client.run_workflow("pipeline", input_data={"topic": "agents"})
+run = client.get_run(result.run_id)
+```
+
+Current limitation:
+
+- callable edge conditions in `WorkflowBuilder` cannot be materialized into the
+  canonical runtime; use string conditions in the DSL/runtime graph for those
+  cases
+
 ## Architecture
 
 ```
@@ -104,7 +153,7 @@ asyncio.run(main())
 | Resources | `pylon.resources`, `pylon.resilience` | Rate limiting, pooling, retry, circuit breaker, bulkhead |
 | Extensibility | `pylon.plugins`, `pylon.control_plane`, `pylon.taskqueue`, `pylon.observability`, `pylon.config`, `pylon.coding` | Plugins, registries, schedulers, metrics, config, coding loop |
 
-Current source: 129 modules across 31 packages, 37 test files (1,275 test cases).
+Current source: 173 Python modules across 33 package directories, 42 test files (1,380 passing tests).
 
 ## Project Configuration
 
@@ -186,15 +235,18 @@ make format      # ruff format src tests
 - [Architecture Overview](docs/architecture.md) — layered module structure
 - [Runtime Flows](docs/architecture/runtime-flows.md) — execution paths for workflow, MCP, A2A, CLI, and approval
 - [Module Map](docs/architecture/module-map.md) — package-by-package reference with maturity guide
+- [Pylon vNext Target Architecture](docs/architecture/pylon-vnext-target-architecture.md) — target three-layer runtime-centered architecture
+- [Pylon vNext Type Design](docs/architecture/pylon-vnext-type-design.md) — proposed types for goals, termination, routing, and evaluation
+- [Pylon vNext Implementation Plan](docs/architecture/pylon-vnext-implementation-plan.md) — ordered delivery plan for bounded autonomy
 - [Getting Started Guide](docs/getting-started.md) — installation, first project, programmatic API
 - [API Reference](docs/api-reference.md) — REST routes and middleware
 - [Implemented Specification](docs/SPECIFICATION.md) — full technical specification
-- [ADR Index](docs/adr/) — architecture decision records (001–008)
+- [ADR Index](docs/adr/) — architecture decision records (001–009)
 - [Workflow/Safety Implementation Plan](docs/architecture/workflow-safety-implementation-plan.md)
 
 ## Current Status
 
-The workflow engine and safety system are the most mature components — they provide compiled deterministic execution, runtime boundary enforcement at MCP/A2A protocol edges, and approval binding with drift detection.
+The workflow engine and safety system are the most mature components. Workflow runs now use a shared runtime path across CLI/API/SDK helpers, API route definitions are registered as canonical `PylonProject` resources, and SDK workflow execution is separated from explicit ad hoc callable execution. Public run payloads expose machine-readable stop and suspension reasons plus normalized `execution_summary`, `approval_summary`, and replay metadata for operator inspection.
 
 Many infrastructure subsystems (repository, sandbox, secrets, tenancy, plugins) are intentionally shipped as in-memory reference implementations suitable for local development and testing. Production deployments would swap these for persistent backends.
 

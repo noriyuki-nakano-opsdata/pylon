@@ -10,10 +10,21 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import time
+import os
+import secrets
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+
+_PROCESS_FALLBACK_HMAC_KEY = secrets.token_bytes(32)
+
+
+def default_hmac_key() -> bytes:
+    """Resolve HMAC key from environment with a process-local fallback."""
+    configured = os.environ.get("PYLON_HMAC_KEY")
+    if configured:
+        return configured.encode()
+    return _PROCESS_FALLBACK_HMAC_KEY
 
 
 @dataclass
@@ -49,6 +60,33 @@ class AuditRepository:
     def _compute_hmac(self, data: str) -> str:
         return hmac.HMAC(self._hmac_key, data.encode(), hashlib.sha256).hexdigest()
 
+    def _serialize_entry_data(
+        self,
+        *,
+        entry_id: int,
+        tenant_id: str,
+        event_type: str,
+        actor: str,
+        action: str,
+        details: dict[str, Any],
+        prev_hash: str,
+        created_at: datetime,
+    ) -> str:
+        return json.dumps(
+            {
+                "id": entry_id,
+                "tenant_id": tenant_id,
+                "event_type": event_type,
+                "actor": actor,
+                "action": action,
+                "details": details,
+                "prev_hash": prev_hash,
+                "created_at": created_at.astimezone(UTC).isoformat(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
     async def append(
         self,
         *,
@@ -62,17 +100,18 @@ class AuditRepository:
         self._counter += 1
 
         prev_hash = self._entries[-1].entry_hash if self._entries else ""
-
-        entry_data = json.dumps({
-            "id": self._counter,
-            "tenant_id": tenant_id,
-            "event_type": event_type,
-            "actor": actor,
-            "action": action,
-            "details": details or {},
-            "prev_hash": prev_hash,
-            "timestamp": time.time(),
-        }, sort_keys=True)
+        created_at = datetime.now(UTC)
+        normalized_details = details or {}
+        entry_data = self._serialize_entry_data(
+            entry_id=self._counter,
+            tenant_id=tenant_id,
+            event_type=event_type,
+            actor=actor,
+            action=action,
+            details=normalized_details,
+            prev_hash=prev_hash,
+            created_at=created_at,
+        )
 
         entry_hash = self._compute_hash(entry_data)
         hmac_sig = self._compute_hmac(entry_data)
@@ -83,10 +122,11 @@ class AuditRepository:
             event_type=event_type,
             actor=actor,
             action=action,
-            details=details or {},
+            details=normalized_details,
             prev_hash=prev_hash,
             entry_hash=entry_hash,
             hmac_signature=hmac_sig,
+            created_at=created_at,
         )
         self._entries.append(entry)
         return entry
@@ -116,14 +156,8 @@ class AuditRepository:
         """Verify hash chain integrity.
 
         Returns (is_valid, message).
-
-        NOTE: HMAC re-verification is not possible because the original
-        entry_data includes a timestamp from time.time() at append time,
-        which cannot be reconstructed. The HMAC is verified implicitly
-        through the hash chain: if entry_hash is consistent with
-        prev_hash linkage, and HMAC was computed from the same entry_data
-        as entry_hash, then tampering would break the chain.
         """
+
         for i, entry in enumerate(self._entries):
             if i == 0:
                 if entry.prev_hash != "":
@@ -136,6 +170,20 @@ class AuditRepository:
                 return False, f"Entry {entry.id}: missing entry_hash"
             if not entry.hmac_signature:
                 return False, f"Entry {entry.id}: missing hmac_signature"
+            expected_data = self._serialize_entry_data(
+                entry_id=entry.id,
+                tenant_id=entry.tenant_id,
+                event_type=entry.event_type,
+                actor=entry.actor,
+                action=entry.action,
+                details=entry.details,
+                prev_hash=entry.prev_hash,
+                created_at=entry.created_at,
+            )
+            if entry.entry_hash != self._compute_hash(expected_data):
+                return False, f"Entry {entry.id}: entry_hash mismatch"
+            if entry.hmac_signature != self._compute_hmac(expected_data):
+                return False, f"Entry {entry.id}: hmac_signature mismatch"
 
         return True, "Chain integrity verified"
 

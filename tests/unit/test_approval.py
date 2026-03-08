@@ -75,6 +75,17 @@ class TestApprovalRequest:
         assert req.plan_hash == "plan"
         assert req.effect_hash == "effect"
 
+    def test_from_dict_normalizes_naive_datetime_to_utc(self) -> None:
+        req = ApprovalRequest.from_dict(
+            {
+                "id": "apr_test",
+                "created_at": "2026-03-08T12:00:00",
+                "status": "pending",
+            }
+        )
+
+        assert req.created_at.tzinfo == UTC
+
 
 class TestApprovalDecision:
     def test_default_fields(self) -> None:

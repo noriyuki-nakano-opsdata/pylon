@@ -41,13 +41,13 @@ WorkflowGraph
 - conflicting parallel writes fail before commit
 - join semantics are explicit
 - replay verifies `state_hash`
+- run snapshots retain stop/suspension reasons plus operator-facing summaries
 
 ### Important non-guarantees
 
 - no cyclic workflow support
 - no distributed execution
-- no built-in retry/attempt management beyond the current fixed `attempt_id=1`
-- workflow approval wait states are not yet integrated into executor control flow
+- no arbitrary open-ended replanning outside declared refinement policy
 
 ## 2. MCP Tool Call Flow
 
@@ -130,25 +130,55 @@ request
 - `pylon.cli.commands.run`
 - `pylon.cli.state`
 - `pylon.dsl.parser`
+- `pylon.runtime.execution`
+- `pylon.workflow.executor.GraphExecutor`
 
 ### Flow
 
 ```text
 pylon run
   -> load_project(".")
-  -> inspect workflow nodes and referenced agents
-  -> create local run record
-  -> create local checkpoint records
-  -> create local sandbox record
-  -> optionally create pending approval record
+  -> compile_project_graph(...)
+  -> execute_project_sync(...)
+    -> GraphExecutor.execute(...)
+    -> CheckpointRepository / ApprovalManager
+  -> serialize_run(...)
+  -> create local run/checkpoint/approval/sandbox records
   -> persist to $PYLON_HOME/state.json
 ```
 
 ### Important note
 
-This is not a thin wrapper around `GraphExecutor`. It is a separate local state flow intended for CLI developer experience.
+The CLI is still local-state-based, but workflow execution now uses the same runtime core as the API and SDK helpers.
 
-## 5. API Route Flow
+## 5. SDK Workflow Authoring Flow
+
+### Components
+
+- `pylon.sdk.project.materialize_workflow_definition`
+- `pylon.runtime.execution.execute_project_sync`
+- `pylon.workflow.executor.GraphExecutor`
+
+### Flow
+
+```text
+WorkflowBuilder | WorkflowGraph | @workflow factory | PylonProject
+  -> materialize_workflow_definition(...)
+    -> canonical PylonProject + handler registries
+  -> compile_project_graph(...)
+  -> execute_project_sync(...)
+    -> GraphExecutor.execute(...)
+  -> serialize_run(...)
+  -> WorkflowRun snapshot / public run payload
+```
+
+### Important note
+
+SDK builder/decorator authoring is normalized before execution rather than
+introducing a second runtime. Plain callables remain outside this path and must
+use `register_callable()` / `run_callable()`.
+
+## 6. API Route Flow
 
 ### Components
 
@@ -170,9 +200,9 @@ Request
 
 ### Important note
 
-The route handlers operate over an in-memory `RouteStore`. They do not currently orchestrate the full workflow runtime.
+The route handlers still operate over an in-memory `RouteStore`, but that store now holds canonical workflow definitions, persisted run/checkpoint/approval payloads, and shared-runtime control-plane operations for resume, approval, and replay.
 
-## 6. Approval Flow
+## 7. Approval Flow
 
 There are two distinct approval paths.
 
@@ -190,7 +220,7 @@ This path supports submission, approval/rejection, expiry, and binding validatio
 
 This path is simpler and oriented around action gating plus `plan_hash` / `effect_hash` verification.
 
-## 7. How To Read The Repository
+## 8. How To Read The Repository
 
 If you want the most representative implementation path, read in this order:
 

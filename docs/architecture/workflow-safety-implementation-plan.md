@@ -167,12 +167,11 @@ Implemented now:
 
 Remaining from this phase:
 
-- workflow pause/resume integration with approval wait states
 - broader registry/discovery propagation of structured tool descriptors
 
 ## Phase 6: Cleanup and API Surface Alignment
 
-Status: in progress
+Status: mostly completed
 
 ### Deliverables
 
@@ -197,10 +196,11 @@ Status: in progress
 Implemented now:
 
 - README, architecture, specification, getting-started, API reference, and ADR notes have been refreshed against the actual codebase
+- CLI/API/SDK workflow run surfaces now use the same runtime state model for status, stop reason, suspension reason, execution summary, and approval summary
+- replay and inspect expose aligned operator-facing payloads
 
 Remaining from this phase:
 
-- align API / CLI / SDK runtime state models with the programmatic workflow engine
 - expose richer metrics and runtime statuses through public surfaces
 
 ## Cross-Cutting Rules

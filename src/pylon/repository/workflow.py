@@ -8,25 +8,25 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import StrEnum
 from typing import Any
 
 from pylon.errors import WorkflowError
-
-
-class RunStatus(StrEnum):
-    PENDING = "pending"
-    RUNNING = "running"
-    PAUSED = "paused"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-
+from pylon.types import RunStatus, RunStopReason
 
 _VALID_RUN_TRANSITIONS: dict[RunStatus, set[RunStatus]] = {
     RunStatus.PENDING: {RunStatus.RUNNING},
-    RunStatus.RUNNING: {RunStatus.PAUSED, RunStatus.COMPLETED, RunStatus.FAILED},
-    RunStatus.PAUSED: {RunStatus.RUNNING},
+    RunStatus.RUNNING: {
+        RunStatus.WAITING_APPROVAL,
+        RunStatus.PAUSED,
+        RunStatus.COMPLETED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+    },
+    RunStatus.WAITING_APPROVAL: {
+        RunStatus.RUNNING,
+        RunStatus.CANCELLED,
+    },
+    RunStatus.PAUSED: {RunStatus.RUNNING, RunStatus.CANCELLED},
     RunStatus.COMPLETED: set(),
     RunStatus.FAILED: set(),
     RunStatus.CANCELLED: set(),
@@ -53,6 +53,9 @@ class WorkflowRun:
     state: dict[str, Any] = field(default_factory=dict)
     state_version: int = 0
     state_hash: str = ""
+    stop_reason: RunStopReason = RunStopReason.NONE
+    suspension_reason: RunStopReason = RunStopReason.NONE
+    approval_request_id: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -68,25 +71,67 @@ class WorkflowRun:
     def start(self) -> None:
         self._validate_transition(RunStatus.RUNNING)
         self.status = RunStatus.RUNNING
+        self.suspension_reason = RunStopReason.NONE
         self.started_at = datetime.now(UTC)
 
-    def complete(self) -> None:
+    def resume(self) -> None:
+        self._validate_transition(RunStatus.RUNNING)
+        self.status = RunStatus.RUNNING
+        self.suspension_reason = RunStopReason.NONE
+        self.approval_request_id = None
+        if self.started_at is None:
+            self.started_at = datetime.now(UTC)
+
+    def complete(self, reason: RunStopReason = RunStopReason.NONE) -> None:
         self._validate_transition(RunStatus.COMPLETED)
         self.status = RunStatus.COMPLETED
+        self.stop_reason = reason
+        self.suspension_reason = RunStopReason.NONE
+        self.approval_request_id = None
         self.completed_at = datetime.now(UTC)
 
-    def pause(self, reason: str | None = None) -> None:
+    def pause(self, reason: RunStopReason = RunStopReason.NONE) -> None:
         self._validate_transition(RunStatus.PAUSED)
         self.status = RunStatus.PAUSED
-        if reason:
-            self.state["pause_reason"] = reason
+        self.suspension_reason = reason
+        if reason != RunStopReason.NONE:
+            self.state["pause_reason"] = reason.value
 
-    def fail(self, error: str | None = None) -> None:
+    def wait_for_approval(
+        self,
+        approval_request_id: str | None = None,
+        reason: RunStopReason = RunStopReason.APPROVAL_REQUIRED,
+    ) -> None:
+        self._validate_transition(RunStatus.WAITING_APPROVAL)
+        self.status = RunStatus.WAITING_APPROVAL
+        self.suspension_reason = reason
+        self.approval_request_id = approval_request_id
+        self.state["pause_reason"] = reason.value
+        if approval_request_id is not None:
+            self.state["approval_request_id"] = approval_request_id
+
+    def fail(
+        self,
+        error: str | None = None,
+        *,
+        reason: RunStopReason = RunStopReason.WORKFLOW_ERROR,
+    ) -> None:
         self._validate_transition(RunStatus.FAILED)
         self.status = RunStatus.FAILED
+        self.stop_reason = reason
+        self.suspension_reason = RunStopReason.NONE
+        self.approval_request_id = None
         self.completed_at = datetime.now(UTC)
         if error:
             self.state["error"] = error
+
+    def cancel(self, reason: RunStopReason = RunStopReason.EXTERNAL_STOP) -> None:
+        self._validate_transition(RunStatus.CANCELLED)
+        self.status = RunStatus.CANCELLED
+        self.stop_reason = reason
+        self.suspension_reason = RunStopReason.NONE
+        self.approval_request_id = None
+        self.completed_at = datetime.now(UTC)
 
 
 class WorkflowRepository:

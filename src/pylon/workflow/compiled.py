@@ -40,6 +40,10 @@ class CompiledNode:
     agent: str
     node_type: WorkflowNodeType
     join_policy: WorkflowJoinPolicy
+    loop_max_iterations: int | None
+    loop_criterion: str | None
+    loop_threshold: float | None
+    loop_metadata: dict[str, object]
     inbound_edge_keys: tuple[EdgeKey, ...]
     outbound_edges: tuple[CompiledEdge, ...]
 

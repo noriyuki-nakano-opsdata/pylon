@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+_UNSET = object()
+
 
 @dataclass(frozen=True)
 class FieldRule:
@@ -19,7 +21,7 @@ class FieldRule:
     min_length: int | None = None
     max_length: int | None = None
     choices: list[Any] | None = None
-    default: Any = None
+    default: Any = _UNSET
 
 
 Schema = dict[str, FieldRule]
@@ -36,11 +38,19 @@ def validate(data: dict, schema: Schema) -> tuple[bool, list[str]]:
         return False, ["Request body must be a JSON object"]
 
     for field_name, rule in schema.items():
-        value = data.get(field_name)
+        has_value = field_name in data
+        value = data.get(field_name, _UNSET)
 
-        if value is None:
-            if rule.required and rule.default is None:
+        if not has_value:
+            if rule.required and rule.default is _UNSET:
                 errors.append(f"Field '{field_name}' is required")
+            continue
+
+        allows_null = rule.field_type is type(None) or (
+            isinstance(rule.field_type, tuple) and type(None) in rule.field_type
+        )
+        if value is None and not allows_null:
+            errors.append(f"Field '{field_name}' must not be null")
             continue
 
         if not isinstance(value, rule.field_type):
@@ -90,6 +100,15 @@ CREATE_AGENT_SCHEMA: Schema = {
 WORKFLOW_RUN_SCHEMA: Schema = {
     "input": FieldRule(required=False, field_type=dict, default={}),
     "parameters": FieldRule(required=False, field_type=dict, default={}),
+}
+
+WORKFLOW_DEFINITION_SCHEMA: Schema = {
+    "id": FieldRule(required=True, field_type=str, min_length=1),
+    "project": FieldRule(required=True, field_type=dict),
+}
+
+APPROVAL_DECISION_SCHEMA: Schema = {
+    "reason": FieldRule(required=False, field_type=str, default=""),
 }
 
 KILL_SWITCH_SCHEMA: Schema = {

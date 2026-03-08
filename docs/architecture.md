@@ -76,13 +76,13 @@ This runtime is deterministic in the sense that:
 
 ### CLI / API / SDK Surfaces
 
-These surfaces are intentionally lighter than the workflow core:
+These surfaces are still local-first and in-memory, but workflow execution now aligns through the shared runtime helpers in `pylon.runtime.execution`:
 
 - `pylon.cli` stores local state in `$PYLON_HOME` / `~/.pylon`
-- `pylon.api` uses an in-memory `RouteStore`
-- `pylon.sdk.PylonClient` is an in-memory client, not an HTTP transport
+- `pylon.api` still uses an in-memory `RouteStore`, but it now registers canonical workflow definitions, executes workflow runs through the shared runtime, and exposes resume/approve/replay control-plane routes
+- `pylon.sdk.PylonClient` remains an in-memory client, but workflow execution now uses registered canonical definitions and SDK authoring surfaces (`WorkflowBuilder`, `WorkflowGraph`, `@workflow`) that materialize into `PylonProject`, while ad hoc callables remain on a separate explicit helper surface
 
-That means the public surfaces do not yet expose every runtime nuance of `pylon.workflow`.
+That means the public surfaces are still not distributed transports, but they now expose the same workflow run-state model.
 
 ## Runtime Flow Summary
 
@@ -136,12 +136,31 @@ Remote metadata can contribute hints, but local policy stays authoritative.
 ```text
 pylon run
   -> load_project(".")
-  -> inspect workflow/agent definitions
+  -> compile_project_graph(...)
+  -> execute_project_sync(...)
+    -> GraphExecutor.execute(...)
+    -> checkpoint / approval / metrics collection
+  -> serialize_run(...)
   -> write local run/checkpoint/sandbox/approval records
   -> render CLI output
 ```
 
-This is not the same execution path as `pylon.workflow.GraphExecutor`.
+This is now a thin local-state wrapper around the shared workflow runtime.
+
+### 5. SDK workflow authoring flow
+
+```text
+WorkflowBuilder | WorkflowGraph | @workflow factory | PylonProject
+  -> materialize_workflow_definition(...)
+  -> canonical PylonProject + handler registries
+  -> execute_project_sync(...)
+    -> GraphExecutor.execute(...)
+  -> serialize_run(...)
+  -> WorkflowRun snapshot
+```
+
+This keeps SDK-defined workflows on the same runtime semantics as DSL and API
+workflow runs instead of introducing a second execution engine.
 
 ## Safety Architecture
 
@@ -340,3 +359,7 @@ The main gap is not absence of modules, but uneven maturity between:
 - [Runtime Flows](architecture/runtime-flows.md)
 - [Module Map](architecture/module-map.md)
 - [Workflow/Safety Implementation Plan](architecture/workflow-safety-implementation-plan.md)
+- [Pylon vNext Target Architecture](architecture/pylon-vnext-target-architecture.md)
+- [Pylon vNext Type Design](architecture/pylon-vnext-type-design.md)
+- [Pylon vNext Implementation Plan](architecture/pylon-vnext-implementation-plan.md)
+- [ADR-009: Runtime-Centered Bounded Autonomy](adr/009-runtime-centered-bounded-autonomy.md)

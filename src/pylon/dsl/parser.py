@@ -13,15 +13,23 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from pylon.types import AutonomyLevel, SandboxTier, TrustLevel
+from pylon.autonomy.goals import (
+    FailurePolicy,
+    GoalConstraints,
+    GoalSpec,
+    RefinementPolicy,
+    RunCompletionPolicy,
+    SuccessCriterion,
+)
+from pylon.types import AutonomyLevel, SandboxTier, TrustLevel, WorkflowJoinPolicy
 
 _DEFAULT_MODEL = "anthropic/claude-sonnet-4-20250514"
 
 
-def _duration_to_seconds(value: str | int) -> int:
+def _duration_to_seconds(value: str | int | float) -> int:
     """Parse duration string (30m, 1h, 90s) to seconds."""
-    if isinstance(value, int):
-        return value
+    if isinstance(value, (int, float)):
+        return int(value)
     value = value.strip().lower()
     if value.endswith("h"):
         return int(value[:-1]) * 3600
@@ -95,7 +103,22 @@ class WorkflowNodeDef(BaseModel):
     """Workflow node definition."""
 
     agent: str
+    node_type: str = "agent"
+    join_policy: WorkflowJoinPolicy = WorkflowJoinPolicy.ALL_RESOLVED
+    loop_max_iterations: int | None = None
+    loop_criterion: str | None = None
+    loop_threshold: float | None = None
+    loop_metadata: dict[str, Any] = Field(default_factory=dict)
     next: str | list[ConditionalNext | str] | None = None
+
+    @field_validator("node_type")
+    @classmethod
+    def validate_node_type(cls, v: str) -> str:
+        valid = {"agent", "subgraph", "router", "loop"}
+        if v.lower() not in valid:
+            msg = f"Invalid workflow node type: {v}. Must be one of {valid}"
+            raise ValueError(msg)
+        return v.lower()
 
     @field_validator("next", mode="before")
     @classmethod
@@ -159,6 +182,83 @@ class WorkflowDef(BaseModel):
     nodes: dict[str, WorkflowNodeDef] = Field(default_factory=dict)
 
 
+class GoalCriterionDef(BaseModel):
+    """Goal success criterion declaration."""
+
+    type: str
+    threshold: float | None = None
+    rubric: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class GoalConstraintsDef(BaseModel):
+    """Goal-specific resource ceilings."""
+
+    max_iterations: int | None = None
+    max_tokens: int | None = None
+    max_cost_usd: float | None = None
+    timeout: str | int | float | None = None
+    max_replans: int | None = None
+
+    def to_goal_constraints(self) -> GoalConstraints:
+        timeout_seconds = (
+            _duration_to_seconds(self.timeout) if self.timeout is not None else None
+        )
+        return GoalConstraints(
+            max_iterations=self.max_iterations,
+            max_tokens=self.max_tokens,
+            max_cost_usd=self.max_cost_usd,
+            timeout_seconds=timeout_seconds,
+            max_replans=self.max_replans,
+        )
+
+
+class GoalRefinementDef(BaseModel):
+    """Explicit refinement policy declaration."""
+
+    max_replans: int | None = None
+    exhaustion_policy: FailurePolicy | None = None
+
+    def to_refinement_policy(self) -> RefinementPolicy:
+        return RefinementPolicy(
+            max_replans=self.max_replans,
+            exhaustion_policy=self.exhaustion_policy,
+        )
+
+
+class GoalDef(BaseModel):
+    """Optional top-level goal declaration for bounded autonomy."""
+
+    objective: str
+    success_criteria: list[GoalCriterionDef] = Field(default_factory=list)
+    constraints: GoalConstraintsDef = Field(default_factory=GoalConstraintsDef)
+    failure_policy: FailurePolicy = FailurePolicy.ESCALATE
+    completion_policy: RunCompletionPolicy = RunCompletionPolicy.REQUIRE_WORKFLOW_END
+    refinement: GoalRefinementDef = Field(default_factory=GoalRefinementDef)
+    allowed_effect_scopes: list[str] = Field(default_factory=list)
+    allowed_secret_scopes: list[str] = Field(default_factory=list)
+
+    def to_goal_spec(self) -> GoalSpec:
+        return GoalSpec(
+            objective=self.objective,
+            success_criteria=tuple(
+                SuccessCriterion(
+                    type=criterion.type,
+                    threshold=criterion.threshold,
+                    rubric=criterion.rubric,
+                    metadata=dict(criterion.metadata),
+                )
+                for criterion in self.success_criteria
+            ),
+            constraints=self.constraints.to_goal_constraints(),
+            failure_policy=self.failure_policy,
+            completion_policy=self.completion_policy,
+            refinement_policy=self.refinement.to_refinement_policy(),
+            allowed_effect_scopes=frozenset(self.allowed_effect_scopes),
+            allowed_secret_scopes=frozenset(self.allowed_secret_scopes),
+        )
+
+
 class PylonProject(BaseModel):
     """Top-level pylon.yaml project model.
 
@@ -171,6 +271,7 @@ class PylonProject(BaseModel):
     agents: dict[str, AgentDef] = Field(default_factory=dict)
     workflow: WorkflowDef = Field(default_factory=WorkflowDef)
     policy: PolicyDef = Field(default_factory=PolicyDef)
+    goal: GoalDef | None = None
 
     @model_validator(mode="after")
     def validate_workflow_agents(self) -> PylonProject:
@@ -231,6 +332,6 @@ def load_project(path: str | Path) -> PylonProject:
         import json
         data = json.loads(content)
     else:
-        data = yaml.safe_load(content)
+        data = yaml.safe_load(content) or {}
 
     return PylonProject.model_validate(data)

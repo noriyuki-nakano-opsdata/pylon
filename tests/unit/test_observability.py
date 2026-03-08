@@ -6,6 +6,7 @@ import time
 
 import pytest
 
+from pylon.observability.execution_summary import build_execution_summary
 from pylon.observability.exporters import (
     ConsoleExporter,
     ExporterProtocol,
@@ -17,6 +18,7 @@ from pylon.observability.metrics import (
     MetricsCollector,
 )
 from pylon.observability.tracing import Span, SpanStatus, Tracer
+from pylon.types import RunStatus, RunStopReason
 
 # ---------------------------------------------------------------------------
 # Metrics
@@ -97,7 +99,9 @@ class TestPredefinedMetrics:
         expected = {
             "agent_task_duration",
             "agent_task_count",
+            "llm_cost_usd",
             "llm_token_usage",
+            "model_route_count",
             "workflow_step_count",
         }
         assert set(PREDEFINED_METRICS.keys()) == expected
@@ -108,7 +112,9 @@ class TestPredefinedMetrics:
         counter_names = {c["name"] for c in metrics["counters"]}
         histogram_names = {h["name"] for h in metrics["histograms"]}
         assert "agent_task_count" in counter_names
+        assert "llm_cost_usd" in counter_names
         assert "llm_token_usage" in counter_names
+        assert "model_route_count" in counter_names
         assert "workflow_step_count" in counter_names
         assert "agent_task_duration" in histogram_names
 
@@ -242,7 +248,6 @@ class TestStructuredLogger:
             logger.info(f"msg-{i}")
         logs = logger.get_logs(limit=3)
         assert len(logs) == 3
-        # newest first
         assert logs[0].message == "msg-9"
 
     def test_with_context_propagation(self) -> None:
@@ -262,6 +267,19 @@ class TestStructuredLogger:
         logger = StructuredLogger(context={"env": "prod"})
         entry = logger.info("msg", env="staging")
         assert entry.context["env"] == "staging"
+
+
+class TestExecutionSummary:
+    def test_replan_count_falls_back_to_autonomy_state(self) -> None:
+        summary = build_execution_summary(
+            status=RunStatus.RUNNING,
+            stop_reason=RunStopReason.NONE,
+            suspension_reason=RunStopReason.NONE,
+            state={"autonomy": {"replan_count": 2}},
+            event_log=[],
+        )
+
+        assert summary["replan_count"] == 2
 
 
 # ---------------------------------------------------------------------------

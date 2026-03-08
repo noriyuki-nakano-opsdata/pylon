@@ -154,6 +154,37 @@ class TestWorkflowGraph:
         with pytest.raises(WorkflowError, match="at least two inbound edges"):
             g.validate()
 
+    def test_validate_rejects_loop_node_without_loop_configuration(self):
+        g = WorkflowGraph(name="loop-node")
+        g.add_node(
+            "draft",
+            "writer",
+            node_type=WorkflowNodeType.LOOP,
+            next_nodes=[ConditionalEdge(target=END)],
+        )
+
+        with pytest.raises(WorkflowError, match="loop_max_iterations"):
+            g.validate()
+
+    def test_compile_preserves_loop_node_configuration(self):
+        g = WorkflowGraph(name="loop-node")
+        g.add_node(
+            "draft",
+            "writer",
+            node_type=WorkflowNodeType.LOOP,
+            loop_max_iterations=3,
+            loop_criterion="response_quality",
+            loop_threshold=0.8,
+            next_nodes=[ConditionalEdge(target=END)],
+        )
+
+        compiled = g.compile()
+
+        assert compiled.nodes["draft"].node_type == WorkflowNodeType.LOOP
+        assert compiled.nodes["draft"].loop_max_iterations == 3
+        assert compiled.nodes["draft"].loop_criterion == "response_quality"
+        assert compiled.nodes["draft"].loop_threshold == 0.8
+
 
 class TestSafeConditionEvaluator:
     """Tests for the AST-based safe condition evaluator replacing eval()."""

@@ -17,6 +17,8 @@ PREDEFINED_METRICS: dict[str, MetricType] = {
     "agent_task_duration": MetricType.HISTOGRAM,
     "agent_task_count": MetricType.COUNTER,
     "llm_token_usage": MetricType.COUNTER,
+    "llm_cost_usd": MetricType.COUNTER,
+    "model_route_count": MetricType.COUNTER,
     "workflow_step_count": MetricType.COUNTER,
 }
 

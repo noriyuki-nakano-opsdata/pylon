@@ -4,6 +4,7 @@ from pylon.sdk.builder import WorkflowBuilder
 from pylon.sdk.client import PylonClient
 from pylon.sdk.config import SDKConfig
 from pylon.sdk.decorators import AgentRegistry, ToolRegistry, agent, tool, workflow
+from pylon.sdk.project import materialize_workflow_definition, workflow_graph_to_project
 
 __all__ = [
     "PylonClient",
@@ -14,4 +15,6 @@ __all__ = [
     "ToolRegistry",
     "WorkflowBuilder",
     "SDKConfig",
+    "materialize_workflow_definition",
+    "workflow_graph_to_project",
 ]

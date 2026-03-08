@@ -116,6 +116,13 @@ class TestLoadProject:
         with pytest.raises(FileNotFoundError):
             load_project("/nonexistent/path")
 
+    def test_empty_yaml_raises_validation_error(self):
+        with tempfile.NamedTemporaryFile(suffix=".yaml", mode="w", delete=False) as f:
+            f.write("")
+            f.flush()
+            with pytest.raises(ValidationError):
+                load_project(f.name)
+
     def test_undefined_agent_in_workflow(self):
         bad_yaml = """
 version: "1"
@@ -177,3 +184,89 @@ agents:
             "policy": {"max_duration": "30m"},
         })
         assert project.policy.max_duration_seconds() == 1800
+
+    def test_goal_spec_parse(self):
+        project = PylonProject.model_validate({
+            "version": "1",
+            "name": "goal-test",
+            "goal": {
+                "objective": "answer user request",
+                "success_criteria": [
+                    {"type": "rubric", "threshold": 0.8, "rubric": "be accurate"}
+                ],
+                "constraints": {
+                    "max_iterations": 3,
+                    "max_tokens": 1000,
+                    "timeout": "45s",
+                },
+                "failure_policy": "request_approval",
+                "completion_policy": "complete_on_goal",
+                "refinement": {
+                    "max_replans": 2,
+                    "exhaustion_policy": "fail",
+                },
+                "allowed_effect_scopes": ["github.pr.comment"],
+                "allowed_secret_scopes": ["vault"],
+            },
+        })
+
+        assert project.goal is not None
+        goal = project.goal.to_goal_spec()
+        assert goal.objective == "answer user request"
+        assert goal.constraints.max_iterations == 3
+        assert goal.constraints.max_tokens == 1000
+        assert goal.constraints.timeout_seconds == 45
+        assert goal.failure_policy.value == "request_approval"
+        assert goal.completion_policy.value == "complete_on_goal"
+        assert goal.refinement_policy.max_replans == 2
+        assert goal.refinement_policy.exhaustion_policy.value == "fail"
+
+    def test_loop_node_fields_parse(self):
+        project = PylonProject.model_validate({
+            "version": "1",
+            "name": "loop-test",
+            "agents": {"writer": {"role": "draft"}},
+            "workflow": {
+                "type": "graph",
+                "nodes": {
+                    "draft": {
+                        "agent": "writer",
+                        "node_type": "loop",
+                        "loop_max_iterations": 3,
+                        "loop_criterion": "response_quality",
+                        "loop_threshold": 0.8,
+                        "loop_metadata": {"source": "metric"},
+                        "next": "END",
+                    }
+                },
+            },
+        })
+
+        draft = project.workflow.nodes["draft"]
+        assert draft.node_type == "loop"
+        assert draft.loop_max_iterations == 3
+        assert draft.loop_criterion == "response_quality"
+        assert draft.loop_threshold == 0.8
+        assert draft.loop_metadata == {"source": "metric"}
+
+    def test_join_policy_parse(self):
+        project = PylonProject.model_validate({
+            "version": "1",
+            "name": "join-test",
+            "agents": {"router": {"role": "route"}},
+            "workflow": {
+                "type": "graph",
+                "nodes": {
+                    "left": {"agent": "router", "next": "join"},
+                    "right": {"agent": "router", "next": "join"},
+                    "join": {
+                        "agent": "router",
+                        "node_type": "router",
+                        "join_policy": "first",
+                        "next": "END",
+                    },
+                },
+            },
+        })
+
+        assert project.workflow.nodes["join"].join_policy.value == "first"

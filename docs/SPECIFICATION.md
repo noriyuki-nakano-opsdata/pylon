@@ -1,10 +1,11 @@
-# Pylon Implemented Specification v1.4
+# Pylon Implemented Specification v1.5
 
 **Scope:** this document describes the code that currently exists in `src/pylon`. It intentionally prefers implemented behavior over older roadmap or aspirational architecture text.
 
 **Revision History**
 - v1.0-v1.3 (2026-03-07): earlier platform and workflow/safety drafts
 - v1.4 (2026-03-07): rewritten against the actual codebase after a full source review
+- v1.5 (2026-03-08): updated for runtime state unification, approval-aware resume, replay/operator payload normalization, and bounded autonomy work
 
 ## 1. Package Layout
 
@@ -109,13 +110,13 @@ Workflow graph primitives live in `pylon.types` and `pylon.workflow`:
 
 - `PENDING`
 - `RUNNING`
+- `WAITING_APPROVAL`
 - `PAUSED`
 - `COMPLETED`
 - `FAILED`
 - `CANCELLED`
 
-The programmatic workflow engine uses these statuses.
-The CLI keeps a separate local run model and may expose `waiting_approval` in its own state file.
+The same run status model is now exposed through the programmatic workflow engine and the public CLI/API/SDK workflow run surfaces.
 
 ### 2.4 Approval Types
 
@@ -307,12 +308,25 @@ Legacy compatibility:
 - increments `state_version`
 - recomputes `state_hash`
 
-### 4.7 Pause and Failure Behavior
+### 4.7 Pause, Resume, and Failure Behavior
 
 If `max_steps` is reached:
 
 - the run is marked `PAUSED`
 - `state["pause_reason"] = "max_steps_exceeded"`
+
+If approval is required:
+
+- the run is marked `WAITING_APPROVAL`
+- `approval_request_id` is set on the run
+- `suspension_reason = "approval_required"`
+
+If a paused or approval-waiting run is resumed:
+
+- executor control-flow snapshot is restored
+- node and edge status maps are reused
+- loop counters, replan count, and verification state are restored
+- approval-bound resumes validate `plan_hash` and `effect_hash` before continuing
 
 If execution raises:
 
@@ -334,6 +348,7 @@ Workflow run event records appended by `GraphExecutor` contain:
 - `output`
 - `artifacts`
 - `edge_decisions`
+- `edge_resolutions`
 - `llm_events`
 - `tool_events`
 - `metrics`
@@ -384,6 +399,7 @@ Secret-bearing metadata is scrubbed before persistence, but `state_patch` remain
 - reconstructs state by applying `state_patch` or legacy `output`
 - updates `state_version`
 - recomputes `state_hash`
+- rebuilds `execution_summary` from the event log and terminal run metadata
 - raises on hash mismatch
 
 ## 6. Safety Model
@@ -465,6 +481,18 @@ Shared implemented rule:
 
 If scope drifts, approval is invalidated.
 
+The workflow executor and public runtime surfaces use the same approval request model for:
+
+- node-level approval
+- refinement exhaustion with `request_approval`
+- goal verification with `request_approval`
+
+Public run payloads expose:
+
+- `active_approval`
+- `approvals`
+- `approval_summary`
+
 ## 8. Protocols
 
 ### 8.1 MCP
@@ -532,10 +560,27 @@ Routes implemented today:
 - `GET /agents`
 - `GET /agents/{id}`
 - `DELETE /agents/{id}`
+- `POST /workflows`
+- `GET /workflows`
+- `GET /workflows/{id}`
+- `DELETE /workflows/{id}`
 - `POST /workflows/{id}/run`
 - `GET /workflows/{id}/runs/{run_id}`
 - `GET /api/v1/workflow-runs/{run_id}`
+- `POST /api/v1/workflow-runs/{run_id}/resume`
+- `POST /api/v1/approvals/{approval_id}/approve`
+- `POST /api/v1/approvals/{approval_id}/reject`
+- `GET /api/v1/checkpoints/{checkpoint_id}/replay`
 - `POST /kill-switch`
+
+`RouteStore` now keeps:
+
+- tenant-scoped workflow definitions as canonical `PylonProject` payloads
+- normalized run payloads
+- checkpoint payloads
+- approval payloads
+
+Workflow run routes and control-plane routes serialize the same normalized run payload used by the CLI helper layer.
 
 ### 9.2 CLI
 
@@ -579,15 +624,84 @@ CLI run state currently stores:
 
 in a single JSON document under `$PYLON_HOME/state.json`.
 
+Workflow execution for `pylon run` and resume for `pylon approve` both go through the shared runtime helper path:
+
+- `compile_project_graph(...)`
+- `execute_project_sync(...)`
+- `resume_project_sync(...)`
+- `serialize_run(...)`
+
+`pylon inspect` returns the normalized run payload.
+`pylon replay` returns the same payload shape with `view_kind = "replay"` and a `replay` metadata block.
+
 ### 9.3 SDK
 
 `pylon.sdk.PylonClient` is an in-memory client today:
 
 - agent CRUD is local to the client instance
-- workflow handlers are locally registered callables
+- canonical workflow definitions are locally registered as `PylonProject`
+- ad hoc callable execution is still supported, but it is explicitly separated from workflow execution
 - there is no HTTP transport yet
 
 `pylon.sdk.WorkflowBuilder` is a separate immutable builder abstraction and is not the same type as `pylon.workflow.WorkflowGraph`.
+
+SDK workflow authoring is normalized through
+`pylon.sdk.project.materialize_workflow_definition(...)`.
+That materializer accepts:
+
+- `PylonProject`
+- `dict`
+- `str | Path`
+- `WorkflowBuilder`
+- `WorkflowGraph`
+- `WorkflowInfo`
+- `@workflow`-decorated factories
+
+and returns:
+
+- canonical `PylonProject`
+- node-scoped handler registry
+- agent-scoped handler registry
+
+Execution still goes through the shared canonical runtime path:
+
+1. materialize the SDK definition into `PylonProject`
+2. compile the project into runtime `WorkflowGraph`
+3. execute with `GraphExecutor`
+4. apply custom node or agent handlers at runtime if registered
+5. emit the same run payload shape as CLI/API
+
+The SDK does not treat plain callables as workflows. Those belong to the
+explicit ad hoc helper surface:
+
+- `register_callable`
+- `run_callable`
+- `delete_callable`
+
+Current canonicalization limit:
+
+- `WorkflowBuilder` callable edge conditions cannot be converted to canonical
+  workflow definitions and must raise `WorkflowBuilderError`
+
+`WorkflowRun` snapshots in the SDK now expose the operator-facing runtime fields:
+
+- `state`, `event_log`
+- `goal`, `autonomy`, `verification`
+- `runtime_metrics`
+- `policy_resolution`
+- `approval_summary`, `active_approval`, `approvals`
+- `execution_summary`
+- `checkpoint_ids`, `logs`
+- `state_version`, `state_hash`
+
+SDK control-plane methods now include:
+
+- `register_project`, `list_workflows`, `get_workflow`, `delete_workflow`
+- `register_workflow`
+- `run_workflow`, `resume_run`
+- `approve_request`, `reject_request`
+- `replay_checkpoint`
+- `register_callable`, `run_callable`, `delete_callable`
 
 ### 9.4 API Middleware Contract
 
@@ -717,11 +831,11 @@ The canonical A2A task path is:
 The canonical CLI run path is:
 
 1. load `pylon.yaml`
-2. derive local run metadata
-3. write local run/checkpoint/approval/sandbox records
-4. render output
-
-This is separate from the programmatic workflow engine path.
+2. compile the project to `WorkflowGraph` and optional `GoalSpec`
+3. execute through the shared runtime helper and `GraphExecutor`
+4. serialize the normalized run payload
+5. write local run/checkpoint/approval/sandbox records
+6. render output
 
 ## 12. Current Maturity and Known Gaps
 
@@ -731,13 +845,13 @@ Strongest areas today:
 - runtime safety enforcement on protocol boundaries
 - approval binding
 - event-log-based checkpoint and replay model
+- public run-state alignment across CLI/API/SDK for workflow runs
 
 Main gaps today:
 
-- CLI/API/SDK surfaces do not yet expose the full workflow runtime state model
 - many infrastructure modules are reference implementations backed by in-memory stores
 - sandbox runtime integrations are not yet wired to real gVisor/Firecracker backends
-- workflow approval wait states are not yet fully integrated with the programmatic executor
+- replay currently reconstructs state and operator summaries, but it is not yet a full general-purpose distributed durable execution substrate
 
 ## 13. Documentation Map
 

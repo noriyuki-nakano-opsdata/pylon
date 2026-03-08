@@ -184,6 +184,13 @@ class ApprovalManager:
                 details={"request_id": request_id, "status": request.status.value},
             )
 
+        if request.expires_at and datetime.now(UTC) >= request.expires_at:
+            await self._expire_request(request)
+            raise ApprovalAlreadyDecidedError(
+                f"Approval request has expired: {request_id}",
+                details={"request_id": request_id, "status": ApprovalStatus.EXPIRED.value},
+            )
+
         supplied_plan_hash = compute_approval_binding_hash(plan) if plan is not None else ""
         supplied_effect_hash = (
             compute_approval_binding_hash(effect_envelope)

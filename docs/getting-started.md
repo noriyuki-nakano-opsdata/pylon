@@ -110,9 +110,10 @@ pylon logs <run_id>
 
 Current CLI behavior:
 
-- `pylon run` is a local CLI flow backed by `$PYLON_HOME/state.json`
-- it records runs, checkpoints, approvals, and sandboxes in that local state file
-- A3+ agents produce a `waiting_approval` CLI run status
+- `pylon run` uses the shared workflow runtime and persists the resulting run/checkpoint/approval metadata under `$PYLON_HOME/state.json`
+- `pylon inspect` returns the normalized run payload, including `execution_summary`, `approval_summary`, `policy_resolution`, and runtime metrics when present
+- `pylon replay` reconstructs state from the checkpoint event log and returns the same run payload shape with `view_kind: replay`
+- A3+ agents produce the runtime status `waiting_approval`, and `pylon approve` validates approval binding before resuming the workflow
 
 Approve or deny a pending CLI approval:
 
@@ -129,14 +130,96 @@ pylon replay <checkpoint_id>
 
 ## Programmatic Workflow Engine
 
-The richer deterministic DAG runtime lives in `pylon.workflow` and is used programmatically:
+The richer deterministic DAG runtime lives in `pylon.workflow` and also backs workflow execution through the shared CLI/API runtime helpers:
 
 - `WorkflowGraph`
 - `GraphExecutor`
 - `NodeResult`
 - `ReplayEngine`
 
-That engine supports compiled conditions, join policies, patch-based state commits, node-scoped checkpoints, and replay with state hash verification.
+That engine supports compiled conditions, join policies, patch-based state commits, node-scoped checkpoints, pause/resume, approval waits, and replay with state hash verification.
+
+## Programmatic SDK Surface
+
+`pylon.sdk.PylonClient` now separates canonical workflow execution from explicit ad hoc callable execution.
+
+Canonical workflow path:
+
+```python
+from pylon.dsl.parser import PylonProject
+from pylon.sdk.client import PylonClient
+
+client = PylonClient()
+project = PylonProject.model_validate({
+    "version": "1",
+    "name": "demo-project",
+    "agents": {"researcher": {}, "writer": {}},
+    "workflow": {
+        "nodes": {
+            "start": {"agent": "researcher", "next": "finish"},
+            "finish": {"agent": "writer", "next": "END"},
+        }
+    },
+})
+
+client.register_project("demo", project)
+result = client.run_workflow("demo", input_data={"topic": "distributed systems"})
+run = client.get_run(result.run_id)
+```
+
+Explicit ad hoc helper path:
+
+```python
+client.register_callable("upper", lambda value: value.upper())
+result = client.run_callable("upper", input_data="hello")
+```
+
+Current SDK control-plane methods include:
+
+- `register_project`, `list_workflows`, `get_workflow`, `delete_workflow`
+- `run_workflow`, `resume_run`
+- `approve_request`, `reject_request`
+- `replay_checkpoint`
+- `register_callable`, `run_callable`, `delete_callable`
+
+SDK workflow authoring also accepts `WorkflowBuilder`, `WorkflowGraph`, and
+`@workflow`-decorated factories. These are materialized into a canonical
+`PylonProject` before execution, so `run_workflow()` still goes through the same
+compiled graph runtime as the DSL and API surfaces.
+
+```python
+from pylon.sdk import PylonClient, agent, workflow
+
+client = PylonClient()
+
+@agent(name="researcher", role="research")
+def researcher(state):
+    return {"topic": str(state["topic"]).upper()}
+
+@agent(name="writer", role="write")
+def writer(state):
+    return {"summary": f"summary:{state['topic']}"}
+
+@workflow(name="pipeline")
+def define(builder):
+    builder.add_node("research", agent="researcher")
+    builder.add_node("write", agent="writer")
+    builder.add_edge("research", "write")
+    builder.set_entry("research")
+
+client.register_workflow("pipeline", define)
+run_result = client.run_workflow("pipeline", input_data={"topic": "agents"})
+run = client.get_run(run_result.run_id)
+```
+
+Notes:
+
+- `register_workflow()` only accepts canonical workflow definitions and SDK
+  workflow authoring objects
+- plain functions belong to `register_callable()` / `run_callable()`
+- `WorkflowBuilder` callable edge conditions are not materialized into the
+  canonical runtime; use string conditions in the DSL/runtime graph for those
+  cases
 
 ## Safety Features
 

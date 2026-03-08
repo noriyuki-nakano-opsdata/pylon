@@ -12,10 +12,12 @@ from pylon.repository.memory import (
 )
 from pylon.repository.workflow import (
     RunStatus,
+    RunStopReason,
     WorkflowDefinition,
     WorkflowRepository,
     WorkflowRun,
 )
+from pylon.workflow.replay import ReplayEngine
 
 
 class TestCheckpointRepository:
@@ -72,6 +74,39 @@ class TestCheckpointRepository:
         await repo.create(cp)
         assert await repo.delete(cp.id)
         assert await repo.get(cp.id) is None
+
+    @pytest.mark.asyncio
+    async def test_secret_state_patch_is_scrubbed(self, repo):
+        cp = Checkpoint(workflow_run_id="run-1", node_id="x")
+        cp.add_event(input_data={}, state_patch={"api_key": "secret", "safe": "ok"})
+        await repo.create(cp)
+
+        stored = await repo.get(cp.id)
+        assert stored is not None
+        assert stored.event_log[0]["state_patch"] == {"api_key": "[REDACTED]", "safe": "ok"}
+        assert stored.event_log[0]["state_patch_scrubbed"] is True
+
+    def test_replay_skips_hash_verification_for_scrubbed_patch(self):
+        replayed = ReplayEngine.replay_event_log(
+            [
+                {
+                    "node_id": "x",
+                    "state_patch": {"api_key": "[REDACTED]"},
+                    "state_patch_scrubbed": True,
+                    "state_hash": "original-secret-hash",
+                    "state_version": 1,
+                },
+                {
+                    "node_id": "y",
+                    "state_patch": {"safe": "ok"},
+                    "state_hash": "later-unredacted-hash",
+                    "state_version": 2,
+                }
+            ]
+        )
+
+        assert replayed.state == {"api_key": "[REDACTED]", "safe": "ok"}
+        assert replayed.state_hash_verified is False
 
 
 class TestMemoryRepository:
@@ -157,6 +192,51 @@ class TestWorkflowRepository:
         completed = await repo.list_runs(status=RunStatus.COMPLETED)
         assert len(completed) == 1
 
+    @pytest.mark.asyncio
+    async def test_wait_for_approval_sets_shared_runtime_state(self, repo):
+        run = WorkflowRun(workflow_id="wf-1")
+        await repo.create_run(run)
+
+        run.start()
+        run.wait_for_approval("apr-1")
+        await repo.update_run(run)
+
+        result = await repo.get_run(run.id)
+        assert result is not None
+        assert result.status == RunStatus.WAITING_APPROVAL
+        assert result.suspension_reason == RunStopReason.APPROVAL_REQUIRED
+        assert result.approval_request_id == "apr-1"
+
+    @pytest.mark.asyncio
+    async def test_cancel_records_stop_reason(self, repo):
+        run = WorkflowRun(workflow_id="wf-1")
+        await repo.create_run(run)
+
+        run.start()
+        run.cancel(RunStopReason.APPROVAL_DENIED)
+        await repo.update_run(run)
+
+        result = await repo.get_run(run.id)
+        assert result is not None
+        assert result.status == RunStatus.CANCELLED
+        assert result.stop_reason == RunStopReason.APPROVAL_DENIED
+
+    @pytest.mark.asyncio
+    async def test_resume_clears_suspension_state(self, repo):
+        run = WorkflowRun(workflow_id="wf-1")
+        await repo.create_run(run)
+
+        run.start()
+        run.wait_for_approval("apr-1")
+        run.resume()
+        await repo.update_run(run)
+
+        result = await repo.get_run(run.id)
+        assert result is not None
+        assert result.status == RunStatus.RUNNING
+        assert result.suspension_reason == RunStopReason.NONE
+        assert result.approval_request_id is None
+
 
 class TestAuditRepository:
     @pytest.fixture
@@ -212,6 +292,15 @@ class TestAuditRepository:
 
         valid, msg = await repo.verify_chain()
         assert not valid
+
+    @pytest.mark.asyncio
+    async def test_verify_chain_detects_tampered_details(self, repo):
+        await repo.append(event_type="a", actor="x", action="1", details={"ok": True})
+        repo._entries[0].details["ok"] = False
+
+        valid, msg = await repo.verify_chain()
+        assert not valid
+        assert "mismatch" in msg
         assert "mismatch" in msg
 
     @pytest.mark.asyncio

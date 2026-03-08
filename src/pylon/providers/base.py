@@ -39,6 +39,7 @@ class Chunk:
     content: str = ""
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     finish_reason: str | None = None
+    usage: TokenUsage | None = None
 
 
 @dataclass

@@ -116,9 +116,72 @@ Responses:
 - `403 Forbidden`
 - `404 Not Found`
 
+### `POST /workflows`
+
+Register a canonical workflow definition for the current tenant.
+
+Request body:
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `id` | string | Yes | workflow definition ID |
+| `project` | object | Yes | `PylonProject`-compatible payload |
+
+Response `201 Created`
+
+The response includes workflow metadata plus the normalized `project` payload.
+
+Important scope note:
+
+- the HTTP API only accepts canonical `PylonProject`-compatible workflow definitions
+- SDK-only authoring helpers such as `WorkflowBuilder` or `@workflow` factories
+  must be materialized client-side before registration
+
+### `GET /workflows`
+
+List workflow definitions visible to the current tenant.
+
+Response `200 OK`
+
+```json
+{
+  "workflows": [
+    {
+      "id": "build-pipeline",
+      "project_name": "my-project",
+      "tenant_id": "default",
+      "agent_count": 2,
+      "node_count": 3,
+      "goal_enabled": false
+    }
+  ],
+  "count": 1
+}
+```
+
+### `GET /workflows/{id}`
+
+Fetch one tenant-scoped workflow definition.
+
+Responses:
+
+- `200 OK`
+- `403 Forbidden`
+- `404 Not Found`
+
+### `DELETE /workflows/{id}`
+
+Delete one tenant-scoped workflow definition.
+
+Responses:
+
+- `204 No Content`
+- `403 Forbidden`
+- `404 Not Found`
+
 ### `POST /workflows/{id}/run`
 
-Create a workflow run request record for the current tenant.
+Create a workflow run for the current tenant from a registered canonical workflow definition.
 
 Request body:
 
@@ -126,6 +189,8 @@ Request body:
 |-------|------|----------|-------|
 | `input` | object | No | defaults to `{}` |
 | `parameters` | object | No | defaults to `{}` |
+
+The route compiles the registered `PylonProject`, executes it through the shared runtime, and returns the normalized public run payload.
 
 Response `202 Accepted`
 
@@ -139,13 +204,42 @@ Example body:
 {
   "id": "r1a2b3c4d5e6",
   "workflow_id": "build-pipeline",
-  "status": "pending",
+  "project": "my-project",
+  "status": "completed",
+  "stop_reason": "none",
+  "suspension_reason": "none",
   "input": {"repo": "my-app", "branch": "main"},
   "parameters": {"max_retries": 3},
-  "started_at": 1709827200.0,
+  "execution_summary": {
+    "total_events": 1,
+    "last_node": "start",
+    "pending_approval": false
+  },
+  "approval_summary": {
+    "pending": false,
+    "active_request_id": null
+  },
+  "started_at": "2026-03-08T00:00:00+00:00",
   "tenant_id": "default"
 }
 ```
+
+### `POST /api/v1/workflow-runs/{run_id}/resume`
+
+Resume a previously paused workflow run through the same shared runtime.
+
+Request body:
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `input` | object | No | overrides the stored run input when provided |
+
+Responses:
+
+- `200 OK`
+- `403 Forbidden`
+- `404 Not Found`
+- `422 Validation Error`
 
 ### `GET /workflows/{id}/runs/{run_id}`
 
@@ -160,6 +254,59 @@ Responses:
 ### `GET /api/v1/workflow-runs/{run_id}`
 
 Fetch a workflow run by run ID only.
+
+Responses:
+
+- `200 OK`
+- `403 Forbidden`
+- `404 Not Found`
+
+Returned payload shape matches `POST /workflows/{id}/run` and includes:
+
+- `execution_summary`
+- `approval_summary`
+- `policy_resolution`
+- `runtime_metrics`
+- `state_version`
+- `state_hash`
+
+### `POST /api/v1/approvals/{approval_id}/approve`
+
+Approve a pending approval request and resume the owning run.
+
+Request body:
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `reason` | string | No | optional operator comment |
+
+Responses:
+
+- `200 OK`
+- `403 Forbidden`
+- `404 Not Found`
+- `409 Conflict`
+
+### `POST /api/v1/approvals/{approval_id}/reject`
+
+Reject a pending approval request and cancel the owning run.
+
+Request body:
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `reason` | string | No | optional operator comment |
+
+Responses:
+
+- `200 OK`
+- `403 Forbidden`
+- `404 Not Found`
+- `409 Conflict`
+
+### `GET /api/v1/checkpoints/{checkpoint_id}/replay`
+
+Replay a checkpoint from the stored event log and return a normalized payload with `view_kind = "replay"`.
 
 Responses:
 

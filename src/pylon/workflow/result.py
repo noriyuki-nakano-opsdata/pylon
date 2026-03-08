@@ -19,6 +19,9 @@ class NodeResult:
     llm_events: list[dict[str, Any]] = field(default_factory=list)
     tool_events: list[dict[str, Any]] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
+    requires_approval: bool = False
+    approval_request_id: str | None = None
+    approval_reason: str = ""
 
     @classmethod
     def from_raw(cls, value: Any) -> NodeResult:
@@ -52,4 +55,7 @@ class NodeResult:
             "llm_events": llm_events,
             "tool_events": tool_events,
             "metrics": metrics,
+            "requires_approval": self.requires_approval,
+            "approval_request_id": self.approval_request_id,
+            "approval_reason": self.approval_reason,
         }

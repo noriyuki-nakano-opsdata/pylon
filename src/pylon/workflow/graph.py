@@ -29,6 +29,10 @@ class WorkflowGraph:
         *,
         node_type: WorkflowNodeType = WorkflowNodeType.AGENT,
         join_policy: WorkflowJoinPolicy = WorkflowJoinPolicy.ALL_RESOLVED,
+        loop_max_iterations: int | None = None,
+        loop_criterion: str | None = None,
+        loop_threshold: float | None = None,
+        loop_metadata: dict[str, Any] | None = None,
         next_nodes: list[ConditionalEdge] | None = None,
     ) -> WorkflowGraph:
         if node_id == END:
@@ -40,6 +44,10 @@ class WorkflowGraph:
             agent=agent,
             node_type=node_type,
             join_policy=join_policy,
+            loop_max_iterations=loop_max_iterations,
+            loop_criterion=loop_criterion,
+            loop_threshold=loop_threshold,
+            loop_metadata=dict(loop_metadata or {}),
             next=next_nodes or [],
         )
         self._validated = False
@@ -116,6 +124,22 @@ class WorkflowGraph:
         inbound = self.get_inbound_edges()
         for node_id, node in self.nodes.items():
             inbound_count = len(inbound.get(node_id, []))
+            if node.node_type == WorkflowNodeType.LOOP:
+                if node.loop_max_iterations is None or node.loop_max_iterations < 1:
+                    raise WorkflowError(
+                        "Loop nodes require loop_max_iterations >= 1",
+                        details={"node_id": node_id},
+                    )
+                if not node.loop_criterion:
+                    raise WorkflowError(
+                        "Loop nodes require loop_criterion",
+                        details={"node_id": node_id},
+                    )
+                if node.join_policy != WorkflowJoinPolicy.ALL_RESOLVED:
+                    raise WorkflowError(
+                        "Loop nodes only support join_policy=all_resolved",
+                        details={"node_id": node_id, "join_policy": node.join_policy.value},
+                    )
             if node.join_policy == WorkflowJoinPolicy.ALL_RESOLVED:
                 continue
             if inbound_count < 2:
@@ -181,6 +205,10 @@ class WorkflowGraph:
                 agent=node.agent,
                 node_type=node.node_type,
                 join_policy=node.join_policy,
+                loop_max_iterations=node.loop_max_iterations,
+                loop_criterion=node.loop_criterion,
+                loop_threshold=node.loop_threshold,
+                loop_metadata=dict(node.loop_metadata),
                 inbound_edge_keys=tuple(inbound.get(node_id, [])),
                 outbound_edges=outbound_edges,
             )

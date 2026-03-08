@@ -23,12 +23,12 @@ def _to_anthropic_messages(messages: list[Message]) -> tuple[str | None, list[di
 
     Returns (system_prompt, messages_list).
     """
-    system_prompt: str | None = None
+    system_parts: list[str] = []
     api_messages: list[dict] = []
 
     for msg in messages:
         if msg.role == "system":
-            system_prompt = msg.content
+            system_parts.append(msg.content)
         elif msg.role == "tool":
             api_messages.append({
                 "role": "user",
@@ -44,7 +44,8 @@ def _to_anthropic_messages(messages: list[Message]) -> tuple[str | None, list[di
             entry: dict[str, Any] = {"role": msg.role, "content": msg.content}
             api_messages.append(entry)
 
-    return system_prompt, api_messages
+    system_prompt = "\n\n".join(part for part in system_parts if part)
+    return system_prompt or None, api_messages
 
 
 def _extract_usage(usage: Any) -> TokenUsage:
@@ -93,6 +94,11 @@ class AnthropicProvider:
     async def chat(self, messages: list[Message], **kwargs: Any) -> Response:
         """Send a chat request to Anthropic API."""
         system_prompt, api_messages = _to_anthropic_messages(messages)
+        kwargs.pop("cache_strategy", None)
+        kwargs.pop("batch_eligible", None)
+        kwargs.pop("context_compacted", None)
+        kwargs.pop("original_input_tokens", None)
+        kwargs.pop("prepared_input_tokens", None)
 
         create_kwargs: dict[str, Any] = {
             "model": kwargs.get("model", self._model),
@@ -138,6 +144,11 @@ class AnthropicProvider:
     async def stream(self, messages: list[Message], **kwargs: Any) -> AsyncIterator[Chunk]:
         """Stream a chat response from Anthropic API."""
         system_prompt, api_messages = _to_anthropic_messages(messages)
+        kwargs.pop("cache_strategy", None)
+        kwargs.pop("batch_eligible", None)
+        kwargs.pop("context_compacted", None)
+        kwargs.pop("original_input_tokens", None)
+        kwargs.pop("prepared_input_tokens", None)
 
         create_kwargs: dict[str, Any] = {
             "model": kwargs.get("model", self._model),
@@ -147,8 +158,12 @@ class AnthropicProvider:
         }
         if system_prompt:
             create_kwargs["system"] = system_prompt
+        tools = kwargs.get("tools")
+        if tools:
+            create_kwargs["tools"] = tools
 
         try:
+            partial_tool_inputs: dict[int, str] = {}
             async with self._client.messages.stream(**create_kwargs) as stream:
                 async for event in stream:
                     if hasattr(event, "type"):
@@ -156,6 +171,49 @@ class AnthropicProvider:
                             delta = event.delta
                             if hasattr(delta, "text"):
                                 yield Chunk(content=delta.text)
+                            elif getattr(delta, "type", None) == "input_json_delta":
+                                index = int(getattr(event, "index", 0))
+                                partial_tool_inputs[index] = (
+                                    partial_tool_inputs.get(index, "")
+                                    + str(getattr(delta, "partial_json", ""))
+                                )
+                        elif event.type == "content_block_start":
+                            block = getattr(event, "content_block", None)
+                            if getattr(block, "type", None) == "tool_use":
+                                yield Chunk(
+                                    tool_calls=[
+                                        {
+                                            "id": getattr(block, "id", ""),
+                                            "name": getattr(block, "name", ""),
+                                            "input": getattr(block, "input", {}),
+                                        }
+                                    ]
+                                )
+                        elif event.type == "content_block_stop":
+                            index = int(getattr(event, "index", 0))
+                            partial_json = partial_tool_inputs.pop(index, "")
+                            if partial_json:
+                                yield Chunk(
+                                    tool_calls=[
+                                        {
+                                            "id": "",
+                                            "name": "",
+                                            "input_json": partial_json,
+                                        }
+                                    ]
+                                )
+                        elif event.type == "message_delta":
+                            usage = getattr(event, "usage", None)
+                            finish_reason = getattr(
+                                getattr(event, "delta", None),
+                                "stop_reason",
+                                None,
+                            )
+                            if usage is not None or finish_reason is not None:
+                                yield Chunk(
+                                    finish_reason=finish_reason,
+                                    usage=_extract_usage(usage) if usage is not None else None,
+                                )
                         elif event.type == "message_stop":
                             yield Chunk(finish_reason="stop")
         except anthropic.APIError as e:

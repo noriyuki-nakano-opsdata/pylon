@@ -71,6 +71,38 @@ class SandboxTier(enum.Enum):
     NONE = "none"  # Host process: requires SuperAdmin
 
 
+class RunStatus(enum.StrEnum):
+    """Shared workflow run phase across runtime and public surfaces."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    WAITING_APPROVAL = "waiting_approval"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class RunStopReason(enum.StrEnum):
+    """Machine-readable reason for run stop or suspension."""
+
+    NONE = "none"
+    LIMIT_EXCEEDED = "limit_exceeded"
+    TIMEOUT_EXCEEDED = "timeout_exceeded"
+    TOKEN_BUDGET_EXCEEDED = "token_budget_exceeded"
+    COST_BUDGET_EXCEEDED = "cost_budget_exceeded"
+    APPROVAL_REQUIRED = "approval_required"
+    APPROVAL_DENIED = "approval_denied"
+    EXTERNAL_STOP = "external_stop"
+    ESCALATION_REQUIRED = "escalation_required"
+    STUCK_DETECTED = "stuck_detected"
+    LOOP_EXHAUSTED = "loop_exhausted"
+    QUALITY_REACHED = "quality_reached"
+    QUALITY_FAILED = "quality_failed"
+    STATE_CONFLICT = "state_conflict"
+    WORKFLOW_ERROR = "workflow_error"
+
+
 @dataclass(frozen=True)
 class AgentCapability:
     """Agent capability model with Rule-of-Two+ enforcement (Section 2.3).
@@ -111,6 +143,7 @@ class WorkflowNodeType(enum.Enum):
     AGENT = "agent"
     SUBGRAPH = "subgraph"
     ROUTER = "router"
+    LOOP = "loop"
 
 
 class WorkflowJoinPolicy(enum.Enum):
@@ -137,6 +170,10 @@ class WorkflowNode:
     agent: str  # Agent name from agents section
     node_type: WorkflowNodeType = WorkflowNodeType.AGENT
     join_policy: WorkflowJoinPolicy = WorkflowJoinPolicy.ALL_RESOLVED
+    loop_max_iterations: int | None = None
+    loop_criterion: str | None = None
+    loop_threshold: float | None = None
+    loop_metadata: dict[str, Any] = field(default_factory=dict)
     next: list[ConditionalEdge] = field(default_factory=list)
 
 

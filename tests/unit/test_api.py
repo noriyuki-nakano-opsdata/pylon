@@ -16,6 +16,7 @@ from pylon.api.schemas import (
     validate,
 )
 from pylon.api.server import APIServer, Request, Response
+from pylon.dsl.parser import PylonProject
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -38,6 +39,65 @@ def _authed_server() -> tuple[APIServer, RouteStore]:
     server.add_middleware(tenant)
     store = register_routes(server)
     return server, store
+
+
+def _workflow_project(name: str = "demo-project") -> PylonProject:
+    return PylonProject.model_validate(
+        {
+            "version": "1",
+            "name": name,
+            "agents": {
+                "researcher": {"role": "research"},
+                "writer": {"role": "write"},
+            },
+            "workflow": {
+                "nodes": {
+                    "start": {"agent": "researcher", "next": "finish"},
+                    "finish": {"agent": "writer", "next": "END"},
+                }
+            },
+        }
+    )
+
+
+def _limited_workflow_project(name: str = "limited-project") -> PylonProject:
+    return PylonProject.model_validate(
+        {
+            "version": "1",
+            "name": name,
+            "agents": {
+                "researcher": {"role": "research"},
+                "writer": {"role": "write"},
+            },
+            "workflow": {
+                "nodes": {
+                    "start": {"agent": "researcher", "next": "finish"},
+                    "finish": {"agent": "writer", "next": "END"},
+                }
+            },
+            "goal": {
+                "objective": "finish both steps",
+                "constraints": {"max_iterations": 1},
+            },
+        }
+    )
+
+
+def _approval_project(name: str = "approval-project") -> PylonProject:
+    return PylonProject.model_validate(
+        {
+            "version": "1",
+            "name": name,
+            "agents": {
+                "reviewer": {"role": "review", "autonomy": "A4"},
+            },
+            "workflow": {
+                "nodes": {
+                    "review": {"agent": "reviewer", "next": "END"},
+                }
+            },
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +143,11 @@ class TestSchemaValidation:
     def test_workflow_run_schema_optional(self):
         ok, errors = validate({}, WORKFLOW_RUN_SCHEMA)
         assert ok is True
+
+    def test_workflow_run_schema_rejects_explicit_null_input(self):
+        ok, errors = validate({"input": None}, WORKFLOW_RUN_SCHEMA)
+        assert ok is False
+        assert errors == ["Field 'input' must not be null"]
 
 
 # ---------------------------------------------------------------------------
@@ -219,36 +284,292 @@ class TestAgentRoutes:
 # ---------------------------------------------------------------------------
 
 class TestWorkflowRoutes:
+    def test_create_workflow_definition(self):
+        server, store = _server_with_routes()
+        project = _workflow_project("wf1-project").model_dump(mode="json")
+        resp = server.handle_request(
+            "POST",
+            "/workflows",
+            body={"id": "wf1", "project": project},
+        )
+        assert resp.status_code == 201
+        assert resp.body["id"] == "wf1"
+        assert resp.body["project_name"] == "wf1-project"
+        assert resp.body["agent_count"] == 2
+        assert resp.body["node_count"] == 2
+        assert store.get_workflow_project("wf1", tenant_id="default").name == "wf1-project"
+
+    def test_create_workflow_definition_allows_same_id_across_tenants(self):
+        server, store = _server_with_routes()
+        project = _workflow_project("wf-project").model_dump(mode="json")
+
+        tenant_a = server.handle_request(
+            "POST",
+            "/workflows",
+            headers={"X-Tenant-ID": "tenant-a"},
+            body={"id": "wf1", "project": project},
+        )
+        tenant_b = server.handle_request(
+            "POST",
+            "/workflows",
+            headers={"X-Tenant-ID": "tenant-b"},
+            body={"id": "wf1", "project": project},
+        )
+
+        assert tenant_a.status_code == 201
+        assert tenant_b.status_code == 201
+        assert store.get_workflow_project("wf1", tenant_id="tenant-a") is not None
+        assert store.get_workflow_project("wf1", tenant_id="tenant-b") is not None
+
+    def test_list_workflows_filters_by_tenant(self):
+        server, store = _server_with_routes()
+        store.register_workflow_project("wf-default", _workflow_project("default-project"))
+        store.register_workflow_project(
+            "wf-tenant-a",
+            _workflow_project("tenant-a-project"),
+            tenant_id="tenant-a",
+        )
+
+        resp = server.handle_request(
+            "GET",
+            "/workflows",
+            headers={"X-Tenant-ID": "tenant-a"},
+        )
+        assert resp.status_code == 200
+        assert resp.body["count"] == 1
+        assert resp.body["workflows"][0]["id"] == "wf-tenant-a"
+
+    def test_get_workflow_definition(self):
+        server, store = _server_with_routes()
+        store.register_workflow_project("wf1", _workflow_project("wf1-project"))
+
+        resp = server.handle_request("GET", "/workflows/wf1")
+        assert resp.status_code == 200
+        assert resp.body["id"] == "wf1"
+        assert resp.body["project"]["name"] == "wf1-project"
+        assert resp.body["project"]["workflow"]["nodes"]["start"]["agent"] == "researcher"
+
+    def test_delete_workflow_definition(self):
+        server, store = _server_with_routes()
+        store.register_workflow_project("wf1", _workflow_project("wf1-project"))
+
+        resp = server.handle_request("DELETE", "/workflows/wf1")
+        assert resp.status_code == 204
+        assert store.get_workflow_project("wf1", tenant_id="default") is None
+
+    def test_get_workflow_cross_tenant_forbidden(self):
+        server, store = _server_with_routes()
+        store.register_workflow_project(
+            "wf1",
+            _workflow_project("tenant-a-project"),
+            tenant_id="tenant-a",
+        )
+
+        resp = server.handle_request(
+            "GET",
+            "/workflows/wf1",
+            headers={"X-Tenant-ID": "tenant-b"},
+        )
+        assert resp.status_code == 403
+
     def test_start_workflow_run(self):
-        server, _ = _server_with_routes()
+        server, store = _server_with_routes()
+        store.register_workflow_project("wf1", _workflow_project("wf1-project"))
         resp = server.handle_request(
             "POST", "/workflows/wf1/run", body={"input": {"task": "build"}}
         )
         assert resp.status_code == 202
         assert resp.body["workflow_id"] == "wf1"
-        assert resp.body["status"] == "pending"
+        assert resp.body["project"] == "wf1-project"
+        assert resp.body["status"] == "completed"
+        assert resp.body["stop_reason"] == "none"
+        assert resp.body["suspension_reason"] == "none"
+        assert resp.body["input"] == {"task": "build"}
+        assert resp.body["state"]["task"] == "build"
+        assert resp.body["state"]["start_done"] is True
+        assert resp.body["state"]["finish_done"] is True
+        assert resp.body["runtime_metrics"]["iterations"] == 2
+        assert resp.body["goal"] is None
+        assert resp.body["policy_resolution"] is None
+        assert resp.body["active_approval"] is None
+        assert resp.body["approvals"] == []
+        assert resp.body["execution_summary"]["node_sequence"] == ["start", "finish"]
+        assert resp.body["execution_summary"]["total_events"] == 2
+        assert resp.body["execution_summary"]["critical_path"] == [
+            {"node_id": "start", "attempt_id": 1, "loop_iteration": 1},
+            {"node_id": "finish", "attempt_id": 1, "loop_iteration": 1},
+        ]
+        assert resp.body["execution_summary"]["decision_points"][0] == {
+            "type": "edge_decision",
+            "source_node": "start",
+            "edges": [
+                {
+                    "edge_key": "start:0",
+                    "edge_index": 0,
+                    "status": "taken",
+                    "target": "finish",
+                    "condition": None,
+                    "decision_source": "default",
+                    "reason": "default edge selected",
+                }
+            ],
+        }
         assert resp.headers["location"].startswith("/api/v1/workflow-runs/")
 
     def test_get_workflow_run(self):
-        server, _ = _server_with_routes()
+        server, store = _server_with_routes()
+        store.register_workflow_project("wf1", _workflow_project())
         create_resp = server.handle_request("POST", "/workflows/wf1/run", body={})
         run_id = create_resp.body["id"]
         resp = server.handle_request("GET", f"/workflows/wf1/runs/{run_id}")
         assert resp.status_code == 200
+        assert resp.body["runtime_metrics"]["iterations"] == 2
+        assert isinstance(resp.body["event_log"], list)
         assert resp.body["id"] == run_id
 
     def test_get_workflow_run_by_location_route(self):
-        server, _ = _server_with_routes()
+        server, store = _server_with_routes()
+        store.register_workflow_project("wf1", _workflow_project())
         create_resp = server.handle_request("POST", "/workflows/wf1/run", body={})
         location = create_resp.headers["location"]
         resp = server.handle_request("GET", location)
         assert resp.status_code == 200
         assert resp.body["id"] == create_resp.body["id"]
 
+    def test_start_workflow_run_requires_registered_definition(self):
+        server, _ = _server_with_routes()
+        resp = server.handle_request("POST", "/workflows/wf1/run", body={})
+        assert resp.status_code == 404
+        assert resp.body["error"] == "Workflow not found: wf1"
+
     def test_get_workflow_run_not_found(self):
         server, _ = _server_with_routes()
         resp = server.handle_request("GET", "/workflows/wf1/runs/nope")
         assert resp.status_code == 404
+
+    def test_resume_workflow_run(self):
+        server, store = _server_with_routes()
+        store.register_workflow_project("limited", _limited_workflow_project())
+
+        create = server.handle_request(
+            "POST",
+            "/workflows/limited/run",
+            body={"input": {"task": "x"}},
+        )
+        run_id = create.body["id"]
+        assert create.body["status"] == "paused"
+        assert create.body["suspension_reason"] == "limit_exceeded"
+
+        resumed = server.handle_request(
+            "POST",
+            f"/api/v1/workflow-runs/{run_id}/resume",
+            body={},
+        )
+        assert resumed.status_code == 200
+        assert resumed.body["status"] == "paused"
+        assert resumed.body["state"]["finish_done"] is True
+        assert resumed.body["state"]["task"] == "x"
+
+    def test_resume_workflow_run_rejects_input_mismatch(self):
+        server, store = _server_with_routes()
+        store.register_workflow_project("limited", _limited_workflow_project())
+
+        create = server.handle_request(
+            "POST",
+            "/workflows/limited/run",
+            body={"input": {"task": "x"}},
+        )
+        run_id = create.body["id"]
+
+        resumed = server.handle_request(
+            "POST",
+            f"/api/v1/workflow-runs/{run_id}/resume",
+            body={"input": {"task": "y"}},
+        )
+        assert resumed.status_code == 409
+        assert "resume input_data must match" in resumed.body["error"]
+
+    def test_approve_request_resumes_waiting_run(self):
+        server, store = _server_with_routes()
+        store.register_workflow_project("approval", _approval_project())
+
+        create = server.handle_request("POST", "/workflows/approval/run", body={})
+        run_id = create.body["id"]
+        approval_id = create.body["approval_request_id"]
+        assert create.body["status"] == "waiting_approval"
+
+        approved = server.handle_request(
+            "POST",
+            f"/api/v1/approvals/{approval_id}/approve",
+            body={"reason": "ok"},
+        )
+        assert approved.status_code == 200
+        assert approved.body["id"] == run_id
+        assert approved.body["status"] == "completed"
+        assert approved.body["approval_summary"]["approved_request_ids"] == [approval_id]
+
+    def test_reject_request_cancels_waiting_run(self):
+        server, store = _server_with_routes()
+        store.register_workflow_project("approval", _approval_project())
+
+        create = server.handle_request("POST", "/workflows/approval/run", body={})
+        approval_id = create.body["approval_request_id"]
+
+        rejected = server.handle_request(
+            "POST",
+            f"/api/v1/approvals/{approval_id}/reject",
+            body={"reason": "no"},
+        )
+        assert rejected.status_code == 200
+        assert rejected.body["status"] == "cancelled"
+        assert rejected.body["stop_reason"] == "approval_denied"
+        assert rejected.body["active_approval"] is None
+
+    def test_replay_checkpoint(self):
+        server, store = _server_with_routes()
+        store.register_workflow_project("wf1", _workflow_project())
+
+        create = server.handle_request("POST", "/workflows/wf1/run", body={})
+        checkpoint_id = create.body["checkpoint_ids"][-1]
+
+        replay = server.handle_request(
+            "GET",
+            f"/api/v1/checkpoints/{checkpoint_id}/replay",
+        )
+        assert replay.status_code == 200
+        assert replay.body["view_kind"] == "replay"
+        assert replay.body["source_run"] == create.body["id"]
+        assert replay.body["state_hash"]
+
+    def test_replay_intermediate_checkpoint_uses_reconstructed_status(self):
+        server, store = _server_with_routes()
+        store.register_workflow_project("wf1", _workflow_project())
+
+        create = server.handle_request("POST", "/workflows/wf1/run", body={})
+        checkpoint_id = create.body["checkpoint_ids"][0]
+
+        replay = server.handle_request(
+            "GET",
+            f"/api/v1/checkpoints/{checkpoint_id}/replay",
+        )
+        assert replay.status_code == 200
+        assert replay.body["status"] == "running"
+        assert replay.body["stop_reason"] == "none"
+        assert replay.body["execution_summary"]["node_sequence"] == ["start"]
+
+    def test_delete_workflow_keeps_historical_runs_accessible(self):
+        server, store = _server_with_routes()
+        store.register_workflow_project("wf1", _workflow_project())
+
+        create = server.handle_request("POST", "/workflows/wf1/run", body={})
+        run_id = create.body["id"]
+        deleted = server.handle_request("DELETE", "/workflows/wf1")
+        assert deleted.status_code == 204
+
+        get_by_id = server.handle_request("GET", f"/api/v1/workflow-runs/{run_id}")
+        get_by_workflow = server.handle_request("GET", f"/workflows/wf1/runs/{run_id}")
+        assert get_by_id.status_code == 200
+        assert get_by_workflow.status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +752,8 @@ class TestTenantIsolationOnRoutes:
     def test_get_workflow_run_cross_tenant_forbidden(self):
         server = APIServer()
         server.add_middleware(TenantMiddleware(require_tenant=True))
-        register_routes(server)
+        store = register_routes(server)
+        store.register_workflow_project("wf1", _workflow_project(), tenant_id="tenant-a")
 
         create = server.handle_request(
             "POST", "/workflows/wf1/run", headers={"X-Tenant-ID": "tenant-a"}, body={}
