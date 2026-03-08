@@ -1,11 +1,25 @@
 """Tests for Pylon HTTP API server."""
 
+import base64
+import hashlib
+import hmac
+import json
+import time
 
+import pytest
+
+from pylon.api.health import HealthChecker, HealthCheckResult
 from pylon.api.middleware import (
     AuthMiddleware,
+    InMemoryRateLimitStore,
+    InMemoryTokenVerifier,
+    JsonFileTokenVerifier,
+    JWTTokenVerifier,
     MiddlewareChain,
     RateLimitMiddleware,
+    RequestContextMiddleware,
     SecurityHeadersMiddleware,
+    SQLiteRateLimitStore,
     TenantMiddleware,
 )
 from pylon.api.routes import RouteStore, register_routes
@@ -16,24 +30,39 @@ from pylon.api.schemas import (
     validate,
 )
 from pylon.api.server import APIServer, Request, Response
+from pylon.control_plane import InMemoryWorkflowControlPlaneStore
 from pylon.dsl.parser import PylonProject
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _server_with_routes() -> tuple[APIServer, RouteStore]:
+
+def _make_jwt(payload: dict[str, object], secret: str) -> str:
+    header = base64.urlsafe_b64encode(
+        json.dumps({"alg": "HS256", "typ": "JWT"}).encode("utf-8")
+    ).rstrip(b"=").decode("ascii")
+    body = base64.urlsafe_b64encode(
+        json.dumps(payload).encode("utf-8")
+    ).rstrip(b"=").decode("ascii")
+    signing_input = f"{header}.{body}".encode("ascii")
+    signature = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    signature_b64 = base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
+    return f"{header}.{body}.{signature_b64}"
+
+def _server_with_routes(**route_kwargs: object) -> tuple[APIServer, RouteStore]:
     """Create a server with all routes registered and default tenant context."""
     server = APIServer()
     server.add_middleware(TenantMiddleware(require_tenant=False))
-    store = register_routes(server)
+    store = register_routes(server, **route_kwargs)
     return server, store
 
 
 def _authed_server() -> tuple[APIServer, RouteStore]:
     """Create a server with auth + tenant middleware."""
     server = APIServer()
-    auth = AuthMiddleware(valid_tokens={"test-token"})
+    auth = AuthMiddleware(verifier=InMemoryTokenVerifier())
+    auth.add_token("test-token", scopes=("*",))
     tenant = TenantMiddleware(require_tenant=False)
     server.add_middleware(auth)
     server.add_middleware(tenant)
@@ -159,6 +188,16 @@ class TestSchemaValidation:
         assert ok is False
         assert errors == ["Field 'input' must not be null"]
 
+    def test_workflow_run_schema_accepts_idempotency_key(self):
+        ok, errors = validate({"idempotency_key": "req-1"}, WORKFLOW_RUN_SCHEMA)
+        assert ok is True
+        assert errors == []
+
+    def test_workflow_run_schema_accepts_queued_execution_mode(self):
+        ok, errors = validate({"execution_mode": "queued"}, WORKFLOW_RUN_SCHEMA)
+        assert ok is True
+        assert errors == []
+
 
 # ---------------------------------------------------------------------------
 # Server routing
@@ -197,8 +236,9 @@ class TestServerRouting:
         """M11: /workflows/{id}/runs POST should not be registered."""
         server, _ = _server_with_routes()
         resp = server.handle_request("POST", "/workflows/wf1/runs", body={})
-        # Should be 404 (not found) since the duplicate route was removed
-        assert resp.status_code == 404
+        # GET exists for listing runs, but POST must remain unregistered.
+        assert resp.status_code == 405
+        assert resp.headers["allow"] == "GET"
 
     def test_path_param_extraction(self):
         server = APIServer()
@@ -504,6 +544,52 @@ class TestWorkflowRoutes:
         assert isinstance(resp.body["event_log"], list)
         assert resp.body["id"] == run_id
 
+    def test_start_workflow_run_honors_idempotency_key(self):
+        server, store = _server_with_routes()
+        store.register_workflow_project("wf1", _workflow_project())
+        first = server.handle_request(
+            "POST",
+            "/workflows/wf1/run",
+            body={"input": {"msg": "hi"}, "idempotency_key": "req-1"},
+        )
+        second = server.handle_request(
+            "POST",
+            "/workflows/wf1/run",
+            body={"input": {"msg": "hi"}, "idempotency_key": "req-1"},
+        )
+        assert first.status_code == 202
+        assert second.status_code == 202
+        assert first.body["id"] == second.body["id"]
+
+    def test_start_workflow_run_supports_queued_execution_mode(self):
+        server, store = _server_with_routes()
+        store.register_workflow_project("wf1", _workflow_project())
+
+        resp = server.handle_request(
+            "POST",
+            "/workflows/wf1/run",
+            body={"execution_mode": "queued"},
+        )
+
+        assert resp.status_code == 202
+        assert resp.body["execution_mode"] == "queued"
+        assert resp.body["status"] == "completed"
+        assert len(resp.body["checkpoint_ids"]) == 2
+        assert len(resp.body["queue_task_ids"]) == 2
+
+    def test_start_workflow_run_rejects_unsupported_queued_workflow(self):
+        server, store = _server_with_routes()
+        store.register_workflow_project("approval", _approval_project())
+
+        resp = server.handle_request(
+            "POST",
+            "/workflows/approval/run",
+            body={"execution_mode": "queued"},
+        )
+
+        assert resp.status_code == 400
+        assert "queued execution mode currently supports only" in resp.body["error"]
+
     def test_get_workflow_run_by_location_route(self):
         server, store = _server_with_routes()
         store.register_workflow_project("wf1", _workflow_project())
@@ -512,6 +598,55 @@ class TestWorkflowRoutes:
         resp = server.handle_request("GET", location)
         assert resp.status_code == 200
         assert resp.body["id"] == create_resp.body["id"]
+
+    def test_list_workflow_runs_and_global_runs(self):
+        server, store = _server_with_routes()
+        store.register_workflow_project("wf1", _workflow_project())
+        create_resp = server.handle_request("POST", "/workflows/wf1/run", body={})
+        run_id = create_resp.body["id"]
+
+        workflow_runs = server.handle_request("GET", "/workflows/wf1/runs")
+        global_runs = server.handle_request("GET", "/api/v1/workflow-runs")
+
+        assert workflow_runs.status_code == 200
+        assert workflow_runs.body["count"] == 1
+        assert workflow_runs.body["runs"][0]["id"] == run_id
+        assert global_runs.status_code == 200
+        assert global_runs.body["count"] == 1
+        assert global_runs.body["runs"][0]["id"] == run_id
+
+    def test_register_routes_uses_injected_control_plane_store(self):
+        backend = InMemoryWorkflowControlPlaneStore()
+        server, store = _server_with_routes(control_plane_store=backend)
+        assert store.control_plane_store is backend
+
+        store.register_workflow_project("wf1", _workflow_project())
+        create_resp = server.handle_request("POST", "/workflows/wf1/run", body={})
+
+        assert create_resp.status_code == 202
+        assert backend.get_run_record(create_resp.body["id"]) is not None
+
+    def test_route_store_supports_sqlite_backend(self, tmp_path):
+        db_path = tmp_path / "api-control-plane.db"
+        server, store = _server_with_routes(
+            control_plane_backend="sqlite",
+            control_plane_path=str(db_path),
+        )
+        store.register_workflow_project("wf1", _workflow_project())
+        create = server.handle_request("POST", "/workflows/wf1/run", body={})
+        run_id = create.body["id"]
+
+        second_server, _ = _server_with_routes(
+            control_plane_backend="sqlite",
+            control_plane_path=str(db_path),
+        )
+        workflow = second_server.handle_request("GET", "/workflows/wf1")
+        run = second_server.handle_request("GET", f"/api/v1/workflow-runs/{run_id}")
+
+        assert workflow.status_code == 200
+        assert workflow.body["project_name"] == "demo-project"
+        assert run.status_code == 200
+        assert run.body["id"] == run_id
 
     def test_start_workflow_run_requires_registered_definition(self):
         server, _ = _server_with_routes()
@@ -601,6 +736,36 @@ class TestWorkflowRoutes:
         assert rejected.body["status"] == "cancelled"
         assert rejected.body["stop_reason"] == "approval_denied"
         assert rejected.body["active_approval"] is None
+
+    def test_list_approvals_and_checkpoints(self):
+        server, store = _server_with_routes()
+        store.register_workflow_project("approval", _approval_project())
+
+        create = server.handle_request("POST", "/workflows/approval/run", body={})
+        run_id = create.body["id"]
+        approval_id = create.body["approval_request_id"]
+
+        approvals = server.handle_request("GET", "/api/v1/approvals")
+        run_approvals = server.handle_request(
+            "GET",
+            f"/api/v1/workflow-runs/{run_id}/approvals",
+        )
+        checkpoints = server.handle_request("GET", "/api/v1/checkpoints")
+        run_checkpoints = server.handle_request(
+            "GET",
+            f"/api/v1/workflow-runs/{run_id}/checkpoints",
+        )
+
+        assert approvals.status_code == 200
+        assert approvals.body["count"] == 1
+        assert approvals.body["approvals"][0]["id"] == approval_id
+        assert run_approvals.status_code == 200
+        assert run_approvals.body["approvals"][0]["run_id"] == run_id
+        assert checkpoints.status_code == 200
+        assert checkpoints.body["count"] == 1
+        assert run_checkpoints.status_code == 200
+        assert run_checkpoints.body["count"] == 1
+        assert run_checkpoints.body["checkpoints"][0]["run_id"] == run_id
 
     def test_replay_checkpoint(self):
         server, store = _server_with_routes()
@@ -780,6 +945,198 @@ class TestAuthMiddleware:
         resp = server.handle_request("GET", "/health")
         assert resp.status_code == 200
 
+    def test_jwt_verifier_accepts_valid_hs256_token(self):
+        now = int(time.time())
+        token = _make_jwt(
+            {
+                "sub": "svc-jwt",
+                "tenant_id": "tenant-a",
+                "scope": "runs:read runs:write",
+                "iss": "https://issuer.example",
+                "aud": "pylon-api",
+                "jti": "tok-123",
+                "exp": now + 60,
+            },
+            "shared-secret",
+        )
+        verifier = JWTTokenVerifier(
+            secret="shared-secret",
+            issuer="https://issuer.example",
+            audience=("pylon-api",),
+        )
+
+        principal = verifier.verify(token)
+
+        assert principal.subject == "svc-jwt"
+        assert principal.tenant_id == "tenant-a"
+        assert principal.scopes == ("runs:read", "runs:write")
+        assert principal.token_id == "tok-123"
+
+    def test_jwt_verifier_rejects_wrong_audience(self):
+        now = int(time.time())
+        token = _make_jwt(
+            {
+                "sub": "svc-jwt",
+                "tenant_id": "tenant-a",
+                "iss": "https://issuer.example",
+                "aud": "other-api",
+                "exp": now + 60,
+            },
+            "shared-secret",
+        )
+        verifier = JWTTokenVerifier(
+            secret="shared-secret",
+            issuer="https://issuer.example",
+            audience=("pylon-api",),
+        )
+
+        with pytest.raises(ValueError, match="audience"):
+            verifier.verify(token)
+
+    def test_jwt_verifier_rejects_expired_token(self):
+        token = _make_jwt(
+            {
+                "sub": "svc-jwt",
+                "tenant_id": "tenant-a",
+                "exp": int(time.time()) - 5,
+            },
+            "shared-secret",
+        )
+        verifier = JWTTokenVerifier(secret="shared-secret")
+
+        with pytest.raises(ValueError, match="expired"):
+            verifier.verify(token)
+
+    def test_token_bound_principal_exposed_in_context(self):
+        server = APIServer()
+        auth = AuthMiddleware(verifier=InMemoryTokenVerifier())
+        auth.add_token(
+            "bound-token",
+            subject="svc-build",
+            tenant_id="tenant-a",
+            scopes=("runs:write",),
+        )
+        server.add_middleware(auth)
+        captured = {}
+
+        def handler(req: Request) -> Response:
+            captured["principal"] = req.context["auth_principal"]
+            captured["claims"] = req.context["auth_principal_claims"]
+            return Response(body={"ok": True})
+
+        server.add_route("GET", "/test", handler)
+        resp = server.handle_request(
+            "GET",
+            "/test",
+            headers={"Authorization": "Bearer bound-token"},
+        )
+        assert resp.status_code == 200
+        assert captured["principal"].subject == "svc-build"
+        assert captured["principal"].tenant_id == "tenant-a"
+        assert captured["claims"]["scopes"] == ["runs:write"]
+
+    def test_registered_route_rejects_missing_required_scope(self):
+        server = APIServer()
+        auth = AuthMiddleware(verifier=InMemoryTokenVerifier())
+        auth.add_token(
+            "read-only-token",
+            subject="svc-read",
+            tenant_id="tenant-a",
+            scopes=("workflows:read",),
+        )
+        server.add_middleware(auth)
+        server.add_middleware(TenantMiddleware(require_tenant=True))
+        register_routes(server)
+
+        resp = server.handle_request(
+            "POST",
+            "/workflows",
+            headers={"Authorization": "Bearer read-only-token"},
+            body={
+                "id": "wf-authz",
+                "project": _workflow_project("wf-authz").model_dump(mode="json"),
+            },
+        )
+        assert resp.status_code == 403
+        assert resp.body["error"] == "Insufficient scope"
+        assert resp.body["required_scopes"] == ["workflows:write"]
+        assert resp.body["principal_scopes"] == ["workflows:read"]
+
+    def test_registered_route_accepts_namespace_wildcard_scope(self):
+        server = APIServer()
+        auth = AuthMiddleware(verifier=InMemoryTokenVerifier())
+        auth.add_token(
+            "workflow-admin-token",
+            subject="svc-workflows",
+            tenant_id="tenant-a",
+            scopes=("workflows:*",),
+        )
+        server.add_middleware(auth)
+        server.add_middleware(TenantMiddleware(require_tenant=True))
+        register_routes(server)
+
+        resp = server.handle_request(
+            "POST",
+            "/workflows",
+            headers={"Authorization": "Bearer workflow-admin-token"},
+            body={
+                "id": "wf-authz",
+                "project": _workflow_project("wf-authz").model_dump(mode="json"),
+            },
+        )
+        assert resp.status_code == 201
+
+    def test_json_file_token_verifier_rejects_invalid_token(self, tmp_path):
+        token_path = tmp_path / "tokens.json"
+        token_path.write_text(
+            '{"tokens":[{"token":"valid-token","subject":"svc","tenant_id":"tenant-a"}]}',
+            encoding="utf-8",
+        )
+        server = APIServer()
+        server.add_middleware(AuthMiddleware(verifier=JsonFileTokenVerifier(token_path)))
+        server.add_route("GET", "/test", lambda r: Response(body={"ok": True}))
+
+        resp = server.handle_request(
+            "GET",
+            "/test",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        assert resp.status_code == 401
+
+    def test_jwt_auth_middleware_accepts_valid_token(self):
+        server = APIServer()
+        server.add_middleware(AuthMiddleware(
+            verifier=JWTTokenVerifier(
+                secret="shared-secret",
+                issuer="https://issuer.example",
+                audience=("pylon-api",),
+            )
+        ))
+        server.add_middleware(TenantMiddleware(require_tenant=True))
+        server.add_route(
+            "GET",
+            "/test",
+            lambda r: Response(body={"tenant": r.context["tenant_id"]}),
+        )
+        token = _make_jwt(
+            {
+                "sub": "svc-jwt",
+                "tenant_id": "tenant-a",
+                "iss": "https://issuer.example",
+                "aud": "pylon-api",
+                "exp": int(time.time()) + 60,
+            },
+            "shared-secret",
+        )
+
+        resp = server.handle_request(
+            "GET",
+            "/test",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        assert resp.body["tenant"] == "tenant-a"
+
 
 class TestTenantMiddleware:
     def test_tenant_id_injected(self):
@@ -803,6 +1160,48 @@ class TestTenantMiddleware:
         server.add_route("GET", "/test", lambda r: Response())
         resp = server.handle_request("GET", "/test")
         assert resp.status_code == 400
+
+    def test_authenticated_tenant_binding_satisfies_requirement(self):
+        server = APIServer()
+        auth = AuthMiddleware(verifier=InMemoryTokenVerifier())
+        auth.add_token("tenant-bound", subject="svc", tenant_id="tenant-a")
+        server.add_middleware(auth)
+        server.add_middleware(TenantMiddleware(require_tenant=True))
+        captured = {}
+
+        def handler(req: Request) -> Response:
+            captured["tenant_id"] = req.context["tenant_id"]
+            captured["tenant_source"] = req.context["tenant_source"]
+            return Response(body={"ok": True})
+
+        server.add_route("GET", "/test", handler)
+        resp = server.handle_request(
+            "GET",
+            "/test",
+            headers={"Authorization": "Bearer tenant-bound"},
+        )
+        assert resp.status_code == 200
+        assert captured["tenant_id"] == "tenant-a"
+        assert captured["tenant_source"] == "principal"
+
+    def test_authenticated_tenant_binding_rejects_mismatched_header(self):
+        server = APIServer()
+        auth = AuthMiddleware(verifier=InMemoryTokenVerifier())
+        auth.add_token("tenant-bound", subject="svc", tenant_id="tenant-a")
+        server.add_middleware(auth)
+        server.add_middleware(TenantMiddleware(require_tenant=True))
+        server.add_route("GET", "/test", lambda r: Response(body={"ok": True}))
+
+        resp = server.handle_request(
+            "GET",
+            "/test",
+            headers={
+                "Authorization": "Bearer tenant-bound",
+                "X-Tenant-ID": "tenant-b",
+            },
+        )
+        assert resp.status_code == 403
+        assert "not authorized" in resp.body["error"]
 
 
 class TestTenantRequired:
@@ -879,12 +1278,94 @@ class TestRateLimitMiddleware:
         assert resp.status_code == 429
         assert "retry-after" in resp.headers
 
+    def test_shared_in_memory_store_applies_across_instances(self):
+        store = InMemoryRateLimitStore()
+        server_a = APIServer()
+        server_a.add_middleware(TenantMiddleware(require_tenant=True))
+        server_a.add_middleware(
+            RateLimitMiddleware(requests_per_second=0.001, burst=1, store=store)
+        )
+        server_a.add_route("GET", "/test", lambda r: Response(body={"ok": True}))
+        server_b = APIServer()
+        server_b.add_middleware(TenantMiddleware(require_tenant=True))
+        server_b.add_middleware(
+            RateLimitMiddleware(requests_per_second=0.001, burst=1, store=store)
+        )
+        server_b.add_route("GET", "/test", lambda r: Response(body={"ok": True}))
+
+        first = server_a.handle_request("GET", "/test", headers={"X-Tenant-ID": "tenant-a"})
+        second = server_b.handle_request("GET", "/test", headers={"X-Tenant-ID": "tenant-a"})
+
+        assert first.status_code == 200
+        assert second.status_code == 429
+
+    def test_sqlite_store_shares_bucket_state(self, tmp_path):
+        store = SQLiteRateLimitStore(tmp_path / "rate-limit.db")
+        server_a = APIServer()
+        server_a.add_middleware(TenantMiddleware(require_tenant=True))
+        server_a.add_middleware(
+            RateLimitMiddleware(requests_per_second=0.001, burst=1, store=store)
+        )
+        server_a.add_route("GET", "/test", lambda r: Response(body={"ok": True}))
+        server_b = APIServer()
+        server_b.add_middleware(TenantMiddleware(require_tenant=True))
+        server_b.add_middleware(
+            RateLimitMiddleware(
+                requests_per_second=0.001,
+                burst=1,
+                store=SQLiteRateLimitStore(tmp_path / "rate-limit.db"),
+            )
+        )
+        server_b.add_route("GET", "/test", lambda r: Response(body={"ok": True}))
+
+        first = server_a.handle_request("GET", "/test", headers={"X-Tenant-ID": "tenant-a"})
+        second = server_b.handle_request("GET", "/test", headers={"X-Tenant-ID": "tenant-a"})
+
+        assert first.status_code == 200
+        assert second.status_code == 429
+
 
 class TestMiddlewareChain:
     def test_chain_builder(self):
         chain = MiddlewareChain()
-        chain.add(AuthMiddleware()).add(TenantMiddleware())
-        assert len(chain.middlewares) == 2
+        chain.add(RequestContextMiddleware()).add(AuthMiddleware()).add(TenantMiddleware())
+        assert len(chain.middlewares) == 3
+
+
+class TestRequestContextMiddleware:
+    def test_generates_request_and_correlation_ids(self):
+        server = APIServer()
+        server.add_middleware(RequestContextMiddleware())
+
+        def handler(req: Request) -> Response:
+            return Response(
+                body={
+                    "request_id": req.context["request_id"],
+                    "correlation_id": req.context["correlation_id"],
+                }
+            )
+
+        server.add_route("GET", "/test", handler)
+        resp = server.handle_request("GET", "/test")
+        assert resp.status_code == 200
+        assert resp.body["request_id"]
+        assert resp.body["correlation_id"] == resp.body["request_id"]
+        assert resp.headers["x-request-id"] == resp.body["request_id"]
+        assert resp.headers["x-correlation-id"] == resp.body["correlation_id"]
+
+    def test_preserves_incoming_correlation_id(self):
+        server = APIServer()
+        server.add_middleware(RequestContextMiddleware())
+        server.add_route("GET", "/test", lambda r: Response(body=r.context))
+
+        resp = server.handle_request(
+            "GET",
+            "/test",
+            headers={"X-Correlation-ID": "corr-123"},
+        )
+        assert resp.status_code == 200
+        assert resp.body["correlation_id"] == "corr-123"
+        assert resp.headers["x-correlation-id"] == "corr-123"
 
 
 class TestTenantIdValidation:
@@ -986,8 +1467,6 @@ class TestResponse:
 # ---------------------------------------------------------------------------
 # Health check system
 # ---------------------------------------------------------------------------
-
-from pylon.api.health import HealthCheckResult, HealthChecker
 
 
 class TestHealthChecker:

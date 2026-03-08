@@ -35,15 +35,15 @@ Many subsystems are intentionally shipped as in-memory or local-first reference 
 | `pylon.agents` | lifecycle, registry, pool, supervisor | in-memory manager layer |
 | `pylon.protocols.mcp` | MCP JSON-RPC server/client/auth/types | functional reference implementation |
 | `pylon.protocols.a2a` | peer tasks, agent cards, delegation checks | functional reference implementation |
-| `pylon.api` | lightweight API server and routes | in-memory route store |
+| `pylon.api` | lightweight API server, routes, transport and wiring factories | route facade over pluggable control-plane store |
 | `pylon.cli` | local project commands and persisted run state | local filesystem implementation |
-| `pylon.sdk` | decorators, builder, in-memory client | local/in-memory convenience layer |
+| `pylon.sdk` | decorators, builder, local client, HTTP client | local convenience layer plus thin HTTP transport adapter |
 | `pylon.repository` | workflow/checkpoint/audit/memory repositories | in-memory implementations |
 | `pylon.sandbox` | sandbox policy, lifecycle, execution helpers | policy-rich reference layer |
 | `pylon.secrets` | versioned secret storage, vault abstraction | in-memory implementations |
 | `pylon.tenancy` | tenant context, isolation, quota, lifecycle | in-memory/contextvar implementations |
 | `pylon.plugins` | plugin discovery, manifests, lifecycle, hooks | local plugin infrastructure |
-| `pylon.taskqueue` | queue, workers, retry, scheduler | in-memory queueing |
+| `pylon.taskqueue` | queue, workers, retry, scheduler | in-memory queueing plus store-backed durable queue adapters |
 | `pylon.resources` | pools, quotas, monitors, limiters | utility layer |
 | `pylon.resilience` | retry, fallback, circuit breaker, bulkhead | utility layer |
 | `pylon.observability` | metrics, tracing, logging, exporters | in-memory/reference instrumentation |
@@ -565,6 +565,11 @@ Routes implemented today:
 - `GET /workflows/{id}`
 - `DELETE /workflows/{id}`
 - `POST /workflows/{id}/run`
+  - accepts `execution_mode=inline|queued`
+  - `queued` mode persists the same run/checkpoint payload shape, but currently supports only straight-line agent DAGs without goals, approval gates, loops, routers, conditional edges, or non-default join policies
+  - `parameters.queued.retry` may configure `fixed` or `exponential_backoff` retries
+  - `parameters.queued` may also configure `lease_timeout_seconds` and `heartbeat_interval_seconds`
+  - queued run state and runtime metrics include `retrying_task_ids`, `dead_letter_task_ids`, normalized `retry_policy`, `lease_timeout_seconds`, `heartbeat_interval_seconds`, and `heartbeat_total`
 - `GET /workflows/{id}/runs/{run_id}`
 - `GET /api/v1/workflow-runs/{run_id}`
 - `POST /api/v1/workflow-runs/{run_id}/resume`
@@ -573,14 +578,30 @@ Routes implemented today:
 - `GET /api/v1/checkpoints/{checkpoint_id}/replay`
 - `POST /kill-switch`
 
-`RouteStore` now keeps:
+`RouteStore` now fronts the shared control-plane store contract and projects:
 
 - tenant-scoped workflow definitions as canonical `PylonProject` payloads
-- normalized run payloads
+- raw run records through the shared query builders
 - checkpoint payloads
 - approval payloads
 
-Workflow run routes and control-plane routes serialize the same normalized run payload used by the CLI helper layer.
+Workflow run routes and control-plane routes serialize the same normalized run payload used by the CLI and SDK layers.
+
+If API authentication is enabled and a request carries an authenticated
+principal, route authorization is scope-based. The current route scope taxonomy
+is:
+
+- `agents:read`, `agents:write`
+- `workflows:read`, `workflows:write`
+- `runs:read`, `runs:write`
+- `approvals:read`, `approvals:write`
+- `checkpoints:read`
+- `kill-switch:write`
+
+Scope matching supports exact values, namespace wildcards such as
+`workflows:*`, and global wildcard `*`. If authentication is disabled and no
+principal is present, route scope checks are skipped so local/reference
+deployments retain their existing behavior.
 
 ### 9.2 CLI
 
@@ -588,12 +609,10 @@ The CLI is local-state-based today.
 
 It persists:
 
-- runs
-- checkpoints
-- approvals
-- sandboxes
+- workflow lifecycle data through the local control-plane store
+- sandbox metadata in CLI state
 
-under `$PYLON_HOME/state.json`.
+under `$PYLON_HOME/control-plane.json` and `$PYLON_HOME/state.json`.
 
 Current workflow-related CLI commands:
 
@@ -636,12 +655,13 @@ Workflow execution for `pylon run` and resume for `pylon approve` both go throug
 
 ### 9.3 SDK
 
-`pylon.sdk.PylonClient` is an in-memory client today:
+`pylon.sdk.PylonClient` is an in-memory/local client today:
 
 - agent CRUD is local to the client instance
 - canonical workflow definitions are locally registered as `PylonProject`
 - ad hoc callable execution is still supported, but it is explicitly separated from workflow execution
-- there is no HTTP transport yet
+- `pylon.sdk.PylonHTTPClient` now provides a transport adapter over the same
+  public workflow/control-plane payloads
 
 `pylon.sdk.WorkflowBuilder` is a separate immutable builder abstraction and is not the same type as `pylon.workflow.WorkflowGraph`.
 
@@ -707,13 +727,42 @@ SDK control-plane methods now include:
 
 `pylon.api.middleware` currently provides:
 
+- `RequestContextMiddleware`
 - `AuthMiddleware`
 - `TenantMiddleware`
 - `RateLimitMiddleware`
 - `SecurityHeadersMiddleware`
 - `MiddlewareChain`
 
-The route layer assumes `tenant_id` has already been injected into request context.
+`pylon.api.factory` provides the standard server wiring surface:
+
+- `APIServerConfig`
+- `APIMiddlewareConfig`
+- `AuthMiddlewareConfig`
+- `TenantMiddlewareConfig`
+- `RateLimitMiddlewareConfig`
+- `build_api_server(...)`
+- `build_http_api_server(...)`
+
+Reference auth backends currently include:
+
+- `none`
+- `memory`
+- `json_file`
+- `jwt_hs256`
+
+`AuthMiddleware` can now use pluggable token verifiers and projects an
+authenticated principal into request context. `TenantMiddleware` derives the
+effective tenant either from `X-Tenant-ID` or from the authenticated principal
+binding and rejects mismatches between the two. The reference JWT verifier
+supports HS256 plus `iss` / `aud` / `exp` / `nbf` / `iat` validation and
+configurable tenant/subject/scopes claims. Route registration enforces
+server-side scope checks whenever an authenticated principal is present.
+`RateLimitMiddleware` accepts a pluggable token-bucket store and defaults to
+tenant-scoped buckets.
+`RequestContextMiddleware` injects request/correlation IDs into request context
+and echoes them back on responses, so CLI/API/SDK transport logs can share the
+same correlation surface.
 
 ## 10. Infrastructure and Supporting Modules
 
@@ -846,6 +895,7 @@ The scheduler-oriented planning path is:
 2. project nodes into `WorkflowTask` instances
 3. compute dependency waves with `WorkflowScheduler.compute_waves()`
 4. expose a `distributed_wave_plan` through API/SDK/runtime helpers
+5. optionally consume that plan through `pylon.runtime.QueuedWorkflowDispatchRunner` and `pylon.taskqueue.StoreBackedTaskQueue`
 
 This path is a planning/deployment view only. It does not execute nodes and does
 not replace `GraphExecutor`.

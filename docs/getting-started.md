@@ -44,6 +44,9 @@ my-project/
 ```
 
 CLI runtime state is stored separately under `$PYLON_HOME` or `~/.pylon`.
+Workflow runs, checkpoints, and approvals are persisted in
+`$PYLON_HOME/control-plane.json`; sandbox/config state remains in
+`$PYLON_HOME/state.json`.
 
 ## Configure `pylon.yaml`
 
@@ -110,7 +113,7 @@ pylon logs <run_id>
 
 Current CLI behavior:
 
-- `pylon run` uses the shared workflow runtime and persists the resulting run/checkpoint/approval metadata under `$PYLON_HOME/state.json`
+- `pylon run` uses the shared workflow runtime and persists the resulting run/checkpoint/approval metadata under `$PYLON_HOME/control-plane.json`
 - `pylon inspect` returns the normalized run payload, including `execution_summary`, `approval_summary`, `policy_resolution`, and runtime metrics when present
 - `pylon replay` reconstructs state from the checkpoint event log and returns the same run payload shape with `view_kind: replay`
 - A3+ agents produce the runtime status `waiting_approval`, and `pylon approve` validates approval binding before resuming the workflow

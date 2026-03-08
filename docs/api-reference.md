@@ -5,37 +5,76 @@ This document describes the lightweight route contract implemented by `pylon.api
 ## Scope
 
 `pylon.api.server.APIServer` is a small in-process HTTP-style router.
-`pylon.api.routes.register_routes()` installs route handlers backed by an in-memory `RouteStore`.
+`pylon.api.routes.register_routes()` installs route handlers backed by a control-plane store.
 
-There is no built-in network daemon in this package. You compose:
+The API package ships a lightweight stdlib HTTP adapter, but the route contract
+itself remains transport-agnostic. You compose:
 
 - `APIServer`
+- `create_http_server(...)` when you want an embedded HTTP transport
+- `build_api_server(...)` / `build_http_api_server(...)` when you want the
+  standard middleware stack and route wiring from config
 - optional middlewares from `pylon.api.middleware`
 - route handlers from `pylon.api.routes`
+
+The default reference wiring uses:
+
+- `RouteStore` as an API facade over a pluggable control-plane store
+- `WorkflowRunService` for workflow lifecycle transitions
+- shared query builders for run/replay/operator views
+
+`register_routes()` can either accept an already constructed `RouteStore` / control-plane store,
+or build one from backend settings. The reference backends are `memory`, `json_file`, and `sqlite`.
+
+`pylon.api.factory` provides:
+
+- `APIServerConfig`
+- `APIMiddlewareConfig`
+- `AuthMiddlewareConfig`
+- `TenantMiddlewareConfig`
+- `RateLimitMiddlewareConfig`
+- `build_api_server(...)`
+- `build_http_api_server(...)`
+
+Auth backend choices in the reference wiring are:
+
+- `none`
+- `memory`
+- `json_file`
+- `jwt_hs256`
 
 ## Typical Middleware Stack
 
 The common stack is:
 
-1. `AuthMiddleware`
-2. `TenantMiddleware`
-3. `RateLimitMiddleware`
-4. `SecurityHeadersMiddleware`
+1. `RequestContextMiddleware`
+2. `AuthMiddleware`
+3. `TenantMiddleware`
+4. `RateLimitMiddleware`
+5. `SecurityHeadersMiddleware`
 
 Important details:
 
 - authentication is optional and only enforced if `AuthMiddleware` is installed
 - route handlers expect `tenant_id` in `request.context`
-- `TenantMiddleware` normally provides that context from `X-Tenant-ID`
+- `TenantMiddleware` can source tenant context either from `X-Tenant-ID` or from
+  an authenticated principal bound to a tenant
+- `RequestContextMiddleware` injects `request_id` and `correlation_id` into
+  request context and echoes them back on responses
 - `/health` bypasses auth and tenant checks
 
 ## Request Context Expectations
 
 When the standard middlewares are installed:
 
-- `Authorization: Bearer <token>` is required for non-health routes
-- `X-Tenant-ID: <tenant-id>` is required unless `TenantMiddleware(require_tenant=False)` is used
-- rate limits are applied per tenant via token bucket
+- `Authorization: Bearer <token>` is required for non-health routes when auth is enabled
+- `X-Tenant-ID: <tenant-id>` is required unless either:
+  - `TenantMiddleware(require_tenant=False)` is used, or
+  - the authenticated principal already carries a tenant binding
+- `X-Request-ID` is optional; when omitted, the server generates one
+- `X-Correlation-ID` is optional; when omitted, it defaults to the request ID
+- rate limits are applied through a pluggable token-bucket store and default to
+  tenant-scoped buckets
 
 ## Routes
 
@@ -227,8 +266,32 @@ Request body:
 |-------|------|----------|-------|
 | `input` | object | No | defaults to `{}` |
 | `parameters` | object | No | defaults to `{}` |
+| `idempotency_key` | string | No | write-side deduplication key |
+| `execution_mode` | string | No | `inline` or `queued`, defaults to `inline` |
 
 The route compiles the registered `PylonProject`, executes it through the shared runtime, and returns the normalized public run payload.
+
+Queued mode notes:
+
+- `execution_mode="queued"` persists the same run/checkpoint/query model as inline mode
+- current support is intentionally limited to straight-line agent DAGs
+- goals, approval-gated autonomy, loops, routers, conditional edges, and non-default join policies are rejected instead of silently degrading semantics
+- optional queued retry configuration may be passed as `parameters.queued.retry`
+- optional queued lease configuration may be passed as `parameters.queued`
+  - `lease_timeout_seconds`: positive float, defaults to `30.0`
+  - `heartbeat_interval_seconds`: positive float smaller than `lease_timeout_seconds`
+- `policy`: `fixed` or `exponential_backoff`
+  - `max_retries`: integer `>= 0`
+  - delay fields:
+    - `fixed`: `delay_seconds`
+    - `exponential_backoff`: `base_delay_seconds`, `max_delay_seconds`
+- queued run state and runtime metrics expose:
+  - `retrying_task_ids`
+  - `dead_letter_task_ids`
+  - normalized `retry_policy`
+  - `lease_timeout_seconds`
+  - `heartbeat_interval_seconds`
+  - `heartbeat_total`
 
 Important persistence note:
 
@@ -240,6 +303,16 @@ Response `202 Accepted`
 Headers:
 
 - `Location: /api/v1/workflow-runs/{run_id}`
+
+### `GET /workflows/{id}/runs`
+
+List normalized run views for one workflow definition.
+
+Responses:
+
+- `200 OK`
+- `403 Forbidden`
+- `404 Not Found`
 
 Example body:
 
@@ -313,6 +386,22 @@ Returned payload shape matches `POST /workflows/{id}/run` and includes:
 - `state_version`
 - `state_hash`
 
+### `GET /api/v1/workflow-runs`
+
+List all run views for the current tenant.
+
+### `GET /api/v1/workflow-runs/{run_id}/approvals`
+
+List approval records associated with one run.
+
+### `GET /api/v1/workflow-runs/{run_id}/checkpoints`
+
+List checkpoint records associated with one run.
+
+### `GET /api/v1/approvals`
+
+List approval records visible to the current tenant.
+
 ### `POST /api/v1/approvals/{approval_id}/approve`
 
 Approve a pending approval request and resume the owning run.
@@ -346,6 +435,10 @@ Responses:
 - `403 Forbidden`
 - `404 Not Found`
 - `409 Conflict`
+
+### `GET /api/v1/checkpoints`
+
+List checkpoint records visible to the current tenant.
 
 ### `GET /api/v1/checkpoints/{checkpoint_id}/replay`
 
@@ -425,22 +518,60 @@ Common status codes:
 
 ## Middleware Details
 
+### `RequestContextMiddleware`
+
+- injects `request_id`, `correlation_id`, and `request_started_at` into request context
+- preserves incoming `X-Request-ID` / `X-Correlation-ID` when present
+- generates a request ID when none is supplied
+- echoes `x-request-id` and `x-correlation-id` on responses
+
 ### `AuthMiddleware`
 
 - skips `/health`
 - expects `Authorization: Bearer <token>`
-- validates tokens against an in-memory set
+- accepts a pluggable `TokenVerifier`
+- supports the reference `InMemoryTokenVerifier`, `JsonFileTokenVerifier`, and `JWTTokenVerifier`
+- projects an `AuthPrincipal` into `request.context["auth_principal"]`
+- when an authenticated principal is present, registered API routes enforce scope-based authorization
+- exact scopes, namespace wildcards like `workflows:*`, and global wildcard `*` are supported
+
+`JWTTokenVerifier` validates HS256 bearer tokens and supports:
+
+- `iss`
+- `aud`
+- `exp`
+- `nbf`
+- `iat`
+- configurable tenant/subject/scopes claim names
+
+Route scope taxonomy:
+
+- `agents:read`, `agents:write`
+- `workflows:read`, `workflows:write`
+- `runs:read`, `runs:write`
+- `approvals:read`, `approvals:write`
+- `checkpoints:read`
+- `kill-switch:write`
+
+Compatibility note:
+
+- if authentication is disabled and no `AuthPrincipal` is present, route scope checks are skipped
+- if authentication is enabled and a principal is authenticated, route scope checks are enforced
 
 ### `TenantMiddleware`
 
 - skips `/health`
 - injects `tenant_id` into `request.context`
+- prefers tenant binding from the authenticated principal when available
+- rejects `X-Tenant-ID` that conflicts with the authenticated principal
 - validates tenant IDs against `^[a-z0-9][a-z0-9_-]{0,63}$`
 
 ### `RateLimitMiddleware`
 
 - default rate: `10` requests/sec
 - default burst: `20`
+- accepts a pluggable `RateLimitStore`
+- supports the reference `InMemoryRateLimitStore` and `SQLiteRateLimitStore`
 - emits `retry-after` header on `429`
 
 ### `SecurityHeadersMiddleware`

@@ -177,8 +177,10 @@ def test_run_inspect_logs_and_replay_flow() -> None:
         ]
 
         checkpoint_id = run_data["checkpoint_ids"][0]
-        state = json.loads(Path(".pylon-home/state.json").read_text(encoding="utf-8"))
-        stored_run = state["runs"][run_id]
+        control_plane = json.loads(
+            Path(".pylon-home/control-plane.json").read_text(encoding="utf-8")
+        )
+        stored_run = control_plane["workflow_runs_by_id"][run_id]
         assert "approval_summary" not in stored_run
         assert "execution_summary" not in stored_run
         assert "approval_id" not in stored_run
@@ -660,8 +662,10 @@ def test_corrupted_state_file_is_recovered() -> None:
         assert run_result.exit_code == 0
         run_id = _extract(r"Run ID: (run_[a-f0-9]+)", run_result.output)
 
-        state = json.loads((pylon_home / "state.json").read_text(encoding="utf-8"))
-        assert run_id in state["runs"]
+        control_plane = json.loads(
+            (pylon_home / "control-plane.json").read_text(encoding="utf-8")
+        )
+        assert run_id in control_plane["workflow_runs_by_id"]
 
 
 def test_corrupted_config_file_is_recovered() -> None:

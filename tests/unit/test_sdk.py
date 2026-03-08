@@ -249,6 +249,51 @@ class TestPylonClientWorkflows:
         assert result.status == RunStatus.COMPLETED
         assert result.output is None
 
+    def test_run_workflow_honors_idempotency_key(self, client: PylonClient):
+        client.register_project("echo", _workflow_project("echo-project"))
+        first = client.run_workflow("echo", input_data={"msg": "hi"}, idempotency_key="req-1")
+        second = client.run_workflow("echo", input_data={"msg": "hi"}, idempotency_key="req-1")
+        assert first.run_id == second.run_id
+        assert len(client.list_runs()) == 1
+
+    def test_run_workflow_supports_queued_execution_mode(self, client: PylonClient):
+        client.register_project("echo", _workflow_project("echo-project"))
+
+        result = client.run_workflow("echo", execution_mode="queued")
+
+        assert result.status == RunStatus.COMPLETED
+        run = client.get_run(result.run_id)
+        assert run.execution_mode == "queued"
+        assert len(run.checkpoint_ids) == 2
+        assert len(run.queue_task_ids) == 2
+        assert run.state["queue"]["completed_task_ids"] == run.queue_task_ids
+
+    def test_run_workflow_rejects_unsupported_queued_mode(self, client: PylonClient):
+        client.register_project("approval", _approval_project("approval-project"))
+
+        with pytest.raises(PylonClientError, match="queued execution mode currently supports only"):
+            client.run_workflow("approval", execution_mode="queued")
+
+    def test_sdk_can_use_sqlite_control_plane_backend(self, tmp_path: Path):
+        db_path = tmp_path / "control-plane.db"
+        client = PylonClient(
+            control_plane_backend="sqlite",
+            control_plane_path=str(db_path),
+        )
+        client.register_project("echo", _workflow_project("echo-project"))
+        result = client.run_workflow("echo", input_data={"msg": "hi"})
+        assert result.status == RunStatus.COMPLETED
+
+        reopened = PylonClient(
+            control_plane_backend="sqlite",
+            control_plane_path=str(db_path),
+        )
+        workflow = reopened.get_workflow("echo")
+        assert workflow.name == "echo-project"
+        runs = reopened.list_runs(workflow_id="echo")
+        assert len(runs) == 1
+        assert runs[0].run_id == result.run_id
+
     def test_run_callable_with_handler(self, client: PylonClient):
         client.register_callable("upper", lambda data: data.upper())
         result = client.run_callable("upper", input_data="hello")
@@ -304,6 +349,16 @@ class TestPylonClientWorkflows:
                 }
             ],
         }
+
+    def test_list_runs_returns_query_projected_runs(self, client: PylonClient):
+        client.register_project("w", _workflow_project("workflow-w"))
+        result = client.run_workflow("w")
+
+        runs = client.list_runs(workflow_id="w")
+
+        assert len(runs) == 1
+        assert runs[0].run_id == result.run_id
+        assert runs[0].execution_summary is not None
 
     def test_run_workflow_exposes_runtime_metadata(self, client: PylonClient):
         client.register_project("echo", _workflow_project("echo-project"))
@@ -494,6 +549,18 @@ class TestPylonClientWorkflows:
         assert cancelled.status == RunStatus.CANCELLED
         assert cancelled.stop_reason == RunStopReason.APPROVAL_DENIED
         assert cancelled.active_approval is None
+
+    def test_list_approvals_and_checkpoints(self, client: PylonClient):
+        client.register_project("approval", _approval_project())
+        result = client.run_workflow("approval")
+
+        approvals = client.list_approvals(workflow_id="approval")
+        checkpoints = client.list_checkpoints(run_id=result.run_id)
+
+        assert len(approvals) == 1
+        assert approvals[0]["run_id"] == result.run_id
+        assert len(checkpoints) == 1
+        assert checkpoints[0]["run_id"] == result.run_id
 
     def test_replay_checkpoint_returns_replay_payload(self, client: PylonClient):
         client.register_project("echo", _workflow_project("echo-project"))

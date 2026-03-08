@@ -40,6 +40,9 @@ def build_run_record(
     completed_at: str | None = None,
     view_kind: str = "run",
     replay: dict[str, Any] | None = None,
+    execution_mode: str = "inline",
+    queue_task_ids: list[str] | tuple[str, ...] = (),
+    record_version: int = 1,
 ) -> dict[str, Any]:
     """Build the canonical stored run record."""
     payload = {
@@ -48,6 +51,7 @@ def build_run_record(
         "project": project_name or workflow_id,
         "workflow": workflow_name or workflow_id,
         "workflow_id": workflow_id,
+        "execution_mode": execution_mode,
         "status": status.value,
         "stop_reason": stop_reason.value,
         "suspension_reason": suspension_reason.value,
@@ -70,7 +74,9 @@ def build_run_record(
         "state_hash": state_hash,
         "event_log": list(event_log),
         "checkpoint_ids": list(checkpoint_ids),
+        "queue_task_ids": list(queue_task_ids),
         "logs": list(logs),
+        "record_version": record_version,
         "created_at": created_at,
         "started_at": started_at,
     }
@@ -124,6 +130,9 @@ def rebuild_run_record(
         completed_at=run_record.get("completed_at"),
         view_kind=str(run_record.get("view_kind", "run")),
         replay=run_record.get("replay"),
+        execution_mode=str(run_record.get("execution_mode", "inline")),
+        queue_task_ids=list(run_record.get("queue_task_ids", [])),
+        record_version=int(run_record.get("record_version", 1)),
     )
     for key, value in run_record.items():
         if key not in payload:

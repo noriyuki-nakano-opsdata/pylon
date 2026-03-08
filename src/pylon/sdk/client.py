@@ -1,28 +1,22 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from pylon.approval import ApprovalManager, ApprovalRequest, ApprovalStore
 from pylon.config.pipeline import build_validation_report, validate_project_definition
-from pylon.dsl.parser import PylonProject, load_project
-from pylon.observability.query_service import (
-    build_replay_query_payload,
-    build_run_query_payload,
+from pylon.control_plane import (
+    ControlPlaneBackend,
+    ControlPlaneStoreConfig,
+    build_workflow_control_plane_store,
 )
-from pylon.observability.run_record import rebuild_run_record
-from pylon.repository.audit import AuditRepository, default_hmac_key
+from pylon.control_plane.workflow_service import WorkflowControlPlaneStore, WorkflowRunService
+from pylon.dsl.parser import PylonProject, load_project
+from pylon.observability.query_service import build_run_query_payload
 from pylon.runtime import (
-    execute_project_sync,
     execute_single_node_sync,
-    normalize_runtime_input,
-    plan_project_dispatch,
-    resume_project_sync,
     serialize_run,
 )
 from pylon.sdk.builder import WorkflowBuilder, WorkflowGraph
@@ -34,17 +28,8 @@ from pylon.sdk.project import (
     materialize_workflow_definition,
 )
 from pylon.types import RunStatus, RunStopReason
-from pylon.workflow.replay import ReplayEngine, resolve_replay_view_state
 
 logger = logging.getLogger(__name__)
-
-
-def _run_sync(coro: object) -> object:
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
 
 
 @dataclass
@@ -80,6 +65,7 @@ class WorkflowRun:
     status: RunStatus
     project_name: str | None = None
     view_kind: str = "run"
+    execution_mode: str = "inline"
     input_data: Any = None
     output: Any = None
     error: str | None = None
@@ -101,6 +87,7 @@ class WorkflowRun:
     approval_summary: dict[str, Any] | None = None
     execution_summary: dict[str, Any] | None = None
     checkpoint_ids: list[str] = field(default_factory=list)
+    queue_task_ids: list[str] = field(default_factory=list)
     logs: list[str] = field(default_factory=list)
     state_version: int = 0
     state_hash: str = ""
@@ -135,6 +122,9 @@ class PylonClient:
         timeout: int = 30,
         *,
         config: SDKConfig | None = None,
+        control_plane_store: WorkflowControlPlaneStore | None = None,
+        control_plane_backend: str | ControlPlaneBackend = ControlPlaneBackend.MEMORY,
+        control_plane_path: str | None = None,
     ) -> None:
         if config is not None:
             self._config = config
@@ -150,14 +140,29 @@ class PylonClient:
         self._run_payloads: dict[str, dict[str, Any]] = {}
         self._checkpoints: dict[str, dict[str, Any]] = {}
         self._approvals: dict[str, dict[str, Any]] = {}
-        self._workflow_projects: dict[str, PylonProject] = {}
-        self._workflow_node_handlers: dict[str, dict[str, Any]] = {}
-        self._workflow_agent_handlers: dict[str, dict[str, Any]] = {}
         self._callables: dict[str, Any] = {}
+        if control_plane_store is not None:
+            self._control_plane_store = control_plane_store
+        else:
+            backend = (
+                control_plane_backend
+                if isinstance(control_plane_backend, ControlPlaneBackend)
+                else ControlPlaneBackend(str(control_plane_backend))
+            )
+            self._control_plane_store = build_workflow_control_plane_store(
+                ControlPlaneStoreConfig(
+                    backend=backend,
+                    path=control_plane_path,
+                )
+            )
 
     @property
     def config(self) -> SDKConfig:
         return self._config
+
+    @property
+    def _workflow_service(self) -> WorkflowRunService:
+        return WorkflowRunService(self)
 
     # -- Agent CRUD ----------------------------------------------------------
 
@@ -225,6 +230,7 @@ class PylonClient:
             status=status,
             project_name=payload.get("project"),
             view_kind=str(payload.get("view_kind", "run")),
+            execution_mode=str(payload.get("execution_mode", "inline")),
             input_data=payload.get("input"),
             output=state.get("output"),
             error=payload.get("error"),
@@ -246,6 +252,7 @@ class PylonClient:
             approval_summary=payload.get("approval_summary"),
             execution_summary=payload.get("execution_summary"),
             checkpoint_ids=list(payload.get("checkpoint_ids", [])),
+            queue_task_ids=list(payload.get("queue_task_ids", [])),
             logs=list(payload.get("logs", [])),
             state_version=int(payload.get("state_version", 0)),
             state_hash=str(payload.get("state_hash", "")),
@@ -270,107 +277,209 @@ class PylonClient:
             "goal_enabled": project.goal is not None,
         }
 
+    def get_workflow_project(
+        self,
+        workflow_id: str,
+        *,
+        tenant_id: str = "default",
+    ) -> PylonProject | None:
+        project = self._control_plane_store.get_workflow_project(
+            workflow_id,
+            tenant_id=tenant_id,
+        )
+        if project is None and tenant_id != "default":
+            return self._control_plane_store.get_workflow_project(
+                workflow_id,
+                tenant_id="default",
+            )
+        return project
+
+    def get_run_record(self, run_id: str) -> dict[str, Any] | None:
+        payload = self._run_payloads.get(run_id)
+        if payload is None:
+            payload = self._control_plane_store.get_run_record(run_id)
+            if payload is not None:
+                self._run_payloads[run_id] = dict(payload)
+        return None if payload is None else dict(payload)
+
+    def put_run_record(
+        self,
+        run_record: dict[str, Any],
+        *,
+        workflow_id: str,
+        tenant_id: str = "default",
+        parameters: dict[str, Any] | None = None,
+        expected_record_version: int | None = None,
+    ) -> dict[str, Any]:
+        stored_payload = self._control_plane_store.put_run_record(
+            run_record,
+            workflow_id=workflow_id,
+            tenant_id=tenant_id,
+            parameters=parameters,
+            expected_record_version=expected_record_version,
+        )
+        run_id = str(stored_payload["id"])
+        self._run_payloads[run_id] = stored_payload
+        self._runs[run_id] = self._build_workflow_run(build_run_query_payload(stored_payload))
+        return stored_payload
+
+    def get_checkpoint_record(self, checkpoint_id: str) -> dict[str, Any] | None:
+        checkpoint = self._control_plane_store.get_checkpoint_record(checkpoint_id)
+        return None if checkpoint is None else dict(checkpoint)
+
+    def put_checkpoint_record(self, checkpoint_payload: dict[str, Any]) -> None:
+        self._control_plane_store.put_checkpoint_record(checkpoint_payload)
+        self._checkpoints[str(checkpoint_payload["id"])] = dict(checkpoint_payload)
+
+    def list_run_checkpoints(self, run_id: str) -> list[dict[str, Any]]:
+        checkpoints = self._control_plane_store.list_run_checkpoints(run_id)
+        self._checkpoints.update({str(cp["id"]): dict(cp) for cp in checkpoints})
+        return checkpoints
+
+    def get_approval_record(self, approval_id: str) -> dict[str, Any] | None:
+        approval = self._control_plane_store.get_approval_record(approval_id)
+        return None if approval is None else dict(approval)
+
+    def put_approval_record(self, approval_payload: dict[str, Any]) -> None:
+        self._control_plane_store.put_approval_record(approval_payload)
+        self._approvals[str(approval_payload["id"])] = dict(approval_payload)
+
+    def list_run_approvals(self, run_id: str) -> list[dict[str, Any]]:
+        approvals = self._control_plane_store.list_run_approvals(run_id)
+        self._approvals.update({str(ap["id"]): dict(ap) for ap in approvals})
+        return approvals
+
+    def get_node_handlers(self, workflow_id: str) -> dict[str, Any] | None:
+        return self._control_plane_store.get_node_handlers(workflow_id)
+
+    def get_agent_handlers(self, workflow_id: str) -> dict[str, Any] | None:
+        return self._control_plane_store.get_agent_handlers(workflow_id)
+
+    def list_all_run_records(self) -> list[dict[str, Any]]:
+        payloads = self._control_plane_store.list_all_run_records()
+        self._run_payloads.update({str(payload["id"]): dict(payload) for payload in payloads})
+        return payloads
+
+    def get_run_record_by_idempotency_key(
+        self,
+        workflow_id: str,
+        *,
+        tenant_id: str = "default",
+        idempotency_key: str,
+    ) -> dict[str, Any] | None:
+        payload = self._control_plane_store.get_run_record_by_idempotency_key(
+            workflow_id,
+            tenant_id=tenant_id,
+            idempotency_key=idempotency_key,
+        )
+        if payload is not None:
+            self._run_payloads[str(payload["id"])] = dict(payload)
+        return payload
+
+    def put_run_idempotency_key(
+        self,
+        workflow_id: str,
+        *,
+        tenant_id: str = "default",
+        idempotency_key: str,
+        run_id: str,
+    ) -> None:
+        self._control_plane_store.put_run_idempotency_key(
+            workflow_id,
+            tenant_id=tenant_id,
+            idempotency_key=idempotency_key,
+            run_id=run_id,
+        )
+        payload = self._control_plane_store.get_run_record(run_id)
+        if payload is not None:
+            payload["idempotency_key"] = idempotency_key
+            self._run_payloads[run_id] = payload
+            self._runs[run_id] = self._build_workflow_run(build_run_query_payload(payload))
+
+    def list_all_approval_records(self) -> list[dict[str, Any]]:
+        payloads = self._control_plane_store.list_all_approval_records()
+        self._approvals.update({str(payload["id"]): dict(payload) for payload in payloads})
+        return payloads
+
+    def get_audit_record(self, entry_id: int) -> dict[str, Any] | None:
+        return self._control_plane_store.get_audit_record(entry_id)
+
+    def get_last_audit_record(self) -> dict[str, Any] | None:
+        return self._control_plane_store.get_last_audit_record()
+
+    def put_audit_record(self, audit_payload: dict[str, Any]) -> None:
+        self._control_plane_store.put_audit_record(audit_payload)
+
+    def list_audit_records(
+        self,
+        *,
+        tenant_id: str | None = None,
+        event_type: str | None = None,
+        limit: int | None = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        return self._control_plane_store.list_audit_records(
+            tenant_id=tenant_id,
+            event_type=event_type,
+            limit=limit,
+            offset=offset,
+        )
+
+    def get_queue_task_record(self, task_id: str) -> dict[str, Any] | None:
+        return self._control_plane_store.get_queue_task_record(task_id)
+
+    def put_queue_task_record(self, task_payload: dict[str, Any]) -> None:
+        self._control_plane_store.put_queue_task_record(task_payload)
+
+    def delete_queue_task_record(self, task_id: str) -> bool:
+        return self._control_plane_store.delete_queue_task_record(task_id)
+
+    def list_queue_task_records(
+        self,
+        *,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self._control_plane_store.list_queue_task_records(status=status)
+
     def _persist_execution(
         self,
         payload: dict[str, Any],
         artifacts: Any,
     ) -> WorkflowRun:
         run_id = str(payload["id"])
-        stored_payload = dict(payload)
-        self._run_payloads[run_id] = stored_payload
+        stored_payload = self.put_run_record(
+            payload,
+            workflow_id=str(payload.get("workflow_id", payload.get("workflow", ""))),
+            parameters=payload.get("parameters", {}),
+        )
         for checkpoint in artifacts.checkpoints:
             checkpoint_payload = checkpoint.to_dict()
             checkpoint_payload["run_id"] = run_id
-            self._checkpoints[checkpoint.id] = checkpoint_payload
+            self.put_checkpoint_record(checkpoint_payload)
         for approval in artifacts.approvals:
             approval_payload = dict(approval)
             approval_payload["run_id"] = approval_payload.get("run_id") or approval_payload.get(
                 "context", {}
             ).get("run_id", run_id)
-            self._approvals[approval_payload["id"]] = approval_payload
+            self.put_approval_record(approval_payload)
         run = self._build_workflow_run(build_run_query_payload(stored_payload))
         self._runs[run_id] = run
         return run
-
-    def _checkpoint_payloads_for_run(self, run_id: str) -> list[dict[str, Any]]:
-        return [
-            dict(checkpoint)
-            for checkpoint in self._checkpoints.values()
-            if checkpoint.get("run_id") == run_id
-        ]
-
-    def _approval_payloads_for_run(self, run_id: str) -> list[dict[str, Any]]:
-        return [
-            dict(approval)
-            for approval in self._approvals.values()
-            if approval.get("run_id") == run_id
-        ]
-
-    def _approval_manager(self) -> tuple[ApprovalManager, ApprovalStore]:
-        store = ApprovalStore()
-        for payload in self._approvals.values():
-            try:
-                approval = ApprovalRequest.from_dict(payload)
-            except Exception as exc:
-                logger.warning(
-                    "Skipping malformed approval payload %s: %s",
-                    payload.get("id", "?"),
-                    exc,
-                )
-                continue
-            _run_sync(store.create(approval))
-        return (
-            ApprovalManager(
-                store,
-                AuditRepository(hmac_key=default_hmac_key()),
-            ),
-            store,
-        )
-
-    def _sync_approvals_from_store(self, store: ApprovalStore) -> None:
-        for stored_request in _run_sync(store.list()):
-            payload = stored_request.to_dict()
-            existing = self._approvals.get(payload["id"], {})
-            merged = {**existing, **payload}
-            if "run_id" not in merged:
-                merged["run_id"] = merged.get("context", {}).get("run_id", "")
-            self._approvals[payload["id"]] = merged
-
-    def _rebuild_run_payload(
-        self,
-        run_payload: dict[str, Any],
-        *,
-        status: RunStatus,
-        stop_reason: RunStopReason,
-        suspension_reason: RunStopReason,
-        active_approval: dict[str, Any] | None,
-        approval_request_id: str | None,
-    ) -> dict[str, Any]:
-        run_id = str(run_payload["id"])
-        updated = rebuild_run_record(
-            run_payload,
-            status=status,
-            stop_reason=stop_reason,
-            suspension_reason=suspension_reason,
-            active_approval=active_approval,
-            approvals=self._approval_payloads_for_run(run_id),
-            approval_request_id=approval_request_id,
-        )
-        self._run_payloads[run_id] = updated
-        self._runs[run_id] = self._build_workflow_run(build_run_query_payload(updated))
-        return updated
 
     def run_workflow(
         self,
         name: str,
         input_data: Any = None,
+        *,
+        idempotency_key: str | None = None,
+        execution_mode: str = "inline",
     ) -> WorkflowResult:
         """Execute a workflow synchronously and return the result.
 
         Workflow execution always uses the canonical compiled graph runtime.
         Ad hoc callable execution is exposed separately via ``run_callable``.
         """
-        project = self._workflow_projects.get(name)
+        project = self._control_plane_store.get_workflow_project(name)
         if project is None and name in self._callables:
             raise PylonClientError(
                 f"Workflow {name!r} is registered as a callable. Use run_callable() instead."
@@ -378,20 +487,15 @@ class PylonClient:
         if project is None:
             raise PylonClientError(f"Workflow {name!r} not found")
         try:
-            artifacts = execute_project_sync(
-                project,
-                input_data=normalize_runtime_input(input_data),
+            stored_run = self._workflow_service.start_run(
                 workflow_id=name,
-                node_handlers=self._workflow_node_handlers.get(name),
-                agent_handlers=self._workflow_agent_handlers.get(name),
-            )
-            payload = serialize_run(
-                artifacts,
-                project_name=project.name,
-                workflow_name=name,
                 input_data=input_data,
+                idempotency_key=idempotency_key,
+                execution_mode=execution_mode,
             )
-            run = self._persist_execution(payload, artifacts)
+            run = self._build_workflow_run(
+                self._workflow_service.get_run_payload(str(stored_run["id"]))
+            )
             run_id = run.run_id
 
             return WorkflowResult(
@@ -401,6 +505,10 @@ class PylonClient:
                 stop_reason=run.stop_reason,
                 suspension_reason=run.suspension_reason,
             )
+        except PylonClientError:
+            raise
+        except ValueError as exc:
+            raise PylonClientError(str(exc)) from exc
         except Exception:
             run_id = uuid.uuid4().hex[:12]
             logger.exception("Workflow %r run %s failed", name, run_id)
@@ -492,39 +600,43 @@ class PylonClient:
             ) from exc
         except WorkflowBuilderError as exc:
             raise PylonClientError(str(exc)) from exc
-        self._workflow_projects[name] = project
-        self._workflow_node_handlers[name] = dict(node_handlers)
-        self._workflow_agent_handlers[name] = dict(agent_handlers)
+        self._control_plane_store.register_workflow_project(name, project)
+        if hasattr(self._control_plane_store, "set_handlers"):
+            getattr(self._control_plane_store, "set_handlers")(
+                name,
+                node_handlers=dict(node_handlers),
+                agent_handlers=dict(agent_handlers),
+            )
 
     def list_workflows(self) -> list[dict[str, Any]]:
         """List canonical workflow definitions known to the client."""
         return [
             self._workflow_summary(name, project)
-            for name, project in self._workflow_projects.items()
+            for name, project in self._control_plane_store.list_workflow_projects()
         ]
 
     def get_workflow(self, name: str) -> PylonProject:
         """Retrieve a canonical workflow definition by its registered ID."""
-        if name not in self._workflow_projects:
+        project = self._control_plane_store.get_workflow_project(name)
+        if project is None:
             raise PylonClientError(f"Workflow {name!r} not found")
-        return self._workflow_projects[name]
+        return project
 
     def delete_workflow(self, name: str) -> None:
         """Delete a canonical workflow definition by its registered ID."""
-        if name not in self._workflow_projects:
+        if self._control_plane_store.get_workflow_project(name) is None:
             raise PylonClientError(f"Workflow {name!r} not found")
-        del self._workflow_projects[name]
-        self._workflow_node_handlers.pop(name, None)
-        self._workflow_agent_handlers.pop(name, None)
+        self._control_plane_store.remove_workflow_project(name, tenant_id="default")
 
     def plan_workflow(self, name: str, *, tenant_id: str = "default") -> dict[str, Any]:
         """Return the scheduler-oriented dispatch plan for a workflow."""
-        project = self.get_workflow(name)
-        return plan_project_dispatch(
-            project,
-            workflow_id=name,
-            tenant_id=tenant_id,
-        ).to_dict()
+        try:
+            return self._workflow_service.get_workflow_plan(
+                name,
+                tenant_id=tenant_id,
+            )
+        except KeyError as exc:
+            raise PylonClientError(str(exc)) from exc
 
     def register_callable(self, name: str, handler: Any) -> None:
         """Register an explicit ad hoc callable."""
@@ -571,39 +683,28 @@ class PylonClient:
             ) from exc
         except WorkflowBuilderError as exc:
             raise PylonClientError(str(exc)) from exc
-        self._workflow_projects[name] = project
-        self._workflow_node_handlers[name] = dict(node_handlers)
-        self._workflow_agent_handlers[name] = dict(agent_handlers)
+        self._control_plane_store.register_workflow_project(name, project)
+        if hasattr(self._control_plane_store, "set_handlers"):
+            getattr(self._control_plane_store, "set_handlers")(
+                name,
+                node_handlers=dict(node_handlers),
+                agent_handlers=dict(agent_handlers),
+            )
 
     def resume_run(self, run_id: str, input_data: Any = None) -> WorkflowRun:
         """Resume a paused workflow run through the canonical runtime."""
-        if run_id not in self._run_payloads:
-            raise PylonClientError(f"Run {run_id!r} not found")
-        run_payload = dict(self._run_payloads[run_id])
-        workflow_id = str(run_payload.get("workflow_id", run_payload.get("workflow", "")))
-        if not workflow_id:
-            raise PylonClientError(f"Run {run_id!r} has no associated workflow_id")
-        project = self.get_workflow(workflow_id)
-        raw_input = run_payload.get("input") if input_data is None else input_data
         try:
-            artifacts = resume_project_sync(
-                project,
-                run_payload,
-                input_data=normalize_runtime_input(raw_input),
-                checkpoints=self._checkpoint_payloads_for_run(run_id),
-                approvals=self._approval_payloads_for_run(run_id),
-                node_handlers=self._workflow_node_handlers.get(workflow_id),
-                agent_handlers=self._workflow_agent_handlers.get(workflow_id),
+            stored_run = self._workflow_service.resume_run(
+                run_id,
+                input_data=input_data,
             )
+        except KeyError as exc:
+            raise PylonClientError(str(exc)) from exc
         except ValueError as exc:
             raise PylonClientError(str(exc)) from exc
-        payload = serialize_run(
-            artifacts,
-            project_name=project.name,
-            workflow_name=workflow_id,
-            input_data=raw_input,
+        return self._build_workflow_run(
+            self._workflow_service.get_run_payload(str(stored_run["id"]))
         )
-        return self._persist_execution(payload, artifacts)
 
     def approve_request(
         self,
@@ -612,32 +713,19 @@ class PylonClient:
         reason: str | None = None,
     ) -> WorkflowRun:
         """Approve a pending approval request and resume its run."""
-        if approval_id not in self._approvals:
-            raise PylonClientError(f"Approval request {approval_id!r} not found")
-        request = self._approvals[approval_id]
-        if request.get("status") != "pending":
-            raise PylonClientError(f"Approval request already decided: {approval_id}")
-        run_id = str(request.get("run_id", ""))
-        if run_id not in self._run_payloads:
-            raise PylonClientError(f"Run {run_id!r} not found")
-
-        manager, store = self._approval_manager()
-        _run_sync(manager.approve(approval_id, "sdk", comment=reason or ""))
-        binding_plan = request.get("context", {}).get("binding_plan")
-        binding_effects = request.get("context", {}).get("binding_effect_envelope")
-        _run_sync(
-            manager.validate_binding(
+        try:
+            stored_run = self._workflow_service.approve_request(
                 approval_id,
-                plan=binding_plan,
-                effect_envelope=binding_effects,
+                actor="sdk",
+                reason=reason,
             )
+        except KeyError as exc:
+            raise PylonClientError(str(exc)) from exc
+        except ValueError as exc:
+            raise PylonClientError(str(exc)) from exc
+        return self._build_workflow_run(
+            self._workflow_service.get_run_payload(str(stored_run["id"]))
         )
-        self._sync_approvals_from_store(store)
-        decided = self._approvals[approval_id]
-        decided["decided_at"] = decided.get("decided_at") or datetime.now(UTC).isoformat()
-        if reason:
-            decided["reason"] = reason
-        return self.resume_run(run_id)
 
     def reject_request(
         self,
@@ -646,110 +734,67 @@ class PylonClient:
         reason: str | None = None,
     ) -> WorkflowRun:
         """Reject a pending approval request and cancel its run."""
-        if approval_id not in self._approvals:
-            raise PylonClientError(f"Approval request {approval_id!r} not found")
-        request = self._approvals[approval_id]
-        if request.get("status") != "pending":
-            raise PylonClientError(f"Approval request already decided: {approval_id}")
-        run_id = str(request.get("run_id", ""))
-        if run_id not in self._run_payloads:
-            raise PylonClientError(f"Run {run_id!r} not found")
-
-        manager, store = self._approval_manager()
-        _run_sync(manager.reject(approval_id, "sdk", reason or ""))
-        self._sync_approvals_from_store(store)
-        decided = self._approvals[approval_id]
-        decided["decided_at"] = decided.get("decided_at") or datetime.now(UTC).isoformat()
-        if reason:
-            decided["reason"] = reason
-
-        run_payload = dict(self._run_payloads[run_id])
-        run_payload.setdefault("logs", []).append(f"approval_rejected:{approval_id}")
-        return self._build_workflow_run(
-            self._rebuild_run_payload(
-                run_payload,
-                status=RunStatus.CANCELLED,
-                stop_reason=RunStopReason.APPROVAL_DENIED,
-                suspension_reason=RunStopReason.NONE,
-                active_approval=None,
-                approval_request_id=None,
+        try:
+            stored_run = self._workflow_service.reject_request(
+                approval_id,
+                actor="sdk",
+                reason=reason,
             )
+        except KeyError as exc:
+            raise PylonClientError(str(exc)) from exc
+        except ValueError as exc:
+            raise PylonClientError(str(exc)) from exc
+        return self._build_workflow_run(
+            self._workflow_service.get_run_payload(str(stored_run["id"]))
         )
 
     def replay_checkpoint(self, checkpoint_id: str) -> dict[str, Any]:
         """Replay a checkpoint and return the normalized replay payload."""
-        checkpoint = self._checkpoints.get(checkpoint_id)
-        if checkpoint is None:
-            raise PylonClientError(f"Checkpoint {checkpoint_id!r} not found")
-        source_run_id = str(checkpoint.get("run_id", ""))
-        source_run = self._run_payloads.get(source_run_id)
-        if source_run is None:
-            raise PylonClientError(f"Run {source_run_id!r} not found")
-
-        source_input = source_run.get("input")
-        replay_input = normalize_runtime_input(source_input) or {}
-        checkpoint_events = list(checkpoint.get("event_log", []))
-        source_events = list(source_run.get("event_log", []))
-        max_seq = max(
-            (
-                int(event.get("seq", 0))
-                for event in checkpoint_events
-                if event.get("seq") is not None
-            ),
-            default=0,
-        )
-        replay_events = source_events
-        if max_seq > 0 and source_events:
-            replay_events = [
-                event for event in source_events if int(event.get("seq", 0)) <= max_seq
-            ]
-        elif checkpoint_events:
-            replay_events = checkpoint_events
-
-        replayed = ReplayEngine.replay_event_log(
-            replay_events,
-            initial_state=replay_input,
-            source_status=RunStatus(str(source_run.get("status", RunStatus.COMPLETED.value))),
-            stop_reason=RunStopReason(
-                str(source_run.get("stop_reason", RunStopReason.NONE.value))
-            ),
-            suspension_reason=RunStopReason(
-                str(source_run.get("suspension_reason", RunStopReason.NONE.value))
-            ),
-            active_approval=source_run.get("active_approval"),
-        )
-        replay_view = resolve_replay_view_state(
-            source_status=RunStatus(str(source_run.get("status", RunStatus.COMPLETED.value))),
-            stop_reason=RunStopReason(
-                str(source_run.get("stop_reason", RunStopReason.NONE.value))
-            ),
-            suspension_reason=RunStopReason(
-                str(source_run.get("suspension_reason", RunStopReason.NONE.value))
-            ),
-            source_event_count=len(source_events),
-            replayed_event_count=len(replay_events),
-            active_approval=source_run.get("active_approval"),
-            approval_request_id=source_run.get("approval_request_id"),
-        )
-        return build_replay_query_payload(
-            source_run=source_run,
-            checkpoint_id=checkpoint_id,
-            replayed=replayed,
-            replay_view=replay_view,
-            approvals=(
-                self._approval_payloads_for_run(source_run_id)
-                if replay_view["is_terminal_replay"]
-                else []
-            ),
-        )
+        try:
+            return self._workflow_service.replay_checkpoint(checkpoint_id)
+        except KeyError as exc:
+            raise PylonClientError(str(exc)) from exc
 
     def get_run(self, run_id: str) -> WorkflowRun:
         """Retrieve the status of a workflow run by its ID.
 
         Raises PylonClientError if the run ID is unknown.
         """
-        if run_id not in self._run_payloads:
+        if self._control_plane_store.get_run_record(run_id) is None:
             raise PylonClientError(f"Run {run_id!r} not found")
-        payload = build_run_query_payload(self._run_payloads[run_id])
+        payload = self._workflow_service.get_run_payload(run_id)
+        self._run_payloads[run_id] = dict(payload)
         self._runs[run_id] = self._build_workflow_run(payload)
         return self._runs[run_id]
+
+    def list_runs(self, *, workflow_id: str | None = None) -> list[WorkflowRun]:
+        """List workflow runs projected through the canonical query service."""
+        payloads = self._workflow_service.list_run_payloads(workflow_id=workflow_id)
+        runs = [self._build_workflow_run(payload) for payload in payloads]
+        for run in runs:
+            self._runs[run.run_id] = run
+        return runs
+
+    def list_approvals(
+        self,
+        *,
+        workflow_id: str | None = None,
+        run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List approval records for operator-facing inspection."""
+        return self._workflow_service.list_approval_payloads(
+            workflow_id=workflow_id,
+            run_id=run_id,
+        )
+
+    def list_checkpoints(
+        self,
+        *,
+        workflow_id: str | None = None,
+        run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List checkpoint records for operator-facing inspection."""
+        return self._workflow_service.list_checkpoint_payloads(
+            workflow_id=workflow_id,
+            run_id=run_id,
+        )

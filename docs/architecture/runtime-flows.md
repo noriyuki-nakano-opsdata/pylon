@@ -226,7 +226,7 @@ Request
 
 ### Important note
 
-The route handlers still operate over an in-memory `RouteStore`, but that store now holds canonical workflow definitions, persisted run/checkpoint/approval payloads, and shared-runtime control-plane operations for resume, approval, and replay.
+The route handlers operate over a `RouteStore` facade that fronts a pluggable control-plane backend. The reference backends are `memory`, `json_file`, and `sqlite`, while resume, approval, replay, and query projections still flow through the shared runtime/control-plane services.
 
 ## 7. Approval Flow
 

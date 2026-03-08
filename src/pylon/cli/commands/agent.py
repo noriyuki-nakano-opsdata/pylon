@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import click
 
-from pylon.cli.state import load_state
+from pylon.cli.state import load_control_plane_store
 
 
 @click.group()
@@ -19,11 +19,14 @@ def agent_list(ctx: click.Context) -> None:
     from pylon.cli.main import get_ctx
     cli_ctx = get_ctx(ctx)
 
-    state = load_state()
+    store = load_control_plane_store()
     names: set[str] = set()
-    for run in state["runs"].values():
+    for run in store.list_all_run_records():
         for name in run.get("agents", []):
             names.add(name)
+    if not names:
+        for _, project in store.list_workflow_projects(tenant_id="default"):
+            names.update(project.agents.keys())
 
     data = [{"id": f"agent-{name}", "name": name, "state": "ready"} for name in sorted(names)]
     click.echo(cli_ctx.formatter.render(data))

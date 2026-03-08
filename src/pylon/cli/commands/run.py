@@ -8,10 +8,9 @@ from pathlib import Path
 import click
 
 from pylon.cli.errors import fail_command
-from pylon.cli.state import load_state, new_id, now_ts, save_state
+from pylon.cli.state import load_control_plane_store, load_state, new_id, now_ts, save_state
+from pylon.control_plane import WorkflowRunService
 from pylon.errors import ExitCode
-from pylon.observability.query_service import build_run_query_payload
-from pylon.runtime import execute_project_sync, normalize_runtime_input, serialize_run
 
 
 @click.command()
@@ -53,19 +52,15 @@ def run(ctx: click.Context, workflow: str | None, input_json: str | None) -> Non
     selected_workflow = workflow or "default"
     now = now_ts()
 
+    control_plane_store = load_control_plane_store()
+    control_plane_store.register_workflow_project(selected_workflow, project)
+    workflow_service = WorkflowRunService(control_plane_store)
     state = load_state()
-    artifacts = execute_project_sync(
-        project,
-        input_data=normalize_runtime_input(input_data),
+    stored_run = workflow_service.start_run(
         workflow_id=selected_workflow,
-    )
-    run_id = artifacts.run.id
-    run_record = serialize_run(
-        artifacts,
-        project_name=project.name,
-        workflow_name=selected_workflow,
         input_data=input_data,
     )
+    run_id = str(stored_run["id"])
 
     sandbox_id = new_id("sbx_")
     state["sandboxes"][sandbox_id] = {
@@ -75,24 +70,18 @@ def run(ctx: click.Context, workflow: str | None, input_json: str | None) -> Non
         "run_id": run_id,
         "created_at": now,
     }
-    run_record["sandbox_id"] = sandbox_id
-    run_record["project_path"] = str(Path.cwd())
-    run_record["agents"] = list(project.agents.keys())
-    run_record["nodes"] = list(project.workflow.nodes.keys())
-    run_record["updated_at"] = now
-    state["runs"][run_id] = run_record
-    for approval in artifacts.approvals:
-        approval_payload = dict(approval)
-        approval_payload["run_id"] = approval_payload.get("run_id") or approval_payload.get(
-            "context", {}
-        ).get("run_id", run_id)
-        state["approvals"][approval_payload["id"]] = approval_payload
-    for checkpoint in artifacts.checkpoints:
-        checkpoint_payload = checkpoint.to_dict()
-        checkpoint_payload["run_id"] = run_id
-        state["checkpoints"][checkpoint.id] = checkpoint_payload
+    stored_run["sandbox_id"] = sandbox_id
+    stored_run["project_path"] = str(Path.cwd())
+    stored_run["agents"] = list(project.agents.keys())
+    stored_run["nodes"] = list(project.workflow.nodes.keys())
+    stored_run["updated_at"] = now
+    control_plane_store.put_run_record(
+        stored_run,
+        workflow_id=selected_workflow,
+        parameters=stored_run.get("parameters", {}),
+    )
     save_state(state)
-    run_payload = build_run_query_payload(run_record)
+    run_payload = workflow_service.get_run_payload(run_id)
 
     click.echo(f"Starting workflow '{selected_workflow}' for project '{project.name}'")
     click.echo(f"Run ID: {run_id}")

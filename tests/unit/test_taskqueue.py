@@ -140,6 +140,72 @@ class TestTaskQueue:
         q.enqueue(task)
         assert q.requeue(task.id) is False  # still PENDING
 
+    def test_dequeue_with_lease_assigns_owner(self):
+        q = TaskQueue()
+        task = _task()
+        q.enqueue(task)
+
+        leased = q.dequeue_with_lease(
+            lease_owner="worker-1",
+            lease_timeout_seconds=30,
+        )
+
+        assert leased is not None
+        assert leased.status == TaskStatus.RUNNING
+        assert leased.lease_owner == "worker-1"
+        assert leased.lease_expires_at is not None
+        assert leased.last_heartbeat_at is not None
+
+    def test_heartbeat_extends_current_lease(self):
+        q = TaskQueue()
+        task = _task()
+        q.enqueue(task)
+        leased = q.dequeue_with_lease(
+            lease_owner="worker-1",
+            lease_timeout_seconds=10,
+            now=datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC),
+        )
+        assert leased is not None
+        original_expiry = leased.lease_expires_at
+
+        ok = q.heartbeat(
+            leased.id,
+            lease_owner="worker-1",
+            lease_timeout_seconds=10,
+            now=datetime(2026, 1, 1, 0, 0, 5, tzinfo=UTC),
+        )
+
+        assert ok is True
+        assert leased.lease_expires_at is not None
+        assert original_expiry is not None
+        assert leased.lease_expires_at > original_expiry
+
+    def test_recover_expired_leases_only_recovers_expired_tasks(self):
+        q = TaskQueue()
+        expired = _task("expired")
+        fresh = _task("fresh")
+        q.enqueue(expired)
+        q.enqueue(fresh)
+        q.dequeue_with_lease(
+            lease_owner="worker-1",
+            lease_timeout_seconds=1,
+            now=datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC),
+        )
+        q.dequeue_with_lease(
+            lease_owner="worker-2",
+            lease_timeout_seconds=30,
+            now=datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC),
+        )
+
+        recovered = q.recover_expired_leases(
+            now=datetime(2026, 1, 1, 0, 0, 2, tzinfo=UTC)
+        )
+
+        assert recovered == 1
+        assert expired.status == TaskStatus.PENDING
+        assert expired.retries == 1
+        assert fresh.status == TaskStatus.RUNNING
+
     def test_purge_removes_terminal_tasks(self):
         q = TaskQueue()
         t1 = _task("t1")

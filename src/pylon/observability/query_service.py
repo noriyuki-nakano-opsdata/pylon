@@ -19,6 +19,7 @@ def _base_run_kwargs(run_payload: Mapping[str, Any]) -> dict[str, Any]:
         "workflow_id": str(run_payload.get("workflow_id", run_payload.get("workflow", ""))),
         "project_name": run_payload.get("project"),
         "workflow_name": run_payload.get("workflow"),
+        "execution_mode": str(run_payload.get("execution_mode", "inline")),
         "status": RunStatus(str(run_payload.get("status", RunStatus.PENDING.value))),
         "stop_reason": RunStopReason(
             str(run_payload.get("stop_reason", RunStopReason.NONE.value))
@@ -43,6 +44,7 @@ def _base_run_kwargs(run_payload: Mapping[str, Any]) -> dict[str, Any]:
         "state_hash": str(run_payload.get("state_hash", "")),
         "event_log": list(run_payload.get("event_log", [])),
         "checkpoint_ids": list(run_payload.get("checkpoint_ids", [])),
+        "queue_task_ids": list(run_payload.get("queue_task_ids", [])),
         "logs": list(run_payload.get("logs", [])),
         "created_at": run_payload.get("created_at"),
         "started_at": run_payload.get("started_at"),

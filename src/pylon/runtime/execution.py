@@ -256,6 +256,8 @@ def execute_project_sync(
     provider_registry: ProviderRegistry | None = None,
     model_router: ModelRouter | None = None,
     llm_runtime: LLMRuntime | None = None,
+    approval_store: ApprovalStore | None = None,
+    approval_manager: ApprovalManager | None = None,
     node_handlers: dict[str, Any] | None = None,
     agent_handlers: dict[str, Any] | None = None,
     expected_resume_input: dict[str, Any] | None | object = _UNSET,
@@ -266,14 +268,17 @@ def execute_project_sync(
         repo = CheckpointRepository()
         for payload in existing_checkpoints:
             await repo.create(_checkpoint_from_payload(payload))
-        approval_store = ApprovalStore()
+        effective_approval_store = approval_store or ApprovalStore()
         for payload in existing_approvals:
-            await approval_store.create(_deserialize_approval(payload))
-        approval_manager = ApprovalManager(
-            approval_store,
+            await effective_approval_store.create(_deserialize_approval(payload))
+        effective_approval_manager = approval_manager or ApprovalManager(
+            effective_approval_store,
             AuditRepository(hmac_key=default_hmac_key()),
         )
-        executor = GraphExecutor(checkpoint_repo=repo, approval_manager=approval_manager)
+        executor = GraphExecutor(
+            checkpoint_repo=repo,
+            approval_manager=effective_approval_manager,
+        )
         graph = compile_project_graph(project)
         run = existing_run or WorkflowRun(id=f"run_{uuid.uuid4().hex}", workflow_id=workflow_id)
 
@@ -408,7 +413,7 @@ def execute_project_sync(
                     node_id,
                     goal_spec=goal_spec,
                 )
-                approval = await approval_manager.submit_request(
+                approval = await effective_approval_manager.submit_request(
                     agent_id=node.agent,
                     action=f"workflow.node:{node_id}",
                     autonomy_level=agent.to_autonomy_level(),
@@ -472,7 +477,7 @@ def execute_project_sync(
         checkpoints = tuple(await repo.list(workflow_run_id=executed.id))
         approvals = tuple(
             request.to_dict()
-            for request in await approval_store.list()
+            for request in await effective_approval_store.list()
             if request.context.get("run_id") == executed.id
         )
         return ExecutionArtifacts(
@@ -494,6 +499,8 @@ def resume_project_sync(
     provider_registry: ProviderRegistry | None = None,
     model_router: ModelRouter | None = None,
     llm_runtime: LLMRuntime | None = None,
+    approval_store: ApprovalStore | None = None,
+    approval_manager: ApprovalManager | None = None,
     node_handlers: dict[str, Any] | None = None,
     agent_handlers: dict[str, Any] | None = None,
 ) -> ExecutionArtifacts:
@@ -508,6 +515,8 @@ def resume_project_sync(
         provider_registry=provider_registry,
         model_router=model_router,
         llm_runtime=llm_runtime,
+        approval_store=approval_store,
+        approval_manager=approval_manager,
         node_handlers=node_handlers,
         agent_handlers=agent_handlers,
         expected_resume_input=normalize_runtime_input(run_payload.get("input")),

@@ -76,11 +76,34 @@ This runtime is deterministic in the sense that:
 
 ### CLI / API / SDK Surfaces
 
-These surfaces are still local-first and in-memory, but workflow execution now aligns through the shared runtime helpers in `pylon.runtime.execution`:
+These surfaces are still local-first, but workflow execution now aligns through the shared runtime helpers in `pylon.runtime.execution`:
 
-- `pylon.cli` stores local state in `$PYLON_HOME` / `~/.pylon`
-- `pylon.api` still uses an in-memory `RouteStore`, but it now registers canonical workflow definitions, executes workflow runs through the shared runtime, and exposes resume/approve/replay control-plane routes
-- `pylon.sdk.PylonClient` remains an in-memory client, but workflow execution now uses registered canonical definitions and SDK authoring surfaces (`WorkflowBuilder`, `WorkflowGraph`, `@workflow`) that materialize into `PylonProject`, while ad hoc callables remain on a separate explicit helper surface
+- `pylon.cli` stores local config/sandbox state in `$PYLON_HOME` / `~/.pylon` and persists workflow lifecycle data through `JsonFileWorkflowControlPlaneStore`
+- `pylon.api.RouteStore` is now an API facade over the shared control-plane store contract and can be backed by `memory`, `json_file`, or `sqlite`
+- `pylon.api.factory` now builds the standard API middleware stack from config,
+  including pluggable auth and rate-limit backends
+- the reference auth stack now includes HS256 JWT verification in addition to
+  memory- and file-backed service tokens
+- registered API routes now enforce scope-based authorization whenever an
+  authenticated principal is present, while unauthenticated local/reference
+  deployments continue to bypass scope checks
+- request/correlation ID propagation is now part of the standard API wiring, so
+  transport-level tracing has a stable contract across embedded HTTP and SDK use
+- `pylon.control_plane.WorkflowRunService` now owns shared start/resume/approve/reject/replay/list transitions for API and SDK surfaces
+- `pylon.sdk.PylonClient` remains a local client for embedded use, while
+  `pylon.sdk.PylonHTTPClient` now targets the same public workflow/control-plane
+  payloads over HTTP
+- workflow execution still uses registered canonical definitions and SDK
+  authoring surfaces (`WorkflowBuilder`, `WorkflowGraph`, `@workflow`) that
+  materialize into `PylonProject`, while ad hoc callables remain on a separate
+  explicit helper surface
+- `pylon.control_plane.JsonFileWorkflowControlPlaneStore` provides a durable JSON-backed reference store for workflow definitions, raw run records, checkpoints, and approvals
+- `pylon.control_plane.SQLiteWorkflowControlPlaneStore` provides a durable relational local backend with schema versioning, record-version compare-and-swap, and idempotency-key persistence
+- `pylon.control_plane.build_workflow_control_plane_store(...)` now selects `memory`, `json_file`, or `sqlite` backends behind the same store contract
+- `pylon.taskqueue.StoreBackedTaskQueue` and `pylon.runtime.QueuedWorkflowDispatchRunner` provide a durable local bridge from `distributed_wave_plan` to queue/worker execution without introducing a second workflow runtime, including lease ownership, heartbeat recovery, retry policy, and dead-letter semantics
+- `pylon.api.middleware` now supports pluggable token verification and pluggable
+  rate-limit stores, so tenant identity can be bound to authenticated service
+  tokens instead of relying only on `X-Tenant-ID`
 
 That means the public surfaces are still not distributed transports, but they now expose the same workflow run-state model.
 
@@ -95,7 +118,11 @@ Pylon now also exposes a scheduler-facing planning path:
 
 This is intentionally separate from execution. The canonical runtime remains the
 inline `GraphExecutor`; the wave plan is a deployment/planning surface for
-future queued or distributed runners.
+queued or distributed runners. The current queued runner consumes the dispatch
+plan through the durable task queue and now persists the same run/checkpoint
+query model as inline mode for straight-line agent DAGs. It is still not a
+full second workflow state machine: conditional edges, loops, routers, goals,
+and approval-gated execution remain inline-only semantics today.
 
 ### Command vs Query Model
 
@@ -104,6 +131,7 @@ Run persistence and operator-facing read models are now intentionally distinct.
 - command-side storage keeps raw run records
 - query-side builders derive `execution_summary`, `approval_summary`, and replay metadata
 - CLI/API/SDK all read through the same query projection layer
+- API/SDK write-side lifecycle operations now flow through the same `WorkflowRunService`
 
 ## Runtime Flow Summary
 
@@ -157,16 +185,16 @@ Remote metadata can contribute hints, but local policy stays authoritative.
 ```text
 pylon run
   -> load_project(".")
-  -> compile_project_graph(...)
-  -> execute_project_sync(...)
+  -> register local project in JsonFileWorkflowControlPlaneStore
+  -> WorkflowRunService.start_run(...)
     -> GraphExecutor.execute(...)
     -> checkpoint / approval / metrics collection
-  -> serialize_run(...)
-  -> write local run/checkpoint/sandbox/approval records
+    -> write raw run/checkpoint/approval records to $PYLON_HOME/control-plane.json
+  -> write local sandbox/config state to $PYLON_HOME/state.json
   -> render CLI output
 ```
 
-This is now a thin local-state wrapper around the shared workflow runtime.
+This is now a thin local wrapper around the shared workflow runtime and shared control-plane service.
 
 ### 5. SDK workflow authoring flow
 
@@ -303,8 +331,8 @@ The repository currently exposes three user-facing surfaces with different matur
 | Surface | Backing implementation | Current character |
 |---------|------------------------|-------------------|
 | CLI | `pylon.cli` + local JSON/YAML state | local developer workflow and demos |
-| API | `pylon.api` + in-memory `RouteStore` | lightweight embedded HTTP-style contract |
-| SDK | `pylon.sdk` | in-memory client/builder/decorator convenience layer |
+| API | `pylon.api` + pluggable `RouteStore` facade | lightweight embedded HTTP-style contract |
+| SDK | `pylon.sdk` | local client/builder/decorator layer plus thin HTTP client |
 
 The workflow core lives behind those surfaces rather than being uniformly wired through them.
 
@@ -379,6 +407,7 @@ The main gap is not absence of modules, but uneven maturity between:
 
 - [Runtime Flows](architecture/runtime-flows.md)
 - [Module Map](architecture/module-map.md)
+- [Production Readiness Plan](architecture/production-readiness-implementation-plan.md)
 - [Workflow/Safety Implementation Plan](architecture/workflow-safety-implementation-plan.md)
 - [Pylon vNext Target Architecture](architecture/pylon-vnext-target-architecture.md)
 - [Pylon vNext Type Design](architecture/pylon-vnext-type-design.md)

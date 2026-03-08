@@ -118,6 +118,14 @@ Current limitation:
   canonical runtime; use string conditions in the DSL/runtime graph for those
   cases
 
+Control-plane backend selection:
+
+- CLI can switch `memory`, `json_file`, and `sqlite` backends through
+  `control_plane.backend` / `control_plane.path` in `config.yaml`, or
+  `PYLON_CONTROL_PLANE_BACKEND` / `PYLON_CONTROL_PLANE_PATH`
+- SDK can switch backends through `PylonClient(control_plane_backend=..., control_plane_path=...)`
+- all backends share the same `WorkflowControlPlaneStore` contract
+
 ## Dispatch Planning
 
 Pylon now exposes a scheduler-oriented planning view without changing the
@@ -158,7 +166,7 @@ still uses `GraphExecutor` directly.
 | Agents | `pylon.agents` | Agent lifecycle, registry, pool, supervisor |
 | Approval | `pylon.approval` | Approval manager with plan/effect binding verification |
 | Protocols | `pylon.protocols.mcp`, `pylon.protocols.a2a` | MCP JSON-RPC server with OAuth, A2A tasks with peer delegation |
-| API / CLI / SDK | `pylon.api`, `pylon.cli`, `pylon.sdk` | Lightweight API server, local CLI, in-memory SDK client |
+| API / CLI / SDK | `pylon.api`, `pylon.cli`, `pylon.sdk` | Lightweight API server, local CLI, and SDK surfaces over the shared control plane |
 | DSL / Providers | `pylon.dsl`, `pylon.providers` | YAML/JSON workflow parser, LLM provider abstraction |
 | Persistence | `pylon.repository`, `pylon.state`, `pylon.events` | Workflow runs, checkpoints, audit log, state store, event bus |
 | Infra | `pylon.sandbox`, `pylon.secrets`, `pylon.tenancy` | Sandbox policy, secret storage, tenant context/isolation |
@@ -250,6 +258,7 @@ make format      # ruff format src tests
 - [Pylon vNext Target Architecture](docs/architecture/pylon-vnext-target-architecture.md) — target three-layer runtime-centered architecture
 - [Pylon vNext Type Design](docs/architecture/pylon-vnext-type-design.md) — proposed types for goals, termination, routing, and evaluation
 - [Pylon vNext Implementation Plan](docs/architecture/pylon-vnext-implementation-plan.md) — ordered delivery plan for bounded autonomy
+- [Production Readiness Plan](docs/architecture/production-readiness-implementation-plan.md) — required work to move from reference implementations to production backends
 - [Getting Started Guide](docs/getting-started.md) — installation, first project, programmatic API
 - [API Reference](docs/api-reference.md) — REST routes and middleware
 - [Implemented Specification](docs/SPECIFICATION.md) — full technical specification

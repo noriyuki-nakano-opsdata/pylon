@@ -10,6 +10,8 @@ from typing import Any
 
 import yaml
 
+from pylon.control_plane import JsonFileWorkflowControlPlaneStore, WorkflowRunService
+
 
 def _pylon_home() -> Path:
     env_home = Path.home()
@@ -31,6 +33,10 @@ def _state_path() -> Path:
 
 def _config_path() -> Path:
     return _pylon_home() / "config.yaml"
+
+
+def _control_plane_path() -> Path:
+    return _pylon_home() / "control-plane.json"
 
 
 def _default_state() -> dict[str, Any]:
@@ -64,6 +70,42 @@ def load_state() -> dict[str, Any]:
 
 def save_state(state: dict[str, Any]) -> None:
     _state_path().write_text(json.dumps(state, indent=2, default=str))
+
+
+def load_control_plane_store() -> JsonFileWorkflowControlPlaneStore:
+    store = JsonFileWorkflowControlPlaneStore(_control_plane_path())
+    _migrate_legacy_state(store)
+    return store
+
+
+def load_workflow_service() -> WorkflowRunService:
+    return WorkflowRunService(load_control_plane_store())
+
+
+def _migrate_legacy_state(store: JsonFileWorkflowControlPlaneStore) -> None:
+    legacy = load_state()
+    if (
+        store.list_all_run_records()
+        or not legacy["runs"]
+        and not legacy["checkpoints"]
+        and not legacy["approvals"]
+    ):
+        return
+    for run in legacy["runs"].values():
+        workflow_id = str(run.get("workflow_id", run.get("workflow", "")))
+        if not workflow_id:
+            continue
+        tenant_id = str(run.get("tenant_id", "default"))
+        store.put_run_record(
+            dict(run),
+            workflow_id=workflow_id,
+            tenant_id=tenant_id,
+            parameters=run.get("parameters", {}),
+        )
+    for checkpoint in legacy["checkpoints"].values():
+        store.put_checkpoint_record(dict(checkpoint))
+    for approval in legacy["approvals"].values():
+        store.put_approval_record(dict(approval))
 
 
 def load_config() -> dict[str, Any]:

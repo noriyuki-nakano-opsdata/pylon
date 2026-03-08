@@ -100,6 +100,13 @@ CREATE_AGENT_SCHEMA: Schema = {
 WORKFLOW_RUN_SCHEMA: Schema = {
     "input": FieldRule(required=False, field_type=dict, default={}),
     "parameters": FieldRule(required=False, field_type=dict, default={}),
+    "idempotency_key": FieldRule(required=False, field_type=str, default=""),
+    "execution_mode": FieldRule(
+        required=False,
+        field_type=str,
+        choices=["inline", "queued"],
+        default="inline",
+    ),
 }
 
 WORKFLOW_DEFINITION_SCHEMA: Schema = {
