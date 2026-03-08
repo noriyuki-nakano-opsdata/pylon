@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from pylon.providers.base import Message
+from pylon.types import AutonomyLevel
 
 try:
     import tiktoken
@@ -13,6 +15,34 @@ try:
     _HAS_TIKTOKEN = True
 except ImportError:
     _HAS_TIKTOKEN = False
+
+
+_A0_A1_KEYS = frozenset({"input", "task", "node_id"})
+_A2_KEYS = _A0_A1_KEYS | frozenset({"memory", "history"})
+_HISTORY_LIMIT = 5
+
+
+def project_context(
+    full_context: dict[str, Any],
+    autonomy_level: AutonomyLevel,
+) -> dict[str, Any]:
+    """Project workflow context based on agent autonomy level.
+
+    A0/A1: Only immediate task input and basic state
+    A2: Task + relevant memory entries + trimmed history
+    A3/A4: Full context including sibling results and goal state
+    """
+    if autonomy_level >= AutonomyLevel.A3:
+        return full_context
+
+    if autonomy_level <= AutonomyLevel.A1:
+        return {k: v for k, v in full_context.items() if k in _A0_A1_KEYS}
+
+    # A2: include memory and trimmed history
+    projected = {k: v for k, v in full_context.items() if k in _A2_KEYS}
+    if "history" in projected and isinstance(projected["history"], list):
+        projected["history"] = projected["history"][-_HISTORY_LIMIT:]
+    return projected
 
 
 def _estimate_message_tokens(messages: list[Message]) -> int:

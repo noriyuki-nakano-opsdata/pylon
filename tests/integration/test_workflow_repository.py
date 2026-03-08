@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from pylon.errors import WorkflowError
+from pylon.errors import ConcurrencyError, WorkflowError
 from pylon.repository.audit import AuditRepository
 from pylon.repository.checkpoint import Checkpoint, CheckpointRepository
 from pylon.repository.memory import (
@@ -180,6 +180,54 @@ async def test_workflow_run_list_with_filters():
 
     completed = await repo.list_runs(status=RunStatus.COMPLETED)
     assert len(completed) == 1
+
+
+# ---------- Optimistic Locking ----------
+
+
+async def test_update_run_correct_expected_version():
+    repo = WorkflowRepository()
+    run = WorkflowRun(workflow_id="wf-1", state_version=1)
+    await repo.create_run(run)
+
+    # Simulate a second copy (as a real DB would return a separate object)
+    run2 = WorkflowRun(
+        id=run.id, workflow_id="wf-1", state_version=2
+    )
+    updated = await repo.update_run(run2, expected_version=1)
+    assert updated.state_version == 2
+
+
+async def test_update_run_wrong_expected_version_raises():
+    repo = WorkflowRepository()
+    run = WorkflowRun(workflow_id="wf-1", state_version=3)
+    await repo.create_run(run)
+
+    run2 = WorkflowRun(
+        id=run.id, workflow_id="wf-1", state_version=4
+    )
+    with pytest.raises(ConcurrencyError, match="Version conflict"):
+        await repo.update_run(run2, expected_version=1)
+
+
+async def test_update_run_no_expected_version_skips_check():
+    repo = WorkflowRepository()
+    run = WorkflowRun(workflow_id="wf-1", state_version=5)
+    await repo.create_run(run)
+
+    run2 = WorkflowRun(
+        id=run.id, workflow_id="wf-1", state_version=6
+    )
+    updated = await repo.update_run(run2)
+    assert updated.state_version == 6
+
+
+def test_concurrency_error_is_retryable():
+    err = ConcurrencyError("conflict")
+    assert err.retryable is True
+    assert err.status_code == 409
+    assert err.code == "CONCURRENCY_CONFLICT"
+    assert err.category == "infrastructure"
 
 
 # ---------- AuditRepository ----------

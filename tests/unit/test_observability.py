@@ -12,7 +12,7 @@ from pylon.observability.exporters import (
     ExporterProtocol,
     InMemoryExporter,
 )
-from pylon.observability.logging import LogLevel, StructuredLogger
+from pylon.observability.logging import LogEntry, LogLevel, LogSink, StructuredLogger
 from pylon.observability.metrics import (
     PREDEFINED_METRICS,
     MetricsCollector,
@@ -274,6 +274,80 @@ class TestStructuredLogger:
         logger = StructuredLogger(context={"env": "prod"})
         entry = logger.info("msg", env="staging")
         assert entry.context["env"] == "staging"
+
+
+class TestStructuredLoggerRingBuffer:
+    def test_oldest_entries_evicted(self) -> None:
+        logger = StructuredLogger(max_entries=5)
+        for i in range(8):
+            logger.info(f"msg-{i}")
+        logs = logger.get_logs()
+        assert len(logs) == 5
+        # newest first
+        messages = [e.message for e in logs]
+        assert messages == ["msg-7", "msg-6", "msg-5", "msg-4", "msg-3"]
+
+    def test_default_max_entries(self) -> None:
+        logger = StructuredLogger()
+        # Just verify it accepts many entries without error
+        for i in range(100):
+            logger.info(f"msg-{i}")
+        assert len(logger.get_logs()) == 100
+
+
+class TestLogSink:
+    def test_sink_receives_entries(self) -> None:
+        collected: list[LogEntry] = []
+
+        class CollectorSink:
+            def emit(self, entry: LogEntry) -> None:
+                collected.append(entry)
+
+        logger = StructuredLogger()
+        logger.register_sink(CollectorSink())
+        logger.info("hello")
+        logger.error("boom")
+        assert len(collected) == 2
+        assert collected[0].message == "hello"
+        assert collected[1].message == "boom"
+
+    def test_sink_satisfies_protocol(self) -> None:
+        class MySink:
+            def emit(self, entry: LogEntry) -> None:
+                pass
+
+        assert isinstance(MySink(), LogSink)
+
+    def test_no_sinks_still_works(self) -> None:
+        logger = StructuredLogger()
+        entry = logger.info("works")
+        assert entry.message == "works"
+        assert len(logger.get_logs()) == 1
+
+    def test_sink_exception_does_not_crash_logger(self) -> None:
+        class BadSink:
+            def emit(self, entry: LogEntry) -> None:
+                raise RuntimeError("sink failure")
+
+        logger = StructuredLogger()
+        logger.register_sink(BadSink())
+        entry = logger.info("should not crash")
+        assert entry.message == "should not crash"
+        assert len(logger.get_logs()) == 1
+
+    def test_child_logger_shares_sinks(self) -> None:
+        collected: list[LogEntry] = []
+
+        class CollectorSink:
+            def emit(self, entry: LogEntry) -> None:
+                collected.append(entry)
+
+        logger = StructuredLogger()
+        logger.register_sink(CollectorSink())
+        child = logger.with_context(component="auth")
+        child.info("from child")
+        assert len(collected) == 1
+        assert collected[0].context["component"] == "auth"
 
 
 class TestExecutionSummary:

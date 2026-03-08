@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -42,6 +45,7 @@ class HookSystem:
     def __init__(self) -> None:
         self._hooks: dict[str, HookPoint] = {}
         self._subscriptions: dict[str, list[_HookSubscription]] = {}
+        self._reentrancy_guard: set[str] = set()
 
         for name, desc in _PREDEFINED_HOOKS:
             self.register_hook(name, desc)
@@ -97,30 +101,37 @@ class HookSystem:
         """Trigger a hook, executing all subscribed handlers in priority order."""
         if hook_name not in self._hooks:
             raise KeyError(f"Unknown hook: {hook_name}")
-        ctx = context or {}
-        results: list[HookResult] = []
-        for sub in self._subscriptions.get(hook_name, []):
-            start = time.monotonic()
-            try:
-                result = sub.handler(ctx)
-                duration = time.monotonic() - start
-                results.append(
-                    HookResult(
-                        handler_name=sub.handler_name,
-                        result=result,
-                        duration=duration,
+        if hook_name in self._reentrancy_guard:
+            logger.warning("Reentrant trigger of hook '%s' blocked", hook_name)
+            return []
+        self._reentrancy_guard.add(hook_name)
+        try:
+            ctx = context or {}
+            results: list[HookResult] = []
+            for sub in self._subscriptions.get(hook_name, []):
+                start = time.monotonic()
+                try:
+                    result = sub.handler(ctx)
+                    duration = time.monotonic() - start
+                    results.append(
+                        HookResult(
+                            handler_name=sub.handler_name,
+                            result=result,
+                            duration=duration,
+                        )
                     )
-                )
-            except Exception as e:
-                duration = time.monotonic() - start
-                results.append(
-                    HookResult(
-                        handler_name=sub.handler_name,
-                        error=str(e),
-                        duration=duration,
+                except Exception as e:
+                    duration = time.monotonic() - start
+                    results.append(
+                        HookResult(
+                            handler_name=sub.handler_name,
+                            error=str(e),
+                            duration=duration,
+                        )
                     )
-                )
-        return results
+            return results
+        finally:
+            self._reentrancy_guard.discard(hook_name)
 
     def subscriber_count(self, hook_name: str) -> int:
         return len(self._subscriptions.get(hook_name, []))

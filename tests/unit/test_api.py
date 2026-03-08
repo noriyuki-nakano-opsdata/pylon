@@ -169,7 +169,9 @@ class TestServerRouting:
         server, _ = _server_with_routes()
         resp = server.handle_request("GET", "/health")
         assert resp.status_code == 200
-        assert resp.body["status"] == "ok"
+        assert resp.body["status"] == "healthy"
+        assert "checks" in resp.body
+        assert "timestamp" in resp.body
 
     def test_not_found(self):
         server, _ = _server_with_routes()
@@ -979,3 +981,66 @@ class TestResponse:
     def test_json_body_none(self):
         resp = Response(body=None)
         assert resp.json_body() == ""
+
+
+# ---------------------------------------------------------------------------
+# Health check system
+# ---------------------------------------------------------------------------
+
+from pylon.api.health import HealthCheckResult, HealthChecker
+
+
+class TestHealthChecker:
+    def test_all_healthy(self):
+        checker = HealthChecker()
+        checker.register("db", lambda: HealthCheckResult(name="db", status="healthy"))
+        checker.register("cache", lambda: HealthCheckResult(name="cache", status="healthy"))
+        report = checker.run_all_sync()
+        assert report["status"] == "healthy"
+        assert len(report["checks"]) == 2
+        assert all(c["status"] == "healthy" for c in report["checks"])
+
+    def test_one_unhealthy_makes_overall_unhealthy(self):
+        checker = HealthChecker()
+        checker.register("db", lambda: HealthCheckResult(name="db", status="healthy"))
+        checker.register(
+            "cache",
+            lambda: HealthCheckResult(name="cache", status="unhealthy", message="down"),
+        )
+        report = checker.run_all_sync()
+        assert report["status"] == "unhealthy"
+
+    def test_degraded_status(self):
+        checker = HealthChecker()
+        checker.register("db", lambda: HealthCheckResult(name="db", status="healthy"))
+        checker.register(
+            "cache",
+            lambda: HealthCheckResult(name="cache", status="degraded", message="slow"),
+        )
+        report = checker.run_all_sync()
+        assert report["status"] == "degraded"
+
+    def test_exception_caught_as_unhealthy(self):
+        def failing_check() -> HealthCheckResult:
+            raise RuntimeError("connection refused")
+
+        checker = HealthChecker()
+        checker.register("db", failing_check)
+        report = checker.run_all_sync()
+        assert report["status"] == "unhealthy"
+        assert report["checks"][0]["name"] == "db"
+        assert report["checks"][0]["status"] == "unhealthy"
+        assert "connection refused" in report["checks"][0]["message"]
+
+    def test_health_endpoint_returns_proper_structure(self):
+        server, _ = _server_with_routes()
+        resp = server.handle_request("GET", "/health")
+        assert resp.status_code == 200
+        body = resp.body
+        assert body["status"] == "healthy"
+        assert isinstance(body["checks"], list)
+        assert len(body["checks"]) >= 1
+        system_check = body["checks"][0]
+        assert system_check["name"] == "system"
+        assert system_check["status"] == "healthy"
+        assert "timestamp" in body

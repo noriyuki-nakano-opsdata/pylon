@@ -511,3 +511,50 @@ class TestHookSystem:
         assert len(results) == 1
         assert results[0].error is not None
         assert "division by zero" in results[0].error
+
+    def test_reentrant_hook_is_blocked(self):
+        """A handler that triggers the same hook must not cause infinite recursion."""
+        hs = HookSystem()
+        call_count = 0
+
+        def recursive_handler(ctx: dict) -> None:
+            nonlocal call_count
+            call_count += 1
+            hs.trigger("on_error", {"recursive": True})
+
+        hs.subscribe("on_error", recursive_handler, handler_name="recursive")
+        results = hs.trigger("on_error")
+        assert call_count == 1
+        assert len(results) == 1
+
+    def test_different_hooks_not_blocked(self):
+        """Reentrancy guard is per-hook; different hooks fire normally."""
+        hs = HookSystem()
+        inner_results = []
+
+        def cross_hook_handler(ctx: dict) -> str:
+            r = hs.trigger("post_agent_create", {"from": "on_error"})
+            inner_results.extend(r)
+            return "outer"
+
+        hs.subscribe("on_error", cross_hook_handler, handler_name="cross")
+        hs.subscribe("post_agent_create", lambda ctx: "inner", handler_name="inner")
+        results = hs.trigger("on_error")
+        assert len(results) == 1
+        assert results[0].result == "outer"
+        assert len(inner_results) == 1
+        assert inner_results[0].result == "inner"
+
+    def test_guard_cleanup_allows_retrigger(self):
+        """After a hook completes, it can be triggered again."""
+        hs = HookSystem()
+        call_count = 0
+
+        def counting_handler(ctx: dict) -> None:
+            nonlocal call_count
+            call_count += 1
+
+        hs.subscribe("on_error", counting_handler, handler_name="counter")
+        hs.trigger("on_error")
+        hs.trigger("on_error")
+        assert call_count == 2

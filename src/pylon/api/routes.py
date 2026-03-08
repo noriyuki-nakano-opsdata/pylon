@@ -12,6 +12,7 @@ import time
 import uuid
 from typing import Any
 
+from pylon.api.health import build_default_checker
 from pylon.api.schemas import (
     APPROVAL_DECISION_SCHEMA,
     CREATE_AGENT_SCHEMA,
@@ -215,8 +216,13 @@ def register_routes(server: APIServer, store: RouteStore | None = None) -> Route
             s.approvals[approval_payload["id"]] = approval_payload
         return stored_run
 
+    checker = build_default_checker()
+
     def health(request: Request) -> Response:
-        return Response(body={"status": "ok", "timestamp": time.time()})
+        report = checker.run_all_sync()
+        status_code = 200 if report["status"] != "unhealthy" else 503
+        report["timestamp"] = time.time()
+        return Response(status_code=status_code, body=report)
 
     def create_agent(request: Request) -> Response:
         tenant_id = _require_tenant_id(request)

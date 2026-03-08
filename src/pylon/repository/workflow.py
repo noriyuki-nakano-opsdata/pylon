@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from pylon.errors import WorkflowError
+from pylon.errors import ConcurrencyError, WorkflowError
 from pylon.types import RunStatus, RunStopReason
 
 _VALID_RUN_TRANSITIONS: dict[RunStatus, set[RunStatus]] = {
@@ -169,7 +169,22 @@ class WorkflowRepository:
     async def get_run(self, id: str) -> WorkflowRun | None:
         return self._runs.get(id)
 
-    async def update_run(self, run: WorkflowRun) -> WorkflowRun:
+    async def update_run(
+        self, run: WorkflowRun, *, expected_version: int | None = None
+    ) -> WorkflowRun:
+        if expected_version is not None:
+            existing = self._runs.get(run.id)
+            current = existing.state_version if existing else 0
+            if current != expected_version:
+                raise ConcurrencyError(
+                    f"Version conflict on run {run.id}: "
+                    f"expected {expected_version}, got {current}",
+                    details={
+                        "run_id": run.id,
+                        "expected_version": expected_version,
+                        "current_version": current,
+                    },
+                )
         self._runs[run.id] = run
         return run
 
