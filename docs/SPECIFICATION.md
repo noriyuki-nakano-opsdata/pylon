@@ -556,6 +556,8 @@ The provider layer is intentionally small and does not depend on a larger agent 
 Routes implemented today:
 
 - `GET /health`
+- `GET /ready`
+- `GET /metrics`
 - `POST /agents`
 - `GET /agents`
 - `GET /agents/{id}`
@@ -596,12 +598,26 @@ is:
 - `runs:read`, `runs:write`
 - `approvals:read`, `approvals:write`
 - `checkpoints:read`
+- `observability:read`
 - `kill-switch:write`
 
 Scope matching supports exact values, namespace wildcards such as
 `workflows:*`, and global wildcard `*`. If authentication is disabled and no
 principal is present, route scope checks are skipped so local/reference
 deployments retain their existing behavior.
+
+When API observability is enabled, the standard middleware stack also includes
+request telemetry collection. The built-in Prometheus view exports low-cardinality
+transport metrics such as:
+
+- `api_request_count`
+- `api_request_duration_seconds`
+- `api_request_error_count`
+- `api_requests_in_flight`
+
+The reference API transport may also export structured telemetry to a durable
+JSONL sink. In that mode, request logs and spans use the same `request_id`,
+`correlation_id`, and `trace_id` contract exposed in HTTP response headers.
 
 ### 9.2 CLI
 
@@ -728,6 +744,7 @@ SDK control-plane methods now include:
 `pylon.api.middleware` currently provides:
 
 - `RequestContextMiddleware`
+- `RequestTelemetryMiddleware`
 - `AuthMiddleware`
 - `TenantMiddleware`
 - `RateLimitMiddleware`
@@ -741,6 +758,8 @@ SDK control-plane methods now include:
 - `AuthMiddlewareConfig`
 - `TenantMiddlewareConfig`
 - `RateLimitMiddlewareConfig`
+- `RequestContextMiddlewareConfig`
+- `APIObservabilityConfig`
 - `build_api_server(...)`
 - `build_http_api_server(...)`
 
@@ -750,6 +769,8 @@ Reference auth backends currently include:
 - `memory`
 - `json_file`
 - `jwt_hs256`
+- `jwt_jwks`
+- `jwt_oidc`
 
 `AuthMiddleware` can now use pluggable token verifiers and projects an
 authenticated principal into request context. `TenantMiddleware` derives the
@@ -758,8 +779,38 @@ binding and rejects mismatches between the two. The reference JWT verifier
 supports HS256 plus `iss` / `aud` / `exp` / `nbf` / `iat` validation and
 configurable tenant/subject/scopes claims. Route registration enforces
 server-side scope checks whenever an authenticated principal is present.
+The JWKS-backed verifier supports RSA-signed JWTs (`RS256` / `RS384` / `RS512`)
+against a file- or URL-backed JWKS source with cache TTL control and the same
+tenant/subject/scopes claim mapping contract. On key miss or signature failure,
+the verifier invalidates its cache and retries once before returning an auth
+error, so basic key rotation is handled without restarting the server.
+The OIDC-backed verifier extends the same contract by resolving `jwks_uri`
+through an OpenID Connect discovery document loaded from file path or URL, and
+uses the discovery issuer for claim validation when an explicit issuer is not
+configured. Both `jwt_jwks` and `jwt_oidc` default to eager bootstrap
+validation at server construction time and reject `http://` sources unless
+`auth.allow_insecure_http=true` is explicitly configured.
 `RateLimitMiddleware` accepts a pluggable token-bucket store and defaults to
-tenant-scoped buckets.
+tenant-scoped buckets. Bucket scope is configurable via
+`RateLimitMiddlewareConfig.bucket_scope` and currently supports:
+
+- `tenant`
+- `subject`
+- `token`
+- `tenant_subject`
+- `global`
+
+Successful responses echo the resolved bucket scope via `x-ratelimit-scope`.
+Fallback semantics are deterministic so missing principal or tenant context does
+not turn into a silent failure. Built-in rate-limit backends now include:
+
+- `memory`
+- `sqlite`
+- `redis`
+
+All three implement the same token-bucket contract. `redis` is the first
+backend intended for shared/distributed rate-limit state across processes or
+hosts.
 `RequestContextMiddleware` injects request/correlation IDs into request context
 and echoes them back on responses, so CLI/API/SDK transport logs can share the
 same correlation surface.

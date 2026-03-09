@@ -16,6 +16,10 @@ class MetricType(Enum):
 PREDEFINED_METRICS: dict[str, MetricType] = {
     "agent_task_duration": MetricType.HISTOGRAM,
     "agent_task_count": MetricType.COUNTER,
+    "api_request_count": MetricType.COUNTER,
+    "api_request_duration_seconds": MetricType.HISTOGRAM,
+    "api_request_error_count": MetricType.COUNTER,
+    "api_requests_in_flight": MetricType.GAUGE,
     "llm_token_usage": MetricType.COUNTER,
     "llm_cost_usd": MetricType.COUNTER,
     "model_route_count": MetricType.COUNTER,

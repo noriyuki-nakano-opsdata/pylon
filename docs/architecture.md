@@ -84,6 +84,14 @@ These surfaces are still local-first, but workflow execution now aligns through 
   including pluggable auth and rate-limit backends
 - the reference auth stack now includes HS256 JWT verification in addition to
   memory- and file-backed service tokens
+- the reference auth stack also supports JWKS-backed RSA JWT verification from
+  file or URL sources, which is the first managed-verifier-shaped backend in
+  the reference stack
+- the same verifier contract now also supports OIDC discovery documents,
+  including `jwks_uri` resolution and one-shot refresh on key rotation failure
+- trust bootstrap is now explicit in config: JWT discovery/JWKS sources are
+  validated eagerly at startup by default, and insecure `http://` sources are
+  rejected unless explicitly allowed
 - registered API routes now enforce scope-based authorization whenever an
   authenticated principal is present, while unauthenticated local/reference
   deployments continue to bypass scope checks
@@ -104,6 +112,12 @@ These surfaces are still local-first, but workflow execution now aligns through 
 - `pylon.api.middleware` now supports pluggable token verification and pluggable
   rate-limit stores, so tenant identity can be bound to authenticated service
   tokens instead of relying only on `X-Tenant-ID`
+- rate-limit bucket identity is now explicit in config, so the same API stack
+  can be tenant-scoped for reference deployments or principal/token-scoped for
+  production-style service isolation without changing route code
+- rate-limit storage now supports a Redis backend behind the same middleware
+  contract, so process-local reference deployments and shared/distributed
+  deployments do not need different route semantics
 
 That means the public surfaces are still not distributed transports, but they now expose the same workflow run-state model.
 
@@ -383,7 +397,11 @@ The cleanest way to reason about the system today is to split it into three matu
 Supporting modules already exist and are usable independently:
 
 - `events/`: in-memory pub/sub and dead letters
-- `observability/`: metrics, tracing, structured logging, exporters
+- `observability/`: metrics, tracing, structured logging, exporters, Prometheus rendering
+  - the reference API stack now projects request telemetry through these same primitives
+    and can expose `/ready` and `/metrics`
+  - the same request flow can optionally emit durable JSONL telemetry with shared
+    `request_id` / `correlation_id` / `trace_id` correlation
 - `taskqueue/`: priority queue, workers, retry, scheduler
 - `plugins/`: plugin manifests, loader, registry, hook system, extension protocols
 - `resources/`: rate limiting, quotas, pools, monitoring

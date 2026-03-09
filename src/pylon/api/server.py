@@ -52,6 +52,7 @@ class _Route:
     method: str
     pattern: re.Pattern[str]
     param_names: list[str]
+    path_template: str
     handler: HandlerFunc
 
 
@@ -80,6 +81,7 @@ class APIServer:
             method=method.upper(),
             pattern=pattern,
             param_names=param_names,
+            path_template=path,
             handler=handler,
         ))
 
@@ -125,6 +127,7 @@ class APIServer:
         match = route.pattern.match(request.path)
         if match:
             request.path_params = dict(zip(route.param_names, match.groups()))
+        request.context["route_template"] = route.path_template
 
         # Build middleware chain
         handler = route.handler

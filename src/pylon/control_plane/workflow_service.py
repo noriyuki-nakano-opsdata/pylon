@@ -523,6 +523,8 @@ class WorkflowRunService:
         project: PylonProject,
         input_data: Any,
         parameters: Mapping[str, Any] | None,
+        correlation_id: str | None = None,
+        trace_id: str | None = None,
     ) -> dict[str, Any]:
         run = WorkflowRun(workflow_id=workflow_id, tenant_id=tenant_id)
         run.start()
@@ -550,6 +552,8 @@ class WorkflowRunService:
             lease_timeout_seconds=lease_timeout_seconds,
             heartbeat_interval_seconds=heartbeat_interval_seconds,
             retry_policy=retry_policy,
+            correlation_id=correlation_id,
+            trace_id=trace_id,
         )
         queue_task_ids = [task.task_id for task in execution_plan.tasks]
         initial_queue_state = {
@@ -601,6 +605,8 @@ class WorkflowRunService:
             logs=["execution_mode:queued"],
             created_at=run.created_at.isoformat(),
             started_at=run.started_at.isoformat() if run.started_at is not None else None,
+            correlation_id=correlation_id,
+            trace_id=trace_id,
         )
         stored_run = self._store.put_run_record(
             run_record,
@@ -764,6 +770,8 @@ class WorkflowRunService:
                 created_at=run.created_at.isoformat(),
                 started_at=run.started_at.isoformat() if run.started_at is not None else None,
                 completed_at=run.completed_at.isoformat() if run.completed_at is not None else None,
+                correlation_id=correlation_id,
+                trace_id=trace_id,
             )
             stored_run = self._store.put_run_record(
                 run_record,
@@ -780,15 +788,24 @@ class WorkflowRunService:
             failed_task_ids = list(queue_summary.get("failed_task_ids", []))
             blocked_task_ids = list(queue_summary.get("blocked_task_ids", []))
             if dead_letter_task_ids:
+                logger.warning(
+                    "Queued run %s failed: exhausted retries for tasks %s",
+                    run.id, ", ".join(dead_letter_task_ids),
+                )
                 run.fail(
                     error="queued execution exhausted retries for tasks: "
                     + ", ".join(dead_letter_task_ids),
                     reason=RunStopReason.WORKFLOW_ERROR,
                 )
             elif failed_task_ids or blocked_task_ids:
+                all_failing = failed_task_ids + list(blocked_task_ids)
+                logger.warning(
+                    "Queued run %s failed: tasks %s",
+                    run.id, ", ".join(all_failing),
+                )
                 run.fail(
                     error="queued execution failed for tasks: "
-                    + ", ".join(failed_task_ids or blocked_task_ids),
+                    + ", ".join(all_failing),
                     reason=RunStopReason.WORKFLOW_ERROR,
                 )
             else:
@@ -823,6 +840,8 @@ class WorkflowRunService:
             created_at=run.created_at.isoformat(),
             started_at=run.started_at.isoformat() if run.started_at is not None else None,
             completed_at=run.completed_at.isoformat() if run.completed_at is not None else None,
+            correlation_id=correlation_id,
+            trace_id=trace_id,
         )
         return self._store.put_run_record(
             final_record,
@@ -871,7 +890,13 @@ class WorkflowRunService:
         parameters: Mapping[str, Any] | None = None,
         idempotency_key: str | None = None,
         execution_mode: str = "inline",
+        correlation_id: str | None = None,
+        trace_id: str | None = None,
     ) -> dict[str, Any]:
+        logger.info(
+            "start_run workflow_id=%s tenant_id=%s mode=%s",
+            workflow_id, tenant_id, execution_mode,
+        )
         normalized_idempotency_key = (idempotency_key or "").strip()
         if execution_mode not in {"inline", "queued"}:
             raise ValueError(f"Unsupported execution_mode: {execution_mode}")
@@ -893,6 +918,8 @@ class WorkflowRunService:
                 project=project,
                 input_data=input_data,
                 parameters=parameters,
+                correlation_id=correlation_id,
+                trace_id=trace_id,
             )
             if normalized_idempotency_key:
                 try:
@@ -934,6 +961,8 @@ class WorkflowRunService:
             project_name=project.name,
             workflow_name=workflow_id,
             input_data=input_data,
+            correlation_id=correlation_id,
+            trace_id=trace_id,
         )
         stored_run = self._persist_execution(
             workflow_id=workflow_id,
@@ -975,10 +1004,14 @@ class WorkflowRunService:
         *,
         tenant_id: str = "default",
         input_data: Any = None,
+        correlation_id: str | None = None,
+        trace_id: str | None = None,
     ) -> dict[str, Any]:
         run = self._store.get_run_record(run_id)
         if run is None:
             raise KeyError(f"Run not found: {run_id}")
+        resolved_correlation_id = correlation_id or run.get("correlation_id")
+        resolved_trace_id = trace_id or run.get("trace_id")
         expected_record_version = int(run.get("record_version", 1))
         workflow_id = str(run.get("workflow_id", run.get("workflow", "")))
         project = self._store.get_workflow_project(workflow_id, tenant_id=tenant_id)
@@ -1001,6 +1034,8 @@ class WorkflowRunService:
             project_name=project.name,
             workflow_name=workflow_id,
             input_data=raw_input,
+            correlation_id=resolved_correlation_id,
+            trace_id=resolved_trace_id,
         )
         return self._persist_execution(
             workflow_id=workflow_id,
@@ -1019,6 +1054,7 @@ class WorkflowRunService:
         actor: str,
         reason: str | None = None,
     ) -> dict[str, Any]:
+        logger.info("approve_request approval_id=%s actor=%s", approval_id, actor)
         approval = self._store.get_approval_record(approval_id)
         if approval is None:
             raise KeyError(f"Approval request not found: {approval_id}")
@@ -1054,6 +1090,7 @@ class WorkflowRunService:
         actor: str,
         reason: str | None = None,
     ) -> dict[str, Any]:
+        logger.info("reject_request approval_id=%s actor=%s", approval_id, actor)
         approval = self._store.get_approval_record(approval_id)
         if approval is None:
             raise KeyError(f"Approval request not found: {approval_id}")

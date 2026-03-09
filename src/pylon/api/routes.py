@@ -12,7 +12,8 @@ import uuid
 from typing import Any
 
 from pylon.api.authz import require_scopes
-from pylon.api.health import build_default_checker
+from pylon.api.health import build_default_checker, build_default_readiness_checker
+from pylon.api.observability import APIObservabilityBundle
 from pylon.api.schemas import (
     APPROVAL_DECISION_SCHEMA,
     CREATE_AGENT_SCHEMA,
@@ -279,6 +280,9 @@ def register_routes(
     control_plane_store: WorkflowControlPlaneStore | None = None,
     control_plane_backend: ControlPlaneBackend | str = ControlPlaneBackend.MEMORY,
     control_plane_path: str | None = None,
+    observability: APIObservabilityBundle | None = None,
+    readiness_route_enabled: bool = True,
+    metrics_route_enabled: bool = True,
 ) -> RouteStore:
     """Register all API routes on the server. Returns the store."""
     s = store or RouteStore(
@@ -286,6 +290,8 @@ def register_routes(
         control_plane_backend=control_plane_backend,
         control_plane_path=control_plane_path,
     )
+    if observability is not None:
+        setattr(s, "_observability", observability)
     workflow_service = WorkflowRunService(s)
 
     def _workflow_summary(
@@ -316,7 +322,12 @@ def register_routes(
             )
         return Response(status_code=403, body={"error": "Forbidden"})
 
-    checker = build_default_checker()
+    checker = observability.health_checker if observability is not None else build_default_checker()
+    readiness_checker = (
+        observability.readiness_checker
+        if observability is not None
+        else build_default_readiness_checker()
+    )
 
     def _scoped(
         handler: HandlerFunc,
@@ -337,6 +348,26 @@ def register_routes(
         status_code = 200 if report["status"] != "unhealthy" else 503
         report["timestamp"] = time.time()
         return Response(status_code=status_code, body=report)
+
+    def ready(request: Request) -> Response:
+        report = readiness_checker.run_all_sync()
+        ready_flag = report["status"] == "healthy"
+        report["timestamp"] = time.time()
+        report["ready"] = ready_flag
+        report["status"] = "ready" if ready_flag else "not_ready"
+        return Response(status_code=200 if ready_flag else 503, body=report)
+
+    def metrics(request: Request) -> Response:
+        if observability is None or observability.prometheus_exporter is None:
+            return Response(
+                status_code=404,
+                body={"error": "Metrics exporter not configured"},
+            )
+        observability.prometheus_exporter.export_metrics(observability.metrics.get_metrics())
+        return Response(
+            headers={"content-type": "text/plain; version=0.0.4; charset=utf-8"},
+            body=observability.prometheus_exporter.render_latest(),
+        )
 
     def create_agent(request: Request) -> Response:
         tenant_id = _require_tenant_id(request)
@@ -805,6 +836,14 @@ def register_routes(
         return Response(status_code=201, body=event)
 
     server.add_route("GET", "/health", health)
+    if readiness_route_enabled:
+        server.add_route("GET", "/ready", ready)
+    if metrics_route_enabled:
+        server.add_route(
+            "GET",
+            "/metrics",
+            _scoped(metrics, all_of=("observability:read",)),
+        )
     server.add_route(
         "POST", "/agents", _scoped(create_agent, all_of=("agents:write",))
     )

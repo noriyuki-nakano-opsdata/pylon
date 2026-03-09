@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -18,6 +19,8 @@ from pylon.taskqueue import (
     Worker,
 )
 from pylon.taskqueue.store_queue import TaskQueueStore
+
+logger = logging.getLogger(__name__)
 
 DispatchHandler = Callable[[WorkflowDispatchTask, Task], Any]
 
@@ -74,7 +77,11 @@ class QueuedWorkflowDispatchRunner:
         retry_policy: RetryPolicy | None = None,
         dead_letter_queue: DeadLetterQueue | None = None,
         recover_running_tasks: bool = True,
+        correlation_id: str | None = None,
+        trace_id: str | None = None,
     ) -> None:
+        self._correlation_id = correlation_id
+        self._trace_id = trace_id
         self._store = store
         self._queue = queue or StoreBackedTaskQueue(store)
         self._worker = worker or Worker(name="queue-runner")
@@ -89,6 +96,8 @@ class QueuedWorkflowDispatchRunner:
             self._recovered_running_tasks = self._queue.recover_expired_leases(
                 include_unleased=True
             )
+            if self._recovered_running_tasks:
+                logger.info("Recovered %d expired leases", self._recovered_running_tasks)
 
     @property
     def queue(self) -> StoreBackedTaskQueue:
@@ -128,21 +137,27 @@ class QueuedWorkflowDispatchRunner:
                 for state in dependency_states
             ):
                 continue
-            task = Task(
-                id=dispatch_task.task_id,
-                name=f"workflow-dispatch:{dispatch_task.node_id}",
-                priority=min(dispatch_task.wave_index, 9),
-                payload={
+            payload = {
                     "workflow_id": plan.workflow_id,
                     "tenant_id": plan.tenant_id,
                     "node_id": dispatch_task.node_id,
                     "wave_index": dispatch_task.wave_index,
                     "dependency_task_ids": list(dispatch_task.dependency_task_ids),
-                },
+            }
+            if self._correlation_id is not None:
+                payload["correlation_id"] = self._correlation_id
+            if self._trace_id is not None:
+                payload["trace_id"] = self._trace_id
+            task = Task(
+                id=dispatch_task.task_id,
+                name=f"workflow-dispatch:{dispatch_task.node_id}",
+                priority=min(dispatch_task.wave_index, 9),
+                payload=payload,
             )
             self._queue.enqueue(task)
             existing[task.id] = task
             enqueued.append(task.id)
+            logger.debug("Enqueued task %s for node %s", task.id, dispatch_task.node_id)
         return tuple(enqueued)
 
     def process_next(
@@ -295,6 +310,7 @@ class QueuedWorkflowDispatchRunner:
                     lease_timeout_seconds=self._lease_timeout_seconds,
                 )
                 if not ok:
+                    logger.warning("Heartbeat failed for task %s, lease lost", task.id)
                     break
                 with heartbeat_lock:
                     heartbeat_count += 1
@@ -324,6 +340,7 @@ class QueuedWorkflowDispatchRunner:
             return
         if self._retry_policy is not None and self._retry_policy.should_retry(task):
             delay_seconds = self._retry_policy.next_delay(task)
+            logger.info("Scheduling retry %d for task %s", task.retries + 1, task.id)
             task.payload["retry"] = {
                 "scheduled": True,
                 "delay_seconds": delay_seconds,
@@ -340,6 +357,7 @@ class QueuedWorkflowDispatchRunner:
                 }
                 self._queue.save(retry_task)
             return
+        logger.warning("Task %s dead-lettered after %d retries", task.id, task.retries)
         task.payload["dead_letter"] = True
         task.payload["retry"] = {
             "scheduled": False,

@@ -8,15 +8,26 @@ import time
 
 import pytest
 
+from pylon.api.factory import (
+    APIMiddlewareConfig,
+    APIServerConfig,
+    AuthBackend,
+    AuthMiddlewareConfig,
+    TenantMiddlewareConfig,
+    build_api_server,
+)
 from pylon.api.health import HealthChecker, HealthCheckResult
 from pylon.api.middleware import (
     AuthMiddleware,
     InMemoryRateLimitStore,
     InMemoryTokenVerifier,
     JsonFileTokenVerifier,
+    JWKSTokenVerifier,
     JWTTokenVerifier,
     MiddlewareChain,
+    RateLimitBucketScope,
     RateLimitMiddleware,
+    RedisRateLimitStore,
     RequestContextMiddleware,
     SecurityHeadersMiddleware,
     SQLiteRateLimitStore,
@@ -49,6 +60,47 @@ def _make_jwt(payload: dict[str, object], secret: str) -> str:
     signature = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
     signature_b64 = base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
     return f"{header}.{body}.{signature_b64}"
+
+
+def _make_rs256_jwt(
+    payload: dict[str, object],
+    *,
+    key_id: str = "test-key",
+) -> tuple[str, dict[str, object]]:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_key = private_key.public_key()
+    public_numbers = public_key.public_numbers()
+
+    def _b64_uint(value: int) -> str:
+        raw = value.to_bytes((value.bit_length() + 7) // 8, "big")
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+    jwks = {
+        "keys": [
+            {
+                "kty": "RSA",
+                "kid": key_id,
+                "use": "sig",
+                "alg": "RS256",
+                "n": _b64_uint(public_numbers.n),
+                "e": _b64_uint(public_numbers.e),
+            }
+        ]
+    }
+    header = base64.urlsafe_b64encode(
+        json.dumps({"alg": "RS256", "typ": "JWT", "kid": key_id}).encode("utf-8")
+    ).rstrip(b"=").decode("ascii")
+    body = base64.urlsafe_b64encode(
+        json.dumps(payload).encode("utf-8")
+    ).rstrip(b"=").decode("ascii")
+    signing_input = f"{header}.{body}".encode("ascii")
+    signature = private_key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+    signature_b64 = base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
+    token = f"{header}.{body}.{signature_b64}"
+    return token, jwks
 
 def _server_with_routes(**route_kwargs: object) -> tuple[APIServer, RouteStore]:
     """Create a server with all routes registered and default tenant context."""
@@ -211,6 +263,62 @@ class TestServerRouting:
         assert resp.body["status"] == "healthy"
         assert "checks" in resp.body
         assert "timestamp" in resp.body
+
+    def test_ready_endpoint(self):
+        server, _ = build_api_server(
+            APIServerConfig(
+                middleware=APIMiddlewareConfig(
+                    tenant=TenantMiddlewareConfig(require_tenant=False),
+                )
+            )
+        )
+
+        resp = server.handle_request("GET", "/ready")
+
+        assert resp.status_code == 200
+        assert resp.body["status"] == "ready"
+        assert resp.body["ready"] is True
+        assert "checks" in resp.body
+
+    def test_metrics_endpoint_renders_prometheus_text(self):
+        server, _ = build_api_server(
+            APIServerConfig(
+                middleware=APIMiddlewareConfig(
+                    auth=AuthMiddlewareConfig.from_mapping(
+                        {
+                            "backend": AuthBackend.MEMORY.value,
+                            "tokens": [
+                                {
+                                    "token": "obs-token",
+                                    "subject": "svc-observability",
+                                    "scopes": ["observability:read", "agents:write"],
+                                }
+                            ],
+                        }
+                    ),
+                    tenant=TenantMiddlewareConfig(require_tenant=False),
+                )
+            )
+        )
+        create = server.handle_request(
+            "POST",
+            "/agents",
+            headers={"Authorization": "Bearer obs-token"},
+            body={"name": "telemetry-agent"},
+        )
+        assert create.status_code == 201
+
+        metrics = server.handle_request(
+            "GET",
+            "/metrics",
+            headers={"Authorization": "Bearer obs-token"},
+        )
+
+        assert metrics.status_code == 200
+        assert metrics.headers["content-type"].startswith("text/plain")
+        assert "pylon_api_request_count" in metrics.body
+        assert 'route="/agents"' in metrics.body
+        assert create.headers["x-trace-id"]
 
     def test_not_found(self):
         server, _ = _server_with_routes()
@@ -945,6 +1053,43 @@ class TestAuthMiddleware:
         resp = server.handle_request("GET", "/health")
         assert resp.status_code == 200
 
+    def test_ready_skips_auth(self):
+        server, _ = _authed_server()
+        resp = server.handle_request("GET", "/ready")
+        assert resp.status_code == 200
+
+    def test_trace_id_header_is_emitted(self):
+        server = APIServer()
+        server.add_middleware(RequestContextMiddleware())
+        server.add_middleware(TenantMiddleware(require_tenant=False))
+
+        def handler(request: Request) -> Response:
+            request.context["trace_id"] = "trace-123"
+            return Response(body={"ok": True})
+
+        server.add_route("GET", "/trace", handler)
+
+        resp = server.handle_request("GET", "/trace")
+
+        assert resp.status_code == 200
+        assert resp.headers["x-trace-id"] == "trace-123"
+
+    def test_metrics_requires_observability_scope(self):
+        server = APIServer()
+        auth = AuthMiddleware(verifier=InMemoryTokenVerifier())
+        auth.add_token("limited-token", scopes=("runs:read",))
+        server.add_middleware(auth)
+        server.add_middleware(TenantMiddleware(require_tenant=False))
+        register_routes(server)
+
+        resp = server.handle_request(
+            "GET",
+            "/metrics",
+            headers={"Authorization": "Bearer limited-token"},
+        )
+
+        assert resp.status_code == 403
+
     def test_jwt_verifier_accepts_valid_hs256_token(self):
         now = int(time.time())
         token = _make_jwt(
@@ -1006,6 +1151,101 @@ class TestAuthMiddleware:
 
         with pytest.raises(ValueError, match="expired"):
             verifier.verify(token)
+
+    def test_jwks_verifier_accepts_valid_rs256_token(self):
+        token, jwks = _make_rs256_jwt(
+            {
+                "sub": "svc-jwks",
+                "tenant_id": "tenant-a",
+                "scope": "runs:read approvals:write",
+                "iss": "https://issuer.example",
+                "aud": "pylon-api",
+                "jti": "tok-rs256",
+                "exp": int(time.time()) + 60,
+            }
+        )
+        verifier = JWKSTokenVerifier(
+            jwks=jwks,
+            issuer="https://issuer.example",
+            audience=("pylon-api",),
+        )
+
+        principal = verifier.verify(token)
+
+        assert principal.subject == "svc-jwks"
+        assert principal.tenant_id == "tenant-a"
+        assert principal.scopes == ("runs:read", "approvals:write")
+        assert principal.token_id == "tok-rs256"
+
+    def test_jwks_verifier_accepts_oidc_discovery_source(self, tmp_path):
+        token, jwks = _make_rs256_jwt(
+            {
+                "sub": "svc-oidc",
+                "tenant_id": "tenant-a",
+                "scope": "runs:read",
+                "iss": "https://issuer.example",
+                "aud": "pylon-api",
+                "exp": int(time.time()) + 60,
+            }
+        )
+        jwks_path = tmp_path / "jwks.json"
+        jwks_path.write_text(json.dumps(jwks), encoding="utf-8")
+        discovery_path = tmp_path / "openid-configuration.json"
+        discovery_path.write_text(
+            json.dumps(
+                {
+                    "issuer": "https://issuer.example",
+                    "jwks_uri": str(jwks_path),
+                }
+            ),
+            encoding="utf-8",
+        )
+        verifier = JWKSTokenVerifier(
+            oidc_discovery=discovery_path,
+            audience=("pylon-api",),
+        )
+
+        principal = verifier.verify(token)
+
+        assert principal.subject == "svc-oidc"
+        assert principal.tenant_id == "tenant-a"
+
+    def test_jwks_verifier_refreshes_after_key_rotation(self, tmp_path):
+        token1, jwks1 = _make_rs256_jwt(
+            {
+                "sub": "svc-rotate-1",
+                "tenant_id": "tenant-a",
+                "iss": "https://issuer.example",
+                "aud": "pylon-api",
+                "exp": int(time.time()) + 60,
+            },
+            key_id="key-1",
+        )
+        token2, jwks2 = _make_rs256_jwt(
+            {
+                "sub": "svc-rotate-2",
+                "tenant_id": "tenant-a",
+                "iss": "https://issuer.example",
+                "aud": "pylon-api",
+                "exp": int(time.time()) + 60,
+            },
+            key_id="key-2",
+        )
+        jwks_path = tmp_path / "jwks.json"
+        jwks_path.write_text(json.dumps(jwks1), encoding="utf-8")
+        verifier = JWKSTokenVerifier(
+            jwks=jwks_path,
+            issuer="https://issuer.example",
+            audience=("pylon-api",),
+            cache_ttl_seconds=300.0,
+        )
+
+        first = verifier.verify(token1)
+        assert first.subject == "svc-rotate-1"
+
+        jwks_path.write_text(json.dumps(jwks2), encoding="utf-8")
+        second = verifier.verify(token2)
+        assert second.subject == "svc-rotate-2"
 
     def test_token_bound_principal_exposed_in_context(self):
         server = APIServer()
@@ -1259,6 +1499,35 @@ class TestTenantIsolationOnRoutes:
 
 
 class TestRateLimitMiddleware:
+    class _FakeRedisPipeline:
+        def __init__(self, buckets: dict[str, dict[str, str]]) -> None:
+            self._buckets = buckets
+
+        def watch(self, key: str) -> None:
+            self._key = key
+
+        def hgetall(self, key: str) -> dict[str, str]:
+            return dict(self._buckets.get(key, {}))
+
+        def multi(self) -> None:
+            return None
+
+        def hset(self, key: str, mapping: dict[str, float]) -> None:
+            self._buckets[key] = {name: str(value) for name, value in mapping.items()}
+
+        def execute(self) -> None:
+            return None
+
+        def reset(self) -> None:
+            return None
+
+    class _FakeRedisClient:
+        def __init__(self) -> None:
+            self._buckets: dict[str, dict[str, str]] = {}
+
+        def pipeline(self) -> "TestRateLimitMiddleware._FakeRedisPipeline":
+            return TestRateLimitMiddleware._FakeRedisPipeline(self._buckets)
+
     def test_allows_within_burst(self):
         server = APIServer()
         rl = RateLimitMiddleware(requests_per_second=100, burst=5)
@@ -1314,6 +1583,98 @@ class TestRateLimitMiddleware:
                 requests_per_second=0.001,
                 burst=1,
                 store=SQLiteRateLimitStore(tmp_path / "rate-limit.db"),
+            )
+        )
+        server_b.add_route("GET", "/test", lambda r: Response(body={"ok": True}))
+
+        first = server_a.handle_request("GET", "/test", headers={"X-Tenant-ID": "tenant-a"})
+        second = server_b.handle_request("GET", "/test", headers={"X-Tenant-ID": "tenant-a"})
+
+        assert first.status_code == 200
+        assert second.status_code == 429
+
+    def test_subject_bucket_scope_isolates_different_principals(self):
+        store = InMemoryRateLimitStore()
+        server = APIServer()
+        auth = AuthMiddleware(verifier=InMemoryTokenVerifier())
+        auth.add_token("token-a", subject="svc-a", tenant_id="tenant-a")
+        auth.add_token("token-b", subject="svc-b", tenant_id="tenant-a")
+        server.add_middleware(auth)
+        server.add_middleware(TenantMiddleware(require_tenant=True))
+        server.add_middleware(
+            RateLimitMiddleware(
+                requests_per_second=0.001,
+                burst=1,
+                store=store,
+                bucket_scope=RateLimitBucketScope.SUBJECT,
+            )
+        )
+        server.add_route("GET", "/test", lambda r: Response(body={"ok": True}))
+
+        first = server.handle_request(
+            "GET",
+            "/test",
+            headers={"Authorization": "Bearer token-a"},
+        )
+        second = server.handle_request(
+            "GET",
+            "/test",
+            headers={"Authorization": "Bearer token-b"},
+        )
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert first.headers["x-ratelimit-scope"] == "subject"
+
+    def test_token_bucket_scope_isolates_same_subject_with_different_tokens(self):
+        store = InMemoryRateLimitStore()
+        server = APIServer()
+        auth = AuthMiddleware(verifier=InMemoryTokenVerifier())
+        auth.add_token("token-a", subject="svc-a", tenant_id="tenant-a")
+        auth.add_token("token-b", subject="svc-a", tenant_id="tenant-a")
+        server.add_middleware(auth)
+        server.add_middleware(TenantMiddleware(require_tenant=True))
+        server.add_middleware(
+            RateLimitMiddleware(
+                requests_per_second=0.001,
+                burst=1,
+                store=store,
+                bucket_scope=RateLimitBucketScope.TOKEN,
+            )
+        )
+        server.add_route("GET", "/test", lambda r: Response(body={"ok": True}))
+
+        first = server.handle_request(
+            "GET",
+            "/test",
+            headers={"Authorization": "Bearer token-a"},
+        )
+        second = server.handle_request(
+            "GET",
+            "/test",
+            headers={"Authorization": "Bearer token-b"},
+        )
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert second.headers["x-ratelimit-scope"] == "token"
+
+    def test_redis_store_shares_bucket_state(self):
+        fake_client = self._FakeRedisClient()
+        store = RedisRateLimitStore(client=fake_client, key_prefix="pylon:test")
+        server_a = APIServer()
+        server_a.add_middleware(TenantMiddleware(require_tenant=True))
+        server_a.add_middleware(
+            RateLimitMiddleware(requests_per_second=0.001, burst=1, store=store)
+        )
+        server_a.add_route("GET", "/test", lambda r: Response(body={"ok": True}))
+        server_b = APIServer()
+        server_b.add_middleware(TenantMiddleware(require_tenant=True))
+        server_b.add_middleware(
+            RateLimitMiddleware(
+                requests_per_second=0.001,
+                burst=1,
+                store=RedisRateLimitStore(client=fake_client, key_prefix="pylon:test"),
             )
         )
         server_b.add_route("GET", "/test", lambda r: Response(body={"ok": True}))

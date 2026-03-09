@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import heapq
+import logging
 import threading
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from pylon.taskqueue.queue import Task, TaskStatus
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -57,6 +60,7 @@ class StoreBackedTaskQueue:
             task.status = TaskStatus.PENDING
             self._persist_task(task)
             heapq.heappush(self._heap, task)
+            logger.debug("Enqueued task %s (priority=%d)", task.id, task.priority)
             return task.id
 
     def dequeue(
@@ -84,6 +88,7 @@ class StoreBackedTaskQueue:
                     else:
                         current.transition_to(TaskStatus.RUNNING)
                     self._persist_task(current)
+                    logger.debug("Dequeued task %s (lease_owner=%s)", current.id, lease_owner)
                     return current
                 skipped += 1
             if skipped > 0:
@@ -107,6 +112,7 @@ class StoreBackedTaskQueue:
                 return False
             task.transition_to(TaskStatus.CANCELLED)
             self._persist_task(task)
+            logger.debug("Cancelled task %s", task_id)
             return True
 
     def get(self, task_id: str) -> Task | None:
@@ -141,6 +147,7 @@ class StoreBackedTaskQueue:
             task.reset_to_pending(increment_retries=True)
             self._persist_task(task)
             heapq.heappush(self._heap, task)
+            logger.debug("Requeued task %s (retries=%d)", task_id, task.retries)
             return True
 
     def heartbeat(
@@ -162,6 +169,7 @@ class StoreBackedTaskQueue:
             )
             if ok:
                 self._persist_task(task)
+            logger.debug("Heartbeat task %s owner=%s ok=%s", task_id, lease_owner, ok)
             return ok
 
     def recover_expired_leases(
@@ -185,6 +193,8 @@ class StoreBackedTaskQueue:
                 self._persist_task(task)
                 heapq.heappush(self._heap, task)
                 recovered += 1
+            if recovered:
+                logger.info("Recovered %d expired leases", recovered)
             return recovered
 
     def recover_running(self) -> int:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from pylon.dsl.parser import PylonProject
@@ -17,6 +18,7 @@ class InMemoryWorkflowControlPlaneStore:
         node_handlers: dict[str, dict[str, Any]] | None = None,
         agent_handlers: dict[str, dict[str, Any]] | None = None,
     ) -> None:
+        self._lock = threading.RLock()
         self._workflow_projects: dict[tuple[str, str], PylonProject] = {}
         self._workflow_runs_by_id: dict[str, dict[str, Any]] = {}
         self._checkpoints: dict[str, dict[str, Any]] = {}
@@ -42,11 +44,13 @@ class InMemoryWorkflowControlPlaneStore:
             if isinstance(project, PylonProject)
             else PylonProject.model_validate(project)
         )
-        self._workflow_projects[self._workflow_key(workflow_id, tenant_id)] = resolved
+        with self._lock:
+            self._workflow_projects[self._workflow_key(workflow_id, tenant_id)] = resolved
         return resolved
 
     def remove_workflow_project(self, workflow_id: str, *, tenant_id: str) -> None:
-        self._workflow_projects.pop(self._workflow_key(workflow_id, tenant_id), None)
+        with self._lock:
+            self._workflow_projects.pop(self._workflow_key(workflow_id, tenant_id), None)
 
     def get_workflow_project(
         self,
@@ -54,32 +58,36 @@ class InMemoryWorkflowControlPlaneStore:
         *,
         tenant_id: str = "default",
     ) -> PylonProject | None:
-        return self._workflow_projects.get(self._workflow_key(workflow_id, tenant_id))
+        with self._lock:
+            return self._workflow_projects.get(self._workflow_key(workflow_id, tenant_id))
 
     def list_workflow_projects(
         self,
         *,
         tenant_id: str = "default",
     ) -> list[tuple[str, PylonProject]]:
-        results = [
-            (workflow_id, project)
-            for (owner_tenant_id, workflow_id), project in self._workflow_projects.items()
-            if owner_tenant_id == tenant_id
-        ]
+        with self._lock:
+            results = [
+                (workflow_id, project)
+                for (owner_tenant_id, workflow_id), project in self._workflow_projects.items()
+                if owner_tenant_id == tenant_id
+            ]
         results.sort(key=lambda item: item[0])
         return results
 
     def list_all_workflow_projects(self) -> list[tuple[str, str, PylonProject]]:
-        results = [
-            (tenant_id, workflow_id, project)
-            for (tenant_id, workflow_id), project in self._workflow_projects.items()
-        ]
+        with self._lock:
+            results = [
+                (tenant_id, workflow_id, project)
+                for (tenant_id, workflow_id), project in self._workflow_projects.items()
+            ]
         results.sort(key=lambda item: (item[0], item[1]))
         return results
 
     def get_run_record(self, run_id: str) -> dict[str, Any] | None:
-        payload = self._workflow_runs_by_id.get(run_id)
-        return None if payload is None else dict(payload)
+        with self._lock:
+            payload = self._workflow_runs_by_id.get(run_id)
+            return None if payload is None else dict(payload)
 
     def put_run_record(
         self,
@@ -90,31 +98,33 @@ class InMemoryWorkflowControlPlaneStore:
         parameters: dict[str, Any] | None = None,
         expected_record_version: int | None = None,
     ) -> dict[str, Any]:
-        existing = self._workflow_runs_by_id.get(str(run_record["id"]))
-        current_version = (
-            int(existing.get("record_version", 0))
-            if isinstance(existing, dict)
-            else 0
-        )
-        if expected_record_version is not None and current_version != expected_record_version:
-            raise ConcurrencyError(
-                f"Run record version conflict for {run_record['id']}",
-                details={
-                    "run_id": str(run_record["id"]),
-                    "expected_record_version": expected_record_version,
-                    "actual_record_version": current_version,
-                },
+        with self._lock:
+            existing = self._workflow_runs_by_id.get(str(run_record["id"]))
+            current_version = (
+                int(existing.get("record_version", 0))
+                if isinstance(existing, dict)
+                else 0
             )
-        stored = dict(run_record)
-        stored["workflow_id"] = workflow_id
-        stored["tenant_id"] = tenant_id
-        stored["parameters"] = dict(parameters or {})
-        stored["record_version"] = current_version + 1
-        self._workflow_runs_by_id[str(stored["id"])] = stored
-        return stored
+            if expected_record_version is not None and current_version != expected_record_version:
+                raise ConcurrencyError(
+                    f"Run record version conflict for {run_record['id']}",
+                    details={
+                        "run_id": str(run_record["id"]),
+                        "expected_record_version": expected_record_version,
+                        "actual_record_version": current_version,
+                    },
+                )
+            stored = dict(run_record)
+            stored["workflow_id"] = workflow_id
+            stored["tenant_id"] = tenant_id
+            stored["parameters"] = dict(parameters or {})
+            stored["record_version"] = current_version + 1
+            self._workflow_runs_by_id[str(stored["id"])] = stored
+            return stored
 
     def list_all_run_records(self) -> list[dict[str, Any]]:
-        return [dict(payload) for payload in self._workflow_runs_by_id.values()]
+        with self._lock:
+            return [dict(payload) for payload in self._workflow_runs_by_id.values()]
 
     def get_run_record_by_idempotency_key(
         self,
@@ -123,10 +133,12 @@ class InMemoryWorkflowControlPlaneStore:
         tenant_id: str = "default",
         idempotency_key: str,
     ) -> dict[str, Any] | None:
-        run_id = self._idempotency_keys.get((tenant_id, workflow_id, idempotency_key))
-        if run_id is None:
-            return None
-        return self.get_run_record(run_id)
+        with self._lock:
+            run_id = self._idempotency_keys.get((tenant_id, workflow_id, idempotency_key))
+            if run_id is None:
+                return None
+            payload = self._workflow_runs_by_id.get(run_id)
+            return None if payload is None else dict(payload)
 
     def put_run_idempotency_key(
         self,
@@ -136,64 +148,75 @@ class InMemoryWorkflowControlPlaneStore:
         idempotency_key: str,
         run_id: str,
     ) -> None:
-        key = (tenant_id, workflow_id, idempotency_key)
-        existing_run_id = self._idempotency_keys.get(key)
-        if existing_run_id is not None and existing_run_id != run_id:
-            raise ConcurrencyError(
-                f"Idempotency key already bound for workflow {workflow_id}",
-                details={
-                    "workflow_id": workflow_id,
-                    "tenant_id": tenant_id,
-                    "idempotency_key": idempotency_key,
-                    "existing_run_id": existing_run_id,
-                    "run_id": run_id,
-                },
-            )
-        self._idempotency_keys[key] = run_id
+        with self._lock:
+            key = (tenant_id, workflow_id, idempotency_key)
+            existing_run_id = self._idempotency_keys.get(key)
+            if existing_run_id is not None and existing_run_id != run_id:
+                raise ConcurrencyError(
+                    f"Idempotency key already bound for workflow {workflow_id}",
+                    details={
+                        "workflow_id": workflow_id,
+                        "tenant_id": tenant_id,
+                        "idempotency_key": idempotency_key,
+                        "existing_run_id": existing_run_id,
+                        "run_id": run_id,
+                    },
+                )
+            self._idempotency_keys[key] = run_id
 
     def get_checkpoint_record(self, checkpoint_id: str) -> dict[str, Any] | None:
-        payload = self._checkpoints.get(checkpoint_id)
-        return None if payload is None else dict(payload)
+        with self._lock:
+            payload = self._checkpoints.get(checkpoint_id)
+            return None if payload is None else dict(payload)
 
     def put_checkpoint_record(self, checkpoint_payload: dict[str, Any]) -> None:
-        self._checkpoints[str(checkpoint_payload["id"])] = dict(checkpoint_payload)
+        with self._lock:
+            self._checkpoints[str(checkpoint_payload["id"])] = dict(checkpoint_payload)
 
     def list_run_checkpoints(self, run_id: str) -> list[dict[str, Any]]:
-        return [
-            dict(checkpoint)
-            for checkpoint in self._checkpoints.values()
-            if checkpoint.get("run_id") == run_id
-        ]
+        with self._lock:
+            return [
+                dict(checkpoint)
+                for checkpoint in self._checkpoints.values()
+                if checkpoint.get("run_id") == run_id
+            ]
 
     def get_approval_record(self, approval_id: str) -> dict[str, Any] | None:
-        payload = self._approvals.get(approval_id)
-        return None if payload is None else dict(payload)
+        with self._lock:
+            payload = self._approvals.get(approval_id)
+            return None if payload is None else dict(payload)
 
     def put_approval_record(self, approval_payload: dict[str, Any]) -> None:
-        self._approvals[str(approval_payload["id"])] = dict(approval_payload)
+        with self._lock:
+            self._approvals[str(approval_payload["id"])] = dict(approval_payload)
 
     def list_run_approvals(self, run_id: str) -> list[dict[str, Any]]:
-        return [
-            dict(approval)
-            for approval in self._approvals.values()
-            if approval.get("run_id") == run_id
-        ]
+        with self._lock:
+            return [
+                dict(approval)
+                for approval in self._approvals.values()
+                if approval.get("run_id") == run_id
+            ]
 
     def list_all_approval_records(self) -> list[dict[str, Any]]:
-        return [dict(payload) for payload in self._approvals.values()]
+        with self._lock:
+            return [dict(payload) for payload in self._approvals.values()]
 
     def get_audit_record(self, entry_id: int) -> dict[str, Any] | None:
-        payload = self._audit_entries.get(entry_id)
-        return None if payload is None else dict(payload)
+        with self._lock:
+            payload = self._audit_entries.get(entry_id)
+            return None if payload is None else dict(payload)
 
     def get_last_audit_record(self) -> dict[str, Any] | None:
-        if not self._audit_entries:
-            return None
-        last_id = max(self._audit_entries)
-        return dict(self._audit_entries[last_id])
+        with self._lock:
+            if not self._audit_entries:
+                return None
+            last_id = max(self._audit_entries)
+            return dict(self._audit_entries[last_id])
 
     def put_audit_record(self, audit_payload: dict[str, Any]) -> None:
-        self._audit_entries[int(audit_payload["id"])] = dict(audit_payload)
+        with self._lock:
+            self._audit_entries[int(audit_payload["id"])] = dict(audit_payload)
 
     def list_audit_records(
         self,
@@ -203,7 +226,8 @@ class InMemoryWorkflowControlPlaneStore:
         limit: int | None = 100,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        results = list(self._audit_entries.values())
+        with self._lock:
+            results = list(self._audit_entries.values())
         if tenant_id is not None:
             results = [entry for entry in results if entry.get("tenant_id") == tenant_id]
         if event_type is not None:
@@ -214,21 +238,25 @@ class InMemoryWorkflowControlPlaneStore:
         return [dict(entry) for entry in results[offset : offset + limit]]
 
     def get_queue_task_record(self, task_id: str) -> dict[str, Any] | None:
-        payload = self._queue_tasks.get(task_id)
-        return None if payload is None else dict(payload)
+        with self._lock:
+            payload = self._queue_tasks.get(task_id)
+            return None if payload is None else dict(payload)
 
     def put_queue_task_record(self, task_payload: dict[str, Any]) -> None:
-        self._queue_tasks[str(task_payload["id"])] = dict(task_payload)
+        with self._lock:
+            self._queue_tasks[str(task_payload["id"])] = dict(task_payload)
 
     def delete_queue_task_record(self, task_id: str) -> bool:
-        return self._queue_tasks.pop(task_id, None) is not None
+        with self._lock:
+            return self._queue_tasks.pop(task_id, None) is not None
 
     def list_queue_task_records(
         self,
         *,
         status: str | None = None,
     ) -> list[dict[str, Any]]:
-        results = list(self._queue_tasks.values())
+        with self._lock:
+            results = list(self._queue_tasks.values())
         if status is not None:
             results = [task for task in results if task.get("status") == status]
         results.sort(
@@ -240,12 +268,14 @@ class InMemoryWorkflowControlPlaneStore:
         return [dict(task) for task in results]
 
     def get_node_handlers(self, workflow_id: str) -> dict[str, Any] | None:
-        handlers = self._node_handlers.get(workflow_id)
-        return None if handlers is None else dict(handlers)
+        with self._lock:
+            handlers = self._node_handlers.get(workflow_id)
+            return None if handlers is None else dict(handlers)
 
     def get_agent_handlers(self, workflow_id: str) -> dict[str, Any] | None:
-        handlers = self._agent_handlers.get(workflow_id)
-        return None if handlers is None else dict(handlers)
+        with self._lock:
+            handlers = self._agent_handlers.get(workflow_id)
+            return None if handlers is None else dict(handlers)
 
     def set_handlers(
         self,
@@ -254,7 +284,8 @@ class InMemoryWorkflowControlPlaneStore:
         node_handlers: dict[str, Any] | None = None,
         agent_handlers: dict[str, Any] | None = None,
     ) -> None:
-        if node_handlers is not None:
-            self._node_handlers[workflow_id] = dict(node_handlers)
-        if agent_handlers is not None:
-            self._agent_handlers[workflow_id] = dict(agent_handlers)
+        with self._lock:
+            if node_handlers is not None:
+                self._node_handlers[workflow_id] = dict(node_handlers)
+            if agent_handlers is not None:
+                self._agent_handlers[workflow_id] = dict(agent_handlers)

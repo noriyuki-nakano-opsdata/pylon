@@ -562,6 +562,8 @@ def serialize_run(
     project_name: str | None = None,
     workflow_name: str | None = None,
     input_data: Any = None,
+    correlation_id: str | None = None,
+    trace_id: str | None = None,
 ) -> dict[str, Any]:
     """Serialize runtime execution artifacts into the canonical stored run record."""
     run = artifacts.run
@@ -616,4 +618,6 @@ def serialize_run(
         created_at=run.created_at.isoformat(),
         started_at=run.started_at.isoformat() if run.started_at else None,
         completed_at=run.completed_at.isoformat() if run.completed_at else None,
+        correlation_id=correlation_id,
+        trace_id=trace_id,
     )

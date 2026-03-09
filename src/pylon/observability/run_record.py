@@ -43,6 +43,8 @@ def build_run_record(
     execution_mode: str = "inline",
     queue_task_ids: list[str] | tuple[str, ...] = (),
     record_version: int = 1,
+    correlation_id: str | None = None,
+    trace_id: str | None = None,
 ) -> dict[str, Any]:
     """Build the canonical stored run record."""
     payload = {
@@ -79,9 +81,14 @@ def build_run_record(
         "record_version": record_version,
         "created_at": created_at,
         "started_at": started_at,
+        "completed_at": completed_at,
     }
     if replay is not None:
         payload["replay"] = dict(replay)
+    if correlation_id is not None:
+        payload["correlation_id"] = correlation_id
+    if trace_id is not None:
+        payload["trace_id"] = trace_id
     return payload
 
 
@@ -133,6 +140,8 @@ def rebuild_run_record(
         execution_mode=str(run_record.get("execution_mode", "inline")),
         queue_task_ids=list(run_record.get("queue_task_ids", [])),
         record_version=int(run_record.get("record_version", 1)),
+        correlation_id=run_record.get("correlation_id"),
+        trace_id=run_record.get("trace_id"),
     )
     for key, value in run_record.items():
         if key not in payload:

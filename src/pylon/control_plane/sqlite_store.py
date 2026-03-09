@@ -35,7 +35,7 @@ class SQLiteWorkflowControlPlaneStore:
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self._path)
+        connection = sqlite3.connect(self._path, timeout=30.0)
         connection.row_factory = sqlite3.Row
         return connection
 

@@ -74,6 +74,45 @@ def _make_jwt(payload: dict[str, object], secret: str) -> str:
     return f"{header}.{body}.{signature_b64}"
 
 
+def _make_rs256_jwt(
+    payload: dict[str, object],
+    *,
+    key_id: str = "test-key",
+) -> tuple[str, dict[str, object]]:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_numbers = private_key.public_key().public_numbers()
+
+    def _b64_uint(value: int) -> str:
+        raw = value.to_bytes((value.bit_length() + 7) // 8, "big")
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+    jwks = {
+        "keys": [
+            {
+                "kty": "RSA",
+                "kid": key_id,
+                "use": "sig",
+                "alg": "RS256",
+                "n": _b64_uint(public_numbers.n),
+                "e": _b64_uint(public_numbers.e),
+            }
+        ]
+    }
+    header = base64.urlsafe_b64encode(
+        json.dumps({"alg": "RS256", "typ": "JWT", "kid": key_id}).encode("utf-8")
+    ).rstrip(b"=").decode("ascii")
+    body = base64.urlsafe_b64encode(
+        json.dumps(payload).encode("utf-8")
+    ).rstrip(b"=").decode("ascii")
+    signing_input = f"{header}.{body}".encode("ascii")
+    signature = private_key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+    signature_b64 = base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
+    return f"{header}.{body}.{signature_b64}", jwks
+
+
 @pytest.fixture()
 def http_client(tmp_path: Path) -> PylonHTTPClient:
     http_server, _ = build_http_api_server(
@@ -109,6 +148,8 @@ def test_http_client_registers_and_fetches_workflow(http_client: PylonHTTPClient
     assert http_client.last_request_id
     assert http_client.last_response_headers["x-request-id"] == http_client.last_request_id
     assert http_client.last_response_headers["x-correlation-id"] == http_client.last_request_id
+    assert http_client.last_trace_id
+    assert http_client.last_response_headers["x-trace-id"] == http_client.last_trace_id
 
     listed = http_client.list_workflows()
     assert [item["id"] for item in listed] == ["echo"]
@@ -254,6 +295,115 @@ def test_http_client_can_use_jwt_bound_tenant_without_header(tmp_path: Path) -> 
         assert client.last_response_headers["x-correlation-id"] == "corr-http-jwt"
         listed = client.list_workflows()
         assert [item["id"] for item in listed] == ["jwt-echo"]
+    finally:
+        http_server.shutdown()
+        http_server.server_close()
+        thread.join(timeout=2.0)
+
+
+def test_http_client_can_use_jwks_bound_tenant_without_header(tmp_path: Path) -> None:
+    token, jwks = _make_rs256_jwt(
+        {
+            "sub": "svc-jwks",
+            "tenant_id": "tenant-a",
+            "scope": "workflows:write workflows:read",
+            "iss": "https://issuer.example",
+            "aud": "pylon-api",
+            "exp": int(time.time()) + 60,
+        }
+    )
+    jwks_path = tmp_path / "jwks.json"
+    jwks_path.write_text(json.dumps(jwks), encoding="utf-8")
+    http_server, _ = build_http_api_server(
+        APIServerConfig(
+            middleware=APIMiddlewareConfig(
+                auth=AuthMiddlewareConfig(
+                    backend=AuthBackend.JWT_JWKS,
+                    jwks_path=str(jwks_path),
+                    jwt_issuer="https://issuer.example",
+                    jwt_audience=("pylon-api",),
+                ),
+                tenant=TenantMiddlewareConfig(require_tenant=True),
+            ),
+            control_plane=ControlPlaneStoreConfig(
+                backend=ControlPlaneBackend.SQLITE,
+                path=str(tmp_path / "cp.db"),
+            ),
+        ),
+        host="127.0.0.1",
+        port=0,
+    )
+    thread = threading.Thread(target=http_server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = PylonHTTPClient(
+            base_url=f"http://127.0.0.1:{http_server.server_port}",
+            api_key=token,
+            tenant_id=None,
+        )
+        created = client.register_project("jwks-echo", _workflow_project("jwks-echo"))
+        assert created["tenant_id"] == "tenant-a"
+        listed = client.list_workflows()
+        assert [item["id"] for item in listed] == ["jwks-echo"]
+    finally:
+        http_server.shutdown()
+        http_server.server_close()
+        thread.join(timeout=2.0)
+
+
+def test_http_client_can_use_oidc_bound_tenant_without_header(tmp_path: Path) -> None:
+    token, jwks = _make_rs256_jwt(
+        {
+            "sub": "svc-oidc",
+            "tenant_id": "tenant-a",
+            "scope": "workflows:write workflows:read",
+            "iss": "https://issuer.example",
+            "aud": "pylon-api",
+            "exp": int(time.time()) + 60,
+        }
+    )
+    jwks_path = tmp_path / "jwks.json"
+    jwks_path.write_text(json.dumps(jwks), encoding="utf-8")
+    discovery_path = tmp_path / "openid-configuration.json"
+    discovery_path.write_text(
+        json.dumps(
+            {
+                "issuer": "https://issuer.example",
+                "jwks_uri": str(jwks_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    http_server, _ = build_http_api_server(
+        APIServerConfig(
+            middleware=APIMiddlewareConfig(
+                auth=AuthMiddlewareConfig(
+                    backend=AuthBackend.JWT_OIDC,
+                    oidc_discovery_path=str(discovery_path),
+                    jwt_audience=("pylon-api",),
+                ),
+                tenant=TenantMiddlewareConfig(require_tenant=True),
+            ),
+            control_plane=ControlPlaneStoreConfig(
+                backend=ControlPlaneBackend.SQLITE,
+                path=str(tmp_path / "cp.db"),
+            ),
+        ),
+        host="127.0.0.1",
+        port=0,
+    )
+    thread = threading.Thread(target=http_server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = PylonHTTPClient(
+            base_url=f"http://127.0.0.1:{http_server.server_port}",
+            api_key=token,
+            tenant_id=None,
+        )
+        created = client.register_project("oidc-echo", _workflow_project("oidc-echo"))
+        assert created["tenant_id"] == "tenant-a"
+        listed = client.list_workflows()
+        assert [item["id"] for item in listed] == ["oidc-echo"]
     finally:
         http_server.shutdown()
         http_server.server_close()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ class JsonFileWorkflowControlPlaneStore:
         node_handlers: dict[str, dict[str, Any]] | None = None,
         agent_handlers: dict[str, dict[str, Any]] | None = None,
     ) -> None:
+        self._lock = threading.RLock()
         self._path = Path(path)
         self._node_handlers = dict(node_handlers or {})
         self._agent_handlers = dict(agent_handlers or {})
@@ -52,7 +54,8 @@ class JsonFileWorkflowControlPlaneStore:
         if not self._path.exists():
             return _default_state()
         try:
-            raw = json.loads(self._path.read_text())
+            with self._lock:
+                raw = json.loads(self._path.read_text())
         except json.JSONDecodeError as exc:
             raise ValueError(f"Invalid control-plane state file: {self._path}") from exc
         if not isinstance(raw, dict):
@@ -76,9 +79,10 @@ class JsonFileWorkflowControlPlaneStore:
         return state
 
     def _write_state(self, state: dict[str, Any]) -> None:
-        tmp_path = self._path.with_suffix(self._path.suffix + ".tmp")
-        tmp_path.write_text(json.dumps(state, indent=2, sort_keys=True, default=str))
-        tmp_path.replace(self._path)
+        with self._lock:
+            tmp_path = self._path.with_suffix(self._path.suffix + ".tmp")
+            tmp_path.write_text(json.dumps(state, indent=2, sort_keys=True, default=str))
+            tmp_path.replace(self._path)
 
     def register_workflow_project(
         self,

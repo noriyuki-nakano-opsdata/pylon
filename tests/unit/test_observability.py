@@ -9,8 +9,11 @@ import pytest
 from pylon.observability.execution_summary import build_execution_summary
 from pylon.observability.exporters import (
     ConsoleExporter,
+    ExporterLogSink,
     ExporterProtocol,
     InMemoryExporter,
+    JSONLinesExporter,
+    PrometheusExporter,
 )
 from pylon.observability.logging import LogEntry, LogLevel, LogSink, StructuredLogger
 from pylon.observability.metrics import (
@@ -106,6 +109,10 @@ class TestPredefinedMetrics:
         expected = {
             "agent_task_duration",
             "agent_task_count",
+            "api_request_count",
+            "api_request_duration_seconds",
+            "api_request_error_count",
+            "api_requests_in_flight",
             "llm_cost_usd",
             "llm_token_usage",
             "model_route_count",
@@ -118,12 +125,17 @@ class TestPredefinedMetrics:
         metrics = mc.get_metrics()
         counter_names = {c["name"] for c in metrics["counters"]}
         histogram_names = {h["name"] for h in metrics["histograms"]}
+        gauge_names = {g["name"] for g in metrics["gauges"]}
         assert "agent_task_count" in counter_names
+        assert "api_request_count" in counter_names
+        assert "api_request_error_count" in counter_names
         assert "llm_cost_usd" in counter_names
         assert "llm_token_usage" in counter_names
         assert "model_route_count" in counter_names
         assert "workflow_step_count" in counter_names
         assert "agent_task_duration" in histogram_names
+        assert "api_request_duration_seconds" in histogram_names
+        assert "api_requests_in_flight" in gauge_names
 
     def test_predefined_counter_increments(self) -> None:
         mc = MetricsCollector()
@@ -564,3 +576,59 @@ class TestInMemoryExporter:
         assert exp.metrics == []
         assert exp.spans == []
         assert exp.logs == []
+
+
+class TestPrometheusExporter:
+    def test_render_metrics_snapshot(self) -> None:
+        collector = MetricsCollector()
+        collector.counter(
+            "api_request_count",
+            2,
+            labels={"method": "GET", "route": "/agents", "status_class": "2xx"},
+        )
+        collector.histogram(
+            "api_request_duration_seconds",
+            0.25,
+            labels={"method": "GET", "route": "/agents", "status_class": "2xx"},
+        )
+        collector.gauge("api_requests_in_flight", 1.0)
+        exporter = PrometheusExporter(namespace="pylon")
+
+        exporter.export_metrics(collector.get_metrics())
+        rendered = exporter.render_latest()
+
+        assert "pylon_api_request_count" in rendered
+        assert 'route="/agents"' in rendered
+        assert "pylon_api_request_duration_seconds_count" in rendered
+        assert "pylon_api_requests_in_flight" in rendered
+
+
+class TestJSONLinesExporter:
+    def test_writes_metrics_spans_and_logs(self, tmp_path) -> None:
+        path = tmp_path / "telemetry.jsonl"
+        exporter = JSONLinesExporter(path)
+        logger = StructuredLogger()
+        tracer = Tracer()
+
+        exporter.export_metrics({"counters": [{"name": "requests", "value": 1}]})
+        span = tracer.start_span("api.request")
+        tracer.end_span(span.span_id)
+        exporter.export_span(span)
+        exporter.export_log(logger.info("completed", request_id="req-1"))
+
+        lines = path.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 3
+        payloads = [json.loads(line) for line in lines]
+        assert [item["type"] for item in payloads] == ["metrics", "span", "log"]
+
+
+class TestExporterLogSink:
+    def test_forwards_logs_to_exporters(self) -> None:
+        exporter = InMemoryExporter()
+        sink = ExporterLogSink([exporter])
+        entry = StructuredLogger().info("hello", request_id="req-1")
+
+        sink.emit(entry)
+
+        assert len(exporter.logs) == 1
+        assert exporter.logs[0].context["request_id"] == "req-1"

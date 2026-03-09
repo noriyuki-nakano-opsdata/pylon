@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from pylon.observability.exporters import (
     ConsoleExporter,
+    ExporterLogSink,
     ExporterProtocol,
     InMemoryExporter,
+    JSONLinesExporter,
+    PrometheusExporter,
 )
 from pylon.observability.logging import LogLevel, StructuredLogger
 from pylon.observability.metrics import MetricsCollector
@@ -21,8 +24,11 @@ __all__ = [
     "StructuredLogger",
     "LogLevel",
     "ConsoleExporter",
+    "ExporterLogSink",
     "InMemoryExporter",
     "ExporterProtocol",
+    "JSONLinesExporter",
+    "PrometheusExporter",
     "build_run_query_payload",
     "build_replay_query_payload",
     "build_run_record",

@@ -69,16 +69,25 @@ class _BoundHTTPRequestHandler(BaseHTTPRequestHandler):
             )
         self._write_response(response)
 
+    _MAX_BODY_SIZE: int = 10 * 1024 * 1024  # 10 MiB
+
     def _read_request_body(self) -> Any:
         content_length = int(self.headers.get("Content-Length", "0") or "0")
         if content_length <= 0:
+            return None
+        if content_length > self._MAX_BODY_SIZE:
+            self.send_error(413, "Request body too large")
             return None
         raw = self.rfile.read(content_length)
         if not raw:
             return None
         content_type = self.headers.get("Content-Type", "")
         if "application/json" in content_type:
-            return json.loads(raw.decode("utf-8"))
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                self.send_error(400, "Invalid JSON body")
+                return None
         return raw.decode("utf-8")
 
     def _write_response(self, response: Response) -> None:

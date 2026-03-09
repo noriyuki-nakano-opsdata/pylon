@@ -14,15 +14,20 @@ from pylon.api.middleware import (
     InMemoryRateLimitStore,
     InMemoryTokenVerifier,
     JsonFileTokenVerifier,
+    JWKSTokenVerifier,
     JWTTokenVerifier,
     MiddlewareChain,
+    RateLimitBucketScope,
     RateLimitMiddleware,
+    RedisRateLimitStore,
     RequestContextMiddleware,
+    RequestTelemetryMiddleware,
     SecurityHeadersMiddleware,
     ServiceToken,
     SQLiteRateLimitStore,
     TenantMiddleware,
 )
+from pylon.api.observability import APIObservabilityBundle, build_api_observability_bundle
 from pylon.api.routes import RouteStore, register_routes
 from pylon.api.server import APIServer
 from pylon.control_plane import ControlPlaneStoreConfig, WorkflowControlPlaneStore
@@ -34,11 +39,24 @@ class AuthBackend(enum.StrEnum):
     MEMORY = "memory"
     JSON_FILE = "json_file"
     JWT_HS256 = "jwt_hs256"
+    JWT_JWKS = "jwt_jwks"
+    JWT_OIDC = "jwt_oidc"
 
 
 class RateLimitBackend(enum.StrEnum):
     MEMORY = "memory"
     SQLITE = "sqlite"
+    REDIS = "redis"
+
+
+class ObservabilityExporterBackend(enum.StrEnum):
+    NONE = "none"
+    PROMETHEUS = "prometheus"
+
+
+class TelemetrySinkBackend(enum.StrEnum):
+    NONE = "none"
+    JSONL = "jsonl"
 
 
 @dataclass(frozen=True)
@@ -48,6 +66,7 @@ class RequestContextMiddlewareConfig:
     enabled: bool = True
     request_id_header: str = "x-request-id"
     correlation_id_header: str = "x-correlation-id"
+    trace_id_header: str = "x-trace-id"
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any] | None) -> RequestContextMiddlewareConfig:
@@ -64,6 +83,7 @@ class RequestContextMiddlewareConfig:
             correlation_id_header=str(
                 raw.get("correlation_id_header", "x-correlation-id")
             ),
+            trace_id_header=str(raw.get("trace_id_header", "x-trace-id")),
         )
 
 
@@ -76,12 +96,19 @@ class AuthMiddlewareConfig:
     tokens: tuple[ServiceToken, ...] = field(default_factory=tuple)
     jwt_secret: str | None = None
     jwt_secret_path: str | None = None
+    jwks_path: str | None = None
+    jwks_url: str | None = None
+    oidc_discovery_path: str | None = None
+    oidc_discovery_url: str | None = None
     jwt_issuer: str | None = None
     jwt_audience: tuple[str, ...] = field(default_factory=tuple)
     jwt_tenant_claim: str = "tenant_id"
     jwt_subject_claim: str = "sub"
     jwt_scopes_claim: str = "scope"
     jwt_leeway_seconds: float = 0.0
+    jwks_cache_ttl_seconds: float = 300.0
+    bootstrap_validate: bool = True
+    allow_insecure_http: bool = False
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any] | None) -> AuthMiddlewareConfig:
@@ -112,6 +139,10 @@ class AuthMiddlewareConfig:
         tokens = tuple(ServiceToken.from_value(value) for value in raw_tokens)
         jwt_secret = raw.get("jwt_secret")
         jwt_secret_path = raw.get("jwt_secret_path")
+        jwks_path = raw.get("jwks_path")
+        jwks_url = raw.get("jwks_url")
+        oidc_discovery_path = raw.get("oidc_discovery_path")
+        oidc_discovery_url = raw.get("oidc_discovery_url")
         jwt_issuer = raw.get("jwt_issuer")
         jwt_audience_raw = raw.get("jwt_audience", ())
         if jwt_secret is not None and not isinstance(jwt_secret, str):
@@ -123,6 +154,26 @@ class AuthMiddlewareConfig:
             raise ConfigError(
                 "auth.jwt_secret_path must be a string",
                 details={"jwt_secret_path": jwt_secret_path},
+            )
+        if jwks_path is not None and not isinstance(jwks_path, str):
+            raise ConfigError(
+                "auth.jwks_path must be a string",
+                details={"jwks_path": jwks_path},
+            )
+        if jwks_url is not None and not isinstance(jwks_url, str):
+            raise ConfigError(
+                "auth.jwks_url must be a string",
+                details={"jwks_url": jwks_url},
+            )
+        if oidc_discovery_path is not None and not isinstance(oidc_discovery_path, str):
+            raise ConfigError(
+                "auth.oidc_discovery_path must be a string",
+                details={"oidc_discovery_path": oidc_discovery_path},
+            )
+        if oidc_discovery_url is not None and not isinstance(oidc_discovery_url, str):
+            raise ConfigError(
+                "auth.oidc_discovery_url must be a string",
+                details={"oidc_discovery_url": oidc_discovery_url},
             )
         if jwt_issuer is not None and not isinstance(jwt_issuer, str):
             raise ConfigError(
@@ -145,18 +196,38 @@ class AuthMiddlewareConfig:
         jwt_subject_claim = str(raw.get("jwt_subject_claim", "sub"))
         jwt_scopes_claim = str(raw.get("jwt_scopes_claim", "scope"))
         jwt_leeway_seconds = float(raw.get("jwt_leeway_seconds", 0.0))
+        jwks_cache_ttl_seconds = float(raw.get("jwks_cache_ttl_seconds", 300.0))
+        bootstrap_validate = raw.get("bootstrap_validate", True)
+        if not isinstance(bootstrap_validate, bool):
+            raise ConfigError(
+                "auth.bootstrap_validate must be a boolean",
+                details={"bootstrap_validate": bootstrap_validate},
+            )
+        allow_insecure_http = raw.get("allow_insecure_http", False)
+        if not isinstance(allow_insecure_http, bool):
+            raise ConfigError(
+                "auth.allow_insecure_http must be a boolean",
+                details={"allow_insecure_http": allow_insecure_http},
+            )
         return cls(
             backend=backend,
             token_path=token_path,
             tokens=tokens,
             jwt_secret=jwt_secret,
             jwt_secret_path=jwt_secret_path,
+            jwks_path=jwks_path,
+            jwks_url=jwks_url,
+            oidc_discovery_path=oidc_discovery_path,
+            oidc_discovery_url=oidc_discovery_url,
             jwt_issuer=jwt_issuer,
             jwt_audience=jwt_audience,
             jwt_tenant_claim=jwt_tenant_claim,
             jwt_subject_claim=jwt_subject_claim,
             jwt_scopes_claim=jwt_scopes_claim,
             jwt_leeway_seconds=jwt_leeway_seconds,
+            jwks_cache_ttl_seconds=jwks_cache_ttl_seconds,
+            bootstrap_validate=bootstrap_validate,
+            allow_insecure_http=allow_insecure_http,
         )
 
 
@@ -185,8 +256,11 @@ class RateLimitMiddlewareConfig:
     enabled: bool = False
     backend: RateLimitBackend = RateLimitBackend.MEMORY
     path: str | None = None
+    url: str | None = None
+    key_prefix: str = "pylon:rate_limit"
     requests_per_second: float = 10.0
     burst: int = 20
+    bucket_scope: RateLimitBucketScope = RateLimitBucketScope.TENANT
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any] | None) -> RateLimitMiddlewareConfig:
@@ -206,13 +280,33 @@ class RateLimitMiddlewareConfig:
                 details={"backend": backend_value},
             ) from exc
         path = raw.get("path")
+        url = raw.get("url")
+        key_prefix = raw.get("key_prefix", "pylon:rate_limit")
         if path is not None and not isinstance(path, str):
             raise ConfigError(
                 "rate_limit.path must be a string",
                 details={"path": path},
             )
+        if url is not None and not isinstance(url, str):
+            raise ConfigError(
+                "rate_limit.url must be a string",
+                details={"url": url},
+            )
+        if not isinstance(key_prefix, str) or not key_prefix:
+            raise ConfigError(
+                "rate_limit.key_prefix must be a non-empty string",
+                details={"key_prefix": key_prefix},
+            )
         rps = float(raw.get("requests_per_second", 10.0))
         burst = int(raw.get("burst", 20))
+        bucket_scope_value = str(raw.get("bucket_scope", RateLimitBucketScope.TENANT.value))
+        try:
+            bucket_scope = RateLimitBucketScope(bucket_scope_value)
+        except ValueError as exc:
+            raise ConfigError(
+                f"Unsupported rate_limit bucket_scope: {bucket_scope_value}",
+                details={"bucket_scope": bucket_scope_value},
+            ) from exc
         if rps <= 0:
             raise ConfigError(
                 "rate_limit.requests_per_second must be > 0",
@@ -227,8 +321,11 @@ class RateLimitMiddlewareConfig:
             enabled=enabled,
             backend=backend,
             path=path,
+            url=url,
+            key_prefix=key_prefix,
             requests_per_second=rps,
             burst=burst,
+            bucket_scope=bucket_scope,
         )
 
 
@@ -265,11 +362,92 @@ class APIMiddlewareConfig:
 
 
 @dataclass(frozen=True)
+class APIObservabilityConfig:
+    """Configuration for API metrics export and readiness probes."""
+
+    enabled: bool = True
+    request_metrics_enabled: bool = True
+    readiness_route_enabled: bool = True
+    metrics_route_enabled: bool = True
+    exporter_backend: ObservabilityExporterBackend = ObservabilityExporterBackend.PROMETHEUS
+    telemetry_sink_backend: TelemetrySinkBackend = TelemetrySinkBackend.NONE
+    telemetry_export_path: str | None = None
+    metrics_namespace: str = "pylon"
+
+    @classmethod
+    def from_mapping(cls, payload: dict[str, Any] | None) -> APIObservabilityConfig:
+        raw = dict(payload or {})
+        enabled = raw.get("enabled", True)
+        request_metrics_enabled = raw.get("request_metrics_enabled", True)
+        readiness_route_enabled = raw.get("readiness_route_enabled", True)
+        metrics_route_enabled = raw.get("metrics_route_enabled", True)
+        for field_name, value in (
+            ("enabled", enabled),
+            ("request_metrics_enabled", request_metrics_enabled),
+            ("readiness_route_enabled", readiness_route_enabled),
+            ("metrics_route_enabled", metrics_route_enabled),
+        ):
+            if not isinstance(value, bool):
+                raise ConfigError(
+                    f"observability.{field_name} must be a boolean",
+                    details={field_name: value},
+                )
+        exporter_backend_value = str(
+            raw.get("exporter_backend", ObservabilityExporterBackend.PROMETHEUS.value)
+        )
+        try:
+            exporter_backend = ObservabilityExporterBackend(exporter_backend_value)
+        except ValueError as exc:
+            raise ConfigError(
+                f"Unsupported observability exporter backend: {exporter_backend_value}",
+                details={"exporter_backend": exporter_backend_value},
+            ) from exc
+        telemetry_sink_backend_value = str(
+            raw.get("telemetry_sink_backend", TelemetrySinkBackend.NONE.value)
+        )
+        try:
+            telemetry_sink_backend = TelemetrySinkBackend(telemetry_sink_backend_value)
+        except ValueError as exc:
+            raise ConfigError(
+                f"Unsupported observability telemetry sink backend: {telemetry_sink_backend_value}",
+                details={"telemetry_sink_backend": telemetry_sink_backend_value},
+            ) from exc
+        telemetry_export_path = raw.get("telemetry_export_path")
+        if telemetry_export_path is not None and not isinstance(telemetry_export_path, str):
+            raise ConfigError(
+                "observability.telemetry_export_path must be a string",
+                details={"telemetry_export_path": telemetry_export_path},
+            )
+        if telemetry_sink_backend is TelemetrySinkBackend.JSONL and not telemetry_export_path:
+            raise ConfigError(
+                "observability.telemetry_export_path is required for jsonl telemetry sink",
+                details={"telemetry_sink_backend": telemetry_sink_backend.value},
+            )
+        metrics_namespace = str(raw.get("metrics_namespace", "pylon")).strip()
+        if not metrics_namespace:
+            raise ConfigError(
+                "observability.metrics_namespace must be a non-empty string",
+                details={"metrics_namespace": metrics_namespace},
+            )
+        return cls(
+            enabled=enabled,
+            request_metrics_enabled=request_metrics_enabled,
+            readiness_route_enabled=readiness_route_enabled,
+            metrics_route_enabled=metrics_route_enabled,
+            exporter_backend=exporter_backend,
+            telemetry_sink_backend=telemetry_sink_backend,
+            telemetry_export_path=telemetry_export_path,
+            metrics_namespace=metrics_namespace,
+        )
+
+
+@dataclass(frozen=True)
 class APIServerConfig:
     """Configuration for building a reference API server."""
 
     control_plane: ControlPlaneStoreConfig = field(default_factory=ControlPlaneStoreConfig)
     middleware: APIMiddlewareConfig = field(default_factory=APIMiddlewareConfig)
+    observability: APIObservabilityConfig = field(default_factory=APIObservabilityConfig)
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any] | None) -> APIServerConfig:
@@ -281,11 +459,19 @@ class APIServerConfig:
                 default_path=ControlPlaneStoreConfig().path,
             ),
             middleware=APIMiddlewareConfig.from_mapping(raw.get("middleware")),
+            observability=APIObservabilityConfig.from_mapping(raw.get("observability")),
         )
 
 
 def build_auth_middleware(config: AuthMiddlewareConfig) -> AuthMiddleware | None:
     """Build bearer-token auth middleware from config."""
+
+    def _validate_url_policy(source: str, *, label: str) -> None:
+        if source.startswith("http://") and not config.allow_insecure_http:
+            raise ConfigError(
+                f"{label} must use https unless auth.allow_insecure_http=true",
+                details={label.lower().replace(" ", "_"): source},
+            )
 
     if config.backend is AuthBackend.NONE:
         return None
@@ -315,6 +501,61 @@ def build_auth_middleware(config: AuthMiddlewareConfig) -> AuthMiddleware | None
                 leeway_seconds=config.jwt_leeway_seconds,
             )
         )
+    if config.backend is AuthBackend.JWT_JWKS:
+        jwks_source = config.jwks_url or config.jwks_path
+        if not jwks_source:
+            raise ConfigError(
+                "auth.jwks_url or auth.jwks_path is required for jwt_jwks backend"
+            )
+        _validate_url_policy(str(jwks_source), label="JWKS source")
+        verifier = JWKSTokenVerifier(
+            jwks=jwks_source,
+            issuer=config.jwt_issuer,
+            audience=config.jwt_audience,
+            tenant_claim=config.jwt_tenant_claim,
+            subject_claim=config.jwt_subject_claim,
+            scopes_claim=config.jwt_scopes_claim,
+            leeway_seconds=config.jwt_leeway_seconds,
+            cache_ttl_seconds=config.jwks_cache_ttl_seconds,
+            allow_insecure_http=config.allow_insecure_http,
+        )
+        if config.bootstrap_validate:
+            try:
+                verifier.prime()
+            except (OSError, ValueError) as exc:
+                raise ConfigError(
+                    f"Failed to bootstrap JWKS verifier: {exc}",
+                    details={"backend": config.backend.value},
+                ) from exc
+        return AuthMiddleware(verifier=verifier)
+    if config.backend is AuthBackend.JWT_OIDC:
+        discovery_source = config.oidc_discovery_url or config.oidc_discovery_path
+        if not discovery_source:
+            raise ConfigError(
+                "auth.oidc_discovery_url or auth.oidc_discovery_path "
+                "is required for jwt_oidc backend"
+            )
+        _validate_url_policy(str(discovery_source), label="OIDC discovery source")
+        verifier = JWKSTokenVerifier(
+            oidc_discovery=discovery_source,
+            issuer=config.jwt_issuer,
+            audience=config.jwt_audience,
+            tenant_claim=config.jwt_tenant_claim,
+            subject_claim=config.jwt_subject_claim,
+            scopes_claim=config.jwt_scopes_claim,
+            leeway_seconds=config.jwt_leeway_seconds,
+            cache_ttl_seconds=config.jwks_cache_ttl_seconds,
+            allow_insecure_http=config.allow_insecure_http,
+        )
+        if config.bootstrap_validate:
+            try:
+                verifier.prime()
+            except (OSError, ValueError) as exc:
+                raise ConfigError(
+                    f"Failed to bootstrap OIDC verifier: {exc}",
+                    details={"backend": config.backend.value},
+                ) from exc
+        return AuthMiddleware(verifier=verifier)
     raise ConfigError(
         f"Unsupported auth backend: {config.backend.value}",
         details={"backend": config.backend.value},
@@ -333,6 +574,22 @@ def build_rate_limit_middleware(
     elif config.backend is RateLimitBackend.SQLITE:
         path = config.path or str(Path(".pylon") / "rate-limit.db")
         store = SQLiteRateLimitStore(path)
+    elif config.backend is RateLimitBackend.REDIS:
+        if not config.url:
+            raise ConfigError(
+                "rate_limit.url is required for redis backend",
+                details={"backend": config.backend.value},
+            )
+        try:
+            store = RedisRateLimitStore(
+                config.url,
+                key_prefix=config.key_prefix,
+            )
+        except RuntimeError as exc:
+            raise ConfigError(
+                str(exc),
+                details={"backend": config.backend.value},
+            ) from exc
     else:
         raise ConfigError(
             f"Unsupported rate_limit backend: {config.backend.value}",
@@ -342,10 +599,16 @@ def build_rate_limit_middleware(
         requests_per_second=config.requests_per_second,
         burst=config.burst,
         store=store,
+        bucket_scope=config.bucket_scope,
     )
 
 
-def build_middleware_chain(config: APIMiddlewareConfig) -> MiddlewareChain:
+def build_middleware_chain(
+    config: APIMiddlewareConfig,
+    *,
+    observability: APIObservabilityBundle | None = None,
+    request_metrics_enabled: bool = True,
+) -> MiddlewareChain:
     """Build the standard API middleware chain."""
 
     chain = MiddlewareChain()
@@ -353,6 +616,14 @@ def build_middleware_chain(config: APIMiddlewareConfig) -> MiddlewareChain:
         chain.add(RequestContextMiddleware(
             request_id_header=config.request_context.request_id_header,
             correlation_id_header=config.request_context.correlation_id_header,
+            trace_id_header=config.request_context.trace_id_header,
+        ))
+    if observability is not None and request_metrics_enabled:
+        chain.add(RequestTelemetryMiddleware(
+            metrics=observability.metrics,
+            tracer=observability.tracer,
+            logger=observability.logger,
+            exporters=observability.telemetry_exporters,
         ))
     auth = build_auth_middleware(config.auth)
     if auth is not None:
@@ -375,15 +646,58 @@ def build_api_server(
     """Build an APIServer with the standard middleware stack and routes."""
 
     server = APIServer()
-    for middleware in build_middleware_chain(config.middleware).middlewares:
-        server.add_middleware(middleware)
-    route_store = register_routes(
-        server,
-        store=store,
+    route_store = store or RouteStore(
         control_plane_store=control_plane_store,
         control_plane_backend=config.control_plane.backend,
         control_plane_path=config.control_plane.path,
     )
+    observability = (
+        build_api_observability_bundle(
+            control_plane_store=route_store.control_plane_store,
+            auth_backend=config.middleware.auth.backend.value,
+            rate_limit_backend=(
+                config.middleware.rate_limit.backend.value
+                if config.middleware.rate_limit.enabled
+                else None
+            ),
+            metrics_namespace=config.observability.metrics_namespace,
+            enable_prometheus_exporter=(
+                config.observability.exporter_backend
+                is ObservabilityExporterBackend.PROMETHEUS
+            ),
+            telemetry_export_path=(
+                config.observability.telemetry_export_path
+                if config.observability.telemetry_sink_backend
+                is TelemetrySinkBackend.JSONL
+                else None
+            ),
+        )
+        if config.observability.enabled
+        else None
+    )
+    route_store = register_routes(
+        server,
+        store=route_store,
+        control_plane_backend=config.control_plane.backend,
+        control_plane_path=config.control_plane.path,
+        observability=observability,
+        readiness_route_enabled=(
+            config.observability.enabled
+            and config.observability.readiness_route_enabled
+        ),
+        metrics_route_enabled=(
+            config.observability.enabled
+            and config.observability.metrics_route_enabled
+            and observability is not None
+            and observability.prometheus_exporter is not None
+        ),
+    )
+    for middleware in build_middleware_chain(
+        config.middleware,
+        observability=observability,
+        request_metrics_enabled=config.observability.request_metrics_enabled,
+    ).middlewares:
+        server.add_middleware(middleware)
     return server, route_store
 
 

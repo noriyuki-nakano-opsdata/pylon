@@ -190,6 +190,21 @@ Required indexes:
 - reference auth now also supports HS256 JWT verification with issuer/audience
   validation, but production still needs a managed verifier backend or key
   rotation story
+- reference auth now also supports JWKS-backed RSA JWT verification from file
+  or URL sources with cache TTL control, but production still needs OIDC/JWKS
+  lifecycle management and key rotation policy
+- reference auth now supports OIDC discovery-backed JWT verification and
+  one-shot refresh on key rotation failure, but production still needs managed
+  refresh policy, trust-store management, and issuer/bootstrap governance
+- trust bootstrap now defaults to eager validation and secure transport, but
+  production still needs external trust-store distribution and issuer
+  governance beyond local config
+- rate-limit identity is now configurable (`tenant`, `subject`, `token`,
+  `tenant_subject`, `global`), which is the minimum contract needed before
+  introducing a distributed backend without semantic drift
+- a Redis-backed rate-limit store is now available behind the same middleware
+  contract, so the next production step is backend hardening rather than a new
+  API semantic layer
 - reference API server wiring now supports config-driven middleware/backend
   composition through `pylon.api.factory`
 - registered routes now enforce scope-based authorization whenever an
@@ -309,7 +324,7 @@ The queued runner is an execution mode, not a second runtime.
 
 #### Why
 
-[metrics.py](/Users/noriyuki.nakano/Documents/99_work/pylon/src/pylon/observability/metrics.py), [tracing.py](/Users/noriyuki.nakano/Documents/99_work/pylon/src/pylon/observability/tracing.py), and [exporters.py](/Users/noriyuki.nakano/Documents/99_work/pylon/src/pylon/observability/exporters.py) are in-memory or console-oriented.
+[metrics.py](/Users/noriyuki.nakano/Documents/99_work/pylon/src/pylon/observability/metrics.py), [tracing.py](/Users/noriyuki.nakano/Documents/99_work/pylon/src/pylon/observability/tracing.py), and [exporters.py](/Users/noriyuki.nakano/Documents/99_work/pylon/src/pylon/observability/exporters.py) now include Prometheus and durable JSONL reference paths, but managed external tracing/logging export and production alerting are still incomplete.
 
 #### Deliverables
 

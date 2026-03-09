@@ -86,3 +86,8 @@ def build_default_checker() -> HealthChecker:
     checker = HealthChecker()
     checker.register("system", _system_check)
     return checker
+
+
+def build_default_readiness_checker() -> HealthChecker:
+    """Create a readiness checker with the standard baseline system check."""
+    return build_default_checker()

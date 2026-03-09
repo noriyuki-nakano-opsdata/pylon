@@ -33,6 +33,7 @@ or build one from backend settings. The reference backends are `memory`, `json_f
 - `AuthMiddlewareConfig`
 - `TenantMiddlewareConfig`
 - `RateLimitMiddlewareConfig`
+- `APIObservabilityConfig`
 - `build_api_server(...)`
 - `build_http_api_server(...)`
 
@@ -42,16 +43,19 @@ Auth backend choices in the reference wiring are:
 - `memory`
 - `json_file`
 - `jwt_hs256`
+- `jwt_jwks`
+- `jwt_oidc`
 
 ## Typical Middleware Stack
 
 The common stack is:
 
 1. `RequestContextMiddleware`
-2. `AuthMiddleware`
-3. `TenantMiddleware`
-4. `RateLimitMiddleware`
-5. `SecurityHeadersMiddleware`
+2. `RequestTelemetryMiddleware`
+3. `AuthMiddleware`
+4. `TenantMiddleware`
+5. `RateLimitMiddleware`
+6. `SecurityHeadersMiddleware`
 
 Important details:
 
@@ -60,14 +64,16 @@ Important details:
 - `TenantMiddleware` can source tenant context either from `X-Tenant-ID` or from
   an authenticated principal bound to a tenant
 - `RequestContextMiddleware` injects `request_id` and `correlation_id` into
-  request context and echoes them back on responses
-- `/health` bypasses auth and tenant checks
+  request context, and echoes `request_id`, `correlation_id`, and `trace_id`
+  back on responses when available
+- `/health` and `/ready` bypass auth and tenant checks
+- `/metrics` bypasses tenant and rate-limit checks, but still requires auth when auth is enabled
 
 ## Request Context Expectations
 
 When the standard middlewares are installed:
 
-- `Authorization: Bearer <token>` is required for non-health routes when auth is enabled
+- `Authorization: Bearer <token>` is required for non-health/non-ready routes when auth is enabled
 - `X-Tenant-ID: <tenant-id>` is required unless either:
   - `TenantMiddleware(require_tenant=False)` is used, or
   - the authenticated principal already carries a tenant binding
@@ -86,10 +92,60 @@ Response `200 OK`
 
 ```json
 {
-  "status": "ok",
+  "status": "healthy",
+  "checks": [
+    {"name": "system", "status": "healthy", "message": "operational"}
+  ],
   "timestamp": 1709827200.0
 }
 ```
+
+### `GET /ready`
+
+Available when both `observability.enabled=true` **and**
+`observability.readiness_route_enabled=true` (both default to `true`). When
+either setting is `false`, the route is not registered and requests return `404`.
+Returns `200` when the API is ready to serve traffic and `503` when a required
+dependency is unavailable.
+
+```json
+{
+  "status": "ready",
+  "ready": true,
+  "checks": [
+    {"name": "system", "status": "healthy", "message": "operational"},
+    {"name": "control_plane", "status": "healthy", "message": "reachable"}
+  ],
+  "timestamp": 1709827200.0
+}
+```
+
+### `GET /metrics`
+
+Available when observability is enabled and a Prometheus exporter is configured.
+When auth is enabled, the caller must hold `observability:read` (or a wildcard
+covering it).
+
+Response `200 OK`
+
+Content type: `text/plain; version=0.0.4; charset=utf-8`
+
+Example:
+
+```text
+# TYPE pylon_api_request_count counter
+pylon_api_request_count{method="POST",route="/agents",status_class="2xx"} 1.0
+```
+
+> **Note:** The `pylon_` prefix shown above is the default `metrics_namespace`.
+> If `observability.metrics_namespace` is set to a different value, the prefix
+> changes accordingly (e.g., `metrics_namespace: "myapp"` produces
+> `myapp_api_request_count`).
+
+If `observability.telemetry_sink_backend=jsonl` is configured, the same API
+request flow also emits structured log and span records to the configured JSONL
+path. This sink uses the same `request_id`, `correlation_id`, and `trace_id`
+values that appear in HTTP responses.
 
 ### `POST /agents`
 
@@ -527,10 +583,11 @@ Common status codes:
 
 ### `AuthMiddleware`
 
-- skips `/health`
+- skips `/health` and `/ready`
 - expects `Authorization: Bearer <token>`
 - accepts a pluggable `TokenVerifier`
-- supports the reference `InMemoryTokenVerifier`, `JsonFileTokenVerifier`, and `JWTTokenVerifier`
+- supports the reference `InMemoryTokenVerifier`, `JsonFileTokenVerifier`,
+  `JWTTokenVerifier`, and `JWKSTokenVerifier`
 - projects an `AuthPrincipal` into `request.context["auth_principal"]`
 - when an authenticated principal is present, registered API routes enforce scope-based authorization
 - exact scopes, namespace wildcards like `workflows:*`, and global wildcard `*` are supported
@@ -544,6 +601,32 @@ Common status codes:
 - `iat`
 - configurable tenant/subject/scopes claim names
 
+`JWKSTokenVerifier` validates RSA-signed JWTs against a JWKS document and supports:
+
+- `RS256`, `RS384`, `RS512`
+- JWKS loaded from file path or URL
+- `kid` selection from multi-key JWKS documents
+- configurable JWKS cache TTL
+- configurable tenant/subject/scopes claim names
+- refresh-on-key-miss and refresh-on-signature-failure retry once before failing
+
+OIDC discovery support:
+
+- `jwt_oidc` auth backend resolves `jwks_uri` from an OpenID Connect discovery
+  document
+- discovery documents may be loaded from file path or URL
+- discovery issuer is used for claim validation when `jwt_issuer` is not set
+- if both discovery issuer and configured issuer are present, they must match
+
+Trust bootstrap defaults:
+
+- `bootstrap_validate=true` by default for `jwt_jwks` and `jwt_oidc`
+- startup bootstrap loads discovery/JWKS documents eagerly and fails server
+  construction on invalid metadata or empty keysets
+- `allow_insecure_http=false` by default
+- `http://` JWKS and OIDC discovery sources are rejected unless explicitly
+  enabled with `allow_insecure_http=true`
+
 Route scope taxonomy:
 
 - `agents:read`, `agents:write`
@@ -551,6 +634,7 @@ Route scope taxonomy:
 - `runs:read`, `runs:write`
 - `approvals:read`, `approvals:write`
 - `checkpoints:read`
+- `observability:read`
 - `kill-switch:write`
 
 Compatibility note:
@@ -560,7 +644,7 @@ Compatibility note:
 
 ### `TenantMiddleware`
 
-- skips `/health`
+- skips `/health`, `/ready`, and `/metrics`
 - injects `tenant_id` into `request.context`
 - prefers tenant binding from the authenticated principal when available
 - rejects `X-Tenant-ID` that conflicts with the authenticated principal
@@ -568,11 +652,41 @@ Compatibility note:
 
 ### `RateLimitMiddleware`
 
+- skips `/health`, `/ready`, and `/metrics`
 - default rate: `10` requests/sec
 - default burst: `20`
 - accepts a pluggable `RateLimitStore`
-- supports the reference `InMemoryRateLimitStore` and `SQLiteRateLimitStore`
+- supports the reference `InMemoryRateLimitStore`, `SQLiteRateLimitStore`, and
+  `RedisRateLimitStore`
 - emits `retry-after` header on `429`
+- emits `x-ratelimit-scope` on successful responses
+
+Backend options:
+
+- `memory`
+- `sqlite`
+- `redis`
+
+Redis backend notes:
+
+- configured through `rate_limit.url`
+- uses the same token-bucket contract as the in-memory and SQLite stores
+- supports shared rate-limit state across processes or hosts
+
+Bucket scope options:
+
+- `tenant` (default)
+- `subject`
+- `token`
+- `tenant_subject`
+- `global`
+
+Fallback behavior:
+
+- `tenant` falls back to `subject`, then `default`
+- `subject` falls back to `tenant`, then `default`
+- `token` falls back to `subject`, then `tenant`, then `default`
+- `tenant_subject` falls back to `tenant`, then `subject`, then `default`
 
 ### `SecurityHeadersMiddleware`
 
