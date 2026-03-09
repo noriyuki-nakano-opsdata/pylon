@@ -2,182 +2,84 @@
 
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
-![Tests: 1445 passing](https://img.shields.io/badge/tests-1445%20passing-brightgreen)
+![Tests: 1597 passing](https://img.shields.io/badge/tests-1597%20passing-brightgreen)
 
-**Pylon** is a Python-first autonomous agent orchestration platform with deterministic workflow execution, runtime safety enforcement, and protocol integrations for MCP and A2A.
+**Autonomous AI Agent Orchestration Platform**
+
+## Overview
+
+Pylon is a Python-first framework for building, executing, and governing multi-agent AI workflows. It compiles agent pipelines into deterministic DAGs with built-in safety enforcement (Rule-of-Two+), approval gates, and autonomy levels, giving teams control over what agents can do and when human oversight is required. Pylon ships with protocol adapters for MCP and A2A, a pluggable provider layer for LLMs, and reference implementations of infrastructure primitives (task queue, sandbox, secrets, tenancy) that can be swapped for production backends.
+
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph Surfaces["Developer Surfaces"]
+        CLI["CLI"]
+        SDK["SDK"]
+        API["HTTP API"]
+        DSL["DSL / YAML"]
+    end
+
+    subgraph Core["Execution Core"]
+        WF["Workflow DAG Engine"]
+        AG["Agent Runtime"]
+        SF["Safety (Rule-of-Two+)"]
+        AU["Autonomy Levels"]
+        AP["Approval System"]
+    end
+
+    subgraph Infra["Infrastructure"]
+        TQ["Task Queue"]
+        CP["Control Plane"]
+        OB["Observability"]
+        RS["Resilience"]
+        PL["Plugins"]
+    end
+
+    subgraph Protocols["Protocol Boundaries"]
+        MCP["MCP (JSON-RPC + OAuth)"]
+        A2A["A2A (Task Routing)"]
+        LLM["LLM Providers"]
+    end
+
+    subgraph Persistence["Persistence"]
+        REPO["Repository (Runs / Checkpoints)"]
+        STATE["State Store"]
+        SEC["Secrets"]
+        EV["Event Bus / Audit Log"]
+    end
+
+    Surfaces --> Core
+    Core --> Infra
+    Core --> Protocols
+    Core --> Persistence
+    Infra --> Persistence
+```
 
 ## Key Features
 
-| Category | Highlights |
-|----------|------------|
-| **Workflow Engine** | Compiled DAG execution, `ALL_RESOLVED` / `ANY` / `FIRST` join policies, patch-based commits, node-scoped checkpoints, pause/resume, and deterministic replay with state hash verification |
-| **Safety** | Rule-of-Two+ enforcement (no frame may combine untrusted input + secret access + external writes), `SafetyContext` / `ToolDescriptor` dynamic checks, prompt guard pipeline |
-| **Approval** | Plan/effect binding with drift detection, executor-integrated approval waits, and replayable approval context |
-| **Protocols** | MCP JSON-RPC server with OAuth 2.1 + PKCE scopes; A2A task routing with peer delegation checks |
-| **Infrastructure** | Sandbox policy, versioned secrets, multi-tenant isolation, rate limiting, circuit breaker, plugin system, scheduler wave planning — all shipped as local-first reference implementations |
+- **DAG Workflow Engine** -- Compiled graph execution with `ALL_RESOLVED` / `ANY` / `FIRST` join policies, patch-based state commits, node-scoped checkpoints, pause/resume, and deterministic replay with state hash verification.
+- **Safety (Rule-of-Two+)** -- No execution frame may combine untrusted input, secret access, and external writes. Dynamic capability checks via `SafetyContext` and `ToolDescriptor`, plus a prompt guard pipeline.
+- **Approval System** -- Plan/effect binding with drift detection, executor-integrated approval waits, and replayable approval context.
+- **Autonomy Levels** -- Graduated autonomy ladder (A0--A4) controlling agent independence and required human oversight.
+- **MCP Protocol** -- JSON-RPC server with OAuth 2.1 + PKCE scopes for tool integration.
+- **A2A Protocol** -- Agent-to-agent task routing with peer delegation boundary checks.
+- **Multi-Tenant Isolation** -- Tenant-scoped context, resource limits, and namespace separation.
+- **Observability** -- Structured metrics, tracing hooks, and audit logging across all execution paths.
+- **Resilience** -- Rate limiting, circuit breaker, retry policies, and bulkhead isolation.
+- **Sandbox Policies** -- Configurable execution sandbox (Docker, process) with tool-level restrictions.
+- **Versioned Secrets** -- Secret storage with scrubbing enforcement at safety boundaries.
+- **Plugin System** -- Extensible plugin registry for custom agents, tools, and providers.
+- **Task Queue & Scheduler** -- Wave-based dispatch planning over the compiled DAG for queued or distributed runners.
 
 ## Quick Start
 
 ```bash
 pip install pylon-ai
-
-mkdir my-project && cd my-project
-pylon init --name my-project
-pylon run
 ```
 
-## Programmatic API
-
-```python
-import asyncio
-from pylon.workflow import WorkflowGraph, GraphExecutor, END, NodeResult
-from pylon.types import ConditionalEdge
-from pylon.repository.workflow import WorkflowRun
-
-async def main():
-    # 1. Build graph
-    graph = WorkflowGraph(name="example")
-    graph.add_node("plan", "planner", next_nodes=[
-        ConditionalEdge(target="review"),
-    ])
-    graph.add_node("review", "reviewer", next_nodes=[
-        ConditionalEdge(target="apply", condition="state.approved == True"),
-        ConditionalEdge(target=END, condition="state.approved == False"),
-    ])
-    graph.add_node("apply", "applier", next_nodes=[
-        ConditionalEdge(target=END),
-    ])
-
-    # 2. Define handlers
-    async def handler(node_id: str, state: dict) -> dict:
-        if node_id == "plan":
-            return {"plan": "refactor auth module"}
-        elif node_id == "review":
-            return {"approved": True}
-        return {"applied": True}
-
-    # 3. Execute
-    run = WorkflowRun(workflow_id="example")
-    executor = GraphExecutor()
-    result = await executor.execute(
-        graph, run, node_handler=handler,
-        initial_state={"task": "refactor"},
-    )
-    print(f"Status: {result.status.value}")
-    print(f"Final state: {result.state}")
-
-asyncio.run(main())
-```
-
-## SDK Authoring Surfaces
-
-`pylon.sdk.PylonClient` keeps canonical workflow execution separate from
-explicit single-step callable execution.
-
-Canonical workflow definitions can come from:
-
-- `PylonProject`
-- `dict` or `pylon.yaml` path
-- `WorkflowBuilder`
-- `WorkflowGraph`
-- `@workflow`-decorated factory
-
-These are materialized into a canonical `PylonProject` before execution, so
-`run_workflow()` still uses the same compiled graph runtime as the CLI and API.
-Plain callables are not treated as workflows. Register them explicitly through
-`register_callable()` and run them through `run_callable()`.
-
-```python
-from pylon.sdk import PylonClient, agent, workflow
-
-client = PylonClient()
-
-@agent(name="researcher", role="research")
-def researcher(state):
-    return {"topic": str(state["topic"]).upper()}
-
-@agent(name="writer", role="write")
-def writer(state):
-    return {"summary": f"summary:{state['topic']}"}
-
-@workflow(name="pipeline")
-def define(builder):
-    builder.add_node("research", agent="researcher")
-    builder.add_node("write", agent="writer")
-    builder.add_edge("research", "write")
-    builder.set_entry("research")
-
-client.register_workflow("pipeline", define)
-result = client.run_workflow("pipeline", input_data={"topic": "agents"})
-run = client.get_run(result.run_id)
-```
-
-Current limitation:
-
-- callable edge conditions in `WorkflowBuilder` cannot be materialized into the
-  canonical runtime; use string conditions in the DSL/runtime graph for those
-  cases
-
-Control-plane backend selection:
-
-- CLI can switch `memory`, `json_file`, and `sqlite` backends through
-  `control_plane.backend` / `control_plane.path` in `config.yaml`, or
-  `PYLON_CONTROL_PLANE_BACKEND` / `PYLON_CONTROL_PLANE_PATH`
-- SDK can switch backends through `PylonClient(control_plane_backend=..., control_plane_path=...)`
-- all backends share the same `WorkflowControlPlaneStore` contract
-
-## Dispatch Planning
-
-Pylon now exposes a scheduler-oriented planning view without changing the
-canonical inline execution semantics.
-
-- `pylon.runtime.plan_project_dispatch(...)` derives dependency waves from the compiled DAG
-- `PylonClient.plan_workflow(...)` returns the same public dispatch plan
-- `GET /workflows/{id}/plan` exposes the plan through the lightweight API
-
-This planning view is meant for queued or distributed runners. Inline execution
-still uses `GraphExecutor` directly.
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  Developer Surfaces: cli / api / sdk / dsl              │
-├─────────────────────────────────────────────────────────┤
-│  Execution Core: workflow / agents / safety / approval  │
-├─────────────────────────────────────────────────────────┤
-│  Protocol Boundaries: mcp / a2a / providers             │
-├─────────────────────────────────────────────────────────┤
-│  State & Infra: repository / state / events / sandbox   │
-│                 secrets / tenancy / resources            │
-├─────────────────────────────────────────────────────────┤
-│  Support: taskqueue / plugins / resilience / config     │
-│           observability / coding / control_plane        │
-└─────────────────────────────────────────────────────────┘
-```
-
-## Module Structure
-
-| Area | Package | Description |
-|------|---------|-------------|
-| Core | `pylon.types`, `pylon.errors` | Shared enums, dataclasses, and error hierarchy |
-| Workflow | `pylon.workflow` | Compiled DAG execution, conditions, patch commits, replay, structured node results |
-| Safety | `pylon.safety` | Capability validation, autonomy gates, prompt guard, input/output validation, secret scrubbing |
-| Agents | `pylon.agents` | Agent lifecycle, registry, pool, supervisor |
-| Approval | `pylon.approval` | Approval manager with plan/effect binding verification |
-| Protocols | `pylon.protocols.mcp`, `pylon.protocols.a2a` | MCP JSON-RPC server with OAuth, A2A tasks with peer delegation |
-| API / CLI / SDK | `pylon.api`, `pylon.cli`, `pylon.sdk` | Lightweight API server, local CLI, and SDK surfaces over the shared control plane |
-| DSL / Providers | `pylon.dsl`, `pylon.providers` | YAML/JSON workflow parser, LLM provider abstraction |
-| Persistence | `pylon.repository`, `pylon.state`, `pylon.events` | Workflow runs, checkpoints, audit log, state store, event bus |
-| Infra | `pylon.sandbox`, `pylon.secrets`, `pylon.tenancy` | Sandbox policy, secret storage, tenant context/isolation |
-| Resources | `pylon.resources`, `pylon.resilience` | Rate limiting, pooling, retry, circuit breaker, bulkhead |
-| Extensibility | `pylon.plugins`, `pylon.control_plane`, `pylon.taskqueue`, `pylon.observability`, `pylon.config`, `pylon.coding` | Plugins, registries, schedulers, metrics, config, coding loop |
-
-Current source: 173 Python modules across 33 package directories, 42 test files (1,380 passing tests).
-
-## Project Configuration
-
-Pylon projects are configured via `pylon.yaml`:
+Create a `pylon.yaml` in your project directory:
 
 ```yaml
 version: "1"
@@ -190,14 +92,12 @@ agents:
     autonomy: A2
     tools: [file-read, file-write]
     sandbox: docker
-    input_trust: untrusted
 
   reviewer:
     model: anthropic/claude-sonnet-4-20250514
     role: "Review code for quality and security"
     autonomy: A3
     tools: [file-read]
-    sandbox: docker
 
 workflow:
   type: graph
@@ -216,60 +116,81 @@ policy:
   max_cost_usd: 10.0
   max_duration: 60m
   require_approval_above: A3
-  safety:
-    blocked_actions: [git-push, db-write]
-    max_file_changes: 50
-  compliance:
-    audit_log: required
 ```
 
-## CLI Commands
+Run the workflow:
 
 ```bash
-pylon init --name <name>       # Initialize project with pylon.yaml
-pylon run [--input <json>]     # Execute workflow
-pylon inspect <run-id>         # Show run details
-pylon logs <run-id> [--follow] # Stream run logs
-pylon replay <checkpoint-id>   # Replay from checkpoint
-pylon approve <id> [--deny]    # Approve or deny an action
-pylon doctor                   # Check project health
-pylon dev                      # Start development mode
-pylon config get|set|list      # Manage configuration
-pylon sandbox list|clean       # Manage sandboxes
-pylon login                    # Authenticate
+pylon run
 ```
 
-## Running Tests
+## Project Structure
 
-```bash
-make install     # pip install -e ".[dev]"
-make test        # pytest tests/unit/ -v
-make test-all    # pytest tests/ -v
-make lint        # ruff check src tests
-make typecheck   # mypy src/pylon/
-make format      # ruff format src tests
+```
+src/pylon/
+  agents/          # Agent lifecycle, registry, pool, supervisor
+  api/             # Lightweight HTTP API server and middleware
+  approval/        # Approval manager with plan/effect binding
+  autonomy/        # Autonomy level definitions and gates
+  cli/             # CLI commands (init, run, inspect, replay, ...)
+  coding/          # Coding loop and code generation utilities
+  config/          # Configuration loading and management
+  control_plane/   # Control plane store (memory, JSON, SQLite backends)
+  dsl/             # YAML/JSON workflow parser
+  events/          # Event bus and audit log
+  observability/   # Metrics, tracing, and structured logging
+  plugins/         # Plugin registry and loader
+  protocols/
+    mcp/           # MCP JSON-RPC server with OAuth 2.1
+    a2a/           # A2A task routing and peer delegation
+  providers/       # LLM provider abstraction layer
+  repository/      # Workflow runs, checkpoints, audit records
+  resilience/      # Retry, circuit breaker, bulkhead
+  resources/       # Rate limiting and resource pooling
+  runtime/         # Shared runtime and dispatch planning
+  safety/          # Rule-of-Two+, capability checks, prompt guard
+  sandbox/         # Sandbox policy enforcement
+  sdk/             # PylonClient SDK for programmatic use
+  secrets/         # Versioned secret storage and scrubbing
+  state/           # State store abstraction
+  taskqueue/       # Task queue and scheduler wave planning
+  tenancy/         # Multi-tenant context and isolation
+  types.py         # Shared enums and dataclasses
+  errors.py        # Error hierarchy
 ```
 
 ## Documentation
 
-- [Architecture Overview](docs/architecture.md) — layered module structure
-- [Runtime Flows](docs/architecture/runtime-flows.md) — execution paths for workflow, MCP, A2A, CLI, and approval
-- [Module Map](docs/architecture/module-map.md) — package-by-package reference with maturity guide
-- [Pylon vNext Target Architecture](docs/architecture/pylon-vnext-target-architecture.md) — target three-layer runtime-centered architecture
-- [Pylon vNext Type Design](docs/architecture/pylon-vnext-type-design.md) — proposed types for goals, termination, routing, and evaluation
-- [Pylon vNext Implementation Plan](docs/architecture/pylon-vnext-implementation-plan.md) — ordered delivery plan for bounded autonomy
-- [Production Readiness Plan](docs/architecture/production-readiness-implementation-plan.md) — required work to move from reference implementations to production backends
-- [Getting Started Guide](docs/getting-started.md) — installation, first project, programmatic API
-- [API Reference](docs/api-reference.md) — REST routes and middleware
-- [Implemented Specification](docs/SPECIFICATION.md) — full technical specification
-- [ADR Index](docs/adr/) — architecture decision records (001–009)
-- [Workflow/Safety Implementation Plan](docs/architecture/workflow-safety-implementation-plan.md)
+- [Architecture Overview](docs/architecture.md) -- Layered module structure
+- [Runtime Flows](docs/architecture/runtime-flows.md) -- Execution paths for workflow, MCP, A2A, CLI, and approval
+- [Module Map](docs/architecture/module-map.md) -- Package-by-package reference with maturity guide
+- [Getting Started Guide](docs/getting-started.md) -- Installation, first project, programmatic API
+- [API Reference](docs/api-reference.md) -- REST routes and middleware
+- [Specification](docs/SPECIFICATION.md) -- Full technical specification
+- [ADR Index](docs/adr/) -- Architecture decision records (001--009)
+- [vNext Target Architecture](docs/architecture/pylon-vnext-target-architecture.md) -- Target three-layer runtime-centered architecture
+- [vNext Implementation Plan](docs/architecture/pylon-vnext-implementation-plan.md) -- Ordered delivery plan for bounded autonomy
+- [Production Readiness Plan](docs/architecture/production-readiness-implementation-plan.md) -- Moving from reference implementations to production backends
 
-## Current Status
+## Development
 
-The workflow engine and safety system are the most mature components. Workflow runs now use a shared runtime path across CLI/API/SDK helpers, API route definitions are registered as canonical `PylonProject` resources, and SDK workflow execution is separated from explicit ad hoc callable execution. Persisted runs are stored as raw command-side records, while public views rebuild normalized `execution_summary`, `approval_summary`, and replay metadata through shared query services. A scheduler-facing `distributed_wave_plan` is also available as a deployment-planning view over the same compiled DAG.
+```bash
+# Install with dev dependencies
+pip install -e ".[dev]"
 
-Many infrastructure subsystems (repository, sandbox, secrets, tenancy, plugins) are intentionally shipped as in-memory reference implementations suitable for local development and testing. Production deployments would swap these for persistent backends.
+# Run tests
+make test          # Unit tests
+make test-all      # All tests
+
+# Code quality
+make lint          # ruff check src tests
+make typecheck     # mypy src/pylon/
+make format        # ruff format src tests
+```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## License
 

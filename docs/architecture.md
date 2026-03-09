@@ -1,425 +1,799 @@
-# Architecture Overview
+# Pylon Architecture
 
-## What Exists Today
+**Version:** 0.2.0
+**Status:** Living document
 
-Pylon is a Python codebase composed of reference implementations plus a richer programmatic workflow runtime.
+Pylon is an Autonomous AI Agent Orchestration Platform built in Python. It provides a layered, modular architecture for defining, executing, and governing agent-driven workflows with deterministic replay, safety enforcement, and multi-protocol interoperability.
 
-The important architectural split is:
+This document describes the system architecture across six layers, their interactions, and the data flows that connect them.
 
-- **Developer surfaces**: `pylon.cli`, `pylon.sdk`, `pylon.api`
-- **Execution core**: `pylon.workflow`, `pylon.agents`, `pylon.safety`
-- **Protocol boundaries**: `pylon.protocols.mcp`, `pylon.protocols.a2a`, `pylon.providers`
-- **State and infrastructure**: `pylon.repository`, `pylon.state`, `pylon.events`, `pylon.sandbox`, `pylon.secrets`, `pylon.tenancy`
-- **Supporting subsystems**: `pylon.taskqueue`, `pylon.plugins`, `pylon.control_plane`, `pylon.resources`, `pylon.resilience`, `pylon.observability`, `pylon.config`, `pylon.coding`
+---
 
-## Layered View
+## Table of Contents
 
-```text
-+------------------------------------------------------------------+
-| Developer Surfaces                                                |
-| cli/ | sdk/ | api/                                                |
-| Local CLI state, in-memory SDK client, lightweight API routes     |
-+------------------------------------------------------------------+
-| Execution Core                                                    |
-| workflow/ | agents/ | dsl/ | coding/                              |
-| Compiled DAG runtime, agent lifecycle, pylon.yaml, coding loop    |
-+------------------------------------------------------------------+
-| Safety and Protocol Boundaries                                    |
-| safety/ | protocols/mcp/ | protocols/a2a/ | providers/            |
-| Capability rules, runtime safety, MCP/A2A servers, LLM providers  |
-+------------------------------------------------------------------+
-| State and Infrastructure                                          |
-| repository/ | state/ | events/ | sandbox/ | secrets/ | tenancy/  |
-| Runs, checkpoints, snapshots, event bus, sandbox policy, tenancy  |
-+------------------------------------------------------------------+
-| Cross-Cutting Support                                             |
-| taskqueue/ | plugins/ | control_plane/ | observability/           |
-| resources/ | resilience/ | config/                                |
-+------------------------------------------------------------------+
+- [System Architecture Overview](#system-architecture-overview)
+- [Layer 1 -- Developer Surfaces](#layer-1----developer-surfaces)
+- [Layer 2 -- Core Engine](#layer-2----core-engine)
+- [Layer 3 -- Runtime](#layer-3----runtime)
+- [Layer 4 -- Infrastructure](#layer-4----infrastructure)
+- [Layer 5 -- Protocols](#layer-5----protocols)
+- [Layer 6 -- Persistence and Isolation](#layer-6----persistence-and-isolation)
+- [Cross-Cutting Modules](#cross-cutting-modules)
+- [Request Flow](#request-flow)
+- [Workflow Execution Lifecycle](#workflow-execution-lifecycle)
+- [Data Flow](#data-flow)
+- [Safety Architecture](#safety-architecture)
+- [Persistence and Replay Model](#persistence-and-replay-model)
+- [Further Reading](#further-reading)
+
+---
+
+## System Architecture Overview
+
+Pylon is organized into six horizontal layers. Each layer depends only on layers below it, with cross-cutting modules available to all layers.
+
+```mermaid
+flowchart TD
+    subgraph L1["Layer 1 -- Developer Surfaces"]
+        API["pylon.api<br/>HTTP Server, Routing,<br/>Middleware Stack"]
+        CLI["pylon.cli<br/>Click CLI, Project Init,<br/>Run, Resume, Status"]
+        SDK["pylon.sdk<br/>Decorators, Builder,<br/>HTTP Client"]
+    end
+
+    subgraph L2["Layer 2 -- Core Engine"]
+        WF["pylon.workflow<br/>DAG Graph, Compilation,<br/>Executor, Join Policies"]
+        AU["pylon.autonomy<br/>Goal Execution, Model Routing,<br/>Stuck Detection, Critic"]
+        SA["pylon.safety<br/>Rule-of-Two+, SafetyContext,<br/>ToolDescriptor, Prompt Guard"]
+        AP["pylon.approval<br/>ApprovalManager, Plan/Effect<br/>Binding, Drift Detection"]
+    end
+
+    subgraph L3["Layer 3 -- Runtime"]
+        RT["pylon.runtime<br/>Execution Orchestration,<br/>LLM Runtime, Planning"]
+        CP["pylon.control_plane<br/>WorkflowService, Scheduler,<br/>Store Backends"]
+        AG["pylon.agents<br/>Agent Lifecycle, Pool,<br/>Registry, Supervisor"]
+    end
+
+    subgraph L4["Layer 4 -- Infrastructure"]
+        TQ["pylon.taskqueue<br/>StoreBackedTaskQueue,<br/>Worker/Pool, RetryPolicy, DLQ"]
+        OB["pylon.observability<br/>Metrics, Tracing,<br/>Logging, Exporters"]
+        RE["pylon.resilience<br/>Circuit Breaker, Retry,<br/>Fallback, Bulkhead"]
+        RS["pylon.resources<br/>Rate Limiting, Pooling,<br/>Quotas, Monitors"]
+    end
+
+    subgraph L5["Layer 5 -- Protocols"]
+        MCP["pylon.protocols.mcp<br/>JSON-RPC 2.0 Server,<br/>OAuth 2.1 + PKCE"]
+        A2A["pylon.protocols.a2a<br/>Agent-to-Agent Task<br/>Routing, Peer Delegation"]
+        PR["pylon.providers<br/>LLM Provider Abstraction,<br/>Model Profiles"]
+    end
+
+    subgraph L6["Layer 6 -- Persistence and Isolation"]
+        REPO["pylon.repository<br/>Definitions, Runs,<br/>Checkpoints, Audit, Memory"]
+        ST["pylon.state<br/>State Store<br/>Abstractions"]
+        EV["pylon.events<br/>Event Bus,<br/>Handlers, Store"]
+        SEC["pylon.secrets<br/>Versioned Storage,<br/>Vault Abstraction"]
+        SB["pylon.sandbox<br/>Isolation Policy,<br/>Lifecycle"]
+        TN["pylon.tenancy<br/>Tenant Context,<br/>Isolation, Quota"]
+    end
+
+    subgraph CC["Cross-Cutting"]
+        DSL["pylon.dsl<br/>YAML/JSON Parser"]
+        CFG["pylon.config<br/>Config Loading,<br/>Validation"]
+        PLG["pylon.plugins<br/>Discovery,<br/>Lifecycle, Hooks"]
+        COD["pylon.coding<br/>Coding Loop,<br/>Planning, Review"]
+    end
+
+    L1 --> L2
+    L1 --> L3
+    L2 --> L3
+    L2 --> L5
+    L3 --> L4
+    L3 --> L5
+    L3 --> L6
+    L4 --> L6
+    L5 --> L6
+
+    CC -.-> L1
+    CC -.-> L2
+    CC -.-> L3
+    CC -.-> L4
+    CC -.-> L5
+    CC -.-> L6
 ```
 
-## Package Map
+---
 
-At a coarse level, the packages line up like this:
+## Layer 1 -- Developer Surfaces
 
-| Concern | Primary Packages | Notes |
-|---------|------------------|-------|
-| Config and bootstrapping | `pylon.dsl`, `pylon.config`, `pylon.cli` | DSL parsing, local config/state, project bootstrap |
-| Execution runtime | `pylon.workflow`, `pylon.agents` | The most mature runtime path in the repository |
-| Safety | `pylon.safety`, `pylon.approval` | Static capability rules plus runtime boundary enforcement |
-| External protocol boundaries | `pylon.protocols.mcp`, `pylon.protocols.a2a`, `pylon.providers` | JSON-RPC surfaces, OAuth, peer/task routing, LLM abstraction |
-| Persistence and replay | `pylon.repository`, `pylon.state`, `pylon.events` | Workflow runs, checkpoints, memory repository, state machine/snapshots, event bus |
-| Operational infrastructure | `pylon.sandbox`, `pylon.secrets`, `pylon.tenancy` | Mostly reference implementations with real policy models |
-| Cross-cutting utilities | `pylon.resources`, `pylon.resilience`, `pylon.observability` | Limits, retries, metrics, tracing, exporters, query-side read models |
-| Extension and scheduling | `pylon.plugins`, `pylon.taskqueue`, `pylon.control_plane`, `pylon.coding`, `pylon.runtime.planning` | Plugin system, queues, registry/scheduler helpers, coding loop, dispatch planning |
+Developer surfaces are the entry points through which users and external systems interact with Pylon.
 
-## Current Execution Model
+### pylon.api
 
-### Programmatic Workflow Runtime
+HTTP API server providing the primary programmatic interface.
 
-The most developed runtime is the programmatic workflow engine in `pylon.workflow`:
+| Component | Responsibility |
+|-----------|---------------|
+| Router | Route registration, path matching, handler dispatch |
+| Auth Middleware | HS256/RS256 JWT verification, JWKS/OIDC discovery, service token validation |
+| Rate-Limit Middleware | Pluggable bucket identity (tenant/principal/token), memory and Redis backends |
+| Telemetry Middleware | Request/correlation/trace ID propagation, JSONL emission |
+| Tenant Middleware | Tenant context binding from authenticated principal or header |
+| Security Headers Middleware | Standard security response headers |
+| RouteStore | API facade over the control-plane store contract |
+| Factory | Assembles the middleware stack from configuration |
 
-1. `WorkflowGraph` defines nodes and edges
-2. `compile()` validates the DAG and produces `CompiledWorkflow`
-3. `GraphExecutor` executes runnable nodes under explicit join semantics
-4. node handlers return either a raw `dict` or a structured `NodeResult`
-5. `CommitEngine` applies `StatePatch` updates deterministically
-6. `CheckpointRepository` stores node-scoped event logs
-7. `ReplayEngine` reconstructs state and verifies `state_hash`
+The API server exposes `/ready` and `/metrics` endpoints for operational visibility and projects request telemetry through the observability subsystem.
 
-This runtime is deterministic in the sense that:
+### pylon.cli
 
-- graph topology is validated before execution
-- conditions are compiled from a restricted AST, not `eval`
-- parallel writes to the same state key fail fast
-- join policies are explicit: `ALL_RESOLVED`, `ANY`, `FIRST`
+Click-based command-line interface for local development workflows.
 
-### CLI / API / SDK Surfaces
+| Command | Description |
+|---------|-------------|
+| `pylon init` | Scaffold a new project with `pylon.yaml` |
+| `pylon run` | Load project, register in control-plane store, execute workflow |
+| `pylon resume` | Resume a paused or approval-gated workflow run |
+| `pylon status` | Query run state, execution summary, approval status |
 
-These surfaces are still local-first, but workflow execution now aligns through the shared runtime helpers in `pylon.runtime.execution`:
+Local state is persisted under `$PYLON_HOME` (default `~/.pylon`) using `JsonFileWorkflowControlPlaneStore`.
 
-- `pylon.cli` stores local config/sandbox state in `$PYLON_HOME` / `~/.pylon` and persists workflow lifecycle data through `JsonFileWorkflowControlPlaneStore`
-- `pylon.api.RouteStore` is now an API facade over the shared control-plane store contract and can be backed by `memory`, `json_file`, or `sqlite`
-- `pylon.api.factory` now builds the standard API middleware stack from config,
-  including pluggable auth and rate-limit backends
-- the reference auth stack now includes HS256 JWT verification in addition to
-  memory- and file-backed service tokens
-- the reference auth stack also supports JWKS-backed RSA JWT verification from
-  file or URL sources, which is the first managed-verifier-shaped backend in
-  the reference stack
-- the same verifier contract now also supports OIDC discovery documents,
-  including `jwks_uri` resolution and one-shot refresh on key rotation failure
-- trust bootstrap is now explicit in config: JWT discovery/JWKS sources are
-  validated eagerly at startup by default, and insecure `http://` sources are
-  rejected unless explicitly allowed
-- registered API routes now enforce scope-based authorization whenever an
-  authenticated principal is present, while unauthenticated local/reference
-  deployments continue to bypass scope checks
-- request/correlation ID propagation is now part of the standard API wiring, so
-  transport-level tracing has a stable contract across embedded HTTP and SDK use
-- `pylon.control_plane.WorkflowRunService` now owns shared start/resume/approve/reject/replay/list transitions for API and SDK surfaces
-- `pylon.sdk.PylonClient` remains a local client for embedded use, while
-  `pylon.sdk.PylonHTTPClient` now targets the same public workflow/control-plane
-  payloads over HTTP
-- workflow execution still uses registered canonical definitions and SDK
-  authoring surfaces (`WorkflowBuilder`, `WorkflowGraph`, `@workflow`) that
-  materialize into `PylonProject`, while ad hoc callables remain on a separate
-  explicit helper surface
-- `pylon.control_plane.JsonFileWorkflowControlPlaneStore` provides a durable JSON-backed reference store for workflow definitions, raw run records, checkpoints, and approvals
-- `pylon.control_plane.SQLiteWorkflowControlPlaneStore` provides a durable relational local backend with schema versioning, record-version compare-and-swap, and idempotency-key persistence
-- `pylon.control_plane.build_workflow_control_plane_store(...)` now selects `memory`, `json_file`, or `sqlite` backends behind the same store contract
-- `pylon.taskqueue.StoreBackedTaskQueue` and `pylon.runtime.QueuedWorkflowDispatchRunner` provide a durable local bridge from `distributed_wave_plan` to queue/worker execution without introducing a second workflow runtime, including lease ownership, heartbeat recovery, retry policy, and dead-letter semantics
-- `pylon.api.middleware` now supports pluggable token verification and pluggable
-  rate-limit stores, so tenant identity can be bound to authenticated service
-  tokens instead of relying only on `X-Tenant-ID`
-- rate-limit bucket identity is now explicit in config, so the same API stack
-  can be tenant-scoped for reference deployments or principal/token-scoped for
-  production-style service isolation without changing route code
-- rate-limit storage now supports a Redis backend behind the same middleware
-  contract, so process-local reference deployments and shared/distributed
-  deployments do not need different route semantics
+### pylon.sdk
 
-That means the public surfaces are still not distributed transports, but they now expose the same workflow run-state model.
+Programmatic authoring and client library.
 
-### Dispatch Planning View
+| Component | Responsibility |
+|-----------|---------------|
+| `@workflow` decorator | Declarative workflow definition from functions |
+| `WorkflowBuilder` | Fluent builder pattern for graph construction |
+| `PylonClient` | In-process embedded client |
+| `PylonHTTPClient` | Remote HTTP client targeting the same API contract |
 
-Pylon now also exposes a scheduler-facing planning path:
+SDK-defined workflows materialize into `PylonProject` and execute on the same runtime as DSL and API workflows.
 
-1. compile `PylonProject` into `CompiledWorkflow`
-2. project nodes into `WorkflowTask` records
-3. compute dependency waves with `WorkflowScheduler.compute_waves()`
-4. expose a stable `distributed_wave_plan` read model through runtime/API/SDK
+---
 
-This is intentionally separate from execution. The canonical runtime remains the
-inline `GraphExecutor`; the wave plan is a deployment/planning surface for
-queued or distributed runners. The current queued runner consumes the dispatch
-plan through the durable task queue and now persists the same run/checkpoint
-query model as inline mode for straight-line agent DAGs. It is still not a
-full second workflow state machine: conditional edges, loops, routers, goals,
-and approval-gated execution remain inline-only semantics today.
+## Layer 2 -- Core Engine
 
-### Command vs Query Model
+The core engine provides workflow semantics, autonomous execution, safety enforcement, and approval governance.
 
-Run persistence and operator-facing read models are now intentionally distinct.
+### pylon.workflow
 
-- command-side storage keeps raw run records
-- query-side builders derive `execution_summary`, `approval_summary`, and replay metadata
-- CLI/API/SDK all read through the same query projection layer
-- API/SDK write-side lifecycle operations now flow through the same `WorkflowRunService`
+Deterministic DAG-based workflow execution engine.
 
-## Runtime Flow Summary
+| Component | Responsibility |
+|-----------|---------------|
+| `WorkflowGraph` | Node and edge definition, graph topology |
+| `compile()` | DAG validation, cycle detection, produces `CompiledWorkflow` |
+| `GraphExecutor` | Executes runnable nodes under join policies |
+| `CommitEngine` | Applies `StatePatch` updates deterministically |
+| `CheckpointRepository` | Stores node-scoped event logs |
+| `ReplayEngine` | Reconstructs state, verifies `state_hash` integrity |
 
-There are four important execution paths in the current codebase.
+**Join Policies:**
 
-### 1. Programmatic workflow execution
+- `ALL_RESOLVED` -- Wait for all upstream nodes to complete
+- `ANY` -- Proceed when any single upstream completes
+- `FIRST` -- Proceed on the first upstream result, discard others
 
-```text
-WorkflowGraph
-  -> validate()
-  -> compile()
-  -> GraphExecutor.execute(...)
-  -> node handler returns dict | NodeResult
-  -> CommitEngine.apply_patches(...)
-  -> WorkflowRun.event_log append
-  -> CheckpointRepository.create(...)
-  -> ReplayEngine.replay_event_log(...)
+**Determinism guarantees:**
+
+- Graph topology is validated before execution
+- Conditions are compiled from a restricted AST (no `eval`)
+- Parallel writes to the same state key fail fast
+- Join policies are explicit, never inferred
+
+### pylon.autonomy
+
+Goal-directed autonomous execution layer.
+
+| Component | Responsibility |
+|-----------|---------------|
+| Goal Executor | Drives agent loops toward declared objectives |
+| Model Router | Routes to LIGHTWEIGHT, STANDARD, or PREMIUM LLM tiers |
+| Termination Conditions | Configurable stopping criteria (max steps, convergence, timeout) |
+| Stuck Detection | Identifies loops and stalled progress |
+| Critic | Evaluates intermediate outputs for quality |
+| Verifier | Validates final results against goal criteria |
+
+### pylon.safety
+
+Capability-based safety enforcement implementing the Rule-of-Two+ principle.
+
+**Rule-of-Two+** states that no single execution frame may combine all three of:
+
+1. Untrusted input handling (`can_read_untrusted`)
+2. Secret access (`can_access_secrets`)
+3. External writes (`can_write_external`)
+
+Additionally, the pair of untrusted input + secret access is forbidden in a single frame.
+
+| Component | Responsibility |
+|-----------|---------------|
+| `SafetyContext` | Runtime context: data taint, effect scopes, secret scopes, delegation ancestry, approval token |
+| `ToolDescriptor` | Declares dynamic effects of tool invocation |
+| `CapabilityValidator` | Validates capability combinations at agent creation and tool grants |
+| `SafetyEngine` | Evaluates tool use and delegation requests against policy |
+| Prompt Guard Pipeline | Pre-dispatch validation of prompts and tool arguments |
+
+**Enforcement points:**
+
+1. Agent creation and dynamic tool grants
+2. Workflow and autonomy approval checks
+3. MCP `tools/call` request validation
+4. A2A `tasks/send` and `tasks/sendSubscribe`
+5. Router pre-dispatch validation hooks
+
+### pylon.approval
+
+Human-in-the-loop approval governance.
+
+| Component | Responsibility |
+|-----------|---------------|
+| `ApprovalManager` | Manages approval lifecycle and state transitions |
+| Plan/Effect Binding | Associates approval tokens with planned effects |
+| Drift Detection | Detects divergence between approved plan and actual execution |
+| A3+ Enforcement | Enforces approval for high-risk operations |
+
+---
+
+## Layer 3 -- Runtime
+
+The runtime layer orchestrates execution, manages workflow lifecycle, and coordinates agent pools.
+
+### pylon.runtime
+
+Execution orchestration with three dispatch paths.
+
+| Path | Description |
+|------|-------------|
+| Inline | Direct `GraphExecutor` invocation within the calling process |
+| Queued | Wave-based dispatch through `StoreBackedTaskQueue` and `WorkerPool` |
+| Resume | Reload checkpointed state and continue from last committed node |
+
+| Component | Responsibility |
+|-----------|---------------|
+| LLM Runtime | Manages LLM invocation lifecycle, token accounting, streaming |
+| Planning Module | Wave-based dispatch planning via `WorkflowScheduler.compute_waves()` |
+| `QueuedWorkflowDispatchRunner` | Bridges `distributed_wave_plan` to queue/worker execution |
+
+### pylon.control_plane
+
+Workflow lifecycle management and scheduling.
+
+| Component | Responsibility |
+|-----------|---------------|
+| `WorkflowRunService` | Start, resume, approve, reject, replay, list transitions |
+| `WorkflowScheduler` | Computes dependency waves for dispatch planning |
+| `InMemoryStore` | Ephemeral store for testing and embedded use |
+| `JsonFileWorkflowControlPlaneStore` | Durable JSON-backed store for definitions, runs, checkpoints, approvals |
+| `SQLiteWorkflowControlPlaneStore` | Relational backend with schema versioning, CAS, idempotency keys |
+| `build_workflow_control_plane_store()` | Factory selecting `memory`, `json_file`, or `sqlite` backends |
+| Registry | Workflow definition registration and lookup |
+
+**Command vs Query separation:**
+
+- Command side stores raw run records
+- Query side derives `execution_summary`, `approval_summary`, and replay metadata
+- All surfaces (CLI, API, SDK) read through the same query projection
+
+### pylon.agents
+
+Agent lifecycle and coordination.
+
+| Component | Responsibility |
+|-----------|---------------|
+| Agent Lifecycle | Creation, initialization, execution, shutdown |
+| Agent Pool | Concurrency-managed pool of active agents |
+| Agent Registry | Type-based agent registration and lookup |
+| Supervisor | Monitors agent health, restarts failed agents |
+
+---
+
+## Layer 4 -- Infrastructure
+
+Infrastructure modules provide operational capabilities that support the runtime layer.
+
+### pylon.taskqueue
+
+Durable task queue with worker management.
+
+| Component | Responsibility |
+|-----------|---------------|
+| `StoreBackedTaskQueue` | Priority queue with durable persistence |
+| `Worker` / `WorkerPool` | Task consumers with concurrency control |
+| `RetryPolicy` | Fixed interval and exponential backoff strategies |
+| `DeadLetterQueue` | Captures tasks that exceed retry limits |
+
+The task queue provides lease ownership and heartbeat recovery semantics for reliable execution.
+
+### pylon.observability
+
+Comprehensive operational telemetry.
+
+| Component | Responsibility |
+|-----------|---------------|
+| `MetricsCollector` | Counter, gauge, histogram metric collection |
+| `Tracer` / `Span` | Distributed tracing with span lifecycle |
+| `StructuredLogger` | JSON-structured logging with context propagation |
+| Console Exporter | Human-readable console output |
+| JSONL Exporter | Durable structured telemetry files |
+| Prometheus Exporter | Prometheus-compatible metrics rendering at `/metrics` |
+| InMemory Exporter | Testing and inspection |
+
+### pylon.resilience
+
+Fault tolerance patterns.
+
+| Component | Responsibility |
+|-----------|---------------|
+| Circuit Breaker | Fail-fast on repeated downstream failures |
+| Retry | Configurable retry with backoff strategies |
+| Fallback | Alternative execution paths on failure |
+| Bulkhead | Concurrency isolation between workloads |
+
+### pylon.resources
+
+Resource governance.
+
+| Component | Responsibility |
+|-----------|---------------|
+| Rate Limiter | Token bucket and sliding window rate limiting |
+| Resource Pool | Managed pools for connections and handles |
+| Quota Manager | Per-tenant resource quotas |
+| Resource Monitor | Usage tracking and alerting |
+
+---
+
+## Layer 5 -- Protocols
+
+Protocol modules define the external communication boundaries of the system.
+
+### pylon.protocols.mcp
+
+Model Context Protocol server implementing the JSON-RPC 2.0 specification.
+
+| Component | Responsibility |
+|-----------|---------------|
+| JSON-RPC Router | Method routing and request/response lifecycle |
+| Session Manager | Client session creation, tracking, expiration |
+| OAuth 2.1 + PKCE | Scoped access control with proof key for code exchange |
+| Tool Handler | Tool discovery, argument validation, invocation |
+| Resource Handler | Resource listing and content retrieval |
+| Prompt Handler | Prompt template management |
+| Sampling Handler | LLM sampling delegation |
+
+**Validation pipeline:**
+
+1. DTO shape validation
+2. Output-validator safety check on tool arguments
+3. `SafetyEngine.evaluate_tool_use()` enforcement
+4. Tool handler invocation
+
+### pylon.protocols.a2a
+
+Agent-to-Agent protocol for inter-agent task delegation.
+
+| Component | Responsibility |
+|-----------|---------------|
+| Task Lifecycle | State machine for task creation, execution, completion, cancellation |
+| Agent Cards | Agent capability advertisement and discovery |
+| Peer Registry | Peer agent registration and allowlist management |
+| Async Server | Handlers for send, get, cancel, push-notification |
+| Rate Limiting | Per-peer request throttling |
+
+**Delegation flow:**
+
+1. Incoming task request received
+2. Peer allowlist and authenticated sender checks
+3. Rate-limit evaluation
+4. Build or load sender `SafetyContext`
+5. `SafetyEngine.evaluate_delegation()` enforcement
+6. Accept task and transition lifecycle state
+
+Remote metadata may contribute hints, but local policy remains authoritative.
+
+### pylon.providers
+
+LLM provider abstraction layer.
+
+| Component | Responsibility |
+|-----------|---------------|
+| Provider Interface | Uniform API across LLM vendors |
+| Model Profiles | Model capability metadata (context window, cost, latency) |
+| Tier Routing | Maps LIGHTWEIGHT / STANDARD / PREMIUM to concrete models |
+
+---
+
+## Layer 6 -- Persistence and Isolation
+
+Persistence and isolation modules manage state, secrets, events, and execution boundaries.
+
+### pylon.repository
+
+Workflow and operational data persistence.
+
+| Repository | Responsibility |
+|------------|---------------|
+| Workflow Definitions | Stores compiled workflow definitions |
+| Workflow Runs | Persists run records with status, state, and version tracking |
+| Checkpoints | Node-scoped event logs with state hashes |
+| Audit Logs | Immutable records of security-relevant operations |
+| Memory | Agent memory persistence and retrieval |
+
+### pylon.state
+
+State store abstractions.
+
+| Component | Responsibility |
+|-----------|---------------|
+| Key-Value Store | Generic typed state storage |
+| State Machine | Finite state machine with transition validation |
+| Snapshots | Point-in-time state capture |
+| Diffs | State comparison and delta computation |
+
+### pylon.events
+
+Event-driven communication.
+
+| Component | Responsibility |
+|-----------|---------------|
+| Event Bus | In-memory publish/subscribe with topic routing |
+| Event Handlers | Typed handler registration and dispatch |
+| Event Store | Event persistence and replay |
+| Dead Letters | Captures undeliverable events |
+
+### pylon.secrets
+
+Secret management.
+
+| Component | Responsibility |
+|-----------|---------------|
+| Versioned Store | Secret storage with version history |
+| Vault Abstraction | Pluggable backend protocol (in-memory reference, external vault) |
+| Audit | Secret access logging |
+| Rotation | Secret rotation lifecycle helpers |
+
+### pylon.sandbox
+
+Execution isolation.
+
+| Component | Responsibility |
+|-----------|---------------|
+| Sandbox Manager | Sandbox creation, lifecycle, teardown |
+| Isolation Policy | Resource and network constraint definitions |
+| Executor | Sandboxed code execution |
+| Registry | Sandbox type registration |
+
+Note: The current implementation provides an in-memory manager with a policy model. Concrete gVisor and Firecracker runtime integrations are planned but not yet implemented.
+
+### pylon.tenancy
+
+Multi-tenant isolation.
+
+| Component | Responsibility |
+|-----------|---------------|
+| Tenant Context | Request-scoped tenant identity propagation |
+| Isolation Manager | Cross-tenant data isolation enforcement |
+| Quota Manager | Per-tenant resource quota tracking and enforcement |
+| Lifecycle Manager | Tenant provisioning and deprovisioning |
+
+---
+
+## Cross-Cutting Modules
+
+These modules are available to all layers and do not belong to a single tier.
+
+### pylon.dsl
+
+Project definition parser.
+
+- Parses `pylon.yaml` and JSON project definitions into `PylonProject` models
+- Validates project structure, node references, and edge connectivity
+
+### pylon.config
+
+Configuration management.
+
+- Hierarchical configuration loading (defaults, file, environment, runtime)
+- Schema validation for all configuration sections
+- Configuration registry for dynamic access
+
+### pylon.plugins
+
+Plugin system.
+
+- File-system and entry-point based plugin discovery
+- Plugin manifests with dependency declarations
+- Lifecycle management (load, initialize, start, stop, unload)
+- Hook system for extension points across all layers
+
+### pylon.coding
+
+AI-assisted coding workflows.
+
+- Coding loop orchestration (plan, implement, review, commit)
+- Planning phase with task decomposition
+- Code review with safety and quality checks
+- Commit integration with version control
+
+---
+
+## Request Flow
+
+The following diagram traces a workflow execution request from an HTTP client through the full middleware and execution stack.
+
+```mermaid
+sequenceDiagram
+    participant C as HTTP Client
+    participant MW as Middleware Stack
+    participant WRS as WorkflowRunService
+    participant GE as GraphExecutor
+    participant SE as SafetyEngine
+    participant LLM as LLM Provider
+    participant CP as Checkpoint Store
+    participant OB as Observability
+
+    C->>MW: POST /workflows/{id}/runs
+    activate MW
+
+    MW->>MW: Security Headers
+    MW->>MW: Telemetry (assign request_id, trace_id)
+    MW->>MW: Auth (verify JWT / service token)
+    MW->>MW: Tenant (bind tenant context)
+    MW->>MW: Rate Limit (check bucket)
+
+    MW->>WRS: start_run(workflow_id, input)
+    activate WRS
+
+    WRS->>WRS: Load CompiledWorkflow
+    WRS->>WRS: Create WorkflowRun record
+
+    WRS->>GE: execute(compiled_workflow, state)
+    activate GE
+
+    loop For each runnable node
+        GE->>GE: Evaluate join policy
+        GE->>GE: Evaluate edge conditions
+        GE->>SE: evaluate_tool_use(context, descriptor)
+        SE-->>GE: allow / deny
+
+        alt Safety approved
+            GE->>LLM: invoke(prompt, model_tier)
+            LLM-->>GE: response
+        end
+
+        GE->>GE: CommitEngine.apply_patches()
+        GE->>CP: create(checkpoint)
+        GE->>OB: emit(metrics, spans, logs)
+    end
+
+    GE-->>WRS: WorkflowRun (completed)
+    deactivate GE
+
+    WRS->>WRS: Write run record
+    WRS-->>MW: RunResponse
+    deactivate WRS
+
+    MW->>OB: emit(request telemetry)
+    MW-->>C: 200 OK + RunResponse
+    deactivate MW
 ```
 
-This is the path where deterministic execution semantics are strongest.
+---
 
-### 2. MCP tool invocation
+## Workflow Execution Lifecycle
 
-```text
-JsonRpcRequest
-  -> MethodRouter request validator
-  -> DTO validation
-  -> OutputValidator.validate_tool_call_detailed(...)
-  -> resolve ToolDescriptor
-  -> SafetyEngine.evaluate_tool_use(...)
-  -> tool handler invocation
+This diagram shows the complete lifecycle of a workflow from definition through execution and checkpointing.
+
+```mermaid
+flowchart TD
+    DEF["Define Workflow<br/>(DSL / SDK / API)"] --> PARSE["Parse into PylonProject"]
+    PARSE --> GRAPH["Build WorkflowGraph<br/>(nodes, edges, conditions)"]
+    GRAPH --> VALIDATE["validate()<br/>DAG checks, cycle detection"]
+    VALIDATE --> COMPILE["compile()<br/>Produce CompiledWorkflow"]
+
+    COMPILE --> PLAN["Plan Execution<br/>compute_waves()"]
+    PLAN --> DISPATCH{"Dispatch Path"}
+
+    DISPATCH -->|Inline| INLINE["GraphExecutor.execute()"]
+    DISPATCH -->|Queued| QUEUE["Enqueue to TaskQueue"]
+    DISPATCH -->|Resume| RELOAD["Load Checkpoint State"]
+
+    QUEUE --> WORKER["WorkerPool picks up tasks"]
+    WORKER --> INLINE
+    RELOAD --> INLINE
+
+    INLINE --> JOIN{"Evaluate Join Policy<br/>ALL_RESOLVED / ANY / FIRST"}
+    JOIN --> COND{"Evaluate Edge<br/>Conditions"}
+
+    COND -->|Condition met| SAFETY["SafetyEngine<br/>evaluate_tool_use()"]
+    COND -->|Condition not met| SKIP["Skip Node"]
+
+    SAFETY -->|Approved| EXEC["Execute Node Handler"]
+    SAFETY -->|Denied| DENY["Reject with SafetyError"]
+
+    EXEC --> COMMIT["CommitEngine<br/>apply_patches()"]
+    COMMIT --> CKPT["CheckpointRepository<br/>create()"]
+    CKPT --> EVENT["Append to event_log"]
+
+    EVENT --> NEXT{"More runnable<br/>nodes?"}
+    NEXT -->|Yes| JOIN
+    NEXT -->|No| HASH["Compute final state_hash"]
+    SKIP --> NEXT
+
+    HASH --> COMPLETE["WorkflowRun complete"]
+    COMPLETE --> REPLAY["ReplayEngine available<br/>for verification"]
 ```
 
-The safety decision happens before the handler is called.
+---
 
-### 3. A2A delegation
+## Data Flow
 
-```text
-incoming task/send or sendSubscribe
-  -> peer allowlist / authenticated sender checks
-  -> rate-limit check
-  -> build or load sender SafetyContext
-  -> SafetyEngine.evaluate_delegation(...)
-  -> accept task and transition lifecycle
+This diagram shows how state and data flow through the system during a workflow execution.
+
+```mermaid
+flowchart LR
+    subgraph Input
+        YAML["pylon.yaml<br/>Project Definition"]
+        API_REQ["API Request<br/>Workflow Input"]
+        SDK_CALL["SDK Call<br/>Builder / Decorator"]
+    end
+
+    subgraph Parse["Parsing"]
+        PP["PylonProject Model"]
+    end
+
+    subgraph Compile["Compilation"]
+        CW["CompiledWorkflow"]
+        WAVE["Wave Plan<br/>(dependency order)"]
+    end
+
+    subgraph Execute["Execution State"]
+        STATE["Workflow State<br/>(versioned dict)"]
+        PATCH["StatePatch<br/>(delta updates)"]
+        HASH["state_hash<br/>(integrity)"]
+    end
+
+    subgraph Persist["Persistence"]
+        RUN["WorkflowRun<br/>Record"]
+        CKPT["Checkpoint<br/>Event Log"]
+        AUDIT["Audit Log"]
+    end
+
+    subgraph Observe["Telemetry"]
+        METRICS["Metrics"]
+        SPANS["Trace Spans"]
+        LOGS["Structured Logs"]
+    end
+
+    subgraph External["External Systems"]
+        LLM["LLM Providers"]
+        MCP_C["MCP Clients"]
+        A2A_P["A2A Peers"]
+    end
+
+    YAML --> PP
+    API_REQ --> PP
+    SDK_CALL --> PP
+
+    PP --> CW
+    CW --> WAVE
+
+    WAVE --> STATE
+    STATE --> PATCH
+    PATCH --> STATE
+    PATCH --> HASH
+    HASH --> CKPT
+
+    STATE --> RUN
+    RUN --> CKPT
+    CKPT --> AUDIT
+
+    STATE --> METRICS
+    STATE --> SPANS
+    STATE --> LOGS
+
+    CW --> LLM
+    CW --> MCP_C
+    CW --> A2A_P
+
+    LLM --> PATCH
+    MCP_C --> PATCH
+    A2A_P --> PATCH
 ```
 
-Remote metadata can contribute hints, but local policy stays authoritative.
-
-### 4. CLI local run flow
-
-```text
-pylon run
-  -> load_project(".")
-  -> register local project in JsonFileWorkflowControlPlaneStore
-  -> WorkflowRunService.start_run(...)
-    -> GraphExecutor.execute(...)
-    -> checkpoint / approval / metrics collection
-    -> write raw run/checkpoint/approval records to $PYLON_HOME/control-plane.json
-  -> write local sandbox/config state to $PYLON_HOME/state.json
-  -> render CLI output
-```
-
-This is now a thin local wrapper around the shared workflow runtime and shared control-plane service.
-
-### 5. SDK workflow authoring flow
-
-```text
-WorkflowBuilder | WorkflowGraph | @workflow factory | PylonProject
-  -> materialize_workflow_definition(...)
-  -> canonical PylonProject + handler registries
-  -> execute_project_sync(...)
-    -> GraphExecutor.execute(...)
-  -> serialize_run(...)
-  -> WorkflowRun snapshot
-```
-
-This keeps SDK-defined workflows on the same runtime semantics as DSL and API
-workflow runs instead of introducing a second execution engine.
+---
 
 ## Safety Architecture
 
 ### Static Capability Envelope
 
-`AgentCapability` expresses three dangerous capabilities:
+`AgentCapability` declares three dangerous capabilities:
 
-- `can_read_untrusted`
-- `can_access_secrets`
-- `can_write_external`
+| Capability | Description |
+|------------|-------------|
+| `can_read_untrusted` | Agent may process untrusted external input |
+| `can_access_secrets` | Agent may access secrets or credentials |
+| `can_write_external` | Agent may write to external systems |
 
-Rule-of-Two+ forbids:
+**Rule-of-Two+ forbids:**
 
-- all three together
-- the pair `untrusted + secrets`
+- All three capabilities in a single execution frame
+- The pair `can_read_untrusted` + `can_access_secrets` in a single frame
 
 ### Runtime Safety Context
 
-Static capability is not the full decision point. `SafetyContext` adds:
+Static capabilities alone are not sufficient. `SafetyContext` provides runtime state:
 
-- current data taint
-- effect scopes
-- secret scopes
-- delegation ancestry
-- optional approval token
+| Field | Purpose |
+|-------|---------|
+| Data Taint | Tracks whether current data originates from untrusted sources |
+| Effect Scopes | Constrains which external effects are permitted |
+| Secret Scopes | Constrains which secrets are accessible |
+| Delegation Ancestry | Records the chain of agents that delegated the current task |
+| Approval Token | References human approval for elevated operations |
 
-`ToolDescriptor` describes dynamic effects of tool usage:
+`ToolDescriptor` declares the dynamic effects of each tool:
 
-- untrusted input handling
-- secret access
-- external writes
-- effect and secret scopes
-- approval requirement
+| Field | Purpose |
+|-------|---------|
+| Untrusted Input | Whether the tool processes untrusted input |
+| Secret Access | Whether the tool requires secret access |
+| External Writes | Whether the tool performs external writes |
+| Effect Scopes | Which external systems are affected |
+| Secret Scopes | Which secrets are accessed |
+| Approval Required | Whether human approval is required |
 
-### Enforcement Points
+### Enforcement Pipeline
 
-Safety is currently enforced in code at:
+Safety evaluation occurs before any handler invocation:
 
-1. agent creation and dynamic tool grants via `CapabilityValidator`
-2. workflow and autonomy approval checks
-3. MCP `tools/call` request validation
-4. A2A `tasks/send` and `tasks/sendSubscribe`
-5. router pre-dispatch validation hooks
+1. **Agent creation** -- `CapabilityValidator` checks capability combinations
+2. **Tool grants** -- Dynamic capability additions are validated
+3. **Workflow execution** -- Approval checks before node execution
+4. **MCP tool calls** -- DTO validation, output-validator check, `SafetyEngine` evaluation
+5. **A2A delegation** -- Peer authentication, sender context derivation, delegation evaluation
 
-## Protocol Boundaries
+---
 
-### MCP
+## Persistence and Replay Model
 
-`pylon.protocols.mcp` implements:
+### Event Log Structure
 
-- JSON-RPC request/response types
-- a method router
-- session management
-- OAuth 2.1 + PKCE scoped access control
-- tools, resources, prompts, and sampling handlers
+Workflow persistence is event-log oriented. Each `WorkflowRun` maintains:
 
-The MCP server validates:
+| Field | Purpose |
+|-------|---------|
+| `status` | Current run lifecycle state |
+| `state` | Versioned state dictionary |
+| `state_version` | Monotonically increasing version counter |
+| `state_hash` | SHA-256 hash of the current state for integrity verification |
+| `event_log[]` | Ordered sequence of checkpoint events |
 
-- DTO shape
-- output-validator safety on tool arguments
-- `SafetyEngine.evaluate_tool_use(...)`
+### Checkpoint Event Record
 
-before invoking a tool handler.
+Each checkpoint captures a complete node execution record:
 
-### A2A
+| Field | Description |
+|-------|-------------|
+| `seq` | Sequence number within the run |
+| `attempt_id` | Unique attempt identifier for retry tracking |
+| `node_id` | The executed node |
+| `input` / `input_state_version` / `input_state_hash` | Input state snapshot |
+| `state_patch` | Delta applied to state |
+| `edge_decisions` | Which outgoing edges were activated |
+| `llm_events` | LLM invocations and responses |
+| `tool_events` | Tool calls and results |
+| `artifacts` | Produced artifacts |
+| `metrics` | Node-level execution metrics |
+| `state_version` / `state_hash` | Post-execution state snapshot |
 
-`pylon.protocols.a2a` implements:
+### Replay
 
-- task lifecycle state machine
-- agent cards and peer registry
-- async server handling for send/get/cancel/push-notification
-- optional allowed-peer and rate-limit checks
+`ReplayEngine` reconstructs state by replaying the event log from the beginning, recomputing state hashes at each step. A hash mismatch raises an integrity violation, indicating that either the events or the replay logic are inconsistent.
 
-The A2A server derives sender context from local policy or task metadata, then evaluates delegation safety before accepting work.
+Persisted metadata is secret-scrubbed before storage.
 
-## Persistence and Replay
-
-Workflow persistence is event-log oriented:
-
-```text
-WorkflowRun
-  status
-  state
-  state_version
-  state_hash
-  event_log[]
-
-Checkpoint
-  workflow_run_id
-  node_id
-  state_version
-  state_hash
-  event_log[]
-```
-
-Checkpoint event records currently include:
-
-- `seq`
-- `attempt_id`
-- `node_id`
-- `input`
-- `input_state_version`
-- `input_state_hash`
-- `state_patch`
-- `edge_decisions`
-- `llm_events`
-- `tool_events`
-- `artifacts`
-- `metrics`
-- `state_version`
-- `state_hash`
-
-Persisted metadata is secret-scrubbed before storage. Replay recomputes state hashes and raises on mismatch.
-
-## Public Surface Boundaries
-
-The repository currently exposes three user-facing surfaces with different maturity levels:
-
-| Surface | Backing implementation | Current character |
-|---------|------------------------|-------------------|
-| CLI | `pylon.cli` + local JSON/YAML state | local developer workflow and demos |
-| API | `pylon.api` + pluggable `RouteStore` facade | lightweight embedded HTTP-style contract |
-| SDK | `pylon.sdk` | local client/builder/decorator layer plus thin HTTP client |
-
-The workflow core lives behind those surfaces rather than being uniformly wired through them.
-
-## Sandbox, Secrets, and Tenancy
-
-These subsystems are present as reference implementations:
-
-- `sandbox/`: sandbox manager, executor, registry, policy defaults, resource/network checks
-- `secrets/`: in-memory versioned secret manager, Vault protocol, audit, rotation helpers
-- `tenancy/`: tenant context propagation, lifecycle manager, quota manager, isolation enforcement
-
-Important current constraint:
-
-- concrete gVisor / Firecracker runtime integrations are not implemented yet
-- current sandbox lifecycle is an in-memory manager plus policy model
-
-## Maturity Boundaries
-
-The cleanest way to reason about the system today is to split it into three maturity bands.
-
-### Mature and internally coherent
-
-- compiled workflow execution
-- join semantics
-- checkpoint and replay model
-- runtime safety evaluation at MCP/A2A boundaries
-- approval binding and drift detection
-
-### Useful reference implementations
-
-- sandbox lifecycle and policy
-- secret management
-- event bus
-- API route store
-- SDK client
-- CLI persisted state model
-- tenancy, plugins, taskqueue, coding loop
-
-### Designed but not fully wired end-to-end
-
-- public API/CLI/SDK exposure of workflow runtime richness
-- workflow approval wait-state integration in the executor
-- non-memory infrastructure backends
-- concrete high-isolation sandbox backends
-
-## Observability and Supporting Systems
-
-Supporting modules already exist and are usable independently:
-
-- `events/`: in-memory pub/sub and dead letters
-- `observability/`: metrics, tracing, structured logging, exporters, Prometheus rendering
-  - the reference API stack now projects request telemetry through these same primitives
-    and can expose `/ready` and `/metrics`
-  - the same request flow can optionally emit durable JSONL telemetry with shared
-    `request_id` / `correlation_id` / `trace_id` correlation
-- `taskqueue/`: priority queue, workers, retry, scheduler
-- `plugins/`: plugin manifests, loader, registry, hook system, extension protocols
-- `resources/`: rate limiting, quotas, pools, monitoring
-- `resilience/`: retry, fallback, circuit breaker, bulkhead
-- `state/`: key-value store, generic state machine, snapshots, diffs
-
-## Architectural Reality
-
-The codebase is strongest today in:
-
-- deterministic workflow execution
-- safety evaluation at runtime boundaries
-- local/in-memory reference implementations for surrounding systems
-
-The main gap is not absence of modules, but uneven maturity between:
-
-- the rich programmatic workflow engine
-- the simpler public API / CLI / SDK surfaces
+---
 
 ## Further Reading
 
