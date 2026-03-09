@@ -214,7 +214,11 @@ def _checkpoint_from_payload(payload: dict[str, Any]) -> Checkpoint:
         state_hash=str(payload.get("state_hash", "")),
         event_log=list(payload.get("event_log", [])),
         state_ref=payload.get("state_ref"),
-        created_at=datetime.fromisoformat(str(payload["created_at"])),
+        created_at=(
+            datetime.fromisoformat(str(payload["created_at"]))
+            if payload.get("created_at") is not None
+            else datetime.now()
+        ),
     )
     return checkpoint
 
@@ -234,7 +238,11 @@ def deserialize_run(payload: dict[str, Any]) -> WorkflowRun:
             str(payload.get("suspension_reason", RunStopReason.NONE.value))
         ),
         approval_request_id=payload.get("approval_id") or payload.get("approval_request_id"),
-        created_at=datetime.fromisoformat(str(payload["created_at"])),
+        created_at=(
+            datetime.fromisoformat(str(payload["created_at"]))
+            if payload.get("created_at") is not None
+            else datetime.now()
+        ),
     )
     started_at = payload.get("started_at")
     completed_at = payload.get("completed_at")
@@ -508,7 +516,7 @@ def resume_project_sync(
     return execute_project_sync(
         project,
         input_data=input_data,
-        workflow_id=str(run_payload.get("workflow", run_payload.get("workflow_id", "default"))),
+        workflow_id=str(run_payload.get("workflow_id", run_payload.get("workflow", "default"))),
         existing_run=deserialize_run(run_payload),
         existing_checkpoints=checkpoints,
         existing_approvals=approvals,

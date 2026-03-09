@@ -13,6 +13,8 @@ from pylon.api.server import APIServer, Response
 
 logger = logging.getLogger(__name__)
 
+_BODY_ERROR_SENTINEL = object()
+
 
 def _resolve_request_headers(headers: dict[str, str]) -> tuple[str, str]:
     request_id = headers.get("x-request-id", "") or uuid.uuid4().hex
@@ -45,6 +47,8 @@ class _BoundHTTPRequestHandler(BaseHTTPRequestHandler):
 
     def _handle(self) -> None:
         request_body = self._read_request_body()
+        if request_body is _BODY_ERROR_SENTINEL:
+            return
         path = urlsplit(self.path).path
         request_headers = {key: value for key, value in self.headers.items()}
         request_id, correlation_id = _resolve_request_headers(
@@ -77,7 +81,7 @@ class _BoundHTTPRequestHandler(BaseHTTPRequestHandler):
             return None
         if content_length > self._MAX_BODY_SIZE:
             self.send_error(413, "Request body too large")
-            return None
+            return _BODY_ERROR_SENTINEL
         raw = self.rfile.read(content_length)
         if not raw:
             return None
@@ -87,7 +91,7 @@ class _BoundHTTPRequestHandler(BaseHTTPRequestHandler):
                 return json.loads(raw.decode("utf-8"))
             except json.JSONDecodeError:
                 self.send_error(400, "Invalid JSON body")
-                return None
+                return _BODY_ERROR_SENTINEL
         return raw.decode("utf-8")
 
     def _write_response(self, response: Response) -> None:

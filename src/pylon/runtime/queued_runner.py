@@ -329,7 +329,8 @@ class QueuedWorkflowDispatchRunner:
             heartbeat_thread.join(timeout=max(self._heartbeat_interval_seconds * 2.0, 0.5))
         with heartbeat_lock:
             final_count = heartbeat_count
-        assert result is not None
+        if result is None:
+            raise RuntimeError("handler did not return a TaskResult")
         return result, final_count
 
     def _apply_retry_policy(self, task: Task, result: TaskResult) -> None:

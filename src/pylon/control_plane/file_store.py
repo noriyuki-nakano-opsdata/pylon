@@ -54,8 +54,7 @@ class JsonFileWorkflowControlPlaneStore:
         if not self._path.exists():
             return _default_state()
         try:
-            with self._lock:
-                raw = json.loads(self._path.read_text())
+            raw = json.loads(self._path.read_text())
         except json.JSONDecodeError as exc:
             raise ValueError(f"Invalid control-plane state file: {self._path}") from exc
         if not isinstance(raw, dict):
@@ -79,10 +78,9 @@ class JsonFileWorkflowControlPlaneStore:
         return state
 
     def _write_state(self, state: dict[str, Any]) -> None:
-        with self._lock:
-            tmp_path = self._path.with_suffix(self._path.suffix + ".tmp")
-            tmp_path.write_text(json.dumps(state, indent=2, sort_keys=True, default=str))
-            tmp_path.replace(self._path)
+        tmp_path = self._path.with_suffix(self._path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(state, indent=2, sort_keys=True, default=str))
+        tmp_path.replace(self._path)
 
     def register_workflow_project(
         self,
@@ -96,19 +94,21 @@ class JsonFileWorkflowControlPlaneStore:
             if isinstance(project, PylonProject)
             else PylonProject.model_validate(project)
         )
-        state = self._read_state()
-        state["workflow_projects"][self._workflow_key(workflow_id, tenant_id)] = {
-            "tenant_id": tenant_id,
-            "workflow_id": workflow_id,
-            "project": resolved.model_dump(mode="json"),
-        }
-        self._write_state(state)
+        with self._lock:
+            state = self._read_state()
+            state["workflow_projects"][self._workflow_key(workflow_id, tenant_id)] = {
+                "tenant_id": tenant_id,
+                "workflow_id": workflow_id,
+                "project": resolved.model_dump(mode="json"),
+            }
+            self._write_state(state)
         return resolved
 
     def remove_workflow_project(self, workflow_id: str, *, tenant_id: str) -> None:
-        state = self._read_state()
-        state["workflow_projects"].pop(self._workflow_key(workflow_id, tenant_id), None)
-        self._write_state(state)
+        with self._lock:
+            state = self._read_state()
+            state["workflow_projects"].pop(self._workflow_key(workflow_id, tenant_id), None)
+            self._write_state(state)
 
     def get_workflow_project(
         self,
@@ -116,8 +116,11 @@ class JsonFileWorkflowControlPlaneStore:
         *,
         tenant_id: str = "default",
     ) -> PylonProject | None:
-        state = self._read_state()
-        payload = state["workflow_projects"].get(self._workflow_key(workflow_id, tenant_id))
+        with self._lock:
+            state = self._read_state()
+            payload = state["workflow_projects"].get(
+                self._workflow_key(workflow_id, tenant_id)
+            )
         if payload is None:
             return None
         return PylonProject.model_validate(payload["project"])
@@ -127,7 +130,8 @@ class JsonFileWorkflowControlPlaneStore:
         *,
         tenant_id: str = "default",
     ) -> list[tuple[str, PylonProject]]:
-        state = self._read_state()
+        with self._lock:
+            state = self._read_state()
         results: list[tuple[str, PylonProject]] = []
         for payload in state["workflow_projects"].values():
             if payload.get("tenant_id") != tenant_id:
@@ -138,7 +142,8 @@ class JsonFileWorkflowControlPlaneStore:
         return results
 
     def list_all_workflow_projects(self) -> list[tuple[str, str, PylonProject]]:
-        state = self._read_state()
+        with self._lock:
+            state = self._read_state()
         results: list[tuple[str, str, PylonProject]] = []
         for payload in state["workflow_projects"].values():
             results.append(
@@ -152,8 +157,9 @@ class JsonFileWorkflowControlPlaneStore:
         return results
 
     def get_run_record(self, run_id: str) -> dict[str, Any] | None:
-        state = self._read_state()
-        payload = state["workflow_runs_by_id"].get(run_id)
+        with self._lock:
+            state = self._read_state()
+            payload = state["workflow_runs_by_id"].get(run_id)
         return None if payload is None else dict(payload)
 
     def put_run_record(
@@ -165,34 +171,39 @@ class JsonFileWorkflowControlPlaneStore:
         parameters: dict[str, Any] | None = None,
         expected_record_version: int | None = None,
     ) -> dict[str, Any]:
-        state = self._read_state()
-        run_id = str(run_record["id"])
-        existing = state["workflow_runs_by_id"].get(run_id)
-        current_version = (
-            int(existing.get("record_version", 0))
-            if isinstance(existing, dict)
-            else 0
-        )
-        if expected_record_version is not None and current_version != expected_record_version:
-            raise ConcurrencyError(
-                f"Run record version conflict for {run_id}",
-                details={
-                    "run_id": run_id,
-                    "expected_record_version": expected_record_version,
-                    "actual_record_version": current_version,
-                },
+        with self._lock:
+            state = self._read_state()
+            run_id = str(run_record["id"])
+            existing = state["workflow_runs_by_id"].get(run_id)
+            current_version = (
+                int(existing.get("record_version", 0))
+                if isinstance(existing, dict)
+                else 0
             )
-        stored = dict(run_record)
-        stored["workflow_id"] = workflow_id
-        stored["tenant_id"] = tenant_id
-        stored["parameters"] = dict(parameters or {})
-        stored["record_version"] = current_version + 1
-        state["workflow_runs_by_id"][run_id] = stored
-        self._write_state(state)
+            if (
+                expected_record_version is not None
+                and current_version != expected_record_version
+            ):
+                raise ConcurrencyError(
+                    f"Run record version conflict for {run_id}",
+                    details={
+                        "run_id": run_id,
+                        "expected_record_version": expected_record_version,
+                        "actual_record_version": current_version,
+                    },
+                )
+            stored = dict(run_record)
+            stored["workflow_id"] = workflow_id
+            stored["tenant_id"] = tenant_id
+            stored["parameters"] = dict(parameters or {})
+            stored["record_version"] = current_version + 1
+            state["workflow_runs_by_id"][run_id] = stored
+            self._write_state(state)
         return stored
 
     def list_all_run_records(self) -> list[dict[str, Any]]:
-        state = self._read_state()
+        with self._lock:
+            state = self._read_state()
         return [dict(payload) for payload in state["workflow_runs_by_id"].values()]
 
     def get_run_record_by_idempotency_key(
@@ -202,12 +213,13 @@ class JsonFileWorkflowControlPlaneStore:
         tenant_id: str = "default",
         idempotency_key: str,
     ) -> dict[str, Any] | None:
-        state = self._read_state()
-        key = f"{tenant_id}:{workflow_id}:{idempotency_key}"
-        run_id = state["idempotency_keys"].get(key)
-        if not isinstance(run_id, str):
-            return None
-        payload = state["workflow_runs_by_id"].get(run_id)
+        with self._lock:
+            state = self._read_state()
+            key = f"{tenant_id}:{workflow_id}:{idempotency_key}"
+            run_id = state["idempotency_keys"].get(key)
+            if not isinstance(run_id, str):
+                return None
+            payload = state["workflow_runs_by_id"].get(run_id)
         return None if payload is None else dict(payload)
 
     def put_run_idempotency_key(
@@ -218,35 +230,39 @@ class JsonFileWorkflowControlPlaneStore:
         idempotency_key: str,
         run_id: str,
     ) -> None:
-        state = self._read_state()
-        key = f"{tenant_id}:{workflow_id}:{idempotency_key}"
-        existing_run_id = state["idempotency_keys"].get(key)
-        if existing_run_id is not None and existing_run_id != run_id:
-            raise ConcurrencyError(
-                f"Idempotency key already bound for workflow {workflow_id}",
-                details={
-                    "workflow_id": workflow_id,
-                    "tenant_id": tenant_id,
-                    "idempotency_key": idempotency_key,
-                    "existing_run_id": existing_run_id,
-                    "run_id": run_id,
-                },
-            )
-        state["idempotency_keys"][key] = run_id
-        self._write_state(state)
+        with self._lock:
+            state = self._read_state()
+            key = f"{tenant_id}:{workflow_id}:{idempotency_key}"
+            existing_run_id = state["idempotency_keys"].get(key)
+            if existing_run_id is not None and existing_run_id != run_id:
+                raise ConcurrencyError(
+                    f"Idempotency key already bound for workflow {workflow_id}",
+                    details={
+                        "workflow_id": workflow_id,
+                        "tenant_id": tenant_id,
+                        "idempotency_key": idempotency_key,
+                        "existing_run_id": existing_run_id,
+                        "run_id": run_id,
+                    },
+                )
+            state["idempotency_keys"][key] = run_id
+            self._write_state(state)
 
     def get_checkpoint_record(self, checkpoint_id: str) -> dict[str, Any] | None:
-        state = self._read_state()
-        payload = state["checkpoints"].get(checkpoint_id)
+        with self._lock:
+            state = self._read_state()
+            payload = state["checkpoints"].get(checkpoint_id)
         return None if payload is None else dict(payload)
 
     def put_checkpoint_record(self, checkpoint_payload: dict[str, Any]) -> None:
-        state = self._read_state()
-        state["checkpoints"][str(checkpoint_payload["id"])] = dict(checkpoint_payload)
-        self._write_state(state)
+        with self._lock:
+            state = self._read_state()
+            state["checkpoints"][str(checkpoint_payload["id"])] = dict(checkpoint_payload)
+            self._write_state(state)
 
     def list_run_checkpoints(self, run_id: str) -> list[dict[str, Any]]:
-        state = self._read_state()
+        with self._lock:
+            state = self._read_state()
         return [
             dict(checkpoint)
             for checkpoint in state["checkpoints"].values()
@@ -254,17 +270,20 @@ class JsonFileWorkflowControlPlaneStore:
         ]
 
     def get_approval_record(self, approval_id: str) -> dict[str, Any] | None:
-        state = self._read_state()
-        payload = state["approvals"].get(approval_id)
+        with self._lock:
+            state = self._read_state()
+            payload = state["approvals"].get(approval_id)
         return None if payload is None else dict(payload)
 
     def put_approval_record(self, approval_payload: dict[str, Any]) -> None:
-        state = self._read_state()
-        state["approvals"][str(approval_payload["id"])] = dict(approval_payload)
-        self._write_state(state)
+        with self._lock:
+            state = self._read_state()
+            state["approvals"][str(approval_payload["id"])] = dict(approval_payload)
+            self._write_state(state)
 
     def list_run_approvals(self, run_id: str) -> list[dict[str, Any]]:
-        state = self._read_state()
+        with self._lock:
+            state = self._read_state()
         return [
             dict(approval)
             for approval in state["approvals"].values()
@@ -272,25 +291,29 @@ class JsonFileWorkflowControlPlaneStore:
         ]
 
     def list_all_approval_records(self) -> list[dict[str, Any]]:
-        state = self._read_state()
+        with self._lock:
+            state = self._read_state()
         return [dict(payload) for payload in state["approvals"].values()]
 
     def get_audit_record(self, entry_id: int) -> dict[str, Any] | None:
-        state = self._read_state()
-        payload = state["audit_entries"].get(str(entry_id))
+        with self._lock:
+            state = self._read_state()
+            payload = state["audit_entries"].get(str(entry_id))
         return None if payload is None else dict(payload)
 
     def get_last_audit_record(self) -> dict[str, Any] | None:
-        state = self._read_state()
-        if not state["audit_entries"]:
-            return None
-        last_key = max(state["audit_entries"], key=lambda key: int(key))
-        return dict(state["audit_entries"][last_key])
+        with self._lock:
+            state = self._read_state()
+            if not state["audit_entries"]:
+                return None
+            last_key = max(state["audit_entries"], key=lambda key: int(key))
+            return dict(state["audit_entries"][last_key])
 
     def put_audit_record(self, audit_payload: dict[str, Any]) -> None:
-        state = self._read_state()
-        state["audit_entries"][str(audit_payload["id"])] = dict(audit_payload)
-        self._write_state(state)
+        with self._lock:
+            state = self._read_state()
+            state["audit_entries"][str(audit_payload["id"])] = dict(audit_payload)
+            self._write_state(state)
 
     def list_audit_records(
         self,
@@ -300,7 +323,8 @@ class JsonFileWorkflowControlPlaneStore:
         limit: int | None = 100,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        state = self._read_state()
+        with self._lock:
+            state = self._read_state()
         results = list(state["audit_entries"].values())
         if tenant_id is not None:
             results = [entry for entry in results if entry.get("tenant_id") == tenant_id]
@@ -312,21 +336,24 @@ class JsonFileWorkflowControlPlaneStore:
         return [dict(entry) for entry in results[offset : offset + limit]]
 
     def get_queue_task_record(self, task_id: str) -> dict[str, Any] | None:
-        state = self._read_state()
-        payload = state["queue_tasks"].get(task_id)
+        with self._lock:
+            state = self._read_state()
+            payload = state["queue_tasks"].get(task_id)
         return None if payload is None else dict(payload)
 
     def put_queue_task_record(self, task_payload: dict[str, Any]) -> None:
-        state = self._read_state()
-        state["queue_tasks"][str(task_payload["id"])] = dict(task_payload)
-        self._write_state(state)
+        with self._lock:
+            state = self._read_state()
+            state["queue_tasks"][str(task_payload["id"])] = dict(task_payload)
+            self._write_state(state)
 
     def delete_queue_task_record(self, task_id: str) -> bool:
-        state = self._read_state()
-        removed = state["queue_tasks"].pop(task_id, None)
-        if removed is not None:
-            self._write_state(state)
-            return True
+        with self._lock:
+            state = self._read_state()
+            removed = state["queue_tasks"].pop(task_id, None)
+            if removed is not None:
+                self._write_state(state)
+                return True
         return False
 
     def list_queue_task_records(
@@ -334,7 +361,8 @@ class JsonFileWorkflowControlPlaneStore:
         *,
         status: str | None = None,
     ) -> list[dict[str, Any]]:
-        state = self._read_state()
+        with self._lock:
+            state = self._read_state()
         results = list(state["queue_tasks"].values())
         if status is not None:
             results = [task for task in results if task.get("status") == status]
@@ -347,11 +375,13 @@ class JsonFileWorkflowControlPlaneStore:
         return [dict(task) for task in results]
 
     def get_node_handlers(self, workflow_id: str) -> dict[str, Any] | None:
-        handlers = self._node_handlers.get(workflow_id)
+        with self._lock:
+            handlers = self._node_handlers.get(workflow_id)
         return None if handlers is None else dict(handlers)
 
     def get_agent_handlers(self, workflow_id: str) -> dict[str, Any] | None:
-        handlers = self._agent_handlers.get(workflow_id)
+        with self._lock:
+            handlers = self._agent_handlers.get(workflow_id)
         return None if handlers is None else dict(handlers)
 
     def set_handlers(
@@ -361,7 +391,8 @@ class JsonFileWorkflowControlPlaneStore:
         node_handlers: dict[str, Any] | None = None,
         agent_handlers: dict[str, Any] | None = None,
     ) -> None:
-        if node_handlers is not None:
-            self._node_handlers[workflow_id] = dict(node_handlers)
-        if agent_handlers is not None:
-            self._agent_handlers[workflow_id] = dict(agent_handlers)
+        with self._lock:
+            if node_handlers is not None:
+                self._node_handlers[workflow_id] = dict(node_handlers)
+            if agent_handlers is not None:
+                self._agent_handlers[workflow_id] = dict(agent_handlers)
