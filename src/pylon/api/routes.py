@@ -23,7 +23,6 @@ from pylon.api.schemas import (
     validate,
 )
 from pylon.api.server import APIServer, HandlerFunc, Request, Response
-from pylon.config.pipeline import build_validation_report, validate_project_definition
 from pylon.control_plane import (
     ControlPlaneBackend,
     ControlPlaneStoreConfig,
@@ -439,6 +438,8 @@ def register_routes(
                 status_code=409,
                 body={"error": f"Workflow already exists: {workflow_id}"},
             )
+        from pylon.config.pipeline import build_validation_report, validate_project_definition
+
         validation_result = validate_project_definition(body["project"])
         validation_report = build_validation_report(validation_result)
         if not validation_result.valid:
