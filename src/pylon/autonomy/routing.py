@@ -72,6 +72,7 @@ class ModelRouteDecision:
 
 
 DEFAULT_MODEL_PROFILES: tuple[ModelProfile, ...] = (
+    # Anthropic
     ModelProfile(
         provider_name="anthropic",
         model_id="claude-haiku",
@@ -95,6 +96,66 @@ DEFAULT_MODEL_PROFILES: tuple[ModelProfile, ...] = (
         supports_tools=True,
         prompt_caching=True,
         batch_api=True,
+    ),
+    # OpenAI
+    ModelProfile(
+        provider_name="openai",
+        model_id="gpt-4o-mini",
+        tier=ModelTier.LIGHTWEIGHT,
+        supports_tools=True,
+        prompt_caching=False,
+        batch_api=True,
+    ),
+    ModelProfile(
+        provider_name="openai",
+        model_id="gpt-4o",
+        tier=ModelTier.STANDARD,
+        supports_tools=True,
+        prompt_caching=False,
+        batch_api=True,
+    ),
+    ModelProfile(
+        provider_name="openai",
+        model_id="o3",
+        tier=ModelTier.PREMIUM,
+        supports_tools=True,
+        prompt_caching=False,
+        batch_api=True,
+    ),
+    # Google
+    ModelProfile(
+        provider_name="google",
+        model_id="gemini-2.0-flash",
+        tier=ModelTier.LIGHTWEIGHT,
+        supports_tools=True,
+        prompt_caching=True,
+        batch_api=False,
+    ),
+    ModelProfile(
+        provider_name="google",
+        model_id="gemini-2.5-pro",
+        tier=ModelTier.STANDARD,
+        supports_tools=True,
+        prompt_caching=True,
+        batch_api=False,
+    ),
+    # AWS Bedrock
+    ModelProfile(
+        provider_name="bedrock",
+        model_id="anthropic.claude-sonnet-4-20250514-v1:0",
+        tier=ModelTier.STANDARD,
+        supports_tools=True,
+        prompt_caching=False,
+        batch_api=False,
+    ),
+    # Ollama (local)
+    ModelProfile(
+        provider_name="ollama",
+        model_id="llama3.1",
+        tier=ModelTier.LIGHTWEIGHT,
+        supports_tools=False,
+        prompt_caching=False,
+        batch_api=False,
     ),
 )
 
