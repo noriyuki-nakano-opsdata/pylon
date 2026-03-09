@@ -23,6 +23,22 @@ class CacheStrategy(enum.StrEnum):
     BATCH = "batch"
 
 
+class CacheMode(enum.StrEnum):
+    """How the provider handles prompt caching."""
+
+    NONE = "none"
+    EXPLICIT = "explicit"  # Anthropic: cache_control blocks
+    AUTOMATIC = "automatic"  # OpenAI/DeepSeek: automatic prefix caching
+    PREFIX = "prefix"  # Google: context caching API
+
+
+class ApiCompatibility(enum.StrEnum):
+    """API wire format compatibility group."""
+
+    NATIVE = "native"
+    OPENAI_COMPATIBLE = "openai_compatible"
+
+
 @dataclass(frozen=True)
 class ModelProfile:
     """Static model metadata used by the router."""
@@ -33,6 +49,16 @@ class ModelProfile:
     supports_tools: bool = True
     prompt_caching: bool = False
     batch_api: bool = False
+    context_window: int = 128_000
+    max_output_tokens: int = 4096
+    input_price_per_million: float = 0.0
+    output_price_per_million: float = 0.0
+    cache_read_price_per_million: float = 0.0
+    cache_write_price_per_million: float = 0.0
+    supports_reasoning: bool = False
+    supports_vision: bool = False
+    cache_mode: CacheMode = CacheMode.NONE
+    api_compatibility: ApiCompatibility = ApiCompatibility.NATIVE
 
 
 @dataclass(frozen=True)
@@ -80,6 +106,9 @@ DEFAULT_MODEL_PROFILES: tuple[ModelProfile, ...] = (
         supports_tools=True,
         prompt_caching=True,
         batch_api=True,
+        input_price_per_million=1.00,
+        output_price_per_million=5.00,
+        cache_mode=CacheMode.EXPLICIT,
     ),
     ModelProfile(
         provider_name="anthropic",
@@ -88,6 +117,9 @@ DEFAULT_MODEL_PROFILES: tuple[ModelProfile, ...] = (
         supports_tools=True,
         prompt_caching=True,
         batch_api=True,
+        input_price_per_million=3.00,
+        output_price_per_million=15.00,
+        cache_mode=CacheMode.EXPLICIT,
     ),
     ModelProfile(
         provider_name="anthropic",
@@ -96,6 +128,9 @@ DEFAULT_MODEL_PROFILES: tuple[ModelProfile, ...] = (
         supports_tools=True,
         prompt_caching=True,
         batch_api=True,
+        input_price_per_million=5.00,
+        output_price_per_million=25.00,
+        cache_mode=CacheMode.EXPLICIT,
     ),
     # OpenAI
     ModelProfile(
@@ -105,6 +140,9 @@ DEFAULT_MODEL_PROFILES: tuple[ModelProfile, ...] = (
         supports_tools=True,
         prompt_caching=False,
         batch_api=True,
+        input_price_per_million=0.15,
+        output_price_per_million=0.60,
+        cache_mode=CacheMode.AUTOMATIC,
     ),
     ModelProfile(
         provider_name="openai",
@@ -113,6 +151,9 @@ DEFAULT_MODEL_PROFILES: tuple[ModelProfile, ...] = (
         supports_tools=True,
         prompt_caching=False,
         batch_api=True,
+        input_price_per_million=2.50,
+        output_price_per_million=10.00,
+        cache_mode=CacheMode.AUTOMATIC,
     ),
     ModelProfile(
         provider_name="openai",
@@ -121,6 +162,10 @@ DEFAULT_MODEL_PROFILES: tuple[ModelProfile, ...] = (
         supports_tools=True,
         prompt_caching=False,
         batch_api=True,
+        input_price_per_million=2.00,
+        output_price_per_million=8.00,
+        supports_reasoning=True,
+        cache_mode=CacheMode.AUTOMATIC,
     ),
     # Google
     ModelProfile(
@@ -130,6 +175,9 @@ DEFAULT_MODEL_PROFILES: tuple[ModelProfile, ...] = (
         supports_tools=True,
         prompt_caching=True,
         batch_api=False,
+        input_price_per_million=0.15,
+        output_price_per_million=0.60,
+        cache_mode=CacheMode.PREFIX,
     ),
     ModelProfile(
         provider_name="google",
@@ -138,6 +186,10 @@ DEFAULT_MODEL_PROFILES: tuple[ModelProfile, ...] = (
         supports_tools=True,
         prompt_caching=True,
         batch_api=False,
+        input_price_per_million=1.25,
+        output_price_per_million=10.00,
+        supports_reasoning=True,
+        cache_mode=CacheMode.PREFIX,
     ),
     # AWS Bedrock
     ModelProfile(
@@ -147,6 +199,8 @@ DEFAULT_MODEL_PROFILES: tuple[ModelProfile, ...] = (
         supports_tools=True,
         prompt_caching=False,
         batch_api=False,
+        input_price_per_million=3.00,
+        output_price_per_million=15.00,
     ),
     # Ollama (local)
     ModelProfile(
@@ -156,6 +210,99 @@ DEFAULT_MODEL_PROFILES: tuple[ModelProfile, ...] = (
         supports_tools=False,
         prompt_caching=False,
         batch_api=False,
+    ),
+    # DeepSeek
+    ModelProfile(
+        provider_name="deepseek",
+        model_id="deepseek-chat",
+        tier=ModelTier.LIGHTWEIGHT,
+        supports_tools=True,
+        input_price_per_million=0.28,
+        output_price_per_million=0.42,
+        cache_mode=CacheMode.AUTOMATIC,
+        api_compatibility=ApiCompatibility.OPENAI_COMPATIBLE,
+    ),
+    ModelProfile(
+        provider_name="deepseek",
+        model_id="deepseek-reasoner",
+        tier=ModelTier.STANDARD,
+        supports_tools=True,
+        supports_reasoning=True,
+        input_price_per_million=0.28,
+        output_price_per_million=0.42,
+        cache_mode=CacheMode.AUTOMATIC,
+        api_compatibility=ApiCompatibility.OPENAI_COMPATIBLE,
+    ),
+    # Groq
+    ModelProfile(
+        provider_name="groq",
+        model_id="llama-3.3-70b-versatile",
+        tier=ModelTier.LIGHTWEIGHT,
+        supports_tools=True,
+        api_compatibility=ApiCompatibility.OPENAI_COMPATIBLE,
+    ),
+    # Mistral
+    ModelProfile(
+        provider_name="mistral",
+        model_id="mistral-small-3.2",
+        tier=ModelTier.LIGHTWEIGHT,
+        supports_tools=True,
+        input_price_per_million=0.06,
+        output_price_per_million=0.18,
+        api_compatibility=ApiCompatibility.OPENAI_COMPATIBLE,
+    ),
+    ModelProfile(
+        provider_name="mistral",
+        model_id="mistral-large-3",
+        tier=ModelTier.STANDARD,
+        supports_tools=True,
+        input_price_per_million=0.50,
+        output_price_per_million=1.50,
+        api_compatibility=ApiCompatibility.OPENAI_COMPATIBLE,
+    ),
+    # xAI
+    ModelProfile(
+        provider_name="xai",
+        model_id="grok-4",
+        tier=ModelTier.PREMIUM,
+        supports_tools=True,
+        supports_reasoning=True,
+        input_price_per_million=3.00,
+        output_price_per_million=15.00,
+        context_window=256_000,
+        api_compatibility=ApiCompatibility.OPENAI_COMPATIBLE,
+    ),
+    # Moonshot
+    ModelProfile(
+        provider_name="moonshot",
+        model_id="kimi-k2.5",
+        tier=ModelTier.STANDARD,
+        supports_tools=True,
+        supports_reasoning=True,
+        input_price_per_million=0.60,
+        output_price_per_million=3.00,
+        context_window=256_000,
+        api_compatibility=ApiCompatibility.OPENAI_COMPATIBLE,
+    ),
+    # Zhipu
+    ModelProfile(
+        provider_name="zhipu",
+        model_id="glm-5",
+        tier=ModelTier.STANDARD,
+        supports_tools=True,
+        supports_reasoning=True,
+        input_price_per_million=0.50,
+        output_price_per_million=2.00,
+        context_window=200_000,
+        api_compatibility=ApiCompatibility.OPENAI_COMPATIBLE,
+    ),
+    # Together
+    ModelProfile(
+        provider_name="together",
+        model_id="meta-llama/Meta-Llama-3.1-70B",
+        tier=ModelTier.LIGHTWEIGHT,
+        supports_tools=True,
+        api_compatibility=ApiCompatibility.OPENAI_COMPATIBLE,
     ),
 )
 

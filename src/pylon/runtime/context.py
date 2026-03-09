@@ -152,5 +152,28 @@ class ContextManager:
         )
         return summary[: self.config.summary_char_limit]
 
+    def prepare_for_provider(
+        self,
+        messages: list[Message],
+        *,
+        context_window: int = 200000,
+        max_output_tokens: int = 8192,
+        static_instruction: str = "",
+    ) -> PreparedContext:
+        """Prepare context respecting a specific provider's context window.
+
+        Adjusts max_input_tokens based on the provider's context_window
+        minus reserved output tokens, then delegates to a temporary
+        ContextManager to avoid mutating self.config (thread-safe).
+        """
+        available = max(1000, context_window - max_output_tokens)
+        adjusted = ContextWindowConfig(
+            max_input_tokens=min(available, self.config.max_input_tokens) if self.config.max_input_tokens > 0 else available,
+            keep_last_messages=self.config.keep_last_messages,
+            summary_char_limit=self.config.summary_char_limit,
+        )
+        temp_manager = ContextManager(config=adjusted)
+        return temp_manager.prepare(messages, static_instruction=static_instruction)
+
     def _has_system_prefix(self, messages: list[Message]) -> bool:
         return bool(messages) and messages[0].role == "system"

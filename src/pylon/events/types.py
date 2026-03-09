@@ -20,6 +20,9 @@ TASK_COMPLETED = "task.completed"
 KILL_SWITCH_ACTIVATED = "kill_switch.activated"
 APPROVAL_REQUESTED = "approval.requested"
 APPROVAL_GRANTED = "approval.granted"
+PROVIDER_HEALTH_CHANGED = "provider.health_changed"
+PROVIDER_FALLBACK_TRIGGERED = "provider.fallback_triggered"
+BUDGET_THRESHOLD_REACHED = "budget.threshold_reached"
 
 
 @dataclass

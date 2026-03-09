@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
+from typing import Any
 
 
 class ExitCode(enum.IntEnum):
@@ -112,6 +113,25 @@ class ProviderError(PylonError):
     exit_code = ExitCode.PROVIDER_ERROR
     retryable = True
     category = "infrastructure"
+
+
+class RateLimitError(ProviderError):
+    """Provider returned 429 Too Many Requests."""
+
+    code = "RATE_LIMIT_EXCEEDED"
+    status_code = 429
+    retryable = True
+
+    def __init__(
+        self,
+        message: str = "Rate limit exceeded",
+        *,
+        retry_after: float = 0.0,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message, details=details)
+        self.status_code = 429
+        self.retry_after = retry_after
 
 
 class PromptInjectionError(PylonError):

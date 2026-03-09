@@ -17,8 +17,18 @@ class Message:
 
     role: str  # "system", "user", "assistant", "tool"
     content: str
+    content_blocks: list[dict[str, Any]] | None = None
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     tool_call_id: str | None = None
+
+
+@dataclass
+class ReasoningOutput:
+    """Normalized reasoning/thinking output from any provider."""
+
+    content: str
+    tokens: int = 0
+    redacted_for_resend: Any = None
 
 
 @dataclass
@@ -30,6 +40,8 @@ class Response:
     usage: TokenUsage | None = None
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     finish_reason: str = "stop"
+    reasoning: ReasoningOutput | None = None
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -50,6 +62,7 @@ class TokenUsage:
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    reasoning_tokens: int = 0
 
     @property
     def total_tokens(self) -> int:

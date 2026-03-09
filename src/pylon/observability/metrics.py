@@ -24,6 +24,9 @@ PREDEFINED_METRICS: dict[str, MetricType] = {
     "llm_cost_usd": MetricType.COUNTER,
     "model_route_count": MetricType.COUNTER,
     "workflow_step_count": MetricType.COUNTER,
+    "provider_fallback_count": MetricType.COUNTER,
+    "provider_circuit_open_count": MetricType.COUNTER,
+    "llm_cache_savings_usd": MetricType.COUNTER,
 }
 
 
