@@ -1,0 +1,164 @@
+# pylon.yaml — Example: Autonomous Coding Agent (A4)
+# A fully autonomous agent pipeline that implements a feature from spec,
+# including planning, coding, review, iterative refinement, and committing.
+
+version: "1"
+name: autonomous-coding-agent
+description: >
+  End-to-end autonomous coding pipeline. Given a feature specification,
+  the agents plan, implement, review, refine, and commit production-quality
+  code without human intervention.
+
+# ---------------------------------------------------------------------------
+# Agents — all A4 (fully autonomous, no human approval gates)
+# ---------------------------------------------------------------------------
+agents:
+  planner:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Analyze the input feature specification and produce a structured
+      implementation plan. Break down the work into files, functions, and
+      test cases. Identify edge cases and dependencies.
+    autonomy: A4
+    tools: [read_file, list_files]
+    sandbox: gvisor
+    input_trust: untrusted  # spec comes from external input
+
+  coder:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Implement the feature according to the plan produced by the planner.
+      Write clean, well-documented code following project conventions.
+      Include unit tests for all new functions.
+    autonomy: A4
+    tools: [read_file, write_file, list_files]
+    sandbox: gvisor
+    input_trust: internal
+
+  reviewer:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Review the implementation for correctness, code quality, security,
+      and test coverage. Run the test suite and report results. Produce
+      a structured review with pass/fail verdict and actionable feedback.
+    autonomy: A4
+    tools: [read_file, list_files, run_tests]
+    sandbox: gvisor
+    input_trust: internal
+
+  refiner:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Apply review feedback to improve the implementation. Fix bugs,
+      address code quality issues, and re-run tests until the quality
+      threshold is met.
+    autonomy: A4
+    tools: [read_file, write_file, list_files, run_tests]
+    sandbox: gvisor
+    input_trust: internal
+
+  committer:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Create a git commit with a conventional commit message summarizing
+      the implemented feature. Include Co-authored-by trailers for each
+      agent that contributed.
+    autonomy: A4
+    tools: [git_diff, git_commit]
+    sandbox: gvisor
+    input_trust: internal
+
+# ---------------------------------------------------------------------------
+# Workflow — directed graph with a refinement loop
+# ---------------------------------------------------------------------------
+workflow:
+  type: graph
+  nodes:
+    # Step 1: Analyze the spec and produce an implementation plan
+    plan:
+      agent: planner
+      node_type: agent
+      next: implement
+
+    # Step 2: Write the code and tests based on the plan
+    implement:
+      agent: coder
+      node_type: agent
+      next: review
+
+    # Step 3: Review the implementation for quality and correctness
+    review:
+      agent: reviewer
+      node_type: agent
+      next:
+        - target: refine
+          condition: "state.review_passed == false"
+        - target: commit
+          condition: "state.review_passed == true"
+
+    # Step 4: Iterative refinement loop — fix issues and re-review
+    refine:
+      agent: refiner
+      node_type: loop
+      loop_max_iterations: 3        # hard cap on refinement cycles
+      loop_criterion: quality_score  # metric to evaluate on each iteration
+      loop_threshold: 0.85           # exit loop when quality >= 0.85
+      loop_metadata:
+        description: "Refine code until review quality threshold is met"
+      next: review                   # loop back to review after each refinement
+
+    # Step 5: Commit the final implementation
+    commit:
+      agent: committer
+      node_type: agent
+      next: END
+
+# ---------------------------------------------------------------------------
+# Policy — cost, duration, and safety guardrails
+# ---------------------------------------------------------------------------
+policy:
+  max_cost_usd: 5.0
+  max_duration: 30m
+  require_approval_above: A4  # no approval gates in this pipeline
+  safety:
+    blocked_actions:
+      - "git push --force"
+      - "git branch -D main"
+      - "rm -rf /"
+    max_file_changes: 30
+  compliance:
+    audit_log: required
+
+# ---------------------------------------------------------------------------
+# Goal — defines success criteria and constraints for the pipeline
+# ---------------------------------------------------------------------------
+goal:
+  objective: >
+    Implement the feature described in the input specification with
+    production-quality code that passes all tests.
+  success_criteria:
+    - type: test_pass
+      threshold: 1.0  # all tests must pass
+    - type: code_quality
+      threshold: 0.85
+      rubric: >
+        Clean, readable code following project conventions. Functions are
+        small and focused. Error handling is comprehensive. No code
+        duplication. Meaningful variable and function names.
+  constraints:
+    max_iterations: 20
+    max_cost_usd: 5.0
+    timeout: 30m
+    max_replans: 3
+  failure_policy: escalate
+  completion_policy: require_workflow_end
+  refinement:
+    max_replans: 3
+    exhaustion_policy: escalate
+  allowed_effect_scopes:
+    - "fs:read"
+    - "fs:write"
+    - "git:commit"
+    - "process:run_tests"
+  allowed_secret_scopes:
+    - "git:credentials"

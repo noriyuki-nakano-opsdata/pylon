@@ -1,0 +1,166 @@
+# pylon.yaml — Autonomous Research Report Pipeline (A4)
+# Six agents collaborate to research a topic and produce a structured report.
+# researcher_a and researcher_b run in parallel, then results merge through
+# synthesizer -> writer -> fact_checker -> editor.
+
+version: "1"
+name: autonomous-research-report
+description: >
+  Fully autonomous (A4) multi-agent pipeline that researches a topic from
+  academic and industry sources, synthesizes findings, writes a structured
+  report, verifies factual accuracy, and applies final editorial polish.
+
+# ---------------------------------------------------------------------------
+# Agents
+# ---------------------------------------------------------------------------
+agents:
+  # Parallel branch A: academic literature
+  researcher_a:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Search academic databases, journals, and preprint archives for
+      peer-reviewed findings on the given topic. Extract key claims,
+      methodologies, and citations. Output a structured summary with
+      source references.
+    autonomy: A4
+    tools: [web-search, file-read, file-write]
+    sandbox: gvisor
+    input_trust: untrusted          # External search results are untrusted
+
+  # Parallel branch B: industry reports and practitioner sources
+  researcher_b:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Search industry reports, whitepapers, conference talks, and
+      practitioner blogs for real-world data and case studies on the
+      given topic. Extract quantitative metrics, adoption trends, and
+      lessons learned. Output a structured summary with source references.
+    autonomy: A4
+    tools: [web-search, file-read, file-write]
+    sandbox: gvisor
+    input_trust: untrusted
+
+  # Merge point: combines both research branches
+  synthesizer:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Merge the academic and industry research summaries into a unified
+      knowledge base. Identify overlapping themes, contradictions, and
+      gaps. Produce a consolidated outline with categorized findings
+      ready for the writer.
+    autonomy: A4
+    tools: [file-read, file-write]
+    sandbox: gvisor
+
+  # Sequential: drafts the report
+  writer:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Write a comprehensive, well-structured research report based on
+      the synthesized outline. Include an executive summary, methodology
+      section, detailed findings, analysis, and conclusion. Use proper
+      academic citation format throughout.
+    autonomy: A4
+    tools: [file-read, file-write]
+    sandbox: gvisor
+
+  # Sequential: verifies factual claims
+  fact_checker:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Verify every factual claim and citation in the draft report.
+      Cross-reference statistics, dates, and quoted findings against
+      the original sources. Flag unverifiable claims and suggest
+      corrections or removals.
+    autonomy: A4
+    tools: [web-search, file-read, file-write]
+    sandbox: gvisor
+    input_trust: untrusted          # Re-validates external sources
+
+  # Sequential: final editorial pass
+  editor:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Apply final editorial polish to the fact-checked report.
+      Ensure consistent tone, fix grammar and style issues, verify
+      formatting, and produce the publication-ready document.
+    autonomy: A4
+    tools: [file-read, file-write]
+    sandbox: gvisor
+
+# ---------------------------------------------------------------------------
+# Workflow — DAG with parallel fan-out and sequential tail
+# ---------------------------------------------------------------------------
+workflow:
+  type: graph
+  nodes:
+    # Fan-out: two researchers run concurrently
+    research_academic:
+      agent: researcher_a
+      next: synthesize
+
+    research_industry:
+      agent: researcher_b
+      next: synthesize
+
+    # Fan-in: waits for BOTH researchers before proceeding
+    synthesize:
+      agent: synthesizer
+      join_policy: all_resolved      # Block until all inbound edges complete
+      next: write_report
+
+    # Sequential pipeline: write -> verify -> edit
+    write_report:
+      agent: writer
+      next: verify_facts
+
+    verify_facts:
+      agent: fact_checker
+      next: final_edit
+
+    final_edit:
+      agent: editor
+      # Terminal node — no "next" means END
+
+# ---------------------------------------------------------------------------
+# Policy — cost and safety guardrails
+# ---------------------------------------------------------------------------
+policy:
+  max_cost_usd: 3.0
+  max_duration: 20m
+  require_approval_above: A4        # A4 agents run without human approval
+  safety:
+    blocked_actions:
+      - "rm -rf"
+      - "git push --force"
+    max_file_changes: 20
+  compliance:
+    audit_log: required
+
+# ---------------------------------------------------------------------------
+# Goal — bounded autonomy with measurable success criteria
+# ---------------------------------------------------------------------------
+goal:
+  objective: >
+    Produce a comprehensive, factually accurate research report on the
+    given topic.
+  success_criteria:
+    - type: factual_accuracy
+      threshold: 0.95               # 95 % of claims must be verifiable
+    - type: coverage
+      threshold: 0.8
+      rubric: >
+        The report must cover the breadth of the topic, including at
+        least academic foundations, industry adoption, current trends,
+        and open challenges.
+  constraints:
+    max_iterations: 15
+    max_cost_usd: 3.0
+    timeout: 20m
+  failure_policy: escalate
+  completion_policy: require_workflow_end
+  refinement:
+    max_replans: 3
+    exhaustion_policy: escalate      # Escalate to human if replans exhausted
+  allowed_effect_scopes:
+    - "file:report/**"               # Agents may only write under report/

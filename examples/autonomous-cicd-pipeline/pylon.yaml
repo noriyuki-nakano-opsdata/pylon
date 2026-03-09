@@ -1,0 +1,198 @@
+# pylon.yaml — Autonomous CI/CD Pipeline
+# Fully autonomous pipeline: test, scan, gate, deploy, verify, rollback.
+# 7-node workflow with conditional branching and parallel execution.
+
+version: "1"
+name: autonomous-cicd-pipeline
+description: >
+  Autonomous CI/CD pipeline that runs tests and security scans in parallel,
+  evaluates quality gates, deploys through staging to production with
+  automatic rollback on failure.
+
+# ---------------------------------------------------------------------------
+# Agents
+# ---------------------------------------------------------------------------
+agents:
+  # Runs unit and integration test suites, reports pass/fail with coverage
+  test_runner:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Execute unit and integration test suites. Parse test output for
+      failures, flaky tests, and coverage metrics. Report structured
+      results including pass/fail counts and coverage percentage.
+    autonomy: A4  # Fully autonomous — no human in the loop
+    tools: [shell-exec, file-read, test-report-parse]
+    sandbox: gvisor
+    input_trust: medium
+
+  # Performs SAST and DAST security analysis on the codebase
+  security_scanner:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Run static application security testing (SAST) and dynamic
+      application security testing (DAST). Identify vulnerabilities by
+      severity (critical, high, medium, low). Produce a structured
+      findings report.
+    autonomy: A4
+    tools: [shell-exec, file-read, file-search, security-report-parse]
+    sandbox: gvisor
+    input_trust: medium
+
+  # Evaluates combined test and security results to make a go/no-go decision
+  quality_gate:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Evaluate test results and security scan findings. Apply quality
+      thresholds: tests must pass (>= 95% pass rate, >= 80% coverage),
+      no critical/high security vulnerabilities. Emit a go/no-go decision.
+    autonomy: A4
+    tools: [file-read]
+    sandbox: gvisor
+    input_trust: high  # Consumes trusted internal reports only
+
+  # Deploys the application to the staging environment
+  staging_deployer:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Deploy the application to the staging environment using the
+      project's deployment tooling. Verify deployment health via
+      readiness checks. Report deployment status and endpoint URLs.
+    autonomy: A4
+    tools: [shell-exec, deploy-staging, health-check]
+    sandbox: gvisor
+    input_trust: high
+
+  # Runs smoke tests against the staging deployment
+  smoke_tester:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Execute smoke tests against the staging environment. Validate
+      critical user flows, API health endpoints, and response times.
+      Report pass/fail with details on any failures.
+    autonomy: A4
+    tools: [shell-exec, http-client, file-read]
+    sandbox: gvisor
+    input_trust: high
+
+  # Deploys to production — requires human approval (A3)
+  production_deployer:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Execute zero-downtime production deployment using rolling update
+      or blue-green strategy. Monitor deployment health and confirm
+      successful rollout before marking complete.
+    autonomy: A3  # Requires human approval before production deploy
+    tools: [shell-exec, deploy-production, health-check]
+    sandbox: gvisor
+    input_trust: high
+
+  # Automatically rolls back on any failure in the pipeline
+  rollback_handler:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Execute automatic rollback to the last known good deployment.
+      Revert staging or production to the previous stable version.
+      Notify the team with failure details and rollback confirmation.
+    autonomy: A4
+    tools: [shell-exec, deploy-rollback, notification-send]
+    sandbox: gvisor
+    input_trust: high
+
+# ---------------------------------------------------------------------------
+# Workflow — directed graph with parallel fan-out and conditional branching
+# ---------------------------------------------------------------------------
+workflow:
+  type: graph
+  nodes:
+    # --- Parallel fan-out: tests + security run simultaneously ---
+    run_tests:
+      agent: test_runner
+      node_type: start         # Entry point (parallel branch 1)
+      next: evaluate_quality
+
+    run_security:
+      agent: security_scanner
+      node_type: start         # Entry point (parallel branch 2)
+      next: evaluate_quality
+
+    # --- Fan-in: wait for BOTH test and security results ---
+    evaluate_quality:
+      agent: quality_gate
+      join_policy: ALL_RESOLVED  # Blocks until run_tests AND run_security complete
+      next:
+        - target: deploy_staging
+          condition: "state.quality_passed == true"
+        - target: handle_rollback
+          condition: "state.quality_passed == false"
+
+    # --- Deploy to staging (only when quality gate passes) ---
+    deploy_staging:
+      agent: staging_deployer
+      next: run_smoke_tests
+
+    # --- Smoke tests on staging ---
+    run_smoke_tests:
+      agent: smoke_tester
+      next:
+        - target: deploy_production
+          condition: "state.smoke_tests_passed == true"
+        - target: handle_rollback
+          condition: "state.smoke_tests_passed == false"
+
+    # --- Production deployment (human approval required via A3) ---
+    deploy_production:
+      agent: production_deployer
+      next: END
+
+    # --- Rollback on any failure ---
+    handle_rollback:
+      agent: rollback_handler
+      next: END
+
+# ---------------------------------------------------------------------------
+# Policy — cost, duration, safety, and compliance guardrails
+# ---------------------------------------------------------------------------
+policy:
+  max_cost_usd: 2.0
+  max_duration: 45m
+  require_approval_above: A3  # A3+ agents trigger human approval
+  safety:
+    blocked_actions:
+      - "kubectl delete namespace production"
+      - "kubectl delete namespace staging"
+      - "helm uninstall --no-hooks"
+      - "git push --force"
+      - "rm -rf /"
+      - "docker system prune -af"
+    max_file_changes: 100
+  compliance:
+    audit_log: required
+
+# ---------------------------------------------------------------------------
+# Goal — what success looks like for this pipeline
+# ---------------------------------------------------------------------------
+goal:
+  objective: >
+    Safely deploy the application to production with zero-downtime,
+    ensuring all tests pass and no security vulnerabilities are present.
+  success_criteria:
+    - "All unit and integration tests pass with >= 95% pass rate"
+    - "Code coverage >= 80%"
+    - "No critical or high severity security vulnerabilities"
+    - "Staging smoke tests pass within acceptable latency thresholds"
+    - "Production deployment completes with zero-downtime"
+  constraints:
+    - "Total pipeline cost must not exceed $2.00 USD"
+    - "Pipeline must complete within 45 minutes"
+    - "Production deployment requires explicit human approval"
+    - "Rollback must be automatic on any post-deploy failure"
+  failure_policy: rollback_and_notify
+  completion_policy: all_criteria_met
+  refinement: >
+    On partial failure, the pipeline should provide actionable diagnostics
+    so engineers can fix the root cause before re-running.
+  allowed_effect_scopes:
+    - staging-environment
+    - production-environment
+    - ci-artifacts
+    - notification-channels

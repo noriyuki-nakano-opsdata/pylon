@@ -1,0 +1,193 @@
+# pylon.yaml — Example: Autonomous Debugging Swarm
+# A fully autonomous debugging pipeline that diagnoses and fixes production
+# bugs through multi-agent collaboration with iterative refinement loops.
+# No human gates — agents triage, analyze, fix, test, and patch autonomously.
+
+version: "1"
+name: autonomous-debugging-swarm
+description: >
+  End-to-end autonomous debugging swarm. Given a bug report or error log,
+  agents collaborate to triage, identify root cause, implement a fix,
+  verify through iterative testing, check for regressions, and produce
+  a clean patch ready for merge.
+
+# ---------------------------------------------------------------------------
+# Agents — all A4 (fully autonomous, no human approval gates)
+# ---------------------------------------------------------------------------
+agents:
+  # Frontline triage: reads logs, reproduces the bug, classifies severity
+  triager:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Analyze error logs, stack traces, and runtime context to reproduce
+      the reported bug. Classify severity, identify affected components,
+      and produce a structured triage report with reproduction steps.
+    autonomy: A4
+    tools: [read_logs, search_code, reproduce_bug]
+    sandbox: gvisor
+    input_trust: untrusted  # bug reports come from external sources
+
+  # Deep analysis: traces execution paths to find the root cause
+  root_cause_analyzer:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Perform deep analysis on the triaged bug. Trace execution paths,
+      examine git history for recent changes, and identify the exact
+      root cause. Produce a root cause analysis with confidence score
+      and affected code locations.
+    autonomy: A4
+    tools: [read_file, search_code, git_log]
+    sandbox: gvisor
+    input_trust: internal
+
+  # Fix implementation: writes the minimal correct fix
+  fix_developer:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Implement a minimal, correct fix for the identified root cause.
+      Follow existing code conventions and add inline comments explaining
+      the fix rationale. Avoid unnecessary refactoring — fix only what
+      is broken.
+    autonomy: A4
+    tools: [read_file, write_file]
+    sandbox: gvisor
+    input_trust: internal
+
+  # Test verification loop: runs tests until all pass or iterations exhaust
+  test_verifier:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Run the full test suite against the fix. If tests fail, provide
+      structured feedback to the fix developer. Continue iterating until
+      all tests pass or the maximum iteration count is reached.
+    autonomy: A4
+    tools: [run_tests, read_file]
+    sandbox: gvisor
+    input_trust: internal
+
+  # Regression guard: ensures the fix does not break adjacent functionality
+  regression_checker:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Run extended test suites and integration tests on related modules.
+      Compare git diff to identify potential side effects. Flag any
+      regressions or behavioral changes introduced by the fix.
+    autonomy: A4
+    tools: [run_tests, git_diff]
+    sandbox: gvisor
+    input_trust: internal
+
+  # Patch assembly: produces a merge-ready patch with changelog
+  patch_creator:
+    model: anthropic/claude-sonnet-4-20250514
+    role: >
+      Assemble a clean, merge-ready patch from the verified fix. Generate
+      a changelog entry describing the bug, root cause, and fix. Ensure
+      the patch applies cleanly to the target branch.
+    autonomy: A4
+    tools: [git_diff, write_file]
+    sandbox: gvisor
+    input_trust: internal
+
+# ---------------------------------------------------------------------------
+# Workflow — sequential graph with a test verification loop
+# ---------------------------------------------------------------------------
+workflow:
+  type: graph
+  nodes:
+    # Step 1: Triage the bug report and reproduce the issue
+    triage:
+      agent: triager
+      node_type: agent
+      next: analyze
+
+    # Step 2: Deep-dive into root cause identification
+    analyze:
+      agent: root_cause_analyzer
+      node_type: agent
+      next: fix
+
+    # Step 3: Implement the fix based on root cause analysis
+    fix:
+      agent: fix_developer
+      node_type: agent
+      next: verify
+
+    # Step 4: Iterative test loop — retry up to 5 times until all tests pass
+    verify:
+      agent: test_verifier
+      node_type: loop
+      loop_max_iterations: 5          # hard cap on test-fix cycles
+      loop_criterion: test_pass       # metric evaluated each iteration
+      loop_threshold: 1.0             # exit only when 100% tests pass
+      loop_metadata:
+        description: "Run tests and iterate with fix_developer until all pass"
+      next: regression
+
+    # Step 5: Check for regressions in related modules
+    regression:
+      agent: regression_checker
+      node_type: agent
+      next: patch
+
+    # Step 6: Produce a clean patch with changelog
+    patch:
+      agent: patch_creator
+      node_type: agent
+      next: END
+
+# ---------------------------------------------------------------------------
+# Policy — cost, duration, and safety guardrails
+# ---------------------------------------------------------------------------
+policy:
+  max_cost_usd: 8.0
+  max_duration: 45m
+  require_approval_above: A4  # no approval gates in this pipeline
+  safety:
+    blocked_actions:
+      - "git push --force"
+      - "git branch -D main"
+      - "rm -rf /"
+      - "DROP TABLE"
+    max_file_changes: 20  # debugging fixes should be small
+  compliance:
+    audit_log: required
+
+# ---------------------------------------------------------------------------
+# Goal — defines success criteria and constraints for the pipeline
+# ---------------------------------------------------------------------------
+goal:
+  objective: >
+    Identify the root cause of the reported bug and produce a verified
+    fix with zero regressions.
+  success_criteria:
+    # All tests must pass after the fix
+    - type: test_pass
+      threshold: 1.0
+    # No regressions in related modules
+    - type: regression_free
+      threshold: 1.0
+      rubric: >
+        All existing tests continue to pass. No new warnings or
+        behavioral changes in adjacent modules. Integration tests
+        confirm end-to-end correctness.
+    # Root cause must be clearly identified with high confidence
+    - type: root_cause_identified
+      threshold: 0.9
+  constraints:
+    max_iterations: 30
+    max_cost_usd: 8.0
+    timeout: 45m
+    max_replans: 5
+  failure_policy: escalate
+  completion_policy: require_workflow_end
+  refinement:
+    max_replans: 5
+    exhaustion_policy: escalate
+  allowed_effect_scopes:
+    - "fs:read"
+    - "fs:write"
+    - "process:run_tests"
+    - "git:diff"
+    - "git:log"
+    - "logs:read"
