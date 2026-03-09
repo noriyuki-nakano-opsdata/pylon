@@ -108,6 +108,11 @@ class OpenAIProvider:
                 details={"status_code": getattr(e, "status_code", None)},
             ) from e
 
+        if not result.choices:
+            raise ProviderError(
+                "OpenAI returned no choices",
+                details={"model": result.model},
+            )
         choice = result.choices[0]
         content = choice.message.content or ""
         tool_calls = []

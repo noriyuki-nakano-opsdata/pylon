@@ -71,7 +71,13 @@ class EventBus:
             if not self._matches(sub, event):
                 continue
             try:
-                sub.handler(event)
+                result = sub.handler(event)
+                if asyncio.iscoroutine(result):
+                    result.close()  # Cannot await in sync publish; prevent leak
+                    raise TypeError(
+                        f"Async handler registered for sync publish(). "
+                        f"Use publish_async() instead."
+                    )
                 count += 1
             except Exception as e:
                 with self._lock:

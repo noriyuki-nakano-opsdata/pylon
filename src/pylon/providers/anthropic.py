@@ -41,7 +41,10 @@ def _to_anthropic_messages(messages: list[Message]) -> tuple[str | None, list[di
                 ],
             })
         else:
-            entry: dict[str, Any] = {"role": msg.role, "content": msg.content}
+            content: Any = msg.content
+            if msg.content_blocks:
+                content = msg.content_blocks
+            entry: dict[str, Any] = {"role": msg.role, "content": content}
             api_messages.append(entry)
 
     system_prompt = "\n\n".join(part for part in system_parts if part)
@@ -164,6 +167,7 @@ class AnthropicProvider:
 
         try:
             partial_tool_inputs: dict[int, str] = {}
+            tool_call_meta: dict[int, tuple[str, str]] = {}  # index -> (id, name)
             async with self._client.messages.stream(**create_kwargs) as stream:
                 async for event in stream:
                     if hasattr(event, "type"):
@@ -180,11 +184,15 @@ class AnthropicProvider:
                         elif event.type == "content_block_start":
                             block = getattr(event, "content_block", None)
                             if getattr(block, "type", None) == "tool_use":
+                                index = int(getattr(event, "index", 0))
+                                tc_id = getattr(block, "id", "")
+                                tc_name = getattr(block, "name", "")
+                                tool_call_meta[index] = (tc_id, tc_name)
                                 yield Chunk(
                                     tool_calls=[
                                         {
-                                            "id": getattr(block, "id", ""),
-                                            "name": getattr(block, "name", ""),
+                                            "id": tc_id,
+                                            "name": tc_name,
                                             "input": getattr(block, "input", {}),
                                         }
                                     ]
@@ -193,15 +201,18 @@ class AnthropicProvider:
                             index = int(getattr(event, "index", 0))
                             partial_json = partial_tool_inputs.pop(index, "")
                             if partial_json:
+                                tc_id, tc_name = tool_call_meta.pop(index, ("", ""))
                                 yield Chunk(
                                     tool_calls=[
                                         {
-                                            "id": "",
-                                            "name": "",
-                                            "input_json": partial_json,
+                                            "id": tc_id,
+                                            "name": tc_name,
+                                            "input": partial_json,
                                         }
                                     ]
                                 )
+                            else:
+                                tool_call_meta.pop(index, None)
                         elif event.type == "message_delta":
                             usage = getattr(event, "usage", None)
                             finish_reason = getattr(
