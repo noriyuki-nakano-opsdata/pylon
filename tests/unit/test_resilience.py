@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import unittest
 
+import pytest
+
 from pylon.resilience import (
     AllFallbacksFailedError,
     AsyncBulkhead,
@@ -434,51 +436,43 @@ class TestBulkhead(unittest.TestCase):
         self.assertEqual(stats.active, 0)
 
 
-class TestAsyncBulkhead(unittest.TestCase):
-    def test_execute(self):
-        async def run():
-            bh = AsyncBulkhead(max_concurrent=2)
-            result = await bh.execute(_async_return, 42)
-            return result, bh.stats
+class TestAsyncBulkhead:
+    @pytest.mark.asyncio
+    async def test_execute(self):
+        bh = AsyncBulkhead(max_concurrent=2)
+        result = await bh.execute(_async_return, 42)
+        assert result == 42
+        assert bh.stats.completed == 1
 
-        result, stats = asyncio.run(run())
-        self.assertEqual(result, 42)
-        self.assertEqual(stats.completed, 1)
+    @pytest.mark.asyncio
+    async def test_concurrent_execution(self):
+        bh = AsyncBulkhead(max_concurrent=3, max_queue=5)
+        results = await asyncio.gather(*[
+            bh.execute(_async_return, i) for i in range(3)
+        ])
+        assert sorted(results) == [0, 1, 2]
+        assert bh.stats.completed == 3
 
-    def test_concurrent_execution(self):
-        async def run():
-            bh = AsyncBulkhead(max_concurrent=3, max_queue=5)
-            results = await asyncio.gather(*[
-                bh.execute(_async_return, i) for i in range(3)
-            ])
-            return sorted(results), bh.stats
+    @pytest.mark.asyncio
+    async def test_bulkhead_full_rejection(self):
+        bh = AsyncBulkhead(max_concurrent=1, max_queue=0)
+        held = asyncio.Event()
+        release = asyncio.Event()
 
-        results, stats = asyncio.run(run())
-        self.assertEqual(results, [0, 1, 2])
-        self.assertEqual(stats.completed, 3)
+        async def hold():
+            held.set()
+            await release.wait()
+            return "held"
 
-    def test_bulkhead_full_rejection(self):
-        async def run():
-            bh = AsyncBulkhead(max_concurrent=1, max_queue=0)
-            held = asyncio.Event()
-            release = asyncio.Event()
+        task = asyncio.create_task(bh.execute(hold))
+        await held.wait()
+        await asyncio.sleep(0)  # let the task acquire semaphore
 
-            async def hold():
-                held.set()
-                await release.wait()
-                return "held"
+        with pytest.raises(BulkheadFullError):
+            await bh.execute(_async_return, "rejected")
 
-            task = asyncio.create_task(bh.execute(hold))
-            await held.wait()
-            await asyncio.sleep(0)  # let the task acquire semaphore
-
-            with self.assertRaises(BulkheadFullError):
-                await bh.execute(_async_return, "rejected")
-
-            release.set()
-            await task
-
-        asyncio.run(run())
+        release.set()
+        await task
 
 
 async def _async_return(value):

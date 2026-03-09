@@ -117,6 +117,9 @@ class TestPredefinedMetrics:
             "llm_token_usage",
             "model_route_count",
             "workflow_step_count",
+            "provider_fallback_count",
+            "provider_circuit_open_count",
+            "llm_cache_savings_usd",
         }
         assert set(PREDEFINED_METRICS.keys()) == expected
 

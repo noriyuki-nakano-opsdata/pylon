@@ -106,7 +106,11 @@ class TestToolDecorator:
 
         # The function itself is still the original coroutine function
         import asyncio
-        result = asyncio.run(my_fn())
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(my_fn())
+        finally:
+            loop.close()
         assert result == 42
 
 

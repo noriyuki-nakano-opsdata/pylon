@@ -216,14 +216,13 @@ class TestEventBus:
         assert dl[0].error == "2"
         assert dl[1].error == "3"
 
-    def test_publish_async(self) -> None:
+    @pytest.mark.asyncio
+    async def test_publish_async(self) -> None:
         bus = EventBus()
         received: list[Event] = []
         bus.subscribe(AGENT_CREATED, lambda e: received.append(e))
 
-        count = asyncio.get_event_loop().run_until_complete(
-            bus.publish_async(Event(type=AGENT_CREATED))
-        )
+        count = await bus.publish_async(Event(type=AGENT_CREATED))
         assert count == 1
         assert len(received) == 1
 
