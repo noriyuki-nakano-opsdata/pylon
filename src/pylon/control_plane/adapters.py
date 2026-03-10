@@ -80,7 +80,7 @@ class StoreBackedAuditRepository(AuditRepository):
         details: dict[str, Any] | None = None,
     ) -> AuditEntry:
         last_entry = self._store.get_last_audit_record()
-        entry_id = int(last_entry.get("id", 0)) + 1 if last_entry is not None else 1
+        entry_id = self._store.allocate_sequence_value("audit_entries")
         prev_hash = str(last_entry.get("entry_hash", "")) if last_entry is not None else ""
         created_at = datetime.now(UTC)
         normalized_details = details or {}

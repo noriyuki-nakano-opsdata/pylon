@@ -13,13 +13,15 @@ from pylon.errors import ConcurrencyError
 
 def _default_state() -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "workflow_projects": {},
         "workflow_runs_by_id": {},
         "checkpoints": {},
         "approvals": {},
         "audit_entries": {},
         "queue_tasks": {},
+        "surface_records": {},
+        "sequence_counters": {},
         "idempotency_keys": {},
     }
 
@@ -28,7 +30,8 @@ class JsonFileWorkflowControlPlaneStore:
     """Durable JSON-backed store for workflow definitions and run lifecycle data.
 
     This store persists canonical workflow definitions, raw run records,
-    checkpoints, and approval records in a single JSON document.
+    checkpoints, approval records, API surface records, and simple sequence
+    counters in a single JSON document.
     Handler registries remain process-local and are intentionally not persisted.
     """
 
@@ -63,7 +66,7 @@ class JsonFileWorkflowControlPlaneStore:
         raw_schema_version = raw.get("schema_version", state["schema_version"])
         if not isinstance(raw_schema_version, int) or raw_schema_version < 1:
             raise ValueError(f"Invalid control-plane schema version: {self._path}")
-        state["schema_version"] = raw_schema_version
+        state["schema_version"] = max(raw_schema_version, state["schema_version"])
         for key in (
             "workflow_projects",
             "workflow_runs_by_id",
@@ -71,6 +74,8 @@ class JsonFileWorkflowControlPlaneStore:
             "approvals",
             "audit_entries",
             "queue_tasks",
+            "surface_records",
+            "sequence_counters",
             "idempotency_keys",
         ):
             value = raw.get(key)
@@ -373,6 +378,76 @@ class JsonFileWorkflowControlPlaneStore:
             )
         )
         return [dict(task) for task in results]
+
+    def get_surface_record(
+        self,
+        namespace: str,
+        record_id: str,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            state = self._read_state()
+            namespace_records = state["surface_records"].get(namespace, {})
+            payload = namespace_records.get(record_id)
+        return None if payload is None else dict(payload)
+
+    def put_surface_record(
+        self,
+        namespace: str,
+        record_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        with self._lock:
+            state = self._read_state()
+            namespace_records = state["surface_records"].setdefault(namespace, {})
+            namespace_records[record_id] = dict(payload)
+            self._write_state(state)
+
+    def delete_surface_record(
+        self,
+        namespace: str,
+        record_id: str,
+    ) -> bool:
+        with self._lock:
+            state = self._read_state()
+            namespace_records = state["surface_records"].get(namespace)
+            if not isinstance(namespace_records, dict):
+                return False
+            removed = namespace_records.pop(record_id, None)
+            if removed is None:
+                return False
+            if not namespace_records:
+                state["surface_records"].pop(namespace, None)
+            self._write_state(state)
+            return True
+
+    def list_surface_records(
+        self,
+        namespace: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            state = self._read_state()
+            namespace_records = state["surface_records"].get(namespace, {})
+            results = list(namespace_records.values())
+        if tenant_id is not None:
+            results = [record for record in results if record.get("tenant_id") == tenant_id]
+        results.sort(
+            key=lambda record: (
+                str(record.get("updated_at", record.get("created_at", ""))),
+                str(record.get("id", record.get("entry_id", ""))),
+            )
+        )
+        return [dict(record) for record in results]
+
+    def allocate_sequence_value(self, name: str) -> int:
+        with self._lock:
+            state = self._read_state()
+            current = int(state["sequence_counters"].get(name, 0))
+            next_value = current + 1
+            state["sequence_counters"][name] = next_value
+            self._write_state(state)
+            return next_value
 
     def get_node_handlers(self, workflow_id: str) -> dict[str, Any] | None:
         with self._lock:

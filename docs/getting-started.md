@@ -146,8 +146,26 @@ Key points about the configuration:
 Execute the workflow from the project directory:
 
 ```bash
+pylon validate
 pylon run --input '{"topic": "AI safety"}'
 ```
+
+You can also point `pylon run` or `pylon validate` at an explicit project file
+or directory:
+
+```bash
+pylon validate examples/research-pipeline/pylon.yaml
+pylon run examples/research-pipeline/pylon.yaml --input '{"topic": "AI safety"}'
+```
+
+Local CLI workflow naming rules:
+
+- when you run from the current directory, the workflow ID defaults to `default`
+- when you pass a project path, the workflow ID defaults to the project's
+  declared `name`
+- use `--workflow-id <id>` to override either default explicitly
+- deprecated `--project` and `--file` flags are still accepted for migration,
+  but the positional path is canonical
 
 Pylon compiles the YAML into a DAG, validates all references, and executes each
 node in topological order. Because the `reviewer` agent has autonomy level A3
@@ -200,7 +218,7 @@ pylon dev --port 8080
 ### Register a workflow
 
 ```bash
-curl -X POST http://localhost:8080/workflows \
+curl -X POST http://localhost:8080/api/v1/workflows \
   -H "Content-Type: application/json" \
   -H "X-Tenant-ID: default" \
   -d '{
@@ -227,7 +245,7 @@ curl -X POST http://localhost:8080/workflows \
 ### Start a run
 
 ```bash
-curl -X POST http://localhost:8080/workflows/research-pipeline/run \
+curl -X POST http://localhost:8080/api/v1/workflows/research-pipeline/runs \
   -H "Content-Type: application/json" \
   -H "X-Tenant-ID: default" \
   -d '{"input": {"topic": "AI safety"}}'
@@ -251,7 +269,7 @@ Response (`202 Accepted`):
 ### Check run status
 
 ```bash
-curl http://localhost:8080/api/v1/workflow-runs/<run_id> \
+curl http://localhost:8080/api/v1/runs/<run_id> \
   -H "X-Tenant-ID: default"
 ```
 

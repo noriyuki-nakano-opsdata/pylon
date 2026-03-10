@@ -12,6 +12,13 @@ from pylon.sdk.client import PylonClientError, WorkflowResult, WorkflowRun
 from pylon.sdk.config import SDKConfig
 from pylon.types import RunStatus, RunStopReason
 
+_WORKFLOWS_PATH = "/api/v1/workflows"
+_RUNS_PATH = "/api/v1/runs"
+_APPROVALS_PATH = "/api/v1/approvals"
+_CHECKPOINTS_PATH = "/api/v1/checkpoints"
+_CONTRACT_PATH = "/api/v1/contract"
+_FEATURES_PATH = "/api/v1/features"
+
 
 def _build_workflow_run(payload: dict[str, Any]) -> WorkflowRun:
     status = RunStatus(str(payload.get("status", RunStatus.PENDING.value)))
@@ -213,7 +220,7 @@ class PylonHTTPClient:
         project = self._resolve_project_definition(definition)
         _, _, payload = self._request(
             "POST",
-            "/workflows",
+            _WORKFLOWS_PATH,
             body={"id": name, "project": project.model_dump(mode="json")},
         )
         if not isinstance(payload, dict):
@@ -228,22 +235,22 @@ class PylonHTTPClient:
         return self.register_project(name, definition)
 
     def list_workflows(self) -> list[dict[str, Any]]:
-        _, _, payload = self._request("GET", "/workflows")
+        _, _, payload = self._request("GET", _WORKFLOWS_PATH)
         if not isinstance(payload, dict):
             raise PylonClientError("Unexpected response payload type")
         return list(payload.get("workflows", []))
 
     def get_workflow(self, name: str) -> PylonProject:
-        _, _, payload = self._request("GET", f"/workflows/{name}")
+        _, _, payload = self._request("GET", f"{_WORKFLOWS_PATH}/{name}")
         if not isinstance(payload, dict):
             raise PylonClientError("Unexpected response payload type")
         return PylonProject.model_validate(payload["project"])
 
     def delete_workflow(self, name: str) -> None:
-        self._request("DELETE", f"/workflows/{name}")
+        self._request("DELETE", f"{_WORKFLOWS_PATH}/{name}")
 
     def plan_workflow(self, name: str) -> dict[str, Any]:
-        _, _, payload = self._request("GET", f"/workflows/{name}/plan")
+        _, _, payload = self._request("GET", f"{_WORKFLOWS_PATH}/{name}/plan")
         if not isinstance(payload, dict):
             raise PylonClientError("Unexpected response payload type")
         return payload
@@ -267,7 +274,7 @@ class PylonHTTPClient:
             body["idempotency_key"] = idempotency_key
         _, _, payload = self._request(
             "POST",
-            f"/workflows/{name}/run",
+            f"{_WORKFLOWS_PATH}/{name}/runs",
             body=body,
         )
         if not isinstance(payload, dict):
@@ -283,16 +290,16 @@ class PylonHTTPClient:
         )
 
     def get_run(self, run_id: str) -> WorkflowRun:
-        _, _, payload = self._request("GET", f"/api/v1/workflow-runs/{run_id}")
+        _, _, payload = self._request("GET", f"{_RUNS_PATH}/{run_id}")
         if not isinstance(payload, dict):
             raise PylonClientError("Unexpected response payload type")
         return _build_workflow_run(payload)
 
     def list_runs(self, *, workflow_id: str | None = None) -> list[WorkflowRun]:
         path = (
-            f"/workflows/{workflow_id}/runs"
+            f"{_WORKFLOWS_PATH}/{workflow_id}/runs"
             if workflow_id is not None
-            else "/api/v1/workflow-runs"
+            else _RUNS_PATH
         )
         _, _, payload = self._request("GET", path)
         if not isinstance(payload, dict):
@@ -305,7 +312,7 @@ class PylonHTTPClient:
             body["input"] = input_data
         _, _, payload = self._request(
             "POST",
-            f"/api/v1/workflow-runs/{run_id}/resume",
+            f"{_RUNS_PATH}/{run_id}/resume",
             body=body,
         )
         if not isinstance(payload, dict):
@@ -320,7 +327,7 @@ class PylonHTTPClient:
     ) -> WorkflowRun:
         _, _, payload = self._request(
             "POST",
-            f"/api/v1/approvals/{approval_id}/approve",
+            f"{_APPROVALS_PATH}/{approval_id}/approve",
             body={"reason": reason or ""},
         )
         if not isinstance(payload, dict):
@@ -335,7 +342,7 @@ class PylonHTTPClient:
     ) -> WorkflowRun:
         _, _, payload = self._request(
             "POST",
-            f"/api/v1/approvals/{approval_id}/reject",
+            f"{_APPROVALS_PATH}/{approval_id}/reject",
             body={"reason": reason or ""},
         )
         if not isinstance(payload, dict):
@@ -343,16 +350,16 @@ class PylonHTTPClient:
         return _build_workflow_run(payload)
 
     def replay_checkpoint(self, checkpoint_id: str) -> dict[str, Any]:
-        _, _, payload = self._request("GET", f"/api/v1/checkpoints/{checkpoint_id}/replay")
+        _, _, payload = self._request("GET", f"{_CHECKPOINTS_PATH}/{checkpoint_id}/replay")
         if not isinstance(payload, dict):
             raise PylonClientError("Unexpected response payload type")
         return payload
 
     def list_approvals(self, *, run_id: str | None = None) -> list[dict[str, Any]]:
         path = (
-            f"/api/v1/workflow-runs/{run_id}/approvals"
+            f"{_RUNS_PATH}/{run_id}/approvals"
             if run_id is not None
-            else "/api/v1/approvals"
+            else _APPROVALS_PATH
         )
         _, _, payload = self._request("GET", path)
         if not isinstance(payload, dict):
@@ -361,11 +368,23 @@ class PylonHTTPClient:
 
     def list_checkpoints(self, *, run_id: str | None = None) -> list[dict[str, Any]]:
         path = (
-            f"/api/v1/workflow-runs/{run_id}/checkpoints"
+            f"{_RUNS_PATH}/{run_id}/checkpoints"
             if run_id is not None
-            else "/api/v1/checkpoints"
+            else _CHECKPOINTS_PATH
         )
         _, _, payload = self._request("GET", path)
         if not isinstance(payload, dict):
             raise PylonClientError("Unexpected response payload type")
         return list(payload.get("checkpoints", []))
+
+    def get_features(self) -> dict[str, Any]:
+        _, _, payload = self._request("GET", _FEATURES_PATH)
+        if not isinstance(payload, dict):
+            raise PylonClientError("Unexpected response payload type")
+        return payload
+
+    def get_contract(self) -> dict[str, Any]:
+        _, _, payload = self._request("GET", _CONTRACT_PATH)
+        if not isinstance(payload, dict):
+            raise PylonClientError("Unexpected response payload type")
+        return payload

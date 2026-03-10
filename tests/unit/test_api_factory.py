@@ -116,6 +116,26 @@ def test_build_api_server_with_default_stack() -> None:
     assert agent.headers["x-frame-options"] == "DENY"
 
 
+def test_build_api_server_registers_canonical_public_contract() -> None:
+    server, _ = build_api_server(
+        APIServerConfig(
+            middleware=APIMiddlewareConfig(
+                tenant=TenantMiddlewareConfig(require_tenant=False),
+            )
+        )
+    )
+
+    assert server.has_route("GET", "/api/v1/features") is True
+    assert server.has_route("GET", "/api/v1/contract") is True
+    assert server.has_route("POST", "/api/v1/workflows/{id}/runs") is True
+    assert server.has_route("GET", "/api/v1/runs/{run_id}") is True
+    assert server.has_route("POST", "/api/v1/skills/{id}/execute") is True
+    assert server.has_route("GET", "/api/v1/tasks") is True
+    assert server.has_route("GET", "/api/v1/agents/activity") is True
+    assert server.has_route("POST", "/api/v1/ads/audit") is True
+    assert server.has_route("GET", "/api/v1/ads/reports/{report_id}") is True
+
+
 def test_build_api_server_with_token_bound_tenant_and_sqlite_rate_limit(tmp_path: Path) -> None:
     token_path = tmp_path / "tokens.json"
     token_path.write_text(

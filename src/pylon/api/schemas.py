@@ -118,6 +118,13 @@ APPROVAL_DECISION_SCHEMA: Schema = {
     "reason": FieldRule(required=False, field_type=str, default=""),
 }
 
+SKILL_EXECUTE_SCHEMA: Schema = {
+    "input": FieldRule(required=False, field_type=str, default=""),
+    "context": FieldRule(required=False, field_type=dict, default={}),
+    "provider": FieldRule(required=False, field_type=str, default=""),
+    "model": FieldRule(required=False, field_type=str, default=""),
+}
+
 KILL_SWITCH_SCHEMA: Schema = {
     "scope": FieldRule(required=True, field_type=str, min_length=1),
     "reason": FieldRule(required=True, field_type=str, min_length=1),

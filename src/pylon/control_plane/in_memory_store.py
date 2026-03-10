@@ -25,6 +25,8 @@ class InMemoryWorkflowControlPlaneStore:
         self._approvals: dict[str, dict[str, Any]] = {}
         self._audit_entries: dict[int, dict[str, Any]] = {}
         self._queue_tasks: dict[str, dict[str, Any]] = {}
+        self._surface_records: dict[str, dict[str, dict[str, Any]]] = {}
+        self._sequence_counters: dict[str, int] = {}
         self._idempotency_keys: dict[tuple[str, str, str], str] = {}
         self._node_handlers = dict(node_handlers or {})
         self._agent_handlers = dict(agent_handlers or {})
@@ -266,6 +268,64 @@ class InMemoryWorkflowControlPlaneStore:
             )
         )
         return [dict(task) for task in results]
+
+    def get_surface_record(
+        self,
+        namespace: str,
+        record_id: str,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            namespace_records = self._surface_records.get(namespace, {})
+            payload = namespace_records.get(record_id)
+            return None if payload is None else dict(payload)
+
+    def put_surface_record(
+        self,
+        namespace: str,
+        record_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        with self._lock:
+            namespace_records = self._surface_records.setdefault(namespace, {})
+            namespace_records[record_id] = dict(payload)
+
+    def delete_surface_record(
+        self,
+        namespace: str,
+        record_id: str,
+    ) -> bool:
+        with self._lock:
+            namespace_records = self._surface_records.get(namespace)
+            if namespace_records is None:
+                return False
+            removed = namespace_records.pop(record_id, None)
+            if not namespace_records:
+                self._surface_records.pop(namespace, None)
+            return removed is not None
+
+    def list_surface_records(
+        self,
+        namespace: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            results = list(self._surface_records.get(namespace, {}).values())
+        if tenant_id is not None:
+            results = [record for record in results if record.get("tenant_id") == tenant_id]
+        results.sort(
+            key=lambda record: (
+                str(record.get("updated_at", record.get("created_at", ""))),
+                str(record.get("id", record.get("entry_id", ""))),
+            )
+        )
+        return [dict(record) for record in results]
+
+    def allocate_sequence_value(self, name: str) -> int:
+        with self._lock:
+            next_value = self._sequence_counters.get(name, 0) + 1
+            self._sequence_counters[name] = next_value
+            return next_value
 
     def get_node_handlers(self, workflow_id: str) -> dict[str, Any] | None:
         with self._lock:

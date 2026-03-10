@@ -7,7 +7,6 @@ import logging
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlsplit
 
 from pylon.api.server import APIServer, Response
 
@@ -49,7 +48,6 @@ class _BoundHTTPRequestHandler(BaseHTTPRequestHandler):
         request_body = self._read_request_body()
         if request_body is _BODY_ERROR_SENTINEL:
             return
-        path = urlsplit(self.path).path
         request_headers = {key: value for key, value in self.headers.items()}
         request_id, correlation_id = _resolve_request_headers(
             {key.lower(): value for key, value in request_headers.items()}
@@ -57,12 +55,12 @@ class _BoundHTTPRequestHandler(BaseHTTPRequestHandler):
         try:
             response = self.api_server.handle_request(
                 self.command,
-                path,
+                self.path,
                 headers=request_headers,
                 body=request_body,
             )
         except Exception:
-            logger.exception("Unhandled exception while serving %s %s", self.command, path)
+            logger.exception("Unhandled exception while serving %s %s", self.command, self.path)
             response = Response(
                 status_code=500,
                 headers={

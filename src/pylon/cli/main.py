@@ -54,9 +54,11 @@ from pylon.cli.commands.logs import logs  # noqa: E402
 from pylon.cli.commands.replay import replay  # noqa: E402
 from pylon.cli.commands.run import run  # noqa: E402
 from pylon.cli.commands.sandbox import sandbox  # noqa: E402
+from pylon.cli.commands.validate import validate  # noqa: E402
 
 cli.add_command(init)
 cli.add_command(run)
+cli.add_command(validate)
 cli.add_command(dev)
 cli.add_command(inspect)
 cli.add_command(doctor)

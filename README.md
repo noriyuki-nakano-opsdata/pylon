@@ -121,7 +121,10 @@ policy:
 Run the workflow:
 
 ```bash
+pylon validate
 pylon run
+# or point at an explicit project file/directory
+pylon run examples/autonomous-coding-agent/pylon.yaml
 ```
 
 ## Project Structure
@@ -167,6 +170,7 @@ src/pylon/
 - [Getting Started Guide](docs/getting-started.md) -- Installation, first project, programmatic API
 - [API Reference](docs/api-reference.md) -- REST routes and middleware
 - [Specification](docs/SPECIFICATION.md) -- Full technical specification
+- [Improvement Roadmap](docs/improvement-roadmap.md) -- Prioritized fixes for API, CLI, UI parity, and quality gates
 - [ADR Index](docs/adr/) -- Architecture decision records (001--009)
 - [vNext Target Architecture](docs/architecture/pylon-vnext-target-architecture.md) -- Target three-layer runtime-centered architecture
 - [vNext Implementation Plan](docs/architecture/pylon-vnext-implementation-plan.md) -- Ordered delivery plan for bounded autonomy

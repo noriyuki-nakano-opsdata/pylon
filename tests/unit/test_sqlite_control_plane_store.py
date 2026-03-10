@@ -141,3 +141,31 @@ def test_sqlite_store_enforces_expected_record_version(tmp_path: Path) -> None:
             tenant_id="tenant-a",
             expected_record_version=0,
         )
+
+
+def test_sqlite_store_persists_surface_records_and_sequences(tmp_path: Path) -> None:
+    state_path = tmp_path / "control-plane.db"
+    store = _store(state_path)
+    first = store.allocate_sequence_value("memories")
+    second = store.allocate_sequence_value("memories")
+    store.put_surface_record(
+        "tasks",
+        "task-1",
+        {
+            "id": "task-1",
+            "tenant_id": "tenant-a",
+            "title": "Audit ads pipeline",
+            "updated_at": "2026-03-11T00:00:00Z",
+        },
+    )
+
+    reopened = _store(state_path)
+    assert first == 1
+    assert second == 2
+    assert reopened.allocate_sequence_value("memories") == 3
+    assert reopened.get_surface_record("tasks", "task-1") == {
+        "id": "task-1",
+        "tenant_id": "tenant-a",
+        "title": "Audit ads pipeline",
+        "updated_at": "2026-03-11T00:00:00Z",
+    }

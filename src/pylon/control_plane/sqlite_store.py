@@ -10,14 +10,15 @@ from typing import Any
 from pylon.dsl.parser import PylonProject
 from pylon.errors import ConcurrencyError
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 class SQLiteWorkflowControlPlaneStore:
     """Durable relational control-plane store backed by SQLite.
 
     This backend is intended as a local durable relational store that shares the
-    same write-side contract as future PostgreSQL-backed implementations.
+    same write-side contract as future PostgreSQL-backed implementations,
+    including durable API surface records and sequence counters.
     Handler registries remain process-local and are intentionally not persisted.
     """
 
@@ -156,6 +157,32 @@ class SQLiteWorkflowControlPlaneStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_queue_tasks_status_created
                 ON queue_tasks (status, created_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS surface_records (
+                    namespace TEXT NOT NULL,
+                    record_id TEXT NOT NULL,
+                    tenant_id TEXT,
+                    updated_at TEXT,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY (namespace, record_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_surface_records_namespace_tenant_updated
+                ON surface_records (namespace, tenant_id, updated_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sequence_counters (
+                    name TEXT PRIMARY KEY,
+                    value INTEGER NOT NULL
+                )
                 """
             )
             connection.execute(
@@ -603,6 +630,100 @@ class SQLiteWorkflowControlPlaneStore:
         with self._connect() as connection:
             rows = connection.execute(query, tuple(params)).fetchall()
         return [self._load_json(str(row["payload_json"])) for row in rows]
+
+    def get_surface_record(
+        self,
+        namespace: str,
+        record_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT payload_json
+                FROM surface_records
+                WHERE namespace = ? AND record_id = ?
+                """,
+                (namespace, record_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._load_json(str(row["payload_json"]))
+
+    def put_surface_record(
+        self,
+        namespace: str,
+        record_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        tenant_id = payload.get("tenant_id")
+        updated_at = payload.get("updated_at", payload.get("created_at"))
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO surface_records (
+                    namespace, record_id, tenant_id, updated_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    namespace,
+                    record_id,
+                    None if tenant_id is None else str(tenant_id),
+                    None if updated_at is None else str(updated_at),
+                    json.dumps(dict(payload), sort_keys=True, default=str),
+                ),
+            )
+            connection.commit()
+
+    def delete_surface_record(
+        self,
+        namespace: str,
+        record_id: str,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM surface_records
+                WHERE namespace = ? AND record_id = ?
+                """,
+                (namespace, record_id),
+            )
+            connection.commit()
+        return cursor.rowcount > 0
+
+    def list_surface_records(
+        self,
+        namespace: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT payload_json FROM surface_records WHERE namespace = ?"
+        params: list[Any] = [namespace]
+        if tenant_id is not None:
+            query += " AND tenant_id = ?"
+            params.append(tenant_id)
+        query += " ORDER BY updated_at, record_id"
+        with self._connect() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return [self._load_json(str(row["payload_json"])) for row in rows]
+
+    def allocate_sequence_value(self, name: str) -> int:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT value FROM sequence_counters WHERE name = ?",
+                (name,),
+            ).fetchone()
+            current = int(row["value"]) if row is not None else 0
+            next_value = current + 1
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO sequence_counters (name, value)
+                VALUES (?, ?)
+                """,
+                (name, next_value),
+            )
+            connection.commit()
+        return next_value
 
     def get_node_handlers(self, workflow_id: str) -> dict[str, Any] | None:
         handlers = self._node_handlers.get(workflow_id)

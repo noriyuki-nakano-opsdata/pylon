@@ -64,5 +64,6 @@ graph TD
 ## Usage
 
 ```bash
-pylon run --file pylon.yaml --input "topic: Large Language Model Alignment"
+pylon run examples/autonomous-research-report/pylon.yaml \
+  --input '{"topic": "Large Language Model Alignment"}'
 ```

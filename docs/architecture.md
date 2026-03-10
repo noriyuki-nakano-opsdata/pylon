@@ -532,7 +532,7 @@ sequenceDiagram
     participant CP as Checkpoint Store
     participant OB as Observability
 
-    C->>MW: POST /workflows/{id}/runs
+    C->>MW: POST /api/v1/workflows/{id}/runs
     activate MW
 
     MW->>MW: Security Headers

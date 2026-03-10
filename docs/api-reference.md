@@ -84,6 +84,16 @@ When the standard middlewares are installed:
 
 ## Routes
 
+Public contract policy:
+
+- canonical public routes live under `/api/v1`
+- selected versionless routes remain available as compatibility aliases
+- compatibility aliases emit `Deprecation`, `Sunset`, `Link`, and
+  `X-Pylon-Canonical-Path` response headers
+- `GET /api/v1/contract` is the machine-readable contract manifest for
+  canonical routes, scopes, and alias policy
+- new clients should target `/api/v1` and treat aliases as migration-only
+
 ### `GET /health`
 
 Always available.
@@ -134,7 +144,7 @@ Example:
 
 ```text
 # TYPE pylon_api_request_count counter
-pylon_api_request_count{method="POST",route="/agents",status_class="2xx"} 1.0
+pylon_api_request_count{method="POST",route="/api/v1/agents",status_class="2xx"} 1.0
 ```
 
 > **Note:** The `pylon_` prefix shown above is the default `metrics_namespace`.
@@ -147,9 +157,13 @@ request flow also emits structured log and span records to the configured JSONL
 path. This sink uses the same `request_id`, `correlation_id`, and `trace_id`
 values that appear in HTTP responses.
 
-### `POST /agents`
+### `POST /api/v1/agents`
 
 Create an agent record for the current tenant.
+
+Compatibility aliases:
+
+- `POST /agents`
 
 Request body:
 
@@ -178,9 +192,13 @@ Response `201 Created`
 }
 ```
 
-### `GET /agents`
+### `GET /api/v1/agents`
 
 List agents for the current tenant.
+
+Compatibility aliases:
+
+- `GET /agents`
 
 Response `200 OK`
 
@@ -191,9 +209,13 @@ Response `200 OK`
 }
 ```
 
-### `GET /agents/{id}`
+### `GET /api/v1/agents/{id}`
 
 Fetch a tenant-scoped agent by ID.
+
+Compatibility aliases:
+
+- `GET /agents/{id}`
 
 Responses:
 
@@ -201,9 +223,39 @@ Responses:
 - `403 Forbidden`
 - `404 Not Found`
 
-### `DELETE /agents/{id}`
+### `PATCH /api/v1/agents/{id}`
+
+Update mutable agent fields for a tenant-scoped agent.
+
+Compatibility aliases:
+
+- `PATCH /agents/{id}`
+
+Request body:
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `name` | string | No | 1-128 chars |
+| `model` | string | No | provider/model identifier |
+| `role` | string | No | free-form agent role |
+| `autonomy` | string or int | No | `A0`-`A4` or `0`-`4` |
+| `tools` | array | No | full replacement when supplied |
+| `sandbox` | string | No | `gvisor`, `firecracker`, `docker`, `none` |
+| `status` | string | No | lightweight compatibility field for operator UI |
+
+Responses:
+
+- `200 OK`
+- `403 Forbidden`
+- `404 Not Found`
+
+### `DELETE /api/v1/agents/{id}`
 
 Delete a tenant-scoped agent.
+
+Compatibility aliases:
+
+- `DELETE /agents/{id}`
 
 Responses:
 
@@ -211,9 +263,13 @@ Responses:
 - `403 Forbidden`
 - `404 Not Found`
 
-### `POST /workflows`
+### `POST /api/v1/workflows`
 
 Register a canonical workflow definition for the current tenant.
+
+Compatibility aliases:
+
+- `POST /workflows`
 
 Request body:
 
@@ -232,9 +288,13 @@ Important scope note:
 - SDK-only authoring helpers such as `WorkflowBuilder` or `@workflow` factories
   must be materialized client-side before registration
 
-### `GET /workflows`
+### `GET /api/v1/workflows`
 
 List workflow definitions visible to the current tenant.
+
+Compatibility aliases:
+
+- `GET /workflows`
 
 Response `200 OK`
 
@@ -254,9 +314,13 @@ Response `200 OK`
 }
 ```
 
-### `GET /workflows/{id}`
+### `GET /api/v1/workflows/{id}`
 
 Fetch one tenant-scoped workflow definition.
+
+Compatibility aliases:
+
+- `GET /workflows/{id}`
 
 Responses:
 
@@ -264,9 +328,13 @@ Responses:
 - `403 Forbidden`
 - `404 Not Found`
 
-### `GET /workflows/{id}/plan`
+### `GET /api/v1/workflows/{id}/plan`
 
 Return the scheduler-oriented dispatch plan for a canonical workflow definition.
+
+Compatibility aliases:
+
+- `GET /workflows/{id}/plan`
 
 This is a planning view, not an execution endpoint. It projects the compiled DAG
 into dependency waves suitable for queued or distributed runners while leaving
@@ -302,9 +370,13 @@ Response `200 OK`
 }
 ```
 
-### `DELETE /workflows/{id}`
+### `DELETE /api/v1/workflows/{id}`
 
 Delete one tenant-scoped workflow definition.
+
+Compatibility aliases:
+
+- `DELETE /workflows/{id}`
 
 Responses:
 
@@ -312,9 +384,13 @@ Responses:
 - `403 Forbidden`
 - `404 Not Found`
 
-### `POST /workflows/{id}/run`
+### `POST /api/v1/workflows/{id}/runs`
 
 Create a workflow run for the current tenant from a registered canonical workflow definition.
+
+Compatibility aliases:
+
+- `POST /workflows/{id}/run`
 
 Request body:
 
@@ -358,11 +434,15 @@ Response `202 Accepted`
 
 Headers:
 
-- `Location: /api/v1/workflow-runs/{run_id}`
+- `Location: /api/v1/runs/{run_id}`
 
-### `GET /workflows/{id}/runs`
+### `GET /api/v1/workflows/{id}/runs`
 
 List normalized run views for one workflow definition.
+
+Compatibility aliases:
+
+- `GET /workflows/{id}/runs`
 
 Responses:
 
@@ -396,9 +476,13 @@ Example body:
 }
 ```
 
-### `POST /api/v1/workflow-runs/{run_id}/resume`
+### `POST /api/v1/runs/{run_id}/resume`
 
 Resume a previously paused workflow run through the same shared runtime.
+
+Compatibility aliases:
+
+- `POST /api/v1/workflow-runs/{run_id}/resume`
 
 Request body:
 
@@ -413,27 +497,35 @@ Responses:
 - `404 Not Found`
 - `422 Validation Error`
 
-### `GET /workflows/{id}/runs/{run_id}`
+### `GET /api/v1/workflows/{id}/runs/{run_id}`
 
 Fetch a workflow run by workflow ID plus run ID.
 
+Compatibility aliases:
+
+- `GET /workflows/{id}/runs/{run_id}`
+
 Responses:
 
 - `200 OK`
 - `403 Forbidden`
 - `404 Not Found`
 
-### `GET /api/v1/workflow-runs/{run_id}`
+### `GET /api/v1/runs/{run_id}`
 
 Fetch a workflow run by run ID only.
 
+Compatibility aliases:
+
+- `GET /api/v1/workflow-runs/{run_id}`
+
 Responses:
 
 - `200 OK`
 - `403 Forbidden`
 - `404 Not Found`
 
-Returned payload shape matches `POST /workflows/{id}/run` and includes:
+Returned payload shape matches `POST /api/v1/workflows/{id}/runs` and includes:
 
 - `execution_summary`
 - `approval_summary`
@@ -442,17 +534,29 @@ Returned payload shape matches `POST /workflows/{id}/run` and includes:
 - `state_version`
 - `state_hash`
 
-### `GET /api/v1/workflow-runs`
+### `GET /api/v1/runs`
 
 List all run views for the current tenant.
 
-### `GET /api/v1/workflow-runs/{run_id}/approvals`
+Compatibility aliases:
+
+- `GET /api/v1/workflow-runs`
+
+### `GET /api/v1/runs/{run_id}/approvals`
 
 List approval records associated with one run.
 
-### `GET /api/v1/workflow-runs/{run_id}/checkpoints`
+Compatibility aliases:
+
+- `GET /api/v1/workflow-runs/{run_id}/approvals`
+
+### `GET /api/v1/runs/{run_id}/checkpoints`
 
 List checkpoint records associated with one run.
+
+Compatibility aliases:
+
+- `GET /api/v1/workflow-runs/{run_id}/checkpoints`
 
 ### `GET /api/v1/approvals`
 
@@ -505,6 +609,328 @@ Responses:
 - `200 OK`
 - `403 Forbidden`
 - `404 Not Found`
+
+### `GET /api/v1/agents/{id}/skills`
+
+List the skills assigned to one agent.
+
+### `PATCH /api/v1/agents/{id}/skills`
+
+Replace the set of skill IDs assigned to one agent.
+
+Request body:
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `skills` | array | Yes | list of skill IDs |
+
+### `GET /api/v1/agents/activity`
+
+Return tenant-scoped operational views of agents, including the currently
+assigned mission-control task when one matches the agent `id` or `name`.
+
+### `GET /api/v1/agents/{id}/activity`
+
+Return one tenant-scoped operational agent payload.
+
+### `GET /api/v1/tasks`
+
+List mission-control tasks for the current tenant.
+These project-operation records persist in the selected control-plane backend
+(`memory`, `json_file`, or `sqlite`) rather than living only in API process
+memory.
+
+Query params:
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `status` | string | No | `backlog`, `in_progress`, `review`, `done` |
+
+### `POST /api/v1/tasks`
+
+Create a task on the mission-control board.
+
+Required fields:
+
+- `title`
+- `description`
+- `status`
+- `priority`
+- `assignee`
+- `assigneeType`
+
+### `GET /api/v1/tasks/{task_id}`
+
+Fetch one task by ID.
+
+### `PATCH /api/v1/tasks/{task_id}`
+
+Update mutable task fields such as `status`, `priority`, `assignee`, and
+`payload`.
+
+### `DELETE /api/v1/tasks/{task_id}`
+
+Delete one task.
+
+### `GET /api/v1/memories`
+
+List mission-control memory entries for the current tenant.
+
+### `POST /api/v1/memories`
+
+Create one memory entry.
+
+Request body supports:
+
+- `title`
+- `content`
+- `category`
+- `actor`
+- optional `tags`
+- optional `details`
+
+### `DELETE /api/v1/memories/{entry_id}`
+
+Delete one memory entry.
+
+### `GET /api/v1/events`
+
+List scheduled calendar events for the current tenant.
+
+### `POST /api/v1/events`
+
+Create one scheduled event. When `end` is omitted, the reference backend
+defaults it to one hour after `start`.
+
+### `DELETE /api/v1/events/{event_id}`
+
+Delete one scheduled event.
+
+### `GET /api/v1/content`
+
+List content-pipeline items for the current tenant.
+
+### `POST /api/v1/content`
+
+Create one content-pipeline item.
+
+### `PATCH /api/v1/content/{content_id}`
+
+Update mutable content fields such as `stage`, `assignee`, and `description`.
+
+### `DELETE /api/v1/content/{content_id}`
+
+Delete one content item.
+
+### `GET /api/v1/teams`
+
+List tenant-scoped team definitions. The reference backend seeds the default
+product teams on first access so the UI can render immediately.
+
+### `POST /api/v1/teams`
+
+Create one team definition.
+
+### `PATCH /api/v1/teams/{id}`
+
+Update one team definition.
+
+### `DELETE /api/v1/teams/{id}`
+
+Delete one team definition. Agents assigned to that team are moved to the
+tenant's default fallback team.
+
+### `GET /api/v1/skills`
+
+Return a compatibility payload for the UI skills catalog. The current
+implementation is intentionally lightweight and may return an empty catalog.
+
+### `POST /api/v1/skills/scan`
+
+Return a compatibility scan summary for the UI skills page.
+
+### `POST /api/v1/skills/{id}/execute`
+
+Execute one skill through a configured provider runtime when available. If the
+backend has no provider runtime or no default model for the chosen provider,
+the reference implementation returns a deterministic local preview payload
+instead of failing the UI flow.
+
+Request body:
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `input` | string | No | defaults to empty string |
+| `context` | object | No | string map passed as execution context |
+| `provider` | string | No | preferred provider name |
+| `model` | string | No | preferred model ID |
+
+### `GET /api/v1/models`
+
+Return a compatibility provider/model catalog for the UI model management page.
+
+### `GET /api/v1/models/health`
+
+Return per-provider health summaries for the current model catalog.
+
+### `POST /api/v1/models/refresh`
+
+Refresh the compatibility provider/model catalog and return the same payload
+shape as `GET /api/v1/models`.
+
+### `POST /api/v1/models/policy`
+
+Store a lightweight provider policy override.
+
+### `POST /api/v1/ads/audit`
+
+Create one ads audit run and return a `run_id`. The reference backend computes
+the final report deterministically from the supplied platforms, industry, and
+optional budget/account exports, then exposes progressive status through the
+polling endpoint below. Audit runs and reports are stored in the shared
+control-plane backend so they survive API restarts when a durable backend is
+configured.
+
+### `GET /api/v1/ads/audit/{run_id}`
+
+Poll audit status. Returns:
+
+- `status`
+- `progress`
+- `report` once the run reaches `completed`
+
+### `GET /api/v1/ads/reports`
+
+List tenant-scoped ads audit reports, newest first.
+
+### `GET /api/v1/ads/reports/{report_id}`
+
+Fetch one ads audit report.
+
+### `POST /api/v1/ads/plan`
+
+Generate one deterministic media plan from an industry template and optional
+budget.
+
+### `POST /api/v1/ads/budget/optimize`
+
+Return a reference allocation using a 70/20/10 split plus a
+benchmark-informed per-platform mix.
+
+### `GET /api/v1/ads/benchmarks/{platform}`
+
+Return built-in benchmark metadata for one ads platform.
+
+### `GET /api/v1/ads/templates`
+
+Return the built-in industry templates used by the ads planning flow.
+
+### `GET /api/v1/costs/summary`
+
+Return a tenant-scoped cost aggregate for the requested period.
+
+Compatibility aliases:
+
+- `GET /api/v1/costs/realtime`
+
+Query params:
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `period` | string | No | defaults to `mtd` |
+
+Example response:
+
+```json
+{
+  "period": "mtd",
+  "total_usd": 1.245,
+  "budget_usd": 5.0,
+  "run_count": 3,
+  "total_tokens_in": 12000,
+  "total_tokens_out": 4800,
+  "by_provider": {"anthropic": 1.245},
+  "by_model": {"anthropic/claude-sonnet-4-20250514": 1.245}
+}
+```
+
+### `GET /api/v1/features`
+
+Return the product surface manifest for the current tenant. This allows UI and
+SDK clients to hide unimplemented surfaces instead of probing routes ad hoc.
+
+Example response:
+
+```json
+{
+  "contract_version": "2026-03-11",
+  "canonical_prefix": "/api/v1",
+  "legacy_aliases_enabled": true,
+  "legacy_alias_policy": {
+    "deprecated_on": "2026-03-11",
+    "sunset_on": "2026-09-30"
+  },
+  "contract_path": "/api/v1/contract",
+  "tenant_id": "default",
+  "surfaces": {
+    "admin": {
+      "dashboard": true,
+      "workflows": true,
+      "agents": true
+    },
+    "project": {
+      "runs": true,
+      "approvals": true,
+      "lifecycle": true,
+      "tasks": true,
+      "team": true,
+      "memory": true,
+      "calendar": true,
+      "content": true,
+      "ads": true,
+      "studio": false
+    }
+  }
+}
+```
+
+### `GET /api/v1/contract`
+
+Return the canonical public contract manifest for the current tenant.
+
+Use this when you need machine-readable route discovery, alias migration policy,
+or authorization scope metadata for generated clients and contract tests.
+
+Example response:
+
+```json
+{
+  "contract_version": "2026-03-11",
+  "canonical_prefix": "/api/v1",
+  "legacy_alias_policy": {
+    "deprecated_on": "2026-03-11",
+    "sunset_on": "2026-09-30"
+  },
+  "routes": [
+    {
+      "method": "POST",
+      "path": "/api/v1/agents",
+      "aliases": [
+        {
+          "path": "/agents",
+          "deprecated": true,
+          "deprecated_on": "2026-03-11",
+          "sunset_on": "2026-09-30"
+        }
+      ],
+      "authorization": {
+        "any_of_scopes": [],
+        "all_of_scopes": ["agents:write"]
+      }
+    }
+  ]
+}
+```
 
 ### `POST /kill-switch`
 

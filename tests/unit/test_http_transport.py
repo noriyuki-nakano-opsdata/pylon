@@ -186,6 +186,30 @@ def test_http_client_runs_and_replays_workflow(http_client: PylonHTTPClient) -> 
     assert replay["checkpoint_id"] == str(checkpoints[0]["id"])
 
 
+def test_http_client_reads_feature_manifest(http_client: PylonHTTPClient) -> None:
+    manifest = http_client.get_features()
+
+    assert manifest["canonical_prefix"] == "/api/v1"
+    assert manifest["legacy_aliases_enabled"] is True
+    assert manifest["legacy_alias_policy"]["sunset_on"] == "2026-09-30"
+    assert manifest["contract_path"] == "/api/v1/contract"
+    assert manifest["surfaces"]["project"]["runs"] is True
+
+
+def test_http_client_reads_public_contract_manifest(http_client: PylonHTTPClient) -> None:
+    manifest = http_client.get_contract()
+
+    assert manifest["canonical_prefix"] == "/api/v1"
+    assert manifest["legacy_alias_policy"]["deprecated_on"] == "2026-03-11"
+    create_agent = next(
+        route
+        for route in manifest["routes"]
+        if route["method"] == "POST" and route["path"] == "/api/v1/agents"
+    )
+    assert create_agent["aliases"][0]["path"] == "/agents"
+    assert create_agent["authorization"]["all_of_scopes"] == ["agents:write"]
+
+
 def test_http_client_approves_waiting_run(http_client: PylonHTTPClient) -> None:
     http_client.register_project("review", _approval_project())
 

@@ -642,6 +642,7 @@ def build_api_server(
     *,
     store: RouteStore | None = None,
     control_plane_store: WorkflowControlPlaneStore | None = None,
+    provider_registry: "ProviderRegistry | None" = None,
 ) -> tuple[APIServer, RouteStore]:
     """Build an APIServer with the standard middleware stack and routes."""
 
@@ -691,6 +692,7 @@ def build_api_server(
             and observability is not None
             and observability.prometheus_exporter is not None
         ),
+        provider_registry=provider_registry,
     )
     for middleware in build_middleware_chain(
         config.middleware,
@@ -708,6 +710,7 @@ def build_http_api_server(
     port: int = 8080,
     store: RouteStore | None = None,
     control_plane_store: WorkflowControlPlaneStore | None = None,
+    provider_registry: "ProviderRegistry | None" = None,
 ) -> tuple[PylonHTTPServer, RouteStore]:
     """Build an HTTP server around the standard APIServer wiring."""
 
@@ -715,5 +718,6 @@ def build_http_api_server(
         config,
         store=store,
         control_plane_store=control_plane_store,
+        provider_registry=provider_registry,
     )
     return create_http_server(api_server, host=host, port=port), route_store

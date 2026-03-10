@@ -558,27 +558,85 @@ Routes implemented today:
 - `GET /health`
 - `GET /ready`
 - `GET /metrics`
-- `POST /agents`
-- `GET /agents`
-- `GET /agents/{id}`
-- `DELETE /agents/{id}`
-- `POST /workflows`
-- `GET /workflows`
-- `GET /workflows/{id}`
-- `DELETE /workflows/{id}`
-- `POST /workflows/{id}/run`
+- `POST /api/v1/agents`
+- `GET /api/v1/agents`
+- `GET /api/v1/agents/activity`
+- `GET /api/v1/agents/{id}`
+- `GET /api/v1/agents/{id}/activity`
+- `PATCH /api/v1/agents/{id}`
+- `DELETE /api/v1/agents/{id}`
+- `GET /api/v1/agents/{id}/skills`
+- `PATCH /api/v1/agents/{id}/skills`
+- `GET /api/v1/tasks`
+- `POST /api/v1/tasks`
+- `GET /api/v1/tasks/{task_id}`
+- `PATCH /api/v1/tasks/{task_id}`
+- `DELETE /api/v1/tasks/{task_id}`
+- `GET /api/v1/memories`
+- `POST /api/v1/memories`
+- `DELETE /api/v1/memories/{entry_id}`
+- `GET /api/v1/events`
+- `POST /api/v1/events`
+- `DELETE /api/v1/events/{event_id}`
+- `GET /api/v1/content`
+- `POST /api/v1/content`
+- `PATCH /api/v1/content/{content_id}`
+- `DELETE /api/v1/content/{content_id}`
+- `GET /api/v1/teams`
+- `POST /api/v1/teams`
+- `PATCH /api/v1/teams/{id}`
+- `DELETE /api/v1/teams/{id}`
+- `POST /api/v1/workflows`
+- `GET /api/v1/workflows`
+- `GET /api/v1/workflows/{id}`
+- `GET /api/v1/workflows/{id}/plan`
+- `DELETE /api/v1/workflows/{id}`
+- `POST /api/v1/workflows/{id}/runs`
+- `GET /api/v1/workflows/{id}/runs`
   - accepts `execution_mode=inline|queued`
   - `queued` mode persists the same run/checkpoint payload shape, but currently supports only straight-line agent DAGs without goals, approval gates, loops, routers, conditional edges, or non-default join policies
   - `parameters.queued.retry` may configure `fixed` or `exponential_backoff` retries
   - `parameters.queued` may also configure `lease_timeout_seconds` and `heartbeat_interval_seconds`
   - queued run state and runtime metrics include `retrying_task_ids`, `dead_letter_task_ids`, normalized `retry_policy`, `lease_timeout_seconds`, `heartbeat_interval_seconds`, and `heartbeat_total`
-- `GET /workflows/{id}/runs/{run_id}`
-- `GET /api/v1/workflow-runs/{run_id}`
-- `POST /api/v1/workflow-runs/{run_id}/resume`
+- `GET /api/v1/workflows/{id}/runs/{run_id}`
+- `GET /api/v1/runs/{run_id}`
+- `GET /api/v1/runs`
+- `POST /api/v1/runs/{run_id}/resume`
+- `GET /api/v1/runs/{run_id}/approvals`
+- `GET /api/v1/runs/{run_id}/checkpoints`
 - `POST /api/v1/approvals/{approval_id}/approve`
 - `POST /api/v1/approvals/{approval_id}/reject`
+- `GET /api/v1/approvals`
+- `GET /api/v1/checkpoints`
 - `GET /api/v1/checkpoints/{checkpoint_id}/replay`
+- `GET /api/v1/skills`
+- `GET /api/v1/skills/categories`
+- `POST /api/v1/skills/scan`
+- `GET /api/v1/skills/{id}`
+- `POST /api/v1/skills/{id}/execute`
+- `GET /api/v1/models`
+- `GET /api/v1/models/health`
+- `POST /api/v1/models/refresh`
+- `POST /api/v1/models/policy`
+- `POST /api/v1/ads/audit`
+- `GET /api/v1/ads/audit/{run_id}`
+- `GET /api/v1/ads/reports`
+- `GET /api/v1/ads/reports/{report_id}`
+- `POST /api/v1/ads/plan`
+- `POST /api/v1/ads/budget/optimize`
+- `GET /api/v1/ads/benchmarks/{platform}`
+- `GET /api/v1/ads/templates`
+- `GET /api/v1/costs/summary`
+- `GET /api/v1/contract`
+- `GET /api/v1/features`
 - `POST /kill-switch`
+
+Selected versionless routes such as `/agents`, `/workflows`, and
+`/workflows/{id}/run` remain available as compatibility aliases, but `/api/v1`
+is the canonical public contract for new clients. Compatibility aliases emit
+`Deprecation`, `Sunset`, `Link`, and `X-Pylon-Canonical-Path` headers so
+callers can migrate deliberately before the published sunset date of
+`2026-09-30`.
 
 `RouteStore` now fronts the shared control-plane store contract and projects:
 
@@ -586,6 +644,9 @@ Routes implemented today:
 - raw run records through the shared query builders
 - checkpoint payloads
 - approval payloads
+- tenant-scoped product surface records (`agents`, `tasks`, `memories`,
+  `events`, `content`, `teams`, `ads` artifacts, model policies, kill switches)
+  through the same backend durability boundary
 
 Workflow run routes and control-plane routes serialize the same normalized run payload used by the CLI and SDK layers.
 
@@ -633,6 +694,7 @@ under `$PYLON_HOME/control-plane.json` and `$PYLON_HOME/state.json`.
 Current workflow-related CLI commands:
 
 - `pylon init`
+- `pylon validate`
 - `pylon run`
 - `pylon inspect`
 - `pylon logs`
@@ -656,6 +718,13 @@ CLI run state currently stores:
 - `checkpoints`
 - `approvals`
 - `sandboxes`
+
+CLI local workflow ID rules:
+
+- `pylon run` from the current project directory defaults to workflow ID `default`
+- `pylon run <project-path>` defaults to the loaded project's declared `name`
+- `pylon run <workflow-id> --project <path>` remains accepted for migration, but
+  the canonical form is positional path plus optional `--workflow-id`
 
 in a single JSON document under `$PYLON_HOME/state.json`.
 

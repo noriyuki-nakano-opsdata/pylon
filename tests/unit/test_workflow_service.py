@@ -168,6 +168,34 @@ def test_put_run_record_enforces_expected_record_version(tmp_path: Path) -> None
         )
 
 
+def test_json_file_store_persists_surface_records_and_sequences(tmp_path: Path) -> None:
+    state_path = tmp_path / "control-plane.json"
+    store = _store(state_path)
+    first = store.allocate_sequence_value("memories")
+    second = store.allocate_sequence_value("memories")
+    store.put_surface_record(
+        "tasks",
+        "task-1",
+        {
+            "id": "task-1",
+            "tenant_id": "tenant-a",
+            "title": "Investigate funnel leak",
+            "updated_at": "2026-03-11T00:00:00Z",
+        },
+    )
+
+    reopened = _store(state_path)
+    assert first == 1
+    assert second == 2
+    assert reopened.allocate_sequence_value("memories") == 3
+    assert reopened.get_surface_record("tasks", "task-1") == {
+        "id": "task-1",
+        "tenant_id": "tenant-a",
+        "title": "Investigate funnel leak",
+        "updated_at": "2026-03-11T00:00:00Z",
+    }
+
+
 def test_start_run_supports_queued_execution_mode(tmp_path: Path) -> None:
     state_path = tmp_path / "control-plane.json"
     store = _store(state_path)

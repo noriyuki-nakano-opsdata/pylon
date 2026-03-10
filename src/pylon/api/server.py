@@ -9,6 +9,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+from urllib.parse import parse_qs, urlsplit
 
 
 @dataclass
@@ -17,6 +18,7 @@ class Request:
 
     method: str
     path: str
+    query_params: dict[str, str | list[str]] = field(default_factory=dict)
     headers: dict[str, str] = field(default_factory=dict)
     body: Any = None
     path_params: dict[str, str] = field(default_factory=dict)
@@ -89,6 +91,15 @@ class APIServer:
         """Add middleware (executed in registration order)."""
         self._middlewares.append(middleware)
 
+    def list_routes(self) -> list[tuple[str, str]]:
+        """Return registered routes as (method, path_template) pairs."""
+        return [(route.method, route.path_template) for route in self._routes]
+
+    def has_route(self, method: str, path: str) -> bool:
+        """Return True when an exact method/path template is registered."""
+        target = (method.upper(), path)
+        return target in set(self.list_routes())
+
     def handle_request(
         self,
         method: str,
@@ -97,12 +108,19 @@ class APIServer:
         body: Any = None,
     ) -> Response:
         """Route and handle an incoming request."""
+        split = urlsplit(path)
+        normalized_path = split.path or "/"
+        query_params: dict[str, str | list[str]] = {}
+        for key, values in parse_qs(split.query, keep_blank_values=True).items():
+            query_params[key] = values[0] if len(values) == 1 else values
         request = Request(
             method=method.upper(),
-            path=path,
+            path=normalized_path,
+            query_params=query_params,
             headers={k.lower(): v for k, v in (headers or {}).items()},
             body=body,
         )
+        request.context["query_params"] = query_params
 
         # Match route
         route = self._match_route(request.method, request.path)

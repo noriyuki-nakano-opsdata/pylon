@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import time
+from pathlib import Path
 
 import pytest
 
@@ -41,8 +42,10 @@ from pylon.api.schemas import (
     validate,
 )
 from pylon.api.server import APIServer, Request, Response
-from pylon.control_plane import InMemoryWorkflowControlPlaneStore
+from pylon.control_plane import ControlPlaneBackend, InMemoryWorkflowControlPlaneStore
 from pylon.dsl.parser import PylonProject
+from pylon.providers.base import Response as ProviderResponse, TokenUsage
+from pylon.runtime.llm import ProviderRegistry
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -139,6 +142,31 @@ def _workflow_project(name: str = "demo-project") -> PylonProject:
             },
         }
     )
+
+
+class _FakeSkillProvider:
+    def __init__(self, model_id: str) -> None:
+        self._model_id = model_id
+
+    async def chat(self, messages, **kwargs):
+        user_messages = [message.content for message in messages if message.role == "user"]
+        return ProviderResponse(
+            content=" | ".join(user_messages),
+            model=str(kwargs.get("model") or self._model_id),
+            usage=TokenUsage(input_tokens=21, output_tokens=13),
+        )
+
+    async def stream(self, messages, **kwargs):
+        if False:  # pragma: no cover
+            yield messages, kwargs
+
+    @property
+    def model_id(self) -> str:
+        return self._model_id
+
+    @property
+    def provider_name(self) -> str:
+        return "fake"
 
 
 def _limited_workflow_project(name: str = "limited-project") -> PylonProject:
@@ -380,6 +408,16 @@ class TestServerRouting:
         server.handle_request("GET", "/test", headers={"X-Custom": "val"})
         assert captured["x-custom"] == "val"
 
+    def test_query_params_are_parsed(self):
+        server = APIServer()
+
+        def handler(req: Request) -> Response:
+            return Response(body={"query": req.query_params})
+
+        server.add_route("GET", "/search", handler)
+        resp = server.handle_request("GET", "/search?q=pylon&tag=api&tag=v1")
+        assert resp.body == {"query": {"q": "pylon", "tag": ["api", "v1"]}}
+
 
 # ---------------------------------------------------------------------------
 # Agent CRUD routes
@@ -438,6 +476,537 @@ class TestAgentRoutes:
         resp = server.handle_request("DELETE", "/agents/nonexistent")
         assert resp.status_code == 404
 
+    def test_versioned_agent_routes_support_patch_and_skills(self):
+        server, _ = _server_with_routes()
+        create_resp = server.handle_request(
+            "POST",
+            "/api/v1/agents",
+            body={"name": "coder", "skills": ["code-review"]},
+        )
+        assert create_resp.status_code == 201
+        agent_id = create_resp.body["id"]
+
+        patch_resp = server.handle_request(
+            "PATCH",
+            f"/api/v1/agents/{agent_id}",
+            body={"team": "platform", "autonomy": 3},
+        )
+        assert patch_resp.status_code == 200
+        assert patch_resp.body["team"] == "platform"
+        assert patch_resp.body["autonomy"] == "A3"
+
+        skills_resp = server.handle_request("GET", f"/api/v1/agents/{agent_id}/skills")
+        assert skills_resp.status_code == 200
+        assert skills_resp.body["skills"] == [
+            {
+                "id": "code-review",
+                "name": "code-review",
+                "description": "",
+                "category": "uncategorized",
+                "risk": "unknown",
+                "source": "local",
+                "tags": [],
+            }
+        ]
+
+        update_skills = server.handle_request(
+            "PATCH",
+            f"/api/v1/agents/{agent_id}/skills",
+            body={"skills": ["triage"]},
+        )
+        assert update_skills.status_code == 200
+        assert update_skills.body["skills"] == ["triage"]
+
+    def test_skills_and_models_compatibility_routes_return_empty_payloads(self):
+        server, _ = _server_with_routes()
+
+        skills = server.handle_request("GET", "/api/v1/skills")
+        assert skills.status_code == 200
+        assert skills.body == {
+            "skills": [],
+            "total": 0,
+            "categories": {},
+            "sources": {},
+        }
+
+        scan = server.handle_request("POST", "/api/v1/skills/scan")
+        assert scan.status_code == 200
+        assert scan.body == {"total": 0, "new": 0, "removed": 0}
+
+        categories = server.handle_request("GET", "/api/v1/skills/categories")
+        assert categories.status_code == 200
+        assert categories.body == {}
+
+        models = server.handle_request("GET", "/api/v1/models")
+        assert models.status_code == 200
+        assert models.body == {
+            "providers": {},
+            "fallback_chain": [],
+            "policies": {},
+        }
+
+        health = server.handle_request("GET", "/api/v1/models/health")
+        assert health.status_code == 200
+        assert health.body == {}
+
+    def test_skill_execute_returns_local_preview_without_provider_runtime(self):
+        server, store = _server_with_routes()
+        store.skills["triage"] = {
+            "id": "triage",
+            "name": "Issue Triage",
+            "description": "Summarize and prioritize new issues.",
+            "content_preview": "Classify severity and propose the next action.",
+            "category": "operations",
+            "source": "local",
+            "tags": ["triage"],
+        }
+
+        resp = server.handle_request(
+            "POST",
+            "/api/v1/skills/triage/execute",
+            body={
+                "input": "Customer reports login failures after deploy.",
+                "context": {"repo": "pylon", "severity": "high"},
+                "provider": "anthropic",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.body["skill_id"] == "triage"
+        assert resp.body["provider"] == "local"
+        assert resp.body["model"] == "builtin-skill-preview"
+        assert "Customer reports login failures" in resp.body["result"]
+        assert "deterministic local preview" in resp.body["result"]
+
+    def test_skill_execute_uses_provider_runtime_when_available(self):
+        registry = ProviderRegistry({"fake": lambda model_id: _FakeSkillProvider(model_id)})
+        server, store = _server_with_routes(provider_registry=registry)
+        store.skills["triage"] = {
+            "id": "triage",
+            "name": "Issue Triage",
+            "description": "Summarize and prioritize new issues.",
+            "category": "operations",
+            "source": "local",
+            "tags": ["triage"],
+        }
+
+        resp = server.handle_request(
+            "POST",
+            "/api/v1/skills/triage/execute",
+            body={
+                "input": "Login fails after deploy",
+                "context": {"repo": "pylon"},
+                "provider": "fake",
+                "model": "triage-model",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.body == {
+            "skill_id": "triage",
+            "result": 'Execution context:\n{\n  "repo": "pylon"\n} | Login fails after deploy',
+            "tokens_in": 21,
+            "tokens_out": 13,
+            "model": "triage-model",
+            "provider": "fake",
+        }
+
+    def test_features_endpoint_returns_product_surface_manifest(self):
+        server, _ = _server_with_routes()
+        resp = server.handle_request("GET", "/api/v1/features")
+        assert resp.status_code == 200
+        assert resp.body["canonical_prefix"] == "/api/v1"
+        assert resp.body["contract_path"] == "/api/v1/contract"
+        assert resp.body["legacy_alias_policy"]["sunset_on"] == "2026-09-30"
+        assert resp.body["surfaces"]["admin"]["agents"] is True
+        assert resp.body["surfaces"]["project"]["ads"] is True
+        assert resp.body["surfaces"]["project"]["tasks"] is True
+        assert resp.body["surfaces"]["project"]["lifecycle"] is True
+
+    def test_contract_endpoint_returns_canonical_route_manifest(self):
+        server, _ = _server_with_routes()
+        resp = server.handle_request("GET", "/api/v1/contract")
+
+        assert resp.status_code == 200
+        assert resp.body["canonical_prefix"] == "/api/v1"
+        assert resp.body["legacy_alias_policy"]["deprecated_on"] == "2026-03-11"
+        create_agent = next(
+            route
+            for route in resp.body["routes"]
+            if route["method"] == "POST" and route["path"] == "/api/v1/agents"
+        )
+        assert create_agent["aliases"] == [
+            {
+                "path": "/agents",
+                "deprecated": True,
+                "deprecated_on": "2026-03-11",
+                "sunset_on": "2026-09-30",
+            }
+        ]
+        assert create_agent["authorization"]["all_of_scopes"] == ["agents:write"]
+
+    def test_legacy_alias_routes_emit_deprecation_headers(self):
+        server, _ = _server_with_routes()
+        resp = server.handle_request("POST", "/agents", body={"name": "coder"})
+
+        assert resp.status_code == 201
+        assert resp.headers["deprecation"] == "true"
+        assert resp.headers["sunset"] == "2026-09-30"
+        assert resp.headers["x-pylon-canonical-path"] == "/api/v1/agents"
+        assert resp.headers["link"] == '</api/v1/agents>; rel="successor-version"'
+        assert "Deprecated API alias /agents" in resp.headers["warning"]
+
+
+# ---------------------------------------------------------------------------
+# Mission control / ads routes
+# ---------------------------------------------------------------------------
+
+class TestProjectOperationsRoutes:
+    def test_mission_control_crud_and_agent_activity(self):
+        server, _ = _server_with_routes()
+        agent = server.handle_request(
+            "POST",
+            "/api/v1/agents",
+            body={
+                "name": "ops-bot",
+                "model": "openai/gpt-5-mini",
+                "role": "Operations",
+                "team": "product",
+                "tools": ["http", "bash"],
+            },
+        )
+        assert agent.status_code == 201
+        agent_id = agent.body["id"]
+
+        task = server.handle_request(
+            "POST",
+            "/api/v1/tasks",
+            body={
+                "title": "Investigate onboarding drop-off",
+                "description": "Review activation funnel metrics and propose fixes.",
+                "status": "in_progress",
+                "priority": "high",
+                "assignee": "ops-bot",
+                "assigneeType": "ai",
+                "payload": {"run_id": "run-123", "phase": "research"},
+            },
+        )
+        assert task.status_code == 201
+        task_id = task.body["id"]
+
+        activity = server.handle_request("GET", "/api/v1/agents/activity")
+        assert activity.status_code == 200
+        assert activity.body[0]["id"] == agent_id
+        assert activity.body[0]["current_task"]["id"] == task_id
+        assert activity.body[0]["team"] == "product"
+        assert activity.body[0]["uptime_seconds"] >= 0
+
+        task_detail = server.handle_request("GET", f"/api/v1/tasks/{task_id}")
+        assert task_detail.status_code == 200
+        assert task_detail.body["payload"]["phase"] == "research"
+
+        task_patch = server.handle_request(
+            "PATCH",
+            f"/api/v1/tasks/{task_id}",
+            body={"status": "review", "priority": "critical"},
+        )
+        assert task_patch.status_code == 200
+        assert task_patch.body["status"] == "review"
+        assert task_patch.body["priority"] == "critical"
+
+        memory = server.handle_request(
+            "POST",
+            "/api/v1/memories",
+            body={
+                "title": "Activation insight",
+                "content": "Users stall before first integration.",
+                "category": "learnings",
+                "actor": "ops-bot",
+                "tags": ["activation", "onboarding"],
+            },
+        )
+        assert memory.status_code == 201
+        memories = server.handle_request("GET", "/api/v1/memories")
+        assert memories.status_code == 200
+        assert memories.body[0]["details"]["tags"] == ["activation", "onboarding"]
+
+        event = server.handle_request(
+            "POST",
+            "/api/v1/events",
+            body={
+                "title": "Weekly growth review",
+                "description": "Review paid and product loops",
+                "start": "2026-03-11T09:00:00Z",
+                "type": "review",
+                "agentId": agent_id,
+            },
+        )
+        assert event.status_code == 201
+        listed_events = server.handle_request("GET", "/api/v1/events")
+        assert listed_events.status_code == 200
+        assert listed_events.body[0]["end"] == "2026-03-11T10:00:00Z"
+
+        content = server.handle_request(
+            "POST",
+            "/api/v1/content",
+            body={
+                "title": "Launch announcement",
+                "description": "Draft the product launch post",
+                "type": "article",
+                "stage": "draft",
+                "assignee": "ops-bot",
+                "assigneeType": "ai",
+            },
+        )
+        assert content.status_code == 201
+        content_id = content.body["id"]
+        content_patch = server.handle_request(
+            "PATCH",
+            f"/api/v1/content/{content_id}",
+            body={"stage": "review"},
+        )
+        assert content_patch.status_code == 200
+        assert content_patch.body["stage"] == "review"
+
+        teams = server.handle_request("GET", "/api/v1/teams")
+        assert teams.status_code == 200
+        assert any(team["id"] == "product" for team in teams.body)
+
+        created_team = server.handle_request(
+            "POST",
+            "/api/v1/teams",
+            body={"name": "Growth", "nameJa": "グロース", "icon": "TrendingUp"},
+        )
+        assert created_team.status_code == 201
+        updated_team = server.handle_request(
+            "PATCH",
+            f"/api/v1/teams/{created_team.body['id']}",
+            body={"color": "text-lime-400"},
+        )
+        assert updated_team.status_code == 200
+        assert updated_team.body["color"] == "text-lime-400"
+
+        assert server.handle_request("DELETE", f"/api/v1/content/{content_id}").status_code == 204
+        assert server.handle_request("DELETE", f"/api/v1/events/{event.body['id']}").status_code == 204
+        assert server.handle_request("DELETE", f"/api/v1/memories/{memory.body['entry_id']}").status_code == 204
+        assert server.handle_request("DELETE", f"/api/v1/tasks/{task_id}").status_code == 204
+        assert server.handle_request("DELETE", f"/api/v1/teams/{created_team.body['id']}").status_code == 204
+
+    def test_ads_routes_return_coherent_reference_payloads(self):
+        server, store = _server_with_routes()
+
+        templates = server.handle_request("GET", "/api/v1/ads/templates")
+        assert templates.status_code == 200
+        assert any(template["id"] == "saas" for template in templates.body)
+
+        plan = server.handle_request(
+            "POST",
+            "/api/v1/ads/plan",
+            body={"industry_type": "saas", "monthly_budget": 12000},
+        )
+        assert plan.status_code == 200
+        assert plan.body["industry_type"] == "saas"
+        assert plan.body["recommended_platforms"][0] == "google"
+        assert plan.body["campaign_architecture"]
+
+        budget = server.handle_request(
+            "POST",
+            "/api/v1/ads/budget/optimize",
+            body={
+                "current_spend": {
+                    "google": 5000,
+                    "meta": 3000,
+                    "linkedin": 1000,
+                    "tiktok": 500,
+                    "microsoft": 500,
+                },
+                "target_mer": 3.2,
+                "monthly_budget": 12000,
+            },
+        )
+        assert budget.status_code == 200
+        assert budget.body["monthly_budget"] == 12000
+        assert sum(budget.body["platform_mix"].values()) == 12000
+
+        benchmarks = server.handle_request("GET", "/api/v1/ads/benchmarks/google")
+        assert benchmarks.status_code == 200
+        assert benchmarks.body["platform"] == "google"
+        assert benchmarks.body["benchmark_mer"] > 0
+
+        run = server.handle_request(
+            "POST",
+            "/api/v1/ads/audit",
+            body={
+                "platforms": ["google", "meta"],
+                "industry_type": "saas",
+                "monthly_budget": 15000,
+                "account_data": {"google": "campaign export", "meta": "ad set export"},
+            },
+        )
+        assert run.status_code == 201
+        run_id = run.body["run_id"]
+
+        updated_run = dict(store.ads_audit_runs[run_id])
+        updated_run["created_at_epoch"] = time.time() - 10
+        store.ads_audit_runs[run_id] = updated_run
+        status = server.handle_request("GET", f"/api/v1/ads/audit/{run_id}")
+        assert status.status_code == 200
+        assert status.body["status"] == "completed"
+        assert status.body["report"]["aggregate_grade"] in {"A", "B", "C", "D", "F"}
+        assert status.body["report"]["platforms"][0]["checks"]
+
+        reports = server.handle_request("GET", "/api/v1/ads/reports")
+        assert reports.status_code == 200
+        report_id = reports.body[0]["id"]
+
+        report = server.handle_request("GET", f"/api/v1/ads/reports/{report_id}")
+        assert report.status_code == 200
+        assert report.body["aggregate_score"] >= 0
+        assert report.body["total_checks"] == len(report.body["platforms"]) * 5
+        assert "tenant_id" not in report.body
+
+    @pytest.mark.parametrize(
+        ("backend", "filename"),
+        [
+            (ControlPlaneBackend.JSON_FILE, "control-plane.json"),
+            (ControlPlaneBackend.SQLITE, "control-plane.db"),
+        ],
+    )
+    def test_project_surfaces_persist_across_server_restarts(
+        self,
+        tmp_path: Path,
+        backend: ControlPlaneBackend,
+        filename: str,
+    ):
+        control_plane_path = str(tmp_path / filename)
+        server, _ = _server_with_routes(
+            control_plane_backend=backend,
+            control_plane_path=control_plane_path,
+        )
+
+        agent = server.handle_request(
+            "POST",
+            "/api/v1/agents",
+            headers={"X-Tenant-ID": "tenant-a"},
+            body={"name": "growth-bot", "model": "openai/gpt-5-mini", "role": "Growth"},
+        )
+        assert agent.status_code == 201
+
+        task = server.handle_request(
+            "POST",
+            "/api/v1/tasks",
+            headers={"X-Tenant-ID": "tenant-a"},
+            body={
+                "title": "Run weekly audit",
+                "description": "Audit paid media changes",
+                "status": "backlog",
+                "priority": "medium",
+                "assignee": "growth-bot",
+                "assigneeType": "ai",
+            },
+        )
+        assert task.status_code == 201
+
+        team = server.handle_request(
+            "POST",
+            "/api/v1/teams",
+            headers={"X-Tenant-ID": "tenant-a"},
+            body={"name": "Growth", "nameJa": "グロース"},
+        )
+        assert team.status_code == 201
+
+        memory = server.handle_request(
+            "POST",
+            "/api/v1/memories",
+            headers={"X-Tenant-ID": "tenant-a"},
+            body={
+                "title": "Offer insight",
+                "content": "Pricing proof increases conversion.",
+                "category": "patterns",
+                "actor": "growth-bot",
+            },
+        )
+        assert memory.status_code == 201
+
+        audit_run = server.handle_request(
+            "POST",
+            "/api/v1/ads/audit",
+            headers={"X-Tenant-ID": "tenant-a"},
+            body={"platforms": ["google"], "industry_type": "saas", "monthly_budget": 9000},
+        )
+        assert audit_run.status_code == 201
+        run_id = audit_run.body["run_id"]
+
+        server_after_restart, restarted_store = _server_with_routes(
+            control_plane_backend=backend,
+            control_plane_path=control_plane_path,
+        )
+        audit_record = dict(restarted_store.ads_audit_runs[run_id])
+        audit_record["created_at_epoch"] = time.time() - 10
+        restarted_store.ads_audit_runs[run_id] = audit_record
+
+        listed_agents = server_after_restart.handle_request(
+            "GET",
+            "/api/v1/agents/activity",
+            headers={"X-Tenant-ID": "tenant-a"},
+        )
+        assert listed_agents.status_code == 200
+        assert listed_agents.body[0]["name"] == "growth-bot"
+
+        listed_tasks = server_after_restart.handle_request(
+            "GET",
+            "/api/v1/tasks",
+            headers={"X-Tenant-ID": "tenant-a"},
+        )
+        assert listed_tasks.status_code == 200
+        assert listed_tasks.body[0]["title"] == "Run weekly audit"
+
+        listed_teams = server_after_restart.handle_request(
+            "GET",
+            "/api/v1/teams",
+            headers={"X-Tenant-ID": "tenant-a"},
+        )
+        assert any(entry["id"] == team.body["id"] for entry in listed_teams.body)
+
+        listed_memories = server_after_restart.handle_request(
+            "GET",
+            "/api/v1/memories",
+            headers={"X-Tenant-ID": "tenant-a"},
+        )
+        assert listed_memories.body[0]["entry_id"] == memory.body["entry_id"]
+
+        audit_status = server_after_restart.handle_request(
+            "GET",
+            f"/api/v1/ads/audit/{run_id}",
+            headers={"X-Tenant-ID": "tenant-a"},
+        )
+        assert audit_status.status_code == 200
+        assert audit_status.body["status"] == "completed"
+        assert audit_status.body["report"]["platforms"][0]["platform"] == "google"
+
+    def test_model_policies_are_tenant_scoped(self):
+        server, _ = _server_with_routes()
+
+        tenant_a = server.handle_request(
+            "POST",
+            "/api/v1/models/policy",
+            headers={"X-Tenant-ID": "tenant-a"},
+            body={"provider": "anthropic", "policy": "quality", "pin": "claude-sonnet-4-6"},
+        )
+        tenant_b = server.handle_request(
+            "POST",
+            "/api/v1/models/policy",
+            headers={"X-Tenant-ID": "tenant-b"},
+            body={"provider": "anthropic", "policy": "cost", "pin": "claude-haiku-4-5"},
+        )
+        assert tenant_a.status_code == 200
+        assert tenant_b.status_code == 200
+
+        listed_a = server.handle_request("GET", "/api/v1/models", headers={"X-Tenant-ID": "tenant-a"})
+        listed_b = server.handle_request("GET", "/api/v1/models", headers={"X-Tenant-ID": "tenant-b"})
+        assert listed_a.body["providers"]["anthropic"]["policy"] == "quality"
+        assert listed_b.body["providers"]["anthropic"]["policy"] == "cost"
+
 
 # ---------------------------------------------------------------------------
 # Workflow routes
@@ -458,6 +1027,32 @@ class TestWorkflowRoutes:
         assert resp.body["agent_count"] == 2
         assert resp.body["node_count"] == 2
         assert store.get_workflow_project("wf1", tenant_id="default").name == "wf1-project"
+
+    def test_versioned_workflow_routes_are_canonical(self):
+        server, _ = _server_with_routes()
+        project = _workflow_project("wf-v1-project").model_dump(mode="json")
+        created = server.handle_request(
+            "POST",
+            "/api/v1/workflows",
+            body={"id": "wf-v1", "project": project},
+        )
+        assert created.status_code == 201
+
+        listed = server.handle_request("GET", "/api/v1/workflows")
+        assert listed.status_code == 200
+        assert listed.body["workflows"][0]["id"] == "wf-v1"
+
+        started = server.handle_request("POST", "/api/v1/workflows/wf-v1/runs", body={})
+        assert started.status_code == 202
+        run_id = started.body["id"]
+
+        fetched = server.handle_request("GET", f"/api/v1/workflows/wf-v1/runs/{run_id}")
+        assert fetched.status_code == 200
+        assert fetched.body["id"] == run_id
+
+        global_runs = server.handle_request("GET", "/api/v1/runs")
+        assert global_runs.status_code == 200
+        assert global_runs.body["runs"][0]["id"] == run_id
 
     def test_create_workflow_definition_returns_structured_validation_issues(self):
         server, _ = _server_with_routes()
@@ -639,7 +1234,7 @@ class TestWorkflowRoutes:
                 }
             ],
         }
-        assert resp.headers["location"].startswith("/api/v1/workflow-runs/")
+        assert resp.headers["location"].startswith("/api/v1/runs/")
 
     def test_get_workflow_run(self):
         server, store = _server_with_routes()
@@ -714,7 +1309,7 @@ class TestWorkflowRoutes:
         run_id = create_resp.body["id"]
 
         workflow_runs = server.handle_request("GET", "/workflows/wf1/runs")
-        global_runs = server.handle_request("GET", "/api/v1/workflow-runs")
+        global_runs = server.handle_request("GET", "/api/v1/runs")
 
         assert workflow_runs.status_code == 200
         assert workflow_runs.body["count"] == 1
@@ -749,7 +1344,7 @@ class TestWorkflowRoutes:
             control_plane_path=str(db_path),
         )
         workflow = second_server.handle_request("GET", "/workflows/wf1")
-        run = second_server.handle_request("GET", f"/api/v1/workflow-runs/{run_id}")
+        run = second_server.handle_request("GET", f"/api/v1/runs/{run_id}")
 
         assert workflow.status_code == 200
         assert workflow.body["project_name"] == "demo-project"
@@ -782,7 +1377,7 @@ class TestWorkflowRoutes:
 
         resumed = server.handle_request(
             "POST",
-            f"/api/v1/workflow-runs/{run_id}/resume",
+            f"/api/v1/runs/{run_id}/resume",
             body={},
         )
         assert resumed.status_code == 200
@@ -803,7 +1398,7 @@ class TestWorkflowRoutes:
 
         resumed = server.handle_request(
             "POST",
-            f"/api/v1/workflow-runs/{run_id}/resume",
+            f"/api/v1/runs/{run_id}/resume",
             body={"input": {"task": "y"}},
         )
         assert resumed.status_code == 409
@@ -856,12 +1451,12 @@ class TestWorkflowRoutes:
         approvals = server.handle_request("GET", "/api/v1/approvals")
         run_approvals = server.handle_request(
             "GET",
-            f"/api/v1/workflow-runs/{run_id}/approvals",
+            f"/api/v1/runs/{run_id}/approvals",
         )
         checkpoints = server.handle_request("GET", "/api/v1/checkpoints")
         run_checkpoints = server.handle_request(
             "GET",
-            f"/api/v1/workflow-runs/{run_id}/checkpoints",
+            f"/api/v1/runs/{run_id}/checkpoints",
         )
 
         assert approvals.status_code == 200
@@ -916,7 +1511,7 @@ class TestWorkflowRoutes:
         deleted = server.handle_request("DELETE", "/workflows/wf1")
         assert deleted.status_code == 204
 
-        get_by_id = server.handle_request("GET", f"/api/v1/workflow-runs/{run_id}")
+        get_by_id = server.handle_request("GET", f"/api/v1/runs/{run_id}")
         get_by_workflow = server.handle_request("GET", f"/workflows/wf1/runs/{run_id}")
         assert get_by_id.status_code == 200
         assert get_by_workflow.status_code == 200
@@ -957,7 +1552,7 @@ class TestKillSwitchRoute:
             body={"scope": "tenant:tenant-a", "reason": "test", "issued_by": "user"},
         )
         assert resp.status_code == 201
-        assert "tenant:tenant-a" in store.kill_switches
+        assert "tenant-a:tenant:tenant-a" in store.kill_switches
 
     def test_activate_other_tenant_scope_forbidden(self):
         server, _ = _server_with_routes()
@@ -979,7 +1574,7 @@ class TestKillSwitchRoute:
             body={"scope": "agent:123", "reason": "test", "issued_by": "user"},
         )
         assert resp.status_code == 201
-        assert "agent:123" in store.kill_switches
+        assert "tenant-a:agent:123" in store.kill_switches
 
     def test_activate_with_parent_scope_persists_metadata(self):
         server, store = _server_with_routes()
@@ -995,7 +1590,7 @@ class TestKillSwitchRoute:
             },
         )
         assert resp.status_code == 201
-        assert store.kill_switches["workflow:wf-1"]["parent_scope"] == "tenant:tenant-a"
+        assert store.kill_switches["tenant-a:workflow:wf-1"]["parent_scope"] == "tenant:tenant-a"
 
     def test_activate_validation_error(self):
         server, _ = _server_with_routes()

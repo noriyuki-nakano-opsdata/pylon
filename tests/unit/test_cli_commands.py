@@ -607,6 +607,98 @@ def test_doctor_json_output_includes_validation_report() -> None:
         assert payload["checks"][1]["message"] == "pylon.yaml: OK (valid)"
 
 
+def test_validate_command_accepts_explicit_project_path() -> None:
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        runner = CliRunner(env={"PYLON_HOME": ".pylon-home"})
+        project_dir = Path("examples/demo")
+        project_dir.mkdir(parents=True)
+        (project_dir / "pylon.yaml").write_text(_PROJECT_YAML_A2, encoding="utf-8")
+
+        validate_result = runner.invoke(
+            cli,
+            ["--output", "json", "validate", "examples/demo/pylon.yaml"],
+        )
+        assert validate_result.exit_code == 0
+        payload = json.loads(validate_result.output)
+        assert payload["ok"] is True
+        assert payload["path"] == "examples/demo/pylon.yaml"
+
+
+def test_validate_command_accepts_deprecated_file_option() -> None:
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        runner = CliRunner(env={"PYLON_HOME": ".pylon-home"})
+        project_dir = Path("examples/demo")
+        project_dir.mkdir(parents=True)
+        (project_dir / "pylon.yaml").write_text(_PROJECT_YAML_A2, encoding="utf-8")
+
+        validate_result = runner.invoke(
+            cli,
+            ["validate", "--file", "examples/demo/pylon.yaml"],
+        )
+        assert validate_result.exit_code == 0
+        assert "Warning: --file is deprecated" in validate_result.output
+        assert '"ok": true' in validate_result.output
+
+
+def test_run_accepts_project_path_and_key_value_input() -> None:
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        runner = CliRunner(env={"PYLON_HOME": ".pylon-home"})
+        project_dir = Path("examples/demo")
+        project_dir.mkdir(parents=True)
+        (project_dir / "pylon.yaml").write_text(_PROJECT_YAML_BRANCH, encoding="utf-8")
+
+        run_result = runner.invoke(
+            cli,
+            ["run", "examples/demo/pylon.yaml", "--input", "route=left"],
+        )
+        assert run_result.exit_code == 0
+        assert "Starting workflow 'cli-branch'" in run_result.output
+        run_id = _extract(r"Run ID: (run_[a-f0-9]+)", run_result.output)
+
+        inspect_result = runner.invoke(cli, ["--output", "json", "inspect", run_id])
+        assert inspect_result.exit_code == 0
+        payload = json.loads(inspect_result.output)
+        assert payload["workflow_id"] == "cli-branch"
+        assert payload["input"] == {"route": "left"}
+        assert payload["project_path"].endswith("examples/demo")
+        assert payload["state"]["left_done"] is True
+        assert "right_done" not in payload["state"]
+
+
+def test_run_accepts_yaml_mapping_input_and_deprecated_project_option() -> None:
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        runner = CliRunner(env={"PYLON_HOME": ".pylon-home"})
+        project_dir = Path("examples/demo")
+        project_dir.mkdir(parents=True)
+        project_file = project_dir / "pylon.yaml"
+        project_file.write_text(_PROJECT_YAML_A2, encoding="utf-8")
+
+        run_result = runner.invoke(
+            cli,
+            [
+                "run",
+                "--project",
+                str(project_file),
+                "--input",
+                "topic: Large Language Model Alignment",
+            ],
+        )
+        assert run_result.exit_code == 0
+        assert "Warning: --project is deprecated" in run_result.output
+        assert "Starting workflow 'cli-test'" in run_result.output
+        run_id = _extract(r"Run ID: (run_[a-f0-9]+)", run_result.output)
+
+        inspect_result = runner.invoke(cli, ["--output", "json", "inspect", run_id])
+        assert inspect_result.exit_code == 0
+        payload = json.loads(inspect_result.output)
+        assert payload["input"] == {"topic": "Large Language Model Alignment"}
+        assert payload["project_path"].endswith("examples/demo")
+
+
 def test_approval_deny_updates_run_status_and_logs() -> None:
     runner = CliRunner()
     with runner.isolated_filesystem():

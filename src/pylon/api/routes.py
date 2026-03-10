@@ -6,18 +6,29 @@ Routes project API concerns over a pluggable workflow control-plane backend.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import time
 import uuid
+from collections.abc import MutableMapping
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from pylon.api.authz import require_scopes
 from pylon.api.health import build_default_checker, build_default_readiness_checker
 from pylon.api.observability import APIObservabilityBundle
+from pylon.api.public_contract import (
+    PublicContractRegistry,
+    build_feature_manifest,
+    register_public_route,
+    v1,
+)
 from pylon.api.schemas import (
     APPROVAL_DECISION_SCHEMA,
     CREATE_AGENT_SCHEMA,
     KILL_SWITCH_SCHEMA,
+    SKILL_EXECUTE_SCHEMA,
     WORKFLOW_DEFINITION_SCHEMA,
     WORKFLOW_RUN_SCHEMA,
     validate,
@@ -31,8 +42,332 @@ from pylon.control_plane import (
 )
 from pylon.control_plane.workflow_service import WorkflowRunService
 from pylon.dsl.parser import PylonProject
+from pylon.providers.base import Message, TokenUsage
 
 logger = logging.getLogger(__name__)
+
+
+MISSION_TASK_STATUSES = {"backlog", "in_progress", "review", "done"}
+MISSION_TASK_PRIORITIES = {"low", "medium", "high", "critical"}
+MISSION_ASSIGNEE_TYPES = {"human", "ai"}
+MISSION_MEMORY_CATEGORIES = {"sessions", "patterns", "learnings", "decisions"}
+MISSION_CONTENT_STAGES = {
+    "idea",
+    "research",
+    "draft",
+    "script",
+    "review",
+    "ready",
+    "published",
+}
+DEFAULT_AUDIT_AGENTS = (
+    "audit-google",
+    "audit-meta",
+    "audit-creative",
+    "audit-tracking",
+    "audit-budget",
+    "audit-compliance",
+)
+ADS_PLATFORMS = ("google", "meta", "linkedin", "tiktok", "microsoft")
+DEFAULT_TEAM_DEFINITIONS: tuple[dict[str, str], ...] = (
+    {
+        "id": "development",
+        "name": "Engineering",
+        "nameJa": "エンジニアリング",
+        "icon": "Code2",
+        "color": "text-blue-400",
+        "bg": "bg-blue-600",
+    },
+    {
+        "id": "design",
+        "name": "Design",
+        "nameJa": "デザイン",
+        "icon": "Palette",
+        "color": "text-purple-400",
+        "bg": "bg-pink-600",
+    },
+    {
+        "id": "research",
+        "name": "Research & Writing",
+        "nameJa": "リサーチ & ライティング",
+        "icon": "PenTool",
+        "color": "text-emerald-400",
+        "bg": "bg-violet-600",
+    },
+    {
+        "id": "data",
+        "name": "Data & AI",
+        "nameJa": "データ & AI",
+        "icon": "Zap",
+        "color": "text-cyan-400",
+        "bg": "bg-cyan-600",
+    },
+    {
+        "id": "security",
+        "name": "Security",
+        "nameJa": "セキュリティ",
+        "icon": "Shield",
+        "color": "text-red-400",
+        "bg": "bg-red-600",
+    },
+    {
+        "id": "product",
+        "name": "Product & Ops",
+        "nameJa": "プロダクト & 運用",
+        "icon": "Network",
+        "color": "text-orange-400",
+        "bg": "bg-orange-600",
+    },
+)
+ADS_INDUSTRY_TEMPLATES: tuple[dict[str, Any], ...] = (
+    {
+        "id": "saas",
+        "name": "SaaS",
+        "description": "B2B SaaSプロダクト向け。リード獲得とデモ予約を最適化",
+        "platforms": {"google": 40, "linkedin": 35, "meta": 25},
+        "min_monthly": 5000,
+        "primary_kpi": "CAC",
+        "time_to_profit": "3-6ヶ月",
+    },
+    {
+        "id": "ecommerce",
+        "name": "E-commerce",
+        "description": "オンラインストア向け。ROAS最大化と新規顧客獲得",
+        "platforms": {"google": 35, "meta": 40, "tiktok": 25},
+        "min_monthly": 3000,
+        "primary_kpi": "ROAS",
+        "time_to_profit": "1-3ヶ月",
+    },
+    {
+        "id": "local-service",
+        "name": "ローカルサービス",
+        "description": "地域密着型ビジネス向け。来店と問合せを最適化",
+        "platforms": {"google": 60, "meta": 30, "microsoft": 10},
+        "min_monthly": 1000,
+        "primary_kpi": "CPL",
+        "time_to_profit": "1-2ヶ月",
+    },
+    {
+        "id": "b2b-enterprise",
+        "name": "B2B Enterprise",
+        "description": "大企業向けソリューション。ABMとリードナーチャリング",
+        "platforms": {"linkedin": 45, "google": 35, "meta": 20},
+        "min_monthly": 10000,
+        "primary_kpi": "SQL",
+        "time_to_profit": "6-12ヶ月",
+    },
+    {
+        "id": "info-products",
+        "name": "情報商材",
+        "description": "オンラインコース、電子書籍等。ファネル最適化",
+        "platforms": {"meta": 45, "google": 30, "tiktok": 25},
+        "min_monthly": 2000,
+        "primary_kpi": "CPA",
+        "time_to_profit": "1-3ヶ月",
+    },
+    {
+        "id": "mobile-app",
+        "name": "モバイルアプリ",
+        "description": "アプリインストールとエンゲージメント最適化",
+        "platforms": {"google": 35, "meta": 35, "tiktok": 30},
+        "min_monthly": 5000,
+        "primary_kpi": "CPI",
+        "time_to_profit": "3-6ヶ月",
+    },
+    {
+        "id": "real-estate",
+        "name": "不動産",
+        "description": "物件問合せとリード獲得を最適化",
+        "platforms": {"google": 50, "meta": 35, "microsoft": 15},
+        "min_monthly": 3000,
+        "primary_kpi": "CPL",
+        "time_to_profit": "2-4ヶ月",
+    },
+    {
+        "id": "healthcare",
+        "name": "ヘルスケア",
+        "description": "医療・健康サービス向け。予約とコンプライアンス対応",
+        "platforms": {"google": 55, "meta": 30, "microsoft": 15},
+        "min_monthly": 3000,
+        "primary_kpi": "CPA",
+        "time_to_profit": "2-4ヶ月",
+    },
+    {
+        "id": "finance",
+        "name": "金融",
+        "description": "金融サービス向け。リード獲得と規制対応",
+        "platforms": {"google": 45, "linkedin": 30, "meta": 25},
+        "min_monthly": 8000,
+        "primary_kpi": "CAC",
+        "time_to_profit": "3-6ヶ月",
+    },
+    {
+        "id": "agency",
+        "name": "代理店",
+        "description": "マーケティング代理店向け。クライアント獲得",
+        "platforms": {"google": 35, "linkedin": 35, "meta": 30},
+        "min_monthly": 5000,
+        "primary_kpi": "CAC",
+        "time_to_profit": "2-4ヶ月",
+    },
+    {
+        "id": "generic",
+        "name": "汎用",
+        "description": "業種を問わない標準テンプレート",
+        "platforms": {"google": 40, "meta": 35, "microsoft": 25},
+        "min_monthly": 2000,
+        "primary_kpi": "CPA",
+        "time_to_profit": "2-4ヶ月",
+    },
+)
+ADS_BENCHMARKS: dict[str, dict[str, Any]] = {
+    "google": {"avg_ctr": 4.9, "avg_cvr": 5.8, "avg_cpc": 3.4, "benchmark_mer": 3.5},
+    "meta": {"avg_ctr": 1.6, "avg_cvr": 3.2, "avg_cpc": 1.8, "benchmark_mer": 3.1},
+    "linkedin": {"avg_ctr": 0.8, "avg_cvr": 2.4, "avg_cpc": 6.7, "benchmark_mer": 2.6},
+    "tiktok": {"avg_ctr": 1.9, "avg_cvr": 2.8, "avg_cpc": 1.4, "benchmark_mer": 2.9},
+    "microsoft": {"avg_ctr": 2.6, "avg_cvr": 4.4, "avg_cpc": 2.1, "benchmark_mer": 3.2},
+}
+
+
+def _utc_now_iso() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _parse_iso_datetime(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _iso_plus_minutes(value: str, minutes: int) -> str:
+    return (
+        (_parse_iso_datetime(value) + timedelta(minutes=minutes))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _stable_seed(*parts: object) -> int:
+    total = 0
+    for index, part in enumerate(parts, start=1):
+        total += index * sum(ord(ch) for ch in str(part))
+    return total
+
+
+def _grade_from_score(score: int) -> str:
+    if score >= 90:
+        return "A"
+    if score >= 80:
+        return "B"
+    if score >= 70:
+        return "C"
+    if score >= 60:
+        return "D"
+    return "F"
+
+
+def _normalize_weight_map(raw_weights: dict[str, float]) -> dict[str, float]:
+    filtered = {key: float(value) for key, value in raw_weights.items() if float(value) > 0}
+    total = sum(filtered.values())
+    if total <= 0:
+        return {}
+    normalized = {key: value / total for key, value in filtered.items()}
+    return dict(sorted(normalized.items(), key=lambda item: item[1], reverse=True))
+
+
+def _allocate_budget(raw_weights: dict[str, float], total_budget: int) -> dict[str, int]:
+    weights = _normalize_weight_map(raw_weights)
+    if not weights:
+        return {}
+    remaining = total_budget
+    allocation: dict[str, int] = {}
+    ordered = list(weights.items())
+    for index, (platform, weight) in enumerate(ordered):
+        if index == len(ordered) - 1:
+            amount = max(remaining, 0)
+        else:
+            amount = max(int(round(total_budget * weight)), 0)
+            remaining -= amount
+        allocation[platform] = amount
+    return allocation
+
+
+def _team_store_key(tenant_id: str, team_id: str) -> str:
+    return f"{tenant_id}:{team_id}"
+
+
+def _model_policy_store_key(tenant_id: str, provider_name: str) -> str:
+    return f"{tenant_id}:{provider_name}"
+
+
+def _kill_switch_store_key(tenant_id: str, scope: str) -> str:
+    if scope == "global":
+        return scope
+    return f"{tenant_id}:{scope}"
+
+
+def _slugify_identifier(value: str, *, prefix: str) -> str:
+    slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in value).strip("-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    if not slug:
+        slug = f"{prefix}-{uuid.uuid4().hex[:6]}"
+    return slug[:48]
+
+
+class SurfaceNamespaceMap(MutableMapping[str, dict[str, Any]]):
+    """Mutable mapping facade over durable control-plane surface records."""
+
+    def __init__(self, store: WorkflowControlPlaneStore, namespace: str) -> None:
+        self._store = store
+        self._namespace = namespace
+
+    def _normalize_key(self, key: object) -> str:
+        return str(key)
+
+    def __getitem__(self, key: object) -> dict[str, Any]:
+        normalized = self._normalize_key(key)
+        payload = self._store.get_surface_record(self._namespace, normalized)
+        if payload is None:
+            raise KeyError(normalized)
+        return payload
+
+    def __setitem__(self, key: object, value: dict[str, Any]) -> None:
+        normalized = self._normalize_key(key)
+        payload = dict(value)
+        if "id" not in payload and normalized:
+            payload["id"] = normalized
+        self._store.put_surface_record(self._namespace, normalized, payload)
+
+    def __delitem__(self, key: object) -> None:
+        normalized = self._normalize_key(key)
+        if not self._store.delete_surface_record(self._namespace, normalized):
+            raise KeyError(normalized)
+
+    def __iter__(self):
+        for payload in self._store.list_surface_records(self._namespace):
+            yield self._normalize_key(payload.get("id", payload.get("entry_id", "")))
+
+    def __len__(self) -> int:
+        return len(self._store.list_surface_records(self._namespace))
+
+    def get(self, key: object, default: Any = None) -> dict[str, Any] | Any:
+        payload = self._store.get_surface_record(self._namespace, self._normalize_key(key))
+        return default if payload is None else payload
+
+    def values(self):  # type: ignore[override]
+        return list(self._store.list_surface_records(self._namespace))
+
+    def items(self):  # type: ignore[override]
+        return [
+            (self._normalize_key(payload.get("id", payload.get("entry_id", ""))), payload)
+            for payload in self._store.list_surface_records(self._namespace)
+        ]
+
 
 
 class RouteStore:
@@ -45,8 +380,6 @@ class RouteStore:
         control_plane_backend: ControlPlaneBackend | str = ControlPlaneBackend.MEMORY,
         control_plane_path: str | None = None,
     ) -> None:
-        self.agents: dict[str, dict] = {}
-        self.kill_switches: dict[str, dict] = {}  # scope -> event
         if control_plane_store is None:
             backend = (
                 control_plane_backend
@@ -60,6 +393,17 @@ class RouteStore:
                 )
             )
         self._control_plane_store = control_plane_store
+        self.agents = SurfaceNamespaceMap(self._control_plane_store, "agents")
+        self.skills = SurfaceNamespaceMap(self._control_plane_store, "skills")
+        self.model_policies = SurfaceNamespaceMap(self._control_plane_store, "model_policies")
+        self.kill_switches = SurfaceNamespaceMap(self._control_plane_store, "kill_switches")
+        self.tasks = SurfaceNamespaceMap(self._control_plane_store, "tasks")
+        self.memories = SurfaceNamespaceMap(self._control_plane_store, "memories")
+        self.events = SurfaceNamespaceMap(self._control_plane_store, "events")
+        self.content_items = SurfaceNamespaceMap(self._control_plane_store, "content_items")
+        self.teams = SurfaceNamespaceMap(self._control_plane_store, "teams")
+        self.ads_audit_runs = SurfaceNamespaceMap(self._control_plane_store, "ads_audit_runs")
+        self.ads_reports = SurfaceNamespaceMap(self._control_plane_store, "ads_reports")
         self._workflow_index: dict[str, set[str]] = {}
         self._rebuild_workflow_index()
 
@@ -246,6 +590,39 @@ class RouteStore:
     ) -> list[dict[str, Any]]:
         return self._control_plane_store.list_queue_task_records(status=status)
 
+    def get_surface_record(
+        self,
+        namespace: str,
+        record_id: str,
+    ) -> dict[str, Any] | None:
+        return self._control_plane_store.get_surface_record(namespace, record_id)
+
+    def put_surface_record(
+        self,
+        namespace: str,
+        record_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        self._control_plane_store.put_surface_record(namespace, record_id, payload)
+
+    def delete_surface_record(
+        self,
+        namespace: str,
+        record_id: str,
+    ) -> bool:
+        return self._control_plane_store.delete_surface_record(namespace, record_id)
+
+    def list_surface_records(
+        self,
+        namespace: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self._control_plane_store.list_surface_records(namespace, tenant_id=tenant_id)
+
+    def allocate_sequence_value(self, name: str) -> int:
+        return self._control_plane_store.allocate_sequence_value(name)
+
     def get_run_record_for_workflow(
         self,
         workflow_id: str,
@@ -282,6 +659,7 @@ def register_routes(
     observability: APIObservabilityBundle | None = None,
     readiness_route_enabled: bool = True,
     metrics_route_enabled: bool = True,
+    provider_registry: "ProviderRegistry | None" = None,
 ) -> RouteStore:
     """Register all API routes on the server. Returns the store."""
     s = store or RouteStore(
@@ -289,9 +667,10 @@ def register_routes(
         control_plane_backend=control_plane_backend,
         control_plane_path=control_plane_path,
     )
+    public_contract = PublicContractRegistry()
     if observability is not None:
         setattr(s, "_observability", observability)
-    workflow_service = WorkflowRunService(s)
+    workflow_service = WorkflowRunService(s, provider_registry=provider_registry)
 
     def _workflow_summary(
         workflow_id: str,
@@ -342,6 +721,26 @@ def register_routes(
 
         return wrapped
 
+    def _public(
+        method: str,
+        path: str,
+        handler: HandlerFunc,
+        *,
+        aliases: tuple[str, ...] = (),
+        any_of: tuple[str, ...] = (),
+        all_of: tuple[str, ...] = (),
+    ) -> None:
+        register_public_route(
+            server,
+            method,
+            path,
+            _scoped(handler, any_of=any_of, all_of=all_of),
+            aliases=aliases,
+            any_of_scopes=any_of,
+            all_of_scopes=all_of,
+            registry=public_contract,
+        )
+
     def health(request: Request) -> Response:
         report = checker.run_all_sync()
         status_code = 200 if report["status"] != "unhealthy" else 503
@@ -368,25 +767,1085 @@ def register_routes(
             body=observability.prometheus_exporter.render_latest(),
         )
 
-    def create_agent(request: Request) -> Response:
+    def _normalize_autonomy(value: str | int) -> str:
+        if isinstance(value, int):
+            return f"A{value}"
+        upper = value.upper()
+        if upper in {"A0", "A1", "A2", "A3", "A4"}:
+            return upper
+        if upper in {"0", "1", "2", "3", "4"}:
+            return f"A{upper}"
+        return upper
+
+    def _validate_agent_payload(
+        body: Any,
+        *,
+        partial: bool,
+    ) -> list[str]:
+        if not isinstance(body, dict):
+            return ["Request body must be a JSON object"]
+
+        allowed_fields = {
+            "name",
+            "model",
+            "role",
+            "autonomy",
+            "tools",
+            "skills",
+            "sandbox",
+            "status",
+            "team",
+        }
+        errors: list[str] = []
+        for field_name in body:
+            if field_name not in allowed_fields:
+                errors.append(f"Unknown field '{field_name}'")
+
+        if not partial:
+            valid, schema_errors = validate(body, CREATE_AGENT_SCHEMA)
+            if not valid:
+                errors.extend(schema_errors)
+
+        str_fields = {"name", "model", "role", "sandbox", "status", "team"}
+        for field_name in str_fields:
+            if field_name in body and not isinstance(body[field_name], str):
+                errors.append(f"Field '{field_name}' must be of type str")
+
+        if "autonomy" in body:
+            autonomy = body["autonomy"]
+            if not isinstance(autonomy, (str, int)):
+                errors.append("Field 'autonomy' must be of type str | int")
+            elif _normalize_autonomy(autonomy) not in {"A0", "A1", "A2", "A3", "A4"}:
+                errors.append("Field 'autonomy' must be one of ['A0', 'A1', 'A2', 'A3', 'A4', 0, 1, 2, 3, 4]")
+
+        for field_name in ("tools", "skills"):
+            if field_name in body:
+                value = body[field_name]
+                if not isinstance(value, list):
+                    errors.append(f"Field '{field_name}' must be of type list")
+                elif any(not isinstance(item, str) for item in value):
+                    errors.append(f"Field '{field_name}' must contain only strings")
+
+        return errors
+
+    def _agent_skill_payload(skill_id: str) -> dict[str, Any]:
+        if skill_id in s.skills:
+            return dict(s.skills[skill_id])
+        return {
+            "id": skill_id,
+            "name": skill_id,
+            "description": "",
+            "category": "uncategorized",
+            "risk": "unknown",
+            "source": "local",
+            "tags": [],
+        }
+
+    def _collect_model_catalog(tenant_id: str) -> dict[str, dict[str, Any]]:
+        catalog: dict[str, dict[str, Any]] = {}
+        tenant_policies = {
+            str(policy.get("provider", "")): dict(policy)
+            for policy in s.model_policies.values()
+            if policy.get("tenant_id") == tenant_id and policy.get("provider")
+        }
+
+        if provider_registry is not None:
+            for provider_name in provider_registry.provider_names():
+                policy = tenant_policies.get(provider_name, {})
+                catalog[provider_name] = {
+                    "models": [],
+                    "status": "available",
+                    "default_model": "",
+                    "policy": policy.get("policy", "balanced") or "balanced",
+                    "pin": policy.get("pin"),
+                }
+
+        for provider_name, policy in tenant_policies.items():
+            catalog.setdefault(
+                provider_name,
+                {
+                    "models": [],
+                    "status": "available",
+                    "default_model": str(policy.get("pin", "") or ""),
+                    "policy": policy.get("policy", "balanced") or "balanced",
+                    "pin": policy.get("pin"),
+                },
+            )
+
+        for project_tenant_id, _workflow_id, project in s.control_plane_store.list_all_workflow_projects():
+            if not isinstance(project, PylonProject):
+                continue
+            for agent in project.agents.values():
+                model_ref = agent.resolve_model()
+                if "/" in model_ref:
+                    provider_name, model_id = model_ref.split("/", 1)
+                else:
+                    provider_name, model_id = "unknown", model_ref
+                info = catalog.setdefault(
+                    provider_name,
+                    {
+                        "models": [],
+                        "status": "available" if project_tenant_id else "unavailable",
+                        "default_model": "",
+                        "policy": tenant_policies.get(provider_name, {}).get("policy", "balanced") or "balanced",
+                        "pin": tenant_policies.get(provider_name, {}).get("pin"),
+                    },
+                )
+                if model_id and model_id not in {entry["id"] for entry in info["models"]}:
+                    info["models"].append({"id": model_id, "name": model_id})
+                    if not info["default_model"]:
+                        info["default_model"] = model_id
+
+        for provider_name, info in catalog.items():
+            if not info["default_model"] and info["models"]:
+                info["default_model"] = info["models"][0]["id"]
+
+        return dict(sorted(catalog.items()))
+
+    def _query_string(request: Request, name: str, default: str = "") -> str:
+        value = request.query_params.get(name, default)
+        if isinstance(value, list):
+            return str(value[-1] if value else default)
+        return str(value)
+
+    def _list_tenant_records(
+        records: dict[object, dict[str, Any]],
+        *,
+        tenant_id: str,
+        sort_key: str,
+        reverse: bool = True,
+    ) -> list[dict[str, Any]]:
+        return sorted(
+            [dict(record) for record in records.values() if record.get("tenant_id") == tenant_id],
+            key=lambda record: str(record.get(sort_key, "")),
+            reverse=reverse,
+        )
+
+    def _ensure_default_teams(tenant_id: str) -> list[dict[str, Any]]:
+        existing = [
+            dict(team)
+            for team in s.teams.values()
+            if team.get("tenant_id") == tenant_id
+        ]
+        if existing:
+            return sorted(existing, key=lambda team: str(team.get("name", "")))
+        for definition in DEFAULT_TEAM_DEFINITIONS:
+            payload = dict(definition)
+            payload["tenant_id"] = tenant_id
+            payload["created_at"] = _utc_now_iso()
+            s.teams[_team_store_key(tenant_id, payload["id"])] = payload
+        return _ensure_default_teams(tenant_id)
+
+    def _team_record(tenant_id: str, team_id: str) -> dict[str, Any] | None:
+        _ensure_default_teams(tenant_id)
+        return s.teams.get(_team_store_key(tenant_id, team_id))
+
+    def _default_team_id(tenant_id: str) -> str:
+        teams = _ensure_default_teams(tenant_id)
+        for team in teams:
+            if team.get("id") == "product":
+                return str(team["id"])
+        return str(teams[0]["id"]) if teams else "product"
+
+    def _task_matches_agent(task: dict[str, Any], agent: dict[str, Any]) -> bool:
+        assignee = str(task.get("assignee", ""))
+        return assignee in {str(agent.get("id", "")), str(agent.get("name", ""))}
+
+    def _current_task_for_agent(tenant_id: str, agent: dict[str, Any]) -> dict[str, Any] | None:
+        active = [
+            task for task in s.tasks.values()
+            if task.get("tenant_id") == tenant_id
+            and task.get("status") in {"backlog", "in_progress", "review"}
+            and _task_matches_agent(task, agent)
+        ]
+        if not active:
+            return None
+        active.sort(key=lambda task: str(task.get("updated_at", task.get("created_at", ""))), reverse=True)
+        return dict(active[0])
+
+    def _agent_activity_payload(tenant_id: str, agent: dict[str, Any]) -> dict[str, Any]:
+        created_at = str(agent.get("created_at") or _utc_now_iso())
+        uptime_seconds = max(
+            0,
+            int((datetime.now(timezone.utc) - _parse_iso_datetime(created_at)).total_seconds()),
+        )
+        return {
+            "id": str(agent.get("id", "")),
+            "name": str(agent.get("name", "")),
+            "model": str(agent.get("model", "")),
+            "role": str(agent.get("role", "")),
+            "autonomy": str(agent.get("autonomy", "A2")),
+            "tools": list(agent.get("tools", [])),
+            "sandbox": str(agent.get("sandbox", "gvisor")),
+            "status": str(agent.get("status", "ready")),
+            "team": agent.get("team") or _default_team_id(tenant_id),
+            "tenant_id": tenant_id,
+            "current_task": _current_task_for_agent(tenant_id, agent),
+            "uptime_seconds": uptime_seconds,
+        }
+
+    def _industry_template(industry_type: str) -> dict[str, Any]:
+        for template in ADS_INDUSTRY_TEMPLATES:
+            if template["id"] == industry_type:
+                return dict(template)
+        return dict(ADS_INDUSTRY_TEMPLATES[-1])
+
+    def _build_ads_check(
+        *,
+        platform: str,
+        category: str,
+        name: str,
+        severity: str,
+        result: str,
+        finding: str,
+        remediation: str,
+        estimated_fix_time_min: int,
+        is_quick_win: bool,
+    ) -> dict[str, Any]:
+        return {
+            "id": f"{platform}-{_slugify_identifier(category, prefix='cat')}-{_slugify_identifier(name, prefix='check')}",
+            "category": category,
+            "name": name,
+            "severity": severity,
+            "result": result,
+            "finding": finding,
+            "remediation": remediation,
+            "estimated_fix_time_min": estimated_fix_time_min,
+            "is_quick_win": is_quick_win,
+        }
+
+    def _build_ads_report(
+        *,
+        tenant_id: str,
+        platforms: list[str],
+        industry_type: str,
+        monthly_budget: int | None,
+        account_data: dict[str, str],
+    ) -> dict[str, Any]:
+        template = _industry_template(industry_type)
+        recommended_weights = _normalize_weight_map(
+            {platform: float(weight) for platform, weight in template["platforms"].items()}
+        )
+        selected_platforms = platforms or list(recommended_weights.keys()) or list(ADS_PLATFORMS)
+        selection_weights: dict[str, float] = {}
+        for platform in selected_platforms:
+            selection_weights[platform] = recommended_weights.get(platform, 1.0)
+        selection_weights = _normalize_weight_map(selection_weights)
+        effective_budget = int(monthly_budget or template["min_monthly"])
+        score_by_result = {"pass": 100, "warning": 68, "fail": 38, "na": 55}
+        report_platforms: list[dict[str, Any]] = []
+        all_checks: list[dict[str, Any]] = []
+
+        for platform in selected_platforms:
+            benchmark = ADS_BENCHMARKS.get(platform, {})
+            expected_share = float(selection_weights.get(platform, 0.0))
+            platform_budget = int(round(effective_budget * expected_share))
+            minimum_share_budget = int(round(template["min_monthly"] * expected_share))
+            seed = _stable_seed(platform, industry_type, platform_budget)
+            tracking_ready = bool(account_data.get(platform))
+            budget_ratio = (
+                platform_budget / minimum_share_budget
+                if minimum_share_budget > 0 else 1.0
+            )
+            targeting_strength = template["platforms"].get(platform, 0)
+
+            budget_result = "pass" if budget_ratio >= 1 else "warning" if budget_ratio >= 0.7 else "fail"
+            tracking_result = "pass" if tracking_ready else "warning"
+            creative_result = "pass" if seed % 7 not in {0, 1} else "warning"
+            targeting_result = "pass" if targeting_strength >= 25 else "warning"
+            compliance_result = "pass"
+            if industry_type in {"finance", "healthcare"} and platform in {"meta", "tiktok"}:
+                compliance_result = "warning" if tracking_ready else "fail"
+
+            checks = [
+                _build_ads_check(
+                    platform=platform,
+                    category="budget",
+                    name="Budget concentration",
+                    severity="high" if budget_result == "fail" else "medium",
+                    result=budget_result,
+                    finding=(
+                        f"{platform} receives ${platform_budget:,} against a reference floor of ${minimum_share_budget:,}."
+                    ),
+                    remediation="Concentrate spend on the top two channels until each core campaign is fully funded.",
+                    estimated_fix_time_min=25,
+                    is_quick_win=budget_result != "pass",
+                ),
+                _build_ads_check(
+                    platform=platform,
+                    category="tracking",
+                    name="Tracking integrity",
+                    severity="critical" if tracking_result == "fail" else "high",
+                    result=tracking_result,
+                    finding=(
+                        "Account-level data is present and conversion tracking can be validated."
+                        if tracking_ready
+                        else "No account export was supplied, so tracking health cannot be fully verified."
+                    ),
+                    remediation="Export the last 30 days of campaign data and verify conversion events before scaling spend.",
+                    estimated_fix_time_min=35,
+                    is_quick_win=tracking_result != "pass",
+                ),
+                _build_ads_check(
+                    platform=platform,
+                    category="creative",
+                    name="Creative freshness",
+                    severity="medium",
+                    result=creative_result,
+                    finding=(
+                        "Creative rotation cadence looks healthy for the selected channel."
+                        if creative_result == "pass"
+                        else "Refresh cadence appears light for this channel; ad fatigue risk is rising."
+                    ),
+                    remediation="Launch one new concept and two variant hooks to refresh CTR before scaling.",
+                    estimated_fix_time_min=45,
+                    is_quick_win=creative_result == "warning",
+                ),
+                _build_ads_check(
+                    platform=platform,
+                    category="targeting",
+                    name="Audience-platform fit",
+                    severity="medium",
+                    result=targeting_result,
+                    finding=(
+                        f"{platform} is a strong fit for the {industry_type} motion."
+                        if targeting_result == "pass"
+                        else f"{platform} is a secondary channel for {industry_type}; keep it in a learning budget."
+                    ),
+                    remediation="Tighten audience intent and keep secondary channels on a controlled experiment budget.",
+                    estimated_fix_time_min=20,
+                    is_quick_win=targeting_result == "warning",
+                ),
+                _build_ads_check(
+                    platform=platform,
+                    category="compliance",
+                    name="Policy and compliance posture",
+                    severity="critical" if compliance_result == "fail" else "high",
+                    result=compliance_result,
+                    finding=(
+                        "No obvious compliance friction was detected for the selected setup."
+                        if compliance_result == "pass"
+                        else "This channel requires stricter creative and data hygiene for the selected industry."
+                    ),
+                    remediation="Review regulated-claim copy, disclosure language, and landing-page proof before the next launch.",
+                    estimated_fix_time_min=60,
+                    is_quick_win=False,
+                ),
+            ]
+            category_scores: dict[str, int] = {}
+            for check in checks:
+                category_scores.setdefault(check["category"], 0)
+                category_scores[check["category"]] += score_by_result[check["result"]]
+            category_scores = {
+                category: int(round(total / len([check for check in checks if check["category"] == category])))
+                for category, total in category_scores.items()
+            }
+            raw_score = int(round(sum(score_by_result[check["result"]] for check in checks) / len(checks)))
+            raw_score = min(max(raw_score + int(round(benchmark.get("benchmark_mer", 3.0) * 2)) - 6, 0), 100)
+            platform_payload = {
+                "platform": platform,
+                "score": raw_score,
+                "grade": _grade_from_score(raw_score),
+                "budget_share": round(expected_share, 3),
+                "checks": checks,
+                "category_scores": category_scores,
+            }
+            report_platforms.append(platform_payload)
+            all_checks.extend(checks)
+
+        aggregate_score = int(round(sum(platform["score"] for platform in report_platforms) / max(len(report_platforms), 1)))
+        quick_wins = [
+            check for check in all_checks
+            if check["is_quick_win"] and check["result"] in {"warning", "fail"}
+        ]
+        quick_wins.sort(key=lambda check: (check["estimated_fix_time_min"], check["severity"]))
+        critical_issues = [
+            check for check in all_checks
+            if check["severity"] == "critical" and check["result"] == "fail"
+        ]
+        passed_checks = sum(1 for check in all_checks if check["result"] == "pass")
+        warning_checks = sum(1 for check in all_checks if check["result"] == "warning")
+        failed_checks = sum(1 for check in all_checks if check["result"] == "fail")
+        report_id = uuid.uuid4().hex[:12]
+        return {
+            "id": report_id,
+            "tenant_id": tenant_id,
+            "created_at": _utc_now_iso(),
+            "industry_type": industry_type,
+            "aggregate_score": aggregate_score,
+            "aggregate_grade": _grade_from_score(aggregate_score),
+            "platforms": report_platforms,
+            "quick_wins": quick_wins[:8],
+            "critical_issues": critical_issues[:8],
+            "cross_platform": {
+                "budget_assessment": (
+                    "Budget is below the reference floor; prioritize the top one or two channels."
+                    if effective_budget < int(template["min_monthly"])
+                    else "Budget concentration is healthy enough to support a stable test-and-scale motion."
+                ),
+                "tracking_consistency": (
+                    "Tracking evidence was supplied for every audited channel."
+                    if all(account_data.get(platform) for platform in selected_platforms)
+                    else "Tracking coverage is partial; align naming, pixel events, and offline conversion uploads."
+                ),
+                "creative_consistency": (
+                    "Creative strategy is reasonably aligned across platforms."
+                    if len(quick_wins) <= 2
+                    else "Creative refresh cadence is uneven across channels; align hooks and landing-page proof."
+                ),
+                "attribution_overlap": (
+                    "Cross-platform overlap looks contained because the plan is concentrated."
+                    if len(selected_platforms) <= 2
+                    else "Audit assisted attribution overlap on branded and retargeting traffic before scaling."
+                ),
+            },
+            "total_checks": len(all_checks),
+            "passed_checks": passed_checks,
+            "warning_checks": warning_checks,
+            "failed_checks": failed_checks,
+        }
+
+    def _audit_run_payload(run: dict[str, Any]) -> dict[str, Any]:
+        elapsed = max(0.0, time.time() - float(run.get("created_at_epoch", time.time())))
+        progress: dict[str, str] = {}
+        completed = min(len(DEFAULT_AUDIT_AGENTS), int(elapsed / 0.45))
+        for index, node_id in enumerate(DEFAULT_AUDIT_AGENTS):
+            if completed >= len(DEFAULT_AUDIT_AGENTS):
+                progress[node_id] = "completed"
+            elif index < completed:
+                progress[node_id] = "completed"
+            elif index == completed:
+                progress[node_id] = "running"
+            else:
+                progress[node_id] = "pending"
+        status = "completed" if completed >= len(DEFAULT_AUDIT_AGENTS) else "running"
+        payload = {
+            "run_id": str(run.get("id", "")),
+            "status": status,
+            "progress": progress,
+        }
+        if status == "completed":
+            report = s.ads_reports.get(str(run.get("report_id", "")))
+            if report is not None:
+                payload["report"] = dict(report)
+        return payload
+
+    def list_tasks(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        status = _query_string(request, "status")
+        if status and status not in MISSION_TASK_STATUSES:
+            return Response(status_code=422, body={"errors": [f"Unsupported task status: {status}"]})
+        tasks = _list_tenant_records(s.tasks, tenant_id=tenant_id, sort_key="updated_at")
+        if status:
+            tasks = [task for task in tasks if task.get("status") == status]
+        return Response(body=tasks)
+
+    def get_task(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        task_id = request.path_params.get("task_id", "")
+        task = s.tasks.get(task_id)
+        if task is None:
+            return Response(status_code=404, body={"error": f"Task not found: {task_id}"})
+        if task.get("tenant_id") != tenant_id:
+            return Response(status_code=403, body={"error": "Forbidden"})
+        return Response(body=dict(task))
+
+    def create_task(request: Request) -> Response:
         tenant_id = _require_tenant_id(request)
         if tenant_id is None:
             return _tenant_required_response()
         body = request.body or {}
-        valid, errors = validate(body, CREATE_AGENT_SCHEMA)
-        if not valid:
+        if not isinstance(body, dict):
+            return Response(status_code=422, body={"errors": ["Request body must be a JSON object"]})
+        errors: list[str] = []
+        for field_name in ("title", "description", "status", "priority", "assignee", "assigneeType"):
+            if not isinstance(body.get(field_name), str) or not str(body.get(field_name, "")).strip():
+                errors.append(f"Field '{field_name}' is required")
+        if body.get("status") not in MISSION_TASK_STATUSES:
+            errors.append("Field 'status' must be one of ['backlog', 'in_progress', 'review', 'done']")
+        if body.get("priority") not in MISSION_TASK_PRIORITIES:
+            errors.append("Field 'priority' must be one of ['low', 'medium', 'high', 'critical']")
+        if body.get("assigneeType") not in MISSION_ASSIGNEE_TYPES:
+            errors.append("Field 'assigneeType' must be one of ['human', 'ai']")
+        if "payload" in body and not isinstance(body["payload"], dict):
+            errors.append("Field 'payload' must be of type dict")
+        if errors:
+            return Response(status_code=422, body={"errors": errors})
+        now = _utc_now_iso()
+        task_id = uuid.uuid4().hex[:12]
+        task = {
+            "id": task_id,
+            "title": str(body["title"]).strip(),
+            "name": str(body.get("name", body["title"])).strip(),
+            "description": str(body["description"]).strip(),
+            "status": body["status"],
+            "priority": body["priority"],
+            "assignee": str(body["assignee"]).strip(),
+            "assigneeType": body["assigneeType"],
+            "payload": dict(body.get("payload", {})),
+            "created_at": now,
+            "updated_at": now,
+            "tenant_id": tenant_id,
+        }
+        s.tasks[task_id] = task
+        return Response(status_code=201, body=dict(task))
+
+    def update_task(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        task_id = request.path_params.get("task_id", "")
+        task = s.tasks.get(task_id)
+        if task is None:
+            return Response(status_code=404, body={"error": f"Task not found: {task_id}"})
+        if task.get("tenant_id") != tenant_id:
+            return Response(status_code=403, body={"error": "Forbidden"})
+        body = request.body or {}
+        if not isinstance(body, dict):
+            return Response(status_code=422, body={"errors": ["Request body must be a JSON object"]})
+        errors: list[str] = []
+        if "status" in body and body["status"] not in MISSION_TASK_STATUSES:
+            errors.append("Field 'status' must be one of ['backlog', 'in_progress', 'review', 'done']")
+        if "priority" in body and body["priority"] not in MISSION_TASK_PRIORITIES:
+            errors.append("Field 'priority' must be one of ['low', 'medium', 'high', 'critical']")
+        if "assigneeType" in body and body["assigneeType"] not in MISSION_ASSIGNEE_TYPES:
+            errors.append("Field 'assigneeType' must be one of ['human', 'ai']")
+        if "payload" in body and not isinstance(body["payload"], dict):
+            errors.append("Field 'payload' must be of type dict")
+        for field_name in ("title", "name", "description", "assignee"):
+            if field_name in body and not isinstance(body[field_name], str):
+                errors.append(f"Field '{field_name}' must be of type str")
+        if errors:
+            return Response(status_code=422, body={"errors": errors})
+        updated = dict(task)
+        for field_name in ("title", "name", "description", "status", "priority", "assignee", "assigneeType"):
+            if field_name in body:
+                updated[field_name] = body[field_name]
+        if "payload" in body:
+            updated["payload"] = dict(body["payload"])
+        updated["updated_at"] = _utc_now_iso()
+        s.tasks[task_id] = updated
+        return Response(body=dict(updated))
+
+    def delete_task(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        task_id = request.path_params.get("task_id", "")
+        task = s.tasks.get(task_id)
+        if task is None:
+            return Response(status_code=404, body={"error": f"Task not found: {task_id}"})
+        if task.get("tenant_id") != tenant_id:
+            return Response(status_code=403, body={"error": "Forbidden"})
+        del s.tasks[task_id]
+        return Response(status_code=204, body=None)
+
+    def list_memories(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        return Response(body=_list_tenant_records(s.memories, tenant_id=tenant_id, sort_key="timestamp"))
+
+    def create_memory(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        body = request.body or {}
+        if not isinstance(body, dict):
+            return Response(status_code=422, body={"errors": ["Request body must be a JSON object"]})
+        errors: list[str] = []
+        for field_name in ("title", "content", "category", "actor"):
+            if not isinstance(body.get(field_name), str) or not str(body.get(field_name, "")).strip():
+                errors.append(f"Field '{field_name}' is required")
+        if body.get("category") not in MISSION_MEMORY_CATEGORIES:
+            errors.append("Field 'category' must be one of ['sessions', 'patterns', 'learnings', 'decisions']")
+        details = body.get("details", {})
+        if "details" in body and not isinstance(details, dict):
+            errors.append("Field 'details' must be of type dict")
+        tags = body.get("tags", [])
+        if "tags" in body and (not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags)):
+            errors.append("Field 'tags' must contain only strings")
+        if errors:
+            return Response(status_code=422, body={"errors": errors})
+        entry_id = s.control_plane_store.allocate_sequence_value("memories")
+        memory = {
+            "id": entry_id,
+            "entry_id": entry_id,
+            "tenant_id": tenant_id,
+            "event_type": "memory.created",
+            "actor": str(body["actor"]).strip(),
+            "category": body["category"],
+            "title": str(body["title"]).strip(),
+            "content": str(body["content"]).strip(),
+            "details": {
+                **dict(details),
+                "tags": list(tags if isinstance(tags, list) else details.get("tags", [])),
+            },
+            "timestamp": _utc_now_iso(),
+        }
+        s.memories[str(entry_id)] = memory
+        return Response(status_code=201, body=dict(memory))
+
+    def delete_memory(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        raw_entry_id = request.path_params.get("entry_id", "")
+        if not raw_entry_id.isdigit():
+            return Response(status_code=404, body={"error": f"Memory not found: {raw_entry_id}"})
+        entry_id = int(raw_entry_id)
+        memory = s.memories.get(str(entry_id))
+        if memory is None:
+            return Response(status_code=404, body={"error": f"Memory not found: {entry_id}"})
+        if memory.get("tenant_id") != tenant_id:
+            return Response(status_code=403, body={"error": "Forbidden"})
+        del s.memories[str(entry_id)]
+        return Response(status_code=204, body=None)
+
+    def list_agents_activity(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        agents = [
+            _agent_activity_payload(tenant_id, agent)
+            for agent in s.agents.values()
+            if agent.get("tenant_id") == tenant_id
+        ]
+        agents.sort(key=lambda agent: (agent["team"], agent["name"]))
+        return Response(body=agents)
+
+    def get_agent_activity(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        agent_id = request.path_params.get("id", "")
+        agent = s.agents.get(agent_id)
+        if agent is None:
+            return Response(status_code=404, body={"error": f"Agent not found: {agent_id}"})
+        if agent.get("tenant_id") != tenant_id:
+            return Response(status_code=403, body={"error": "Forbidden"})
+        return Response(body=_agent_activity_payload(tenant_id, agent))
+
+    def list_events(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        return Response(body=_list_tenant_records(s.events, tenant_id=tenant_id, sort_key="start", reverse=False))
+
+    def create_event(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        body = request.body or {}
+        if not isinstance(body, dict):
+            return Response(status_code=422, body={"errors": ["Request body must be a JSON object"]})
+        errors: list[str] = []
+        for field_name in ("title", "start", "type", "agentId"):
+            if not isinstance(body.get(field_name), str) or not str(body.get(field_name, "")).strip():
+                errors.append(f"Field '{field_name}' is required")
+        end = str(body.get("end", "") or "")
+        try:
+            _parse_iso_datetime(str(body.get("start", "")))
+            if end:
+                _parse_iso_datetime(end)
+        except ValueError:
+            errors.append("Fields 'start' and 'end' must be ISO-8601 timestamps")
+        if errors:
+            return Response(status_code=422, body={"errors": errors})
+        start = str(body["start"])
+        event_id = uuid.uuid4().hex[:12]
+        event = {
+            "id": event_id,
+            "title": str(body["title"]).strip(),
+            "description": str(body.get("description", "") or ""),
+            "start": start,
+            "end": end or _iso_plus_minutes(start, 60),
+            "type": str(body["type"]).strip(),
+            "agentId": str(body["agentId"]).strip(),
+            "created_at": _utc_now_iso(),
+            "tenant_id": tenant_id,
+        }
+        s.events[event_id] = event
+        return Response(status_code=201, body=dict(event))
+
+    def delete_event(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        event_id = request.path_params.get("event_id", "")
+        event = s.events.get(event_id)
+        if event is None:
+            return Response(status_code=404, body={"error": f"Event not found: {event_id}"})
+        if event.get("tenant_id") != tenant_id:
+            return Response(status_code=403, body={"error": "Forbidden"})
+        del s.events[event_id]
+        return Response(status_code=204, body=None)
+
+    def list_content(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        return Response(body=_list_tenant_records(s.content_items, tenant_id=tenant_id, sort_key="updated_at"))
+
+    def create_content(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        body = request.body or {}
+        if not isinstance(body, dict):
+            return Response(status_code=422, body={"errors": ["Request body must be a JSON object"]})
+        errors: list[str] = []
+        for field_name in ("title", "description", "type", "stage", "assignee", "assigneeType"):
+            if not isinstance(body.get(field_name), str) or not str(body.get(field_name, "")).strip():
+                errors.append(f"Field '{field_name}' is required")
+        if body.get("stage") not in MISSION_CONTENT_STAGES:
+            errors.append("Field 'stage' must be a supported content stage")
+        if body.get("assigneeType") not in MISSION_ASSIGNEE_TYPES:
+            errors.append("Field 'assigneeType' must be one of ['human', 'ai']")
+        if errors:
+            return Response(status_code=422, body={"errors": errors})
+        now = _utc_now_iso()
+        content_id = uuid.uuid4().hex[:12]
+        item = {
+            "id": content_id,
+            "title": str(body["title"]).strip(),
+            "description": str(body["description"]).strip(),
+            "type": str(body["type"]).strip(),
+            "stage": body["stage"],
+            "assignee": str(body["assignee"]).strip(),
+            "assigneeType": body["assigneeType"],
+            "created_at": now,
+            "updated_at": now,
+            "tenant_id": tenant_id,
+        }
+        s.content_items[content_id] = item
+        return Response(status_code=201, body=dict(item))
+
+    def update_content(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        content_id = request.path_params.get("content_id", "")
+        item = s.content_items.get(content_id)
+        if item is None:
+            return Response(status_code=404, body={"error": f"Content not found: {content_id}"})
+        if item.get("tenant_id") != tenant_id:
+            return Response(status_code=403, body={"error": "Forbidden"})
+        body = request.body or {}
+        if not isinstance(body, dict):
+            return Response(status_code=422, body={"errors": ["Request body must be a JSON object"]})
+        errors: list[str] = []
+        if "stage" in body and body["stage"] not in MISSION_CONTENT_STAGES:
+            errors.append("Field 'stage' must be a supported content stage")
+        if "assigneeType" in body and body["assigneeType"] not in MISSION_ASSIGNEE_TYPES:
+            errors.append("Field 'assigneeType' must be one of ['human', 'ai']")
+        for field_name in ("title", "description", "type", "assignee"):
+            if field_name in body and not isinstance(body[field_name], str):
+                errors.append(f"Field '{field_name}' must be of type str")
+        if errors:
+            return Response(status_code=422, body={"errors": errors})
+        updated = dict(item)
+        for field_name in ("title", "description", "type", "stage", "assignee", "assigneeType"):
+            if field_name in body:
+                updated[field_name] = body[field_name]
+        updated["updated_at"] = _utc_now_iso()
+        s.content_items[content_id] = updated
+        return Response(body=dict(updated))
+
+    def delete_content(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        content_id = request.path_params.get("content_id", "")
+        item = s.content_items.get(content_id)
+        if item is None:
+            return Response(status_code=404, body={"error": f"Content not found: {content_id}"})
+        if item.get("tenant_id") != tenant_id:
+            return Response(status_code=403, body={"error": "Forbidden"})
+        del s.content_items[content_id]
+        return Response(status_code=204, body=None)
+
+    def list_teams(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        teams = _ensure_default_teams(tenant_id)
+        return Response(body=[{key: value for key, value in team.items() if key != "tenant_id"} for team in teams])
+
+    def create_team(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        _ensure_default_teams(tenant_id)
+        body = request.body or {}
+        if not isinstance(body, dict):
+            return Response(status_code=422, body={"errors": ["Request body must be a JSON object"]})
+        name = str(body.get("name", "")).strip()
+        if not name:
+            return Response(status_code=422, body={"errors": ["Field 'name' is required"]})
+        team_id = str(body.get("id", "")).strip() or _slugify_identifier(name, prefix="team")
+        store_key = _team_store_key(tenant_id, team_id)
+        if store_key in s.teams:
+            return Response(status_code=409, body={"error": f"Team already exists: {team_id}"})
+        payload = {
+            "id": team_id,
+            "name": name,
+            "nameJa": str(body.get("nameJa", name)).strip() or name,
+            "icon": str(body.get("icon", "Users")).strip() or "Users",
+            "color": str(body.get("color", "text-slate-400")).strip() or "text-slate-400",
+            "bg": str(body.get("bg", "bg-slate-600")).strip() or "bg-slate-600",
+            "tenant_id": tenant_id,
+            "created_at": _utc_now_iso(),
+        }
+        s.teams[store_key] = payload
+        return Response(status_code=201, body={key: value for key, value in payload.items() if key != "tenant_id"})
+
+    def update_team(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        team_id = request.path_params.get("id", "")
+        team = _team_record(tenant_id, team_id)
+        if team is None:
+            return Response(status_code=404, body={"error": f"Team not found: {team_id}"})
+        body = request.body or {}
+        if not isinstance(body, dict):
+            return Response(status_code=422, body={"errors": ["Request body must be a JSON object"]})
+        updated = dict(team)
+        for field_name in ("name", "nameJa", "icon", "color", "bg"):
+            if field_name in body and isinstance(body[field_name], str) and str(body[field_name]).strip():
+                updated[field_name] = str(body[field_name]).strip()
+        s.teams[_team_store_key(tenant_id, team_id)] = updated
+        return Response(body={key: value for key, value in updated.items() if key != "tenant_id"})
+
+    def delete_team(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        team_id = request.path_params.get("id", "")
+        store_key = _team_store_key(tenant_id, team_id)
+        team = s.teams.get(store_key)
+        if team is None:
+            return Response(status_code=404, body={"error": f"Team not found: {team_id}"})
+        del s.teams[store_key]
+        remaining_team_id = _default_team_id(tenant_id)
+        for agent_id, agent in list(s.agents.items()):
+            if agent.get("tenant_id") == tenant_id and agent.get("team") == team_id:
+                updated_agent = dict(agent)
+                updated_agent["team"] = remaining_team_id
+                s.agents[agent_id] = updated_agent
+        return Response(status_code=204, body=None)
+
+    def run_ads_audit(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        body = request.body or {}
+        if not isinstance(body, dict):
+            return Response(status_code=422, body={"errors": ["Request body must be a JSON object"]})
+        platforms = body.get("platforms", [])
+        if not isinstance(platforms, list) or not platforms or any(platform not in ADS_PLATFORMS for platform in platforms):
+            return Response(status_code=422, body={"errors": ["Field 'platforms' must contain supported ads platforms"]})
+        industry_type = str(body.get("industry_type", "")).strip()
+        if industry_type not in {template["id"] for template in ADS_INDUSTRY_TEMPLATES}:
+            return Response(status_code=422, body={"errors": ["Field 'industry_type' must be a supported industry template"]})
+        monthly_budget = body.get("monthly_budget")
+        if monthly_budget is not None and not isinstance(monthly_budget, (int, float)):
+            return Response(status_code=422, body={"errors": ["Field 'monthly_budget' must be numeric"]})
+        account_data = body.get("account_data", {})
+        if account_data is None:
+            account_data = {}
+        if not isinstance(account_data, dict):
+            return Response(status_code=422, body={"errors": ["Field 'account_data' must be of type dict"]})
+        report = _build_ads_report(
+            tenant_id=tenant_id,
+            platforms=[str(platform) for platform in platforms],
+            industry_type=industry_type,
+            monthly_budget=int(monthly_budget) if monthly_budget is not None else None,
+            account_data={str(key): str(value) for key, value in account_data.items()},
+        )
+        s.ads_reports[report["id"]] = report
+        run_id = uuid.uuid4().hex[:12]
+        run = {
+            "id": run_id,
+            "tenant_id": tenant_id,
+            "report_id": report["id"],
+            "platforms": [str(platform) for platform in platforms],
+            "industry_type": industry_type,
+            "created_at_epoch": time.time(),
+        }
+        s.ads_audit_runs[run_id] = run
+        return Response(status_code=201, body={"run_id": run_id})
+
+    def get_ads_audit_status(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        run_id = request.path_params.get("run_id", "")
+        run = s.ads_audit_runs.get(run_id)
+        if run is None:
+            return Response(status_code=404, body={"error": f"Audit run not found: {run_id}"})
+        if run.get("tenant_id") != tenant_id:
+            return Response(status_code=403, body={"error": "Forbidden"})
+        return Response(body=_audit_run_payload(run))
+
+    def list_ads_reports(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        reports = _list_tenant_records(s.ads_reports, tenant_id=tenant_id, sort_key="created_at")
+        for report in reports:
+            report.pop("tenant_id", None)
+        return Response(body=reports)
+
+    def get_ads_report(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        report_id = request.path_params.get("report_id", "")
+        report = s.ads_reports.get(report_id)
+        if report is None:
+            return Response(status_code=404, body={"error": f"Ads report not found: {report_id}"})
+        if report.get("tenant_id") != tenant_id:
+            return Response(status_code=403, body={"error": "Forbidden"})
+        payload = dict(report)
+        payload.pop("tenant_id", None)
+        return Response(body=payload)
+
+    def generate_ads_plan(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        body = request.body or {}
+        if not isinstance(body, dict):
+            return Response(status_code=422, body={"errors": ["Request body must be a JSON object"]})
+        industry_type = str(body.get("industry_type", "")).strip()
+        template = _industry_template(industry_type)
+        monthly_budget = body.get("monthly_budget")
+        if monthly_budget is not None and not isinstance(monthly_budget, (int, float)):
+            return Response(status_code=422, body={"errors": ["Field 'monthly_budget' must be numeric"]})
+        weights = _normalize_weight_map({platform: float(weight) for platform, weight in template["platforms"].items()})
+        recommended_platforms = list(weights.keys())
+        plan_budget = max(int(monthly_budget or template["min_monthly"]), int(template["min_monthly"]))
+        campaign_architecture = []
+        for platform, weight in weights.items():
+            campaign_architecture.append(
+                {
+                    "platform": platform,
+                    "campaign_name": f"{template['name']} {platform.title()} Core",
+                    "objective": (
+                        "Lead generation"
+                        if template["primary_kpi"] in {"CAC", "CPL", "SQL"}
+                        else "Revenue optimization"
+                    ),
+                    "budget_share": round(weight, 3),
+                    "targeting_summary": (
+                        f"Focus on the highest-intent segments for {template['name']} and keep remarketing isolated."
+                    ),
+                    "creative_requirements": [
+                        "One proof-led control",
+                        "Two hook variants",
+                        "Dedicated landing page alignment",
+                    ],
+                }
+            )
+        return Response(body={
+            "industry_type": template["id"],
+            "recommended_platforms": recommended_platforms,
+            "campaign_architecture": campaign_architecture,
+            "monthly_budget_min": max(int(template["min_monthly"]), int(round(plan_budget * 0.6))),
+            "primary_kpi": template["primary_kpi"],
+            "time_to_profit": template["time_to_profit"],
+        })
+
+    def optimize_ads_budget(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        body = request.body or {}
+        if not isinstance(body, dict):
+            return Response(status_code=422, body={"errors": ["Request body must be a JSON object"]})
+        current_spend = body.get("current_spend", {})
+        if not isinstance(current_spend, dict):
+            return Response(status_code=422, body={"errors": ["Field 'current_spend' must be of type dict"]})
+        target_mer = body.get("target_mer", 3.0)
+        if not isinstance(target_mer, (int, float)):
+            return Response(status_code=422, body={"errors": ["Field 'target_mer' must be numeric"]})
+        monthly_budget = body.get("monthly_budget")
+        if monthly_budget is not None and not isinstance(monthly_budget, (int, float)):
+            return Response(status_code=422, body={"errors": ["Field 'monthly_budget' must be numeric"]})
+        budget_total = int(monthly_budget or sum(float(value) for value in current_spend.values()) or 10000)
+        weights: dict[str, float] = {}
+        for platform in ADS_PLATFORMS:
+            benchmark = ADS_BENCHMARKS[platform]
+            current = float(current_spend.get(platform, 0.0) or 0.0)
+            current_share = current / budget_total if budget_total > 0 else 0.0
+            weights[platform] = (
+                benchmark["benchmark_mer"] * float(target_mer)
+                + benchmark["avg_cvr"] * 0.8
+                + current_share * 6
+            )
+        normalized = _normalize_weight_map(weights)
+        allocation = _allocate_budget(normalized, budget_total)
+        for platform in ADS_PLATFORMS:
+            allocation.setdefault(platform, 0)
+        return Response(body={
+            "proven": int(round(budget_total * 0.7)),
+            "growth": int(round(budget_total * 0.2)),
+            "experiment": int(budget_total - int(round(budget_total * 0.7)) - int(round(budget_total * 0.2))),
+            "platform_mix": allocation,
+            "monthly_budget": budget_total,
+            "mer_target": float(target_mer),
+        })
+
+    def get_ads_benchmarks(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        platform = request.path_params.get("platform", "")
+        benchmark = ADS_BENCHMARKS.get(platform)
+        if benchmark is None:
+            return Response(status_code=404, body={"error": f"Benchmarks not found for platform: {platform}"})
+        return Response(body={
+            "platform": platform,
+            **benchmark,
+        })
+
+    def list_ads_templates(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        return Response(body=[dict(template) for template in ADS_INDUSTRY_TEMPLATES])
+
+    def create_agent(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        _ensure_default_teams(tenant_id)
+        body = request.body or {}
+        errors = _validate_agent_payload(body, partial=False)
+        if errors:
             return Response(status_code=422, body={"errors": errors})
         agent_id = uuid.uuid4().hex[:12]
+        now = _utc_now_iso()
         agent = {
             "id": agent_id,
             "name": body["name"],
             "model": body.get("model", ""),
             "role": body.get("role", ""),
-            "autonomy": body.get("autonomy", "A2"),
+            "autonomy": _normalize_autonomy(body.get("autonomy", "A2")),
             "tools": body.get("tools", []),
+            "skills": body.get("skills", []),
             "sandbox": body.get("sandbox", "gvisor"),
             "status": "ready",
             "tenant_id": tenant_id,
+            "team": body.get("team"),
+            "created_at": now,
+            "updated_at": now,
         }
         s.agents[agent_id] = agent
         return Response(status_code=201, body=agent)
@@ -410,6 +1869,75 @@ def register_routes(
             return Response(status_code=403, body={"error": "Forbidden"})
         return Response(body=agent)
 
+    def update_agent(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        agent_id = request.path_params.get("id", "")
+        agent = s.agents.get(agent_id)
+        if agent is None:
+            return Response(status_code=404, body={"error": f"Agent not found: {agent_id}"})
+        if agent.get("tenant_id") != tenant_id:
+            return Response(status_code=403, body={"error": "Forbidden"})
+        body = request.body or {}
+        errors = _validate_agent_payload(body, partial=True)
+        if errors:
+            return Response(status_code=422, body={"errors": errors})
+
+        updated = dict(agent)
+        for field_name in ("name", "model", "role", "sandbox", "status", "team"):
+            if field_name in body:
+                updated[field_name] = body[field_name]
+        if "autonomy" in body:
+            updated["autonomy"] = _normalize_autonomy(body["autonomy"])
+        if "tools" in body:
+            updated["tools"] = list(body["tools"])
+        if "skills" in body:
+            updated["skills"] = list(body["skills"])
+        updated["updated_at"] = _utc_now_iso()
+        s.agents[agent_id] = updated
+        return Response(body=updated)
+
+    def get_agent_skills(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        agent_id = request.path_params.get("id", "")
+        agent = s.agents.get(agent_id)
+        if agent is None:
+            return Response(status_code=404, body={"error": f"Agent not found: {agent_id}"})
+        if agent.get("tenant_id") != tenant_id:
+            return Response(status_code=403, body={"error": "Forbidden"})
+
+        skill_ids = list(agent.get("skills", []))
+        return Response(body={
+            "agent_id": agent_id,
+            "agent_name": agent.get("name", ""),
+            "skills": [_agent_skill_payload(skill_id) for skill_id in skill_ids],
+        })
+
+    def update_agent_skills(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        agent_id = request.path_params.get("id", "")
+        agent = s.agents.get(agent_id)
+        if agent is None:
+            return Response(status_code=404, body={"error": f"Agent not found: {agent_id}"})
+        if agent.get("tenant_id") != tenant_id:
+            return Response(status_code=403, body={"error": "Forbidden"})
+        body = request.body or {}
+        errors = _validate_agent_payload(body, partial=True)
+        if errors:
+            return Response(status_code=422, body={"errors": errors})
+        if "skills" not in body:
+            return Response(status_code=422, body={"errors": ["Field 'skills' is required"]})
+
+        updated = dict(agent)
+        updated["skills"] = list(body["skills"])
+        s.agents[agent_id] = updated
+        return Response(body=updated)
+
     def delete_agent(request: Request) -> Response:
         tenant_id = _require_tenant_id(request)
         if tenant_id is None:
@@ -422,6 +1950,291 @@ def register_routes(
             return Response(status_code=403, body={"error": "Forbidden"})
         del s.agents[agent_id]
         return Response(status_code=204, body=None)
+
+    def list_skills(request: Request) -> Response:
+        _tenant_id = _require_tenant_id(request)
+        if _tenant_id is None:
+            return _tenant_required_response()
+        category = request.query_params.get("category")
+        source = request.query_params.get("source")
+        search = request.query_params.get("search")
+
+        skills = list(s.skills.values())
+        if category:
+            skills = [item for item in skills if item.get("category") == category]
+        if source:
+            skills = [item for item in skills if item.get("source") == source]
+        if search:
+            lowered = str(search).lower()
+            skills = [
+                item for item in skills
+                if lowered in str(item.get("name", "")).lower()
+                or lowered in str(item.get("description", "")).lower()
+            ]
+
+        categories: dict[str, int] = {}
+        sources: dict[str, int] = {}
+        for skill in skills:
+            categories[str(skill.get("category", "uncategorized"))] = (
+                categories.get(str(skill.get("category", "uncategorized")), 0) + 1
+            )
+            sources[str(skill.get("source", "local"))] = (
+                sources.get(str(skill.get("source", "local")), 0) + 1
+            )
+        return Response(body={
+            "skills": skills,
+            "total": len(skills),
+            "categories": categories,
+            "sources": sources,
+        })
+
+    def list_skill_categories(request: Request) -> Response:
+        response = list_skills(request)
+        if response.status_code != 200:
+            return response
+        return Response(body=response.body["categories"])
+
+    def scan_skills(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        return Response(body={"total": len(s.skills), "new": 0, "removed": 0})
+
+    def get_skill(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        skill_id = request.path_params.get("id", "")
+        skill = s.skills.get(skill_id)
+        if skill is None:
+            return Response(status_code=404, body={"error": f"Skill not found: {skill_id}"})
+        return Response(body=skill)
+
+    def _skill_execution_preview_payload(
+        skill: dict[str, Any],
+        *,
+        input_text: str,
+        context: dict[str, Any],
+        note: str,
+    ) -> dict[str, Any]:
+        lines = [f"# Skill: {skill.get('name', skill.get('id', 'unknown-skill'))}"]
+        description = str(skill.get("description", "")).strip()
+        if description:
+            lines.extend(["", description])
+        instructions = str(skill.get("content", skill.get("content_preview", ""))).strip()
+        if instructions:
+            lines.extend(["", "Instructions:", instructions])
+        if input_text:
+            lines.extend(["", "Input:", input_text])
+        if context:
+            lines.extend([
+                "",
+                "Context:",
+                json.dumps(context, ensure_ascii=False, indent=2, sort_keys=True),
+            ])
+        lines.extend(["", f"Note: {note}"])
+        result = "\n".join(lines).strip()
+        serialized_context = json.dumps(context, ensure_ascii=False, sort_keys=True) if context else ""
+        tokens_in = len(f"{input_text} {serialized_context}".strip().split())
+        tokens_out = len(result.split())
+        return {
+            "skill_id": str(skill.get("id", "")),
+            "result": result,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "model": "builtin-skill-preview",
+            "provider": "local",
+        }
+
+    def execute_skill(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        skill_id = request.path_params.get("id", "")
+        skill = s.skills.get(skill_id)
+        if skill is None:
+            return Response(status_code=404, body={"error": f"Skill not found: {skill_id}"})
+
+        body = request.body or {}
+        valid, errors = validate(body, SKILL_EXECUTE_SCHEMA)
+        if not valid:
+            return Response(status_code=422, body={"errors": errors})
+
+        input_text = str(body.get("input", ""))
+        context = dict(body.get("context", {}))
+        requested_provider = str(body.get("provider", "") or "")
+        requested_model = str(body.get("model", "") or "")
+        available_providers = (
+            provider_registry.provider_names() if provider_registry is not None else ()
+        )
+        if not available_providers:
+            return Response(body=_skill_execution_preview_payload(
+                skill,
+                input_text=input_text,
+                context=context,
+                note="No provider runtime is configured, so a deterministic local preview was returned instead of a live execution.",
+            ))
+
+        provider_name = requested_provider
+        model_name = requested_model
+        skill_model = str(skill.get("model", "") or "")
+        if not provider_name and "/" in skill_model:
+            provider_name, inferred_model = skill_model.split("/", 1)
+            if not model_name:
+                model_name = inferred_model
+        elif not provider_name and skill_model and len(available_providers) == 1:
+            provider_name = available_providers[0]
+            if not model_name:
+                model_name = skill_model
+
+        if not provider_name:
+            provider_name = available_providers[0]
+        if provider_name not in available_providers:
+            logger.warning(
+                "Requested skill execution provider %s is unavailable; falling back to %s",
+                provider_name,
+                available_providers[0],
+            )
+            provider_name = available_providers[0]
+
+        if not model_name:
+            catalog = _collect_model_catalog(tenant_id)
+            provider_info = catalog.get(provider_name, {})
+            model_name = str(provider_info.get("default_model", "") or "")
+
+        if not model_name:
+            return Response(body=_skill_execution_preview_payload(
+                skill,
+                input_text=input_text,
+                context=context,
+                note=f"No default model is configured for provider '{provider_name}', so a deterministic local preview was returned instead of a live execution.",
+            ))
+
+        system_sections = [
+            f"You are executing the '{skill.get('name', skill_id)}' skill.",
+        ]
+        description = str(skill.get("description", "")).strip()
+        if description:
+            system_sections.append(f"Skill description:\n{description}")
+        instructions = str(skill.get("content", skill.get("content_preview", ""))).strip()
+        if instructions:
+            system_sections.append(f"Skill instructions:\n{instructions}")
+
+        messages = [
+            Message(role="system", content="\n\n".join(system_sections)),
+        ]
+        if context:
+            messages.append(
+                Message(
+                    role="user",
+                    content=(
+                        "Execution context:\n"
+                        f"{json.dumps(context, ensure_ascii=False, indent=2, sort_keys=True)}"
+                    ),
+                )
+            )
+        messages.append(
+            Message(
+                role="user",
+                content=input_text or "Execute the skill with the available instructions.",
+            )
+        )
+
+        try:
+            provider = provider_registry.resolve(provider_name, model_name)
+            provider_response = asyncio.run(provider.chat(messages, model=model_name))
+        except Exception:  # pragma: no cover - exercised via route-level behavior
+            logger.exception(
+                "Skill execution failed for %s via %s/%s",
+                skill_id,
+                provider_name,
+                model_name,
+            )
+            return Response(body=_skill_execution_preview_payload(
+                skill,
+                input_text=input_text,
+                context=context,
+                note=f"Provider execution failed for {provider_name}/{model_name}, so a deterministic local preview was returned instead.",
+            ))
+
+        usage = provider_response.usage or TokenUsage()
+        return Response(body={
+            "skill_id": skill_id,
+            "result": provider_response.content,
+            "tokens_in": int(usage.input_tokens),
+            "tokens_out": int(usage.output_tokens),
+            "model": provider_response.model or model_name,
+            "provider": provider_name,
+        })
+
+    def list_models(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        catalog = _collect_model_catalog(tenant_id)
+        return Response(body={
+            "providers": catalog,
+            "fallback_chain": list(catalog.keys()),
+            "policies": {
+                provider_name: {
+                    "policy": info.get("policy", "balanced"),
+                    "pin": info.get("pin"),
+                }
+                for provider_name, info in catalog.items()
+            },
+        })
+
+    def refresh_models(request: Request) -> Response:
+        return list_models(request)
+
+    def update_model_policy(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        body = request.body or {}
+        provider_name = body.get("provider")
+        policy = body.get("policy")
+        if not isinstance(provider_name, str) or not provider_name:
+            return Response(status_code=422, body={"errors": ["Field 'provider' is required"]})
+        if not isinstance(policy, str) or not policy:
+            return Response(status_code=422, body={"errors": ["Field 'policy' is required"]})
+        s.model_policies[_model_policy_store_key(tenant_id, provider_name)] = {
+            "policy": policy,
+            "pin": body.get("pin") if isinstance(body.get("pin"), str) else None,
+            "tenant_id": tenant_id,
+            "provider": provider_name,
+        }
+        return Response(body={"ok": True})
+
+    def health_models(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        catalog = _collect_model_catalog(tenant_id)
+        return Response(body={
+            provider_name: {
+                "status": "ok" if info.get("status") == "available" else "error",
+                "latency_ms": 0,
+                "model": info.get("default_model", ""),
+            }
+            for provider_name, info in catalog.items()
+        })
+
+    def get_features(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        manifest = build_feature_manifest()
+        manifest["tenant_id"] = tenant_id
+        return Response(body=manifest)
+
+    def get_contract(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        manifest = public_contract.manifest()
+        manifest["tenant_id"] = tenant_id
+        return Response(body=manifest)
 
     def create_workflow(request: Request) -> Response:
         tenant_id = _require_tenant_id(request)
@@ -566,7 +2379,7 @@ def register_routes(
         except ValueError as exc:
             return Response(status_code=400, body={"error": str(exc)})
         run_id = stored_run["id"]
-        location = f"/api/v1/workflow-runs/{run_id}"
+        location = v1(f"/runs/{run_id}")
         return Response(
             status_code=202,
             headers={"content-type": "application/json", "location": location},
@@ -832,9 +2645,56 @@ def register_routes(
             "issued_by": body["issued_by"],
             "parent_scope": body.get("parent_scope", ""),
             "activated_at": time.time(),
+            "tenant_id": tenant_id,
         }
-        s.kill_switches[scope] = event
+        s.kill_switches[_kill_switch_store_key(tenant_id, scope)] = event
         return Response(status_code=201, body=event)
+
+    def costs_summary(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        period = request.query_params.get("period", "mtd")
+        runs = [
+            r for r in s.list_all_run_records()
+            if r.get("tenant_id") == tenant_id and r.get("status") == "completed"
+        ]
+        total_usd = 0.0
+        by_provider: dict[str, float] = {}
+        by_model: dict[str, float] = {}
+        total_tokens_in = 0
+        total_tokens_out = 0
+        for run in runs:
+            state = run.get("state") or {}
+            cost = state.get("estimated_cost_usd", 0.0) or 0.0
+            total_usd += cost
+            # Aggregate by provider/model from project agents
+            wf_id = str(run.get("workflow_id", run.get("workflow", "")))
+            project = s.get_workflow_project(wf_id, tenant_id=tenant_id)
+            if project:
+                for agent in project.agents.values():
+                    model_str = agent.model or "unknown"
+                    provider = model_str.split("/")[0] if "/" in model_str else "unknown"
+                    by_provider[provider] = by_provider.get(provider, 0.0) + cost / max(len(project.agents), 1)
+                    by_model[model_str] = by_model.get(model_str, 0.0) + cost / max(len(project.agents), 1)
+            total_tokens_in += int(state.get("plan_tokens_in", 0) or 0) + int(state.get("implement_tokens_in", 0) or 0)
+            total_tokens_out += int(state.get("plan_tokens_out", 0) or 0) + int(state.get("implement_tokens_out", 0) or 0)
+        policy_budget = 5.0
+        if runs:
+            wf_id = str(runs[0].get("workflow_id", runs[0].get("workflow", "")))
+            project = s.get_workflow_project(wf_id, tenant_id=tenant_id)
+            if project and project.policy and project.policy.max_cost_usd:
+                policy_budget = project.policy.max_cost_usd
+        return Response(body={
+            "period": period,
+            "total_usd": round(total_usd, 6),
+            "budget_usd": policy_budget,
+            "run_count": len(runs),
+            "total_tokens_in": total_tokens_in,
+            "total_tokens_out": total_tokens_out,
+            "by_provider": {k: round(v, 6) for k, v in by_provider.items()},
+            "by_model": {k: round(v, 6) for k, v in by_model.items()},
+        })
 
     server.add_route("GET", "/health", health)
     if readiness_route_enabled:
@@ -845,102 +2705,73 @@ def register_routes(
             "/metrics",
             _scoped(metrics, all_of=("observability:read",)),
         )
-    server.add_route(
-        "POST", "/agents", _scoped(create_agent, all_of=("agents:write",))
-    )
-    server.add_route("GET", "/agents", _scoped(list_agents, all_of=("agents:read",)))
-    server.add_route(
-        "GET", "/agents/{id}", _scoped(get_agent, all_of=("agents:read",))
-    )
-    server.add_route(
-        "DELETE", "/agents/{id}", _scoped(delete_agent, all_of=("agents:write",))
-    )
-    server.add_route(
-        "POST", "/workflows", _scoped(create_workflow, all_of=("workflows:write",))
-    )
-    server.add_route(
-        "GET", "/workflows", _scoped(list_workflows, all_of=("workflows:read",))
-    )
-    server.add_route(
-        "GET", "/workflows/{id}", _scoped(get_workflow, all_of=("workflows:read",))
-    )
-    server.add_route(
-        "GET",
-        "/workflows/{id}/plan",
-        _scoped(get_workflow_plan, all_of=("workflows:read",)),
-    )
-    server.add_route(
-        "DELETE",
-        "/workflows/{id}",
-        _scoped(delete_workflow, all_of=("workflows:write",)),
-    )
-    server.add_route(
-        "GET",
-        "/workflows/{id}/runs",
-        _scoped(list_workflow_runs, all_of=("runs:read",)),
-    )
-    server.add_route(
-        "POST",
-        "/workflows/{id}/run",
-        _scoped(start_workflow_run, all_of=("runs:write",)),
-    )
-    server.add_route(
-        "GET", "/api/v1/workflow-runs", _scoped(list_runs, all_of=("runs:read",))
-    )
-    server.add_route(
-        "GET",
-        "/workflows/{id}/runs/{run_id}",
-        _scoped(get_workflow_run, all_of=("runs:read",)),
-    )
-    server.add_route(
-        "GET",
-        "/api/v1/workflow-runs/{run_id}",
-        _scoped(get_workflow_run_by_id, all_of=("runs:read",)),
-    )
-    server.add_route(
-        "GET",
-        "/api/v1/workflow-runs/{run_id}/approvals",
-        _scoped(list_run_approvals, all_of=("approvals:read",)),
-    )
-    server.add_route(
-        "GET",
-        "/api/v1/workflow-runs/{run_id}/checkpoints",
-        _scoped(list_run_checkpoints, all_of=("checkpoints:read",)),
-    )
-    server.add_route(
-        "POST",
-        "/api/v1/workflow-runs/{run_id}/resume",
-        _scoped(resume_workflow_run, all_of=("runs:write",)),
-    )
-    server.add_route(
-        "GET",
-        "/api/v1/approvals",
-        _scoped(list_approvals, all_of=("approvals:read",)),
-    )
-    server.add_route(
-        "POST",
-        "/api/v1/approvals/{approval_id}/approve",
-        _scoped(approve_request, all_of=("approvals:write",)),
-    )
-    server.add_route(
-        "POST",
-        "/api/v1/approvals/{approval_id}/reject",
-        _scoped(reject_request, all_of=("approvals:write",)),
-    )
-    server.add_route(
-        "GET",
-        "/api/v1/checkpoints",
-        _scoped(list_checkpoints, all_of=("checkpoints:read",)),
-    )
-    server.add_route(
-        "GET",
-        "/api/v1/checkpoints/{checkpoint_id}/replay",
-        _scoped(replay_checkpoint, all_of=("checkpoints:read",)),
-    )
-    server.add_route(
-        "POST",
-        "/kill-switch",
-        _scoped(activate_kill_switch, all_of=("kill-switch:write",)),
-    )
+    _public("POST", v1("/agents"), create_agent, aliases=("/agents",), all_of=("agents:write",))
+    _public("GET", v1("/agents"), list_agents, aliases=("/agents",), all_of=("agents:read",))
+    _public("GET", v1("/agents/activity"), list_agents_activity, all_of=("agents:read",))
+    _public("GET", v1("/agents/{id}"), get_agent, aliases=("/agents/{id}",), all_of=("agents:read",))
+    _public("PATCH", v1("/agents/{id}"), update_agent, aliases=("/agents/{id}",), all_of=("agents:write",))
+    _public("GET", v1("/agents/{id}/activity"), get_agent_activity, all_of=("agents:read",))
+    _public("GET", v1("/agents/{id}/skills"), get_agent_skills, all_of=("agents:read",))
+    _public("PATCH", v1("/agents/{id}/skills"), update_agent_skills, all_of=("agents:write",))
+    _public("DELETE", v1("/agents/{id}"), delete_agent, aliases=("/agents/{id}",), all_of=("agents:write",))
+
+    _public("POST", v1("/workflows"), create_workflow, aliases=("/workflows",), all_of=("workflows:write",))
+    _public("GET", v1("/workflows"), list_workflows, aliases=("/workflows",), all_of=("workflows:read",))
+    _public("GET", v1("/workflows/{id}"), get_workflow, aliases=("/workflows/{id}",), all_of=("workflows:read",))
+    _public("GET", v1("/workflows/{id}/plan"), get_workflow_plan, aliases=("/workflows/{id}/plan",), all_of=("workflows:read",))
+    _public("DELETE", v1("/workflows/{id}"), delete_workflow, aliases=("/workflows/{id}",), all_of=("workflows:write",))
+    _public("GET", v1("/workflows/{id}/runs"), list_workflow_runs, aliases=("/workflows/{id}/runs",), all_of=("runs:read",))
+    _public("POST", v1("/workflows/{id}/runs"), start_workflow_run, aliases=("/workflows/{id}/run",), all_of=("runs:write",))
+    _public("GET", v1("/workflows/{id}/runs/{run_id}"), get_workflow_run, aliases=("/workflows/{id}/runs/{run_id}",), all_of=("runs:read",))
+    _public("GET", v1("/runs"), list_runs, aliases=("/api/v1/workflow-runs",), all_of=("runs:read",))
+    _public("GET", v1("/runs/{run_id}"), get_workflow_run_by_id, aliases=("/api/v1/workflow-runs/{run_id}",), all_of=("runs:read",))
+    _public("GET", v1("/runs/{run_id}/approvals"), list_run_approvals, aliases=("/api/v1/workflow-runs/{run_id}/approvals",), all_of=("approvals:read",))
+    _public("GET", v1("/runs/{run_id}/checkpoints"), list_run_checkpoints, aliases=("/api/v1/workflow-runs/{run_id}/checkpoints",), all_of=("checkpoints:read",))
+    _public("POST", v1("/runs/{run_id}/resume"), resume_workflow_run, aliases=("/api/v1/workflow-runs/{run_id}/resume",), all_of=("runs:write",))
+    _public("GET", v1("/approvals"), list_approvals, all_of=("approvals:read",))
+    _public("POST", v1("/approvals/{approval_id}/approve"), approve_request, all_of=("approvals:write",))
+    _public("POST", v1("/approvals/{approval_id}/reject"), reject_request, all_of=("approvals:write",))
+    _public("GET", v1("/checkpoints"), list_checkpoints, all_of=("checkpoints:read",))
+    _public("GET", v1("/checkpoints/{checkpoint_id}/replay"), replay_checkpoint, all_of=("checkpoints:read",))
+    _public("GET", v1("/skills"), list_skills, all_of=("agents:read",))
+    _public("GET", v1("/skills/categories"), list_skill_categories, all_of=("agents:read",))
+    _public("POST", v1("/skills/scan"), scan_skills, all_of=("agents:read",))
+    _public("GET", v1("/skills/{id}"), get_skill, all_of=("agents:read",))
+    _public("POST", v1("/skills/{id}/execute"), execute_skill, all_of=("agents:write",))
+    _public("GET", v1("/models"), list_models, all_of=("agents:read",))
+    _public("POST", v1("/models/refresh"), refresh_models, all_of=("agents:read",))
+    _public("POST", v1("/models/policy"), update_model_policy, all_of=("agents:write",))
+    _public("GET", v1("/models/health"), health_models, all_of=("agents:read",))
+    _public("GET", v1("/tasks"), list_tasks, all_of=("runs:read",))
+    _public("POST", v1("/tasks"), create_task, all_of=("runs:write",))
+    _public("GET", v1("/tasks/{task_id}"), get_task, all_of=("runs:read",))
+    _public("PATCH", v1("/tasks/{task_id}"), update_task, all_of=("runs:write",))
+    _public("DELETE", v1("/tasks/{task_id}"), delete_task, all_of=("runs:write",))
+    _public("GET", v1("/memories"), list_memories, all_of=("runs:read",))
+    _public("POST", v1("/memories"), create_memory, all_of=("runs:write",))
+    _public("DELETE", v1("/memories/{entry_id}"), delete_memory, all_of=("runs:write",))
+    _public("GET", v1("/events"), list_events, all_of=("runs:read",))
+    _public("POST", v1("/events"), create_event, all_of=("runs:write",))
+    _public("DELETE", v1("/events/{event_id}"), delete_event, all_of=("runs:write",))
+    _public("GET", v1("/content"), list_content, all_of=("runs:read",))
+    _public("POST", v1("/content"), create_content, all_of=("runs:write",))
+    _public("PATCH", v1("/content/{content_id}"), update_content, all_of=("runs:write",))
+    _public("DELETE", v1("/content/{content_id}"), delete_content, all_of=("runs:write",))
+    _public("GET", v1("/teams"), list_teams, all_of=("agents:read",))
+    _public("POST", v1("/teams"), create_team, all_of=("agents:write",))
+    _public("PATCH", v1("/teams/{id}"), update_team, all_of=("agents:write",))
+    _public("DELETE", v1("/teams/{id}"), delete_team, all_of=("agents:write",))
+    _public("POST", v1("/ads/audit"), run_ads_audit, all_of=("runs:write",))
+    _public("GET", v1("/ads/audit/{run_id}"), get_ads_audit_status, all_of=("runs:read",))
+    _public("GET", v1("/ads/reports"), list_ads_reports, all_of=("runs:read",))
+    _public("GET", v1("/ads/reports/{report_id}"), get_ads_report, all_of=("runs:read",))
+    _public("POST", v1("/ads/plan"), generate_ads_plan, all_of=("runs:write",))
+    _public("POST", v1("/ads/budget/optimize"), optimize_ads_budget, all_of=("runs:write",))
+    _public("GET", v1("/ads/benchmarks/{platform}"), get_ads_benchmarks, all_of=("runs:read",))
+    _public("GET", v1("/ads/templates"), list_ads_templates, all_of=("runs:read",))
+    _public("GET", v1("/contract"), get_contract, all_of=("agents:read",))
+    _public("GET", v1("/features"), get_features, all_of=("agents:read",))
+    _public("POST", "/kill-switch", activate_kill_switch, all_of=("kill-switch:write",))
+    _public("GET", v1("/costs/summary"), costs_summary, aliases=("/api/v1/costs/realtime",), all_of=("runs:read",))
 
     return s

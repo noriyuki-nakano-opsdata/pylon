@@ -32,6 +32,7 @@ from pylon.runtime import (
     resume_project_sync,
 )
 from pylon.runtime.execution import execute_project_sync, serialize_run
+from pylon.runtime.llm import ProviderRegistry
 from pylon.runtime.queued_runner import QueuedWorkflowDispatchRunner
 from pylon.taskqueue import ExponentialBackoff, FixedRetry, TaskStatus
 from pylon.types import (
@@ -172,6 +173,34 @@ class WorkflowControlPlaneStore(Protocol):
         status: str | None = None,
     ) -> list[dict[str, Any]]: ...
 
+    def get_surface_record(
+        self,
+        namespace: str,
+        record_id: str,
+    ) -> dict[str, Any] | None: ...
+
+    def put_surface_record(
+        self,
+        namespace: str,
+        record_id: str,
+        payload: Mapping[str, Any],
+    ) -> None: ...
+
+    def delete_surface_record(
+        self,
+        namespace: str,
+        record_id: str,
+    ) -> bool: ...
+
+    def list_surface_records(
+        self,
+        namespace: str,
+        *,
+        tenant_id: str | None = None,
+    ) -> list[dict[str, Any]]: ...
+
+    def allocate_sequence_value(self, name: str) -> int: ...
+
     def get_node_handlers(self, workflow_id: str) -> dict[str, Any] | None: ...
 
     def get_agent_handlers(self, workflow_id: str) -> dict[str, Any] | None: ...
@@ -180,8 +209,14 @@ class WorkflowControlPlaneStore(Protocol):
 class WorkflowRunService:
     """Shared write-side control plane for workflow lifecycle operations."""
 
-    def __init__(self, store: WorkflowControlPlaneStore) -> None:
+    def __init__(
+        self,
+        store: WorkflowControlPlaneStore,
+        *,
+        provider_registry: ProviderRegistry | None = None,
+    ) -> None:
         self._store = store
+        self._provider_registry = provider_registry
 
     def _approval_manager(self) -> ApprovalManager:
         return (
@@ -955,6 +990,7 @@ class WorkflowRunService:
             approval_manager=self._approval_manager(),
             node_handlers=self._store.get_node_handlers(workflow_id),
             agent_handlers=self._store.get_agent_handlers(workflow_id),
+            provider_registry=self._provider_registry,
         )
         run_record = serialize_run(
             artifacts,

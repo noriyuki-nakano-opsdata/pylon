@@ -71,7 +71,7 @@ The pipeline succeeds only when all three conditions are met:
 ## Usage
 
 ```bash
-pylon run --project examples/autonomous-debugging-swarm/pylon.yaml \
+pylon run examples/autonomous-debugging-swarm/pylon.yaml \
   --input '{"bug_report": "Users report 500 errors on /api/orders endpoint after deploy v2.3.1"}'
 ```
 
