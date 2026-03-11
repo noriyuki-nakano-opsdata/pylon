@@ -6,6 +6,7 @@ import json
 import math
 import uuid
 from datetime import datetime, timezone
+from html import escape
 from typing import Any
 from urllib.parse import urlparse
 
@@ -91,6 +92,69 @@ def _contains_any(spec: str, *terms: str) -> bool:
     return any(term.lower() in lowered for term in terms)
 
 
+_PRODUCT_KIND_SIGNALS: dict[str, tuple[tuple[str, int], ...]] = {
+    "learning": (
+        ("学習", 3),
+        ("勉強", 3),
+        ("lesson", 3),
+        ("quiz", 3),
+        ("education", 3),
+        ("child", 3),
+        ("kids", 3),
+        ("family", 2),
+        ("game", 2),
+        ("ゲーム", 2),
+    ),
+    "operations": (
+        ("workflow", 3),
+        ("approval", 3),
+        ("operator", 3),
+        ("orchestration", 3),
+        ("運用", 3),
+        ("承認", 3),
+        ("監査", 3),
+        ("control plane", 3),
+        ("platform", 1),
+        ("agent", 1),
+        ("ops", 1),
+        ("studio", 1),
+    ),
+    "commerce": (
+        ("checkout", 3),
+        ("commerce", 3),
+        ("e-commerce", 3),
+        ("注文", 3),
+        ("shop", 2),
+        ("store", 2),
+        ("cart", 2),
+        ("order", 2),
+        ("販売", 2),
+    ),
+}
+
+_PRODUCT_KIND_PRIORITY = {
+    "learning": 3,
+    "commerce": 2,
+    "operations": 1,
+    "generic": 0,
+}
+
+
+def _weighted_keyword_score(spec: str, terms: tuple[tuple[str, int], ...]) -> int:
+    lowered = spec.lower()
+    prefix = lowered[:600]
+    score = 0
+    for term, weight in terms:
+        normalized = term.lower()
+        hits = lowered.count(normalized)
+        if hits <= 0:
+            continue
+        score += hits * weight
+        if normalized in prefix:
+            score += weight
+    return score
+
+
 def _selected_feature_names(state: dict[str, Any]) -> list[str]:
     selected = []
     for item in state.get("features", []) or state.get("selected_features", []) or []:
@@ -145,12 +209,18 @@ def _compact_lifecycle_value(value: Any, *, depth: int = 0) -> Any:
 
 def _infer_product_kind(spec: str) -> str:
     tokens = set(_keywords(spec))
-    if _contains_any(spec, "学習", "勉強", "lesson", "quiz", "education", "child", "kids", "family", "game", "ゲーム"):
-        return "learning"
-    if _contains_any(spec, "workflow", "agent", "approval", "operator", "ops", "orchestration", "platform", "運用", "承認", "監査", "studio", "control plane"):
-        return "operations"
-    if _contains_any(spec, "shop", "store", "cart", "checkout", "order", "commerce", "e-commerce", "販売", "注文") or "ec" in tokens:
+    if "ec" in tokens:
         return "commerce"
+    scores = {
+        kind: _weighted_keyword_score(spec, terms)
+        for kind, terms in _PRODUCT_KIND_SIGNALS.items()
+    }
+    top_kind, top_score = max(
+        scores.items(),
+        key=lambda item: (item[1], _PRODUCT_KIND_PRIORITY[item[0]]),
+    )
+    if top_score > 0:
+        return top_kind
     return "generic"
 
 
@@ -831,6 +901,304 @@ def _color_or(value: Any, fallback: str) -> str:
     return fallback
 
 
+def _preview_title(spec: str) -> str:
+    for line in str(spec or "").splitlines():
+        cleaned = line.strip().lstrip("#").strip()
+        if cleaned:
+            return cleaned[:64]
+    return "Lifecycle Product"
+
+
+def _prototype_overrides_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "prototype_kind": str(payload.get("prototype_kind") or payload.get("prototypeKind") or "").strip(),
+        "navigation_style": str(payload.get("navigation_style") or payload.get("navigationStyle") or "").strip(),
+        "density": str(payload.get("density") or "").strip(),
+        "screen_labels": [
+            str(item).strip()
+            for item in _as_list(payload.get("screen_labels") or payload.get("screenLabels"))
+            if str(item).strip()
+        ],
+        "interaction_principles": [
+            str(item).strip()
+            for item in _as_list(payload.get("interaction_principles") or payload.get("interactionPrinciples"))
+            if str(item).strip()
+        ],
+    }
+
+
+def _default_site_map_for_kind(kind: str) -> list[dict[str, str]]:
+    if kind == "learning":
+        return [
+            {"id": "home", "label": "ホーム", "priority": "primary"},
+            {"id": "lessons", "label": "レッスン", "priority": "primary"},
+            {"id": "progress", "label": "進捗", "priority": "primary"},
+            {"id": "guardian", "label": "保護者設定", "priority": "secondary"},
+        ]
+    if kind == "commerce":
+        return [
+            {"id": "catalog", "label": "商品一覧", "priority": "primary"},
+            {"id": "product", "label": "商品詳細", "priority": "primary"},
+            {"id": "checkout", "label": "チェックアウト", "priority": "primary"},
+            {"id": "ops", "label": "運営管理", "priority": "secondary"},
+        ]
+    if kind == "operations":
+        return [
+            {"id": "workspace", "label": "Lifecycle Workspace", "priority": "primary"},
+            {"id": "runs", "label": "Runs", "priority": "primary"},
+            {"id": "approvals", "label": "Approvals", "priority": "primary"},
+            {"id": "artifacts", "label": "Artifacts", "priority": "secondary"},
+        ]
+    return [
+        {"id": "home", "label": "ホーム", "priority": "primary"},
+        {"id": "workflow", "label": "主要導線", "priority": "primary"},
+        {"id": "history", "label": "履歴", "priority": "secondary"},
+        {"id": "settings", "label": "設定", "priority": "utility"},
+    ]
+
+
+def _default_key_paths_for_kind(kind: str) -> list[dict[str, Any]]:
+    if kind == "learning":
+        return [
+            {"name": "Daily lesson loop", "steps": ["ホーム", "今日の課題", "結果", "報酬"]},
+            {"name": "Guardian review", "steps": ["進捗", "学習サマリー", "目標設定"]},
+        ]
+    if kind == "commerce":
+        return [
+            {"name": "Browse to buy", "steps": ["商品一覧", "商品詳細", "チェックアウト", "注文確認"]},
+            {"name": "Inventory mitigation", "steps": ["運営管理", "在庫一覧", "補充判断"]},
+        ]
+    if kind == "operations":
+        return [
+            {"name": "Idea to approval", "steps": ["Lifecycle Workspace", "Research", "Planning", "Approval"]},
+            {"name": "Build to release", "steps": ["Development", "Runs", "Deploy", "Release"]},
+        ]
+    return [
+        {"name": "First-run success", "steps": ["ホーム", "主要導線", "結果"]},
+        {"name": "Configuration", "steps": ["設定", "保存"]},
+    ]
+
+
+def _shell_layout_for_kind(kind: str) -> str:
+    if kind == "commerce":
+        return "top-nav"
+    return "sidebar"
+
+
+def _screen_layout_for_kind(kind: str, *, index: int) -> str:
+    if kind == "operations":
+        return "command-center" if index == 0 else "split-review"
+    if kind == "commerce":
+        return "catalog-grid" if index == 0 else "decision-panel"
+    if kind == "learning":
+        return "guided-lesson" if index == 0 else "progress-console"
+    return "product-workspace" if index == 0 else "detail-canvas"
+
+
+def _screen_modules_for_context(
+    *,
+    kind: str,
+    label: str,
+    features: list[str],
+    use_case: dict[str, Any],
+    key_path: dict[str, Any],
+    personas: list[dict[str, Any]],
+    milestones: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    lowered = label.lower()
+    role = str((_as_dict(personas[0]).get("role") if personas else "") or (_as_dict(personas[0]).get("name") if personas else "") or "Primary user")
+    flow_steps = [str(item) for item in _as_list(use_case.get("main_flow")) if str(item).strip()] or [
+        str(item) for item in _as_list(key_path.get("steps")) if str(item).strip()
+    ]
+    related = [str(item) for item in _as_list(use_case.get("related_stories")) if str(item).strip()] or features[:3]
+    milestone_names = [
+        str(_as_dict(item).get("name") or _as_dict(item).get("criteria") or "").strip()
+        for item in milestones[:3]
+        if str(_as_dict(item).get("name") or _as_dict(item).get("criteria") or "").strip()
+    ]
+
+    if "approval" in lowered or "承認" in lowered:
+        return [
+            {"name": "Review queue", "type": "queue", "items": related[:3] or ["Approval packet", "Rework request", "Decision note"]},
+            {"name": "Decision checklist", "type": "checklist", "items": flow_steps[:4] or ["Inspect evidence", "Review risks", "Approve or rework"]},
+            {"name": "Governance context", "type": "summary", "items": milestone_names[:3] or ["Policy coverage", "Audit trail", "Decision owner"]},
+        ]
+    if "run" in lowered or "telemetry" in lowered or "実行" in lowered:
+        return [
+            {"name": "Run monitor", "type": "timeline", "items": related[:3] or ["Active run", "Blocked node", "Next step"]},
+            {"name": "Checkpoint lane", "type": "timeline", "items": flow_steps[:4] or ["Queued", "Running", "Review", "Released"]},
+            {"name": "Operator notes", "type": "summary", "items": milestone_names[:3] or ["Escalations", "Retry budget", "Handoff clarity"]},
+        ]
+    if "artifact" in lowered or "履歴" in lowered or "lineage" in lowered:
+        return [
+            {"name": "Lineage explorer", "type": "graph", "items": related[:3] or ["Evidence source", "Decision log", "Build artifact"]},
+            {"name": "Trace path", "type": "timeline", "items": flow_steps[:4] or ["Research", "Planning", "Design", "Build"]},
+            {"name": "Reference rail", "type": "summary", "items": milestone_names[:3] or ["Owner", "Timestamp", "Export"]},
+        ]
+    if "setting" in lowered or "設定" in lowered:
+        return [
+            {"name": "Policy groups", "type": "form", "items": related[:3] or ["Notifications", "Permissions", "Automation"]},
+            {"name": "Change flow", "type": "timeline", "items": flow_steps[:4] or ["Edit", "Review", "Apply"]},
+            {"name": "Safety defaults", "type": "summary", "items": milestone_names[:3] or ["Fallback", "Rollback", "Retention"]},
+        ]
+    if kind == "commerce":
+        return [
+            {"name": "Decision shelf", "type": "cards", "items": related[:3] or ["Top picks", "Trust signals", "Saved items"]},
+            {"name": "Purchase flow", "type": "timeline", "items": flow_steps[:4] or ["Compare", "Detail", "Checkout", "Confirm"]},
+            {"name": "Operator insight", "type": "summary", "items": [role, *(milestone_names[:2] or ["Stock risk", "Order state"])]},
+        ]
+    if kind == "learning":
+        return [
+            {"name": "Progress snapshot", "type": "summary", "items": related[:3] or ["Today's lesson", "Streak", "Reward"]},
+            {"name": "Learning loop", "type": "timeline", "items": flow_steps[:4] or ["Start", "Practice", "Result", "Celebrate"]},
+            {"name": "Guardian support", "type": "summary", "items": [role, *(milestone_names[:2] or ["Goal check", "Next recommendation"])]},
+        ]
+    if kind == "operations":
+        return [
+            {"name": "Decision snapshot", "type": "summary", "items": related[:3] or ["Next action", "Blocked phase", "Approval state"]},
+            {"name": "Workflow lane", "type": "timeline", "items": flow_steps[:4] or ["Research", "Planning", "Design", "Deploy"]},
+            {"name": "Operator context", "type": "summary", "items": [role, *(milestone_names[:2] or ["Risk register", "Release signal"])]},
+        ]
+    return [
+        {"name": "Primary tasks", "type": "summary", "items": related[:3] or ["Core workflow", "Status", "Recovery"]},
+        {"name": "Task flow", "type": "timeline", "items": flow_steps[:4] or ["Open", "Act", "Review"]},
+        {"name": "Support context", "type": "summary", "items": [role, *(milestone_names[:2] or ["Help", "Settings"])]},
+    ]
+
+
+def _build_design_prototype(
+    *,
+    spec: str,
+    analysis: dict[str, Any],
+    selected_features: list[str],
+    pattern_name: str,
+    description: str,
+    prototype_overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    kind = _infer_product_kind(spec)
+    overrides = prototype_overrides or {}
+    ia_analysis = _as_dict(analysis.get("ia_analysis"))
+    personas = [dict(item) for item in _as_list(analysis.get("personas")) if isinstance(item, dict)]
+    use_cases = [dict(item) for item in _as_list(analysis.get("use_cases")) if isinstance(item, dict)]
+    key_paths = [dict(item) for item in _as_list(ia_analysis.get("key_paths")) if isinstance(item, dict)] or _default_key_paths_for_kind(kind)
+    site_map = [dict(item) for item in _as_list(ia_analysis.get("site_map")) if isinstance(item, dict)] or _default_site_map_for_kind(kind)
+    design_tokens = _as_dict(analysis.get("design_tokens")) or _base_design_tokens(spec)
+    milestones = [dict(item) for item in _as_list(analysis.get("recommended_milestones")) if isinstance(item, dict)]
+    if not milestones:
+        milestones = [dict(item) for item in _as_list(analysis.get("milestones")) if isinstance(item, dict)]
+    screen_labels = [label for label in overrides.get("screen_labels", []) if label]
+
+    screens: list[dict[str, Any]] = []
+    for index, raw in enumerate(site_map[:4]):
+        node = _as_dict(raw)
+        label = screen_labels[index] if index < len(screen_labels) else str(node.get("label") or node.get("id") or f"Screen {index + 1}")
+        use_case = use_cases[index] if index < len(use_cases) else (use_cases[0] if use_cases else {})
+        key_path = key_paths[index] if index < len(key_paths) else (key_paths[0] if key_paths else {})
+        modules = _screen_modules_for_context(
+            kind=kind,
+            label=label,
+            features=selected_features,
+            use_case=_as_dict(use_case),
+            key_path=_as_dict(key_path),
+            personas=personas,
+            milestones=milestones,
+        )
+        primary_actions = _dedupe_strings(
+            [
+                *(str(item) for item in _as_list(_as_dict(use_case).get("main_flow"))[:2]),
+                f"Open {label}",
+                *(str(item) for item in _as_list(_as_dict(key_path).get("steps"))[:1]),
+            ]
+        )[:3]
+        screens.append(
+            {
+                "id": str(node.get("id") or _slug(label, prefix="screen")),
+                "title": label,
+                "purpose": str(node.get("description") or _as_dict(use_case).get("title") or description),
+                "layout": _screen_layout_for_kind(kind, index=index),
+                "headline": str(_as_dict(use_case).get("title") or f"{label} workspace"),
+                "supporting_text": str(_as_dict(key_path).get("name") or description),
+                "primary_actions": primary_actions or [f"Open {label}"],
+                "modules": modules,
+                "success_state": str(
+                    _as_dict(use_case).get("postconditions")
+                    or (milestones[index]["criteria"] if index < len(milestones) else "")
+                    or "The next action and current state are obvious at a glance."
+                ),
+            }
+        )
+
+    flows = []
+    for index, raw in enumerate(key_paths[:3]):
+        path = _as_dict(raw)
+        steps = [str(item) for item in _as_list(path.get("steps")) if str(item).strip()]
+        if not steps:
+            continue
+        flows.append(
+            {
+                "id": f"flow-{index + 1}",
+                "name": str(path.get("name") or f"Primary flow {index + 1}"),
+                "steps": steps,
+                "goal": str(path.get("goal") or screens[min(index, len(screens) - 1)].get("success_state") or ""),
+            }
+        )
+
+    interaction_principles = _dedupe_strings(
+        list(overrides.get("interaction_principles", []))
+        + [str(item) for item in _as_list(design_tokens.get("effects")) if str(item).strip()]
+        + [
+            "Show the next action close to the active work surface.",
+            "Keep evidence, decision context, and execution status in the same viewport.",
+            "Prefer dense but scannable panels over marketing copy blocks.",
+        ]
+    )[:5]
+
+    primary_nav = [
+        {
+            "id": str(item.get("id") or _slug(str(item.get("label") or "nav"), prefix="nav")),
+            "label": str(item.get("label") or item.get("id") or "Section"),
+            "priority": str(item.get("priority") or "primary"),
+        }
+        for item in site_map[:5]
+    ]
+    prototype_kind = overrides.get("prototype_kind") or (
+        "control-center" if kind == "operations"
+        else "storefront" if kind == "commerce"
+        else "guided-product" if kind == "learning"
+        else "product-workspace"
+    )
+    density = overrides.get("density") or ("high" if kind == "operations" else "medium")
+
+    return {
+        "kind": prototype_kind,
+        "app_shell": {
+            "layout": overrides.get("navigation_style") or _shell_layout_for_kind(kind),
+            "density": density,
+            "primary_navigation": primary_nav,
+            "status_badges": _dedupe_strings(selected_features[:3] or [screen["title"] for screen in screens[:3]]),
+        },
+        "screens": screens,
+        "flows": flows,
+        "interaction_principles": interaction_principles,
+        "design_anchor": {
+            "pattern_name": pattern_name,
+            "description": description,
+            "style_name": str(_as_dict(design_tokens.get("style")).get("name") or ""),
+        },
+    }
+
+
+def _looks_like_prototype_html(code: str) -> bool:
+    lowered = str(code or "").lower()
+    return (
+        "<html" in lowered
+        and "<main" in lowered
+        and "primary navigation" in lowered
+        and "data-screen-id" in lowered
+        and "data-prototype-kind" in lowered
+    )
+
+
 def _extract_json_object(content: str) -> dict[str, Any] | None:
     text = str(content or "").strip()
     if not text:
@@ -916,19 +1284,143 @@ async def _lifecycle_llm_json(
     return payload, [_llm_event_payload(result, purpose=purpose, raw_content=raw_content)], raw_content
 
 
-def _preferred_lifecycle_model(node_id: str) -> str:
-    overrides = {
-        "claude-designer": "anthropic/claude-sonnet",
-        "openai-designer": "openai/o3",
-        "gemini-designer": "google/gemini-2.5-pro",
-        "design-evaluator": "anthropic/claude-sonnet",
-        "planner": "openai/o3",
-        "frontend-builder": "anthropic/claude-sonnet",
-        "backend-builder": "openai/o3",
-        "integrator": "anthropic/claude-sonnet",
-        "reviewer": "anthropic/claude-sonnet",
-    }
-    return overrides.get(node_id, "")
+_LIFECYCLE_MODEL_STRATEGIES: dict[str, dict[str, Any]] = {
+    "competitor-analyst": {
+        "archetype": "long-context competitive comparator",
+        "candidates": ("moonshot/kimi-k2.5", "gemini/gemini-3-pro-preview", "anthropic/claude-sonnet-4-6"),
+    },
+    "market-researcher": {
+        "archetype": "broad market synthesizer",
+        "candidates": ("gemini/gemini-3-pro-preview", "moonshot/kimi-k2.5", "openai/gpt-5-mini"),
+    },
+    "user-researcher": {
+        "archetype": "qualitative interviewer",
+        "candidates": ("anthropic/claude-sonnet-4-6", "moonshot/kimi-k2.5", "openai/gpt-5-mini"),
+    },
+    "tech-evaluator": {
+        "archetype": "system feasibility reasoner",
+        "candidates": ("zhipu/glm-4-plus", "openai/gpt-5-mini", "anthropic/claude-sonnet-4-6"),
+    },
+    "research-synthesizer": {
+        "archetype": "structured synthesis engine",
+        "candidates": ("openai/gpt-5-mini", "moonshot/kimi-k2.5", "anthropic/claude-sonnet-4-6"),
+    },
+    "evidence-librarian": {
+        "archetype": "source normalizer",
+        "candidates": ("moonshot/kimi-k2.5", "gemini/gemini-3-pro-preview", "openai/gpt-5-mini"),
+    },
+    "devils-advocate-researcher": {
+        "archetype": "adversarial systems critic",
+        "candidates": ("zhipu/glm-4-plus", "anthropic/claude-sonnet-4-6", "openai/gpt-5-mini"),
+    },
+    "cross-examiner": {
+        "archetype": "structured contradiction detector",
+        "candidates": ("openai/gpt-5-mini", "zhipu/glm-4-plus", "gemini/gemini-3-pro-preview"),
+    },
+    "research-judge": {
+        "archetype": "decision calibrator",
+        "candidates": ("anthropic/claude-sonnet-4-6", "openai/gpt-5-mini", "zhipu/glm-4-plus"),
+    },
+    "persona-builder": {
+        "archetype": "persona and motivation mapper",
+        "candidates": ("anthropic/claude-sonnet-4-6", "moonshot/kimi-k2.5", "gemini/gemini-3-pro-preview"),
+    },
+    "story-architect": {
+        "archetype": "journey and IA composer",
+        "candidates": ("moonshot/kimi-k2.5", "gemini/gemini-3-pro-preview", "anthropic/claude-sonnet-4-6"),
+    },
+    "feature-analyst": {
+        "archetype": "scope and prioritization reasoner",
+        "candidates": ("zhipu/glm-4-plus", "openai/gpt-5-mini", "anthropic/claude-sonnet-4-6"),
+    },
+    "solution-architect": {
+        "archetype": "delivery architecture planner",
+        "candidates": ("zhipu/glm-4-plus", "anthropic/claude-sonnet-4-6", "openai/gpt-5-mini"),
+    },
+    "planning-synthesizer": {
+        "archetype": "decision-table synthesizer",
+        "candidates": ("openai/gpt-5-mini", "moonshot/kimi-k2.5", "anthropic/claude-sonnet-4-6"),
+    },
+    "scope-skeptic": {
+        "archetype": "scope reduction critic",
+        "candidates": ("zhipu/glm-4-plus", "openai/gpt-5-mini", "gemini/gemini-3-pro-preview"),
+    },
+    "assumption-auditor": {
+        "archetype": "assumption auditor",
+        "candidates": ("anthropic/claude-sonnet-4-6", "zhipu/glm-4-plus", "openai/gpt-5-mini"),
+    },
+    "negative-persona-challenger": {
+        "archetype": "failure-mode generator",
+        "candidates": ("gemini/gemini-3-pro-preview", "moonshot/kimi-k2.5", "zhipu/glm-4-plus"),
+    },
+    "milestone-falsifier": {
+        "archetype": "verification gate critic",
+        "candidates": ("zhipu/glm-4-plus", "openai/gpt-5-mini", "anthropic/claude-sonnet-4-6"),
+    },
+    "planning-judge": {
+        "archetype": "portfolio and tradeoff judge",
+        "candidates": ("anthropic/claude-sonnet-4-6", "openai/gpt-5-mini", "zhipu/glm-4-plus"),
+    },
+    "claude-designer": {
+        "archetype": "premium interaction designer",
+        "candidates": ("anthropic/claude-sonnet-4-6", "moonshot/kimi-k2.5", "gemini/gemini-3-pro-preview"),
+    },
+    "openai-designer": {
+        "archetype": "high-iteration UI concept generator",
+        "candidates": ("moonshot/kimi-k2.5", "openai/gpt-5-mini", "gemini/gemini-3-pro-preview"),
+    },
+    "gemini-designer": {
+        "archetype": "exploratory visual systems designer",
+        "candidates": ("gemini/gemini-3-pro-preview", "moonshot/kimi-k2.5", "anthropic/claude-sonnet-4-6"),
+    },
+    "design-evaluator": {
+        "archetype": "design judge and rubric scorer",
+        "candidates": ("zhipu/glm-4-plus", "anthropic/claude-sonnet-4-6", "openai/gpt-5-mini"),
+    },
+    "planner": {
+        "archetype": "delivery planner",
+        "candidates": ("openai/gpt-5-mini", "zhipu/glm-4-plus", "anthropic/claude-sonnet-4-6"),
+    },
+    "frontend-builder": {
+        "archetype": "UI implementation specialist",
+        "candidates": ("moonshot/kimi-k2.5", "anthropic/claude-sonnet-4-6", "openai/gpt-5-mini"),
+    },
+    "backend-builder": {
+        "archetype": "backend systems implementer",
+        "candidates": ("zhipu/glm-4-plus", "openai/gpt-5-mini", "anthropic/claude-sonnet-4-6"),
+    },
+    "integrator": {
+        "archetype": "cross-artifact integrator",
+        "candidates": ("anthropic/claude-sonnet-4-6", "openai/gpt-5-mini", "moonshot/kimi-k2.5"),
+    },
+    "reviewer": {
+        "archetype": "final quality reviewer",
+        "candidates": ("anthropic/claude-sonnet-4-6", "openai/gpt-5-mini", "zhipu/glm-4-plus"),
+    },
+}
+
+
+def _preferred_lifecycle_model(
+    node_id: str,
+    provider_registry: ProviderRegistry | None = None,
+) -> str:
+    strategy = _as_dict(_LIFECYCLE_MODEL_STRATEGIES.get(node_id))
+    raw_candidates = strategy.get("candidates")
+    candidates = [
+        str(item).strip()
+        for item in (list(raw_candidates) if isinstance(raw_candidates, (list, tuple)) else [])
+        if str(item).strip()
+    ]
+    if not candidates:
+        return ""
+    if provider_registry is None:
+        return candidates[0]
+    available = set(provider_registry.provider_names())
+    for candidate in candidates:
+        provider_name, _ = candidate.split("/", 1)
+        if provider_name in available:
+            return candidate
+    return candidates[0]
 
 
 def _design_variant_payload(
@@ -941,10 +1433,12 @@ def _design_variant_payload(
     accent: str,
     selected_features: list[str],
     spec: str,
+    analysis: dict[str, Any] | None = None,
     rationale: str = "",
     quality_focus: list[str] | None = None,
     score_overrides: dict[str, Any] | None = None,
     provider_note: str = "",
+    prototype_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     scores = {
         "ux_quality": round(0.78 + (0.02 if "Minimal" in pattern_name else 0.0), 2),
@@ -957,18 +1451,33 @@ def _design_variant_payload(
             continue
         scores[score_name] = _clamp_score(score_overrides.get(score_name), default=default)
     preview_features = selected_features or ["Autonomous workflow", "Approval gates", "Quality review"]
+    analysis_payload = _as_dict(analysis)
+    prototype = _build_design_prototype(
+        spec=spec,
+        analysis=analysis_payload,
+        selected_features=preview_features,
+        pattern_name=pattern_name,
+        description=description,
+        prototype_overrides=prototype_overrides,
+    )
+    design_tokens = _as_dict(analysis_payload.get("design_tokens"))
     variant = {
         "id": node_id,
         "model": model_name,
         "pattern_name": pattern_name,
         "description": description,
         "preview_html": _build_preview_html(
-            title=spec[:48] or "Lifecycle Product",
+            title=_preview_title(spec),
             subtitle=description,
             primary=primary,
             accent=accent,
             features=preview_features,
+            prototype=prototype,
+            design_tokens=design_tokens,
         ),
+        "prototype": prototype,
+        "primary_color": primary,
+        "accent_color": accent,
         "tokens": {"in": 320 + len(preview_features) * 14, "out": 900 + len(preview_features) * 20},
         "cost_usd": round(0.18 + len(preview_features) * 0.02, 3),
         "scores": scores,
@@ -1079,6 +1588,24 @@ def _phase_quality_targets(phase: str) -> list[str]:
 
 
 def _phase_support_skills(phase: str) -> list[str]:
+    if phase == "research":
+        return [
+            "market-research",
+            "competitive-intelligence",
+            "evidence-audit",
+            "counterexample-generation",
+            "cross-examination",
+            "decision-calibration",
+        ]
+    if phase == "planning":
+        return [
+            "persona-design",
+            "use-case-design",
+            "feature-prioritization",
+            "scope-challenge",
+            "assumption-audit",
+            "decision-calibration",
+        ]
     if phase == "design":
         return ["design-critique", "accessibility-review", "performance-review"]
     if phase == "development":
@@ -1337,7 +1864,7 @@ async def _plan_node_collaboration(
     payload, llm_events, _ = await _lifecycle_llm_json(
         provider_registry=provider_registry,
         llm_runtime=llm_runtime,
-        preferred_model=_preferred_lifecycle_model(node_id),
+        preferred_model=_preferred_lifecycle_model(node_id, provider_registry),
         purpose=f"lifecycle-skill-plan-{phase}-{node_id}",
         static_instruction=(
             "You are a multi-agent skill planner. Return JSON only. "
@@ -1504,18 +2031,46 @@ def build_lifecycle_phase_blueprints(project_id: str) -> dict[str, Any]:
                 _agent_blueprint(
                     "research-synthesizer",
                     "Research Synthesizer",
-                    "調査結果を統合して意思決定用の artifact を作る",
+                    "調査結果を claim ledger に統合し、反証前の thesis pack を作る",
                     skills=["synthesis", "decision-support"],
+                ),
+                _agent_blueprint(
+                    "evidence-librarian",
+                    "Evidence Librarian",
+                    "根拠と source link を正規化し、採択に使える証拠台帳を作る",
+                    tools=["http", "browser"],
+                    skills=["evidence-audit", "source-normalization"],
+                ),
+                _agent_blueprint(
+                    "devils-advocate-researcher",
+                    "Devil's Advocate",
+                    "市場仮説、競合優位、ユーザー課題の反証を生成する",
+                    skills=["counterexample-generation", "risk-analysis"],
+                ),
+                _agent_blueprint(
+                    "cross-examiner",
+                    "Cross Examiner",
+                    "claim ごとに矛盾、弱い根拠、未解決の問いを洗い出す",
+                    skills=["cross-examination", "fact-checking"],
+                ),
+                _agent_blueprint(
+                    "research-judge",
+                    "Research Judge",
+                    "反証を踏まえて surviving thesis と confidence を確定する",
+                    skills=["decision-calibration", "portfolio-review"],
                 ),
             ],
             "artifacts": [
                 _artifact_descriptor("market-research", "research", "市場機会レポート"),
                 _artifact_descriptor("competitor-map", "research", "競合比較マップ"),
                 _artifact_descriptor("risk-register", "research", "初期リスク登録簿"),
+                _artifact_descriptor("claim-ledger", "research", "claim / evidence / dissent ledger"),
             ],
             "quality_gates": [
-                _quality_gate("evidence-coverage", "競合・市場・技術の 3 軸が揃っている"),
-                _quality_gate("decision-readiness", "機会と脅威が明確に整理されている"),
+                _quality_gate("source-grounding", "採択主張が source と evidence に接地している"),
+                _quality_gate("counterclaim-coverage", "主要仮説に対する反証が生成されている"),
+                _quality_gate("critical-dissent-resolved", "重大な dissent が未解決のまま残っていない"),
+                _quality_gate("confidence-floor", "採択 thesis が planning に渡せる信頼度を満たしている"),
             ],
         },
         "planning": {
@@ -1550,18 +2105,51 @@ def build_lifecycle_phase_blueprints(project_id: str) -> dict[str, Any]:
                 _agent_blueprint(
                     "planning-synthesizer",
                     "Planning Synthesizer",
-                    "企画 artifact を統合して delivery plan に落とす",
+                    "企画 artifact を暫定プランへ統合し、反証可能な decision table を作る",
                     skills=["roadmapping", "program-planning"],
+                ),
+                _agent_blueprint(
+                    "scope-skeptic",
+                    "Scope Skeptic",
+                    "feature scope を削る側から攻撃し、不要な実装を落とす",
+                    skills=["scope-challenge", "feature-pruning"],
+                ),
+                _agent_blueprint(
+                    "assumption-auditor",
+                    "Assumption Auditor",
+                    "persona、JTBD、市場仮説の弱い前提を監査する",
+                    skills=["assumption-audit", "risk-analysis"],
+                ),
+                _agent_blueprint(
+                    "negative-persona-challenger",
+                    "Negative Persona Challenger",
+                    "導入失敗や誤用を招くユーザー像を明示して穴を洗い出す",
+                    skills=["negative-scenario-design", "persona-research"],
+                ),
+                _agent_blueprint(
+                    "milestone-falsifier",
+                    "Milestone Falsifier",
+                    "milestone の曖昧さと検証不能な完了条件を攻撃する",
+                    skills=["milestone-testing", "delivery-risk-analysis"],
+                ),
+                _agent_blueprint(
+                    "planning-judge",
+                    "Planning Judge",
+                    "scope、assumption、milestone の surviving plan を確定する",
+                    skills=["decision-calibration", "roadmapping"],
                 ),
             ],
             "artifacts": [
                 _artifact_descriptor("product-brief", "planning", "課題定義と価値仮説"),
                 _artifact_descriptor("delivery-plan", "planning", "WBS と見積"),
                 _artifact_descriptor("milestone-plan", "planning", "検証可能なマイルストーン"),
+                _artifact_descriptor("decision-table", "planning", "採択 / 却下 / 保留の decision ledger"),
             ],
             "quality_gates": [
-                _quality_gate("persona-coverage", "主要ペルソナとコアユースケースが定義されている"),
-                _quality_gate("scope-discipline", "Must / Should / Could が分離されている"),
+                _quality_gate("feature-traceability", "主要 feature が research claim と use case に接続されている"),
+                _quality_gate("assumption-audit", "主要前提に対する監査結果が残っている"),
+                _quality_gate("negative-persona-coverage", "失敗しやすい利用文脈が明示されている"),
+                _quality_gate("milestone-falsifiability", "milestone が検証条件と失敗条件を持っている"),
             ],
         },
         "design": {
@@ -1771,6 +2359,10 @@ def build_lifecycle_workflow_definition(project_id: str, phase: str) -> dict[str
                 "user-researcher": _agent_def("persona-research"),
                 "tech-evaluator": _agent_def("technical-feasibility", tools=["http"]),
                 "research-synthesizer": _agent_def("evidence-synthesis"),
+                "evidence-librarian": _agent_def("evidence-audit", tools=["http", "browser"]),
+                "devils-advocate-researcher": _agent_def("counterexample-generation"),
+                "cross-examiner": _agent_def("cross-examination"),
+                "research-judge": _agent_def("decision-calibration"),
             },
             "workflow": {
                 "type": "graph",
@@ -1779,8 +2371,16 @@ def build_lifecycle_workflow_definition(project_id: str, phase: str) -> dict[str
                     "market-researcher": {"agent": "market-researcher", "next": ["research-synthesizer"]},
                     "user-researcher": {"agent": "user-researcher", "next": ["research-synthesizer"]},
                     "tech-evaluator": {"agent": "tech-evaluator", "next": ["research-synthesizer"]},
-                    "research-synthesizer": {
-                        "agent": "research-synthesizer",
+                    "research-synthesizer": {"agent": "research-synthesizer", "join_policy": "all_resolved", "next": ["evidence-librarian", "devils-advocate-researcher"]},
+                    "evidence-librarian": {"agent": "evidence-librarian", "next": ["cross-examiner"]},
+                    "devils-advocate-researcher": {"agent": "devils-advocate-researcher", "next": ["cross-examiner"]},
+                    "cross-examiner": {
+                        "agent": "cross-examiner",
+                        "join_policy": "all_resolved",
+                        "next": ["research-judge"],
+                    },
+                    "research-judge": {
+                        "agent": "research-judge",
                         "join_policy": "all_resolved",
                         "next": "END",
                     },
@@ -1799,6 +2399,11 @@ def build_lifecycle_workflow_definition(project_id: str, phase: str) -> dict[str
                 "feature-analyst": _agent_def("feature-prioritization"),
                 "solution-architect": _agent_def("solution-architecture"),
                 "planning-synthesizer": _agent_def("delivery-planning"),
+                "scope-skeptic": _agent_def("scope-challenge"),
+                "assumption-auditor": _agent_def("assumption-audit"),
+                "negative-persona-challenger": _agent_def("negative-persona-challenge"),
+                "milestone-falsifier": _agent_def("milestone-falsification"),
+                "planning-judge": _agent_def("decision-calibration"),
             },
             "workflow": {
                 "type": "graph",
@@ -1807,8 +2412,13 @@ def build_lifecycle_workflow_definition(project_id: str, phase: str) -> dict[str
                     "story-architect": {"agent": "story-architect", "next": ["planning-synthesizer"]},
                     "feature-analyst": {"agent": "feature-analyst", "next": ["planning-synthesizer"]},
                     "solution-architect": {"agent": "solution-architect", "next": ["planning-synthesizer"]},
-                    "planning-synthesizer": {
-                        "agent": "planning-synthesizer",
+                    "planning-synthesizer": {"agent": "planning-synthesizer", "join_policy": "all_resolved", "next": ["scope-skeptic", "assumption-auditor", "negative-persona-challenger", "milestone-falsifier"]},
+                    "scope-skeptic": {"agent": "scope-skeptic", "next": ["planning-judge"]},
+                    "assumption-auditor": {"agent": "assumption-auditor", "next": ["planning-judge"]},
+                    "negative-persona-challenger": {"agent": "negative-persona-challenger", "next": ["planning-judge"]},
+                    "milestone-falsifier": {"agent": "milestone-falsifier", "next": ["planning-judge"]},
+                    "planning-judge": {
+                        "agent": "planning-judge",
                         "join_policy": "all_resolved",
                         "next": "END",
                     },
@@ -1897,6 +2507,25 @@ def build_lifecycle_workflow_handlers(
             "user-researcher": _research_user_handler,
             "tech-evaluator": _research_tech_handler,
             "research-synthesizer": _research_synthesizer_handler,
+            "evidence-librarian": _research_evidence_librarian_handler,
+            "devils-advocate-researcher": lambda node_id, state: _research_devils_advocate_handler(
+                node_id,
+                state,
+                provider_registry=provider_registry,
+                llm_runtime=llm_runtime,
+            ),
+            "cross-examiner": lambda node_id, state: _research_cross_examiner_handler(
+                node_id,
+                state,
+                provider_registry=provider_registry,
+                llm_runtime=llm_runtime,
+            ),
+            "research-judge": lambda node_id, state: _research_judge_handler(
+                node_id,
+                state,
+                provider_registry=provider_registry,
+                llm_runtime=llm_runtime,
+            ),
         }
     if phase == "planning":
         return {
@@ -1905,6 +2534,36 @@ def build_lifecycle_workflow_handlers(
             "feature-analyst": _planning_feature_handler,
             "solution-architect": _planning_solution_handler,
             "planning-synthesizer": _planning_synthesizer_handler,
+            "scope-skeptic": lambda node_id, state: _planning_scope_skeptic_handler(
+                node_id,
+                state,
+                provider_registry=provider_registry,
+                llm_runtime=llm_runtime,
+            ),
+            "assumption-auditor": lambda node_id, state: _planning_assumption_auditor_handler(
+                node_id,
+                state,
+                provider_registry=provider_registry,
+                llm_runtime=llm_runtime,
+            ),
+            "negative-persona-challenger": lambda node_id, state: _planning_negative_persona_handler(
+                node_id,
+                state,
+                provider_registry=provider_registry,
+                llm_runtime=llm_runtime,
+            ),
+            "milestone-falsifier": lambda node_id, state: _planning_milestone_falsifier_handler(
+                node_id,
+                state,
+                provider_registry=provider_registry,
+                llm_runtime=llm_runtime,
+            ),
+            "planning-judge": lambda node_id, state: _planning_judge_handler(
+                node_id,
+                state,
+                provider_registry=provider_registry,
+                llm_runtime=llm_runtime,
+            ),
         }
     if phase == "design":
         return {
@@ -1918,18 +2577,18 @@ def build_lifecycle_workflow_handlers(
                 llm_runtime=llm_runtime,
             ),
             "openai-designer": _design_variant_handler(
-                "GPT-5 Mini",
+                "Kimi K2.5",
                 "Dashboard First",
-                "Optimizes for operational visibility and dense information.",
+                "Optimizes for rapid UI iteration, long-context layout synthesis, and dense operator surfaces.",
                 "#0b3b2e",
                 "#10b981",
                 provider_registry=provider_registry,
                 llm_runtime=llm_runtime,
             ),
             "gemini-designer": _design_variant_handler(
-                "Gemini 3 Flash",
+                "Gemini 3 Pro",
                 "Card Mosaic",
-                "Optimizes for modular cards and mobile scanning.",
+                "Optimizes for exploratory visual systems and modular mobile scanning.",
                 "#312e81",
                 "#06b6d4",
                 provider_registry=provider_registry,
@@ -2136,11 +2795,279 @@ def _completed_phase_count(project_record: dict[str, Any]) -> int:
     )
 
 
+_RESEARCH_PROPOSAL_NODES: tuple[str, ...] = (
+    "competitor-analyst",
+    "market-researcher",
+    "user-researcher",
+    "tech-evaluator",
+)
+_RESEARCH_REVIEW_NODES: tuple[str, ...] = (
+    "evidence-librarian",
+    "devils-advocate-researcher",
+    "cross-examiner",
+    "research-judge",
+)
+_PLANNING_PROPOSAL_NODES: tuple[str, ...] = (
+    "persona-builder",
+    "story-architect",
+    "feature-analyst",
+    "solution-architect",
+)
+_PLANNING_REVIEW_NODES: tuple[str, ...] = (
+    "scope-skeptic",
+    "assumption-auditor",
+    "negative-persona-challenger",
+    "milestone-falsifier",
+    "planning-judge",
+)
+_SEVERITY_WEIGHT = {"critical": 0.22, "high": 0.14, "medium": 0.08, "low": 0.04}
+
+
+def _node_state_key(node_id: str, suffix: str) -> str:
+    return f"{node_id}_{suffix}"
+
+
+def _provider_family(model_name: str) -> str:
+    text = str(model_name or "").strip()
+    return text.split("/", 1)[0] if "/" in text else (text or "deterministic")
+
+
+def _phase_model_assignments(node_ids: list[str] | tuple[str, ...]) -> dict[str, str]:
+    return {node_id: (_preferred_lifecycle_model(node_id) or "deterministic-reference") for node_id in node_ids}
+
+
+def _phase_low_diversity_mode(node_ids: list[str] | tuple[str, ...]) -> bool:
+    families = {
+        _provider_family(model_name)
+        for model_name in _phase_model_assignments(node_ids).values()
+        if model_name != "deterministic-reference"
+    }
+    return len(families) < 2
+
+
+def _claim_entry(
+    claim_id: str,
+    *,
+    statement: str,
+    owner: str,
+    category: str,
+    evidence_ids: list[str],
+    confidence: float = 0.7,
+    status: str = "provisional",
+    counterevidence_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "id": claim_id,
+        "statement": statement,
+        "owner": owner,
+        "category": category,
+        "evidence_ids": _dedupe_strings(evidence_ids),
+        "counterevidence_ids": _dedupe_strings(list(counterevidence_ids or [])),
+        "confidence": _clamp_score(confidence, default=0.7),
+        "status": status,
+    }
+
+
+def _evidence_entry(
+    evidence_id: str,
+    *,
+    source_ref: str,
+    source_type: str,
+    snippet: str,
+    relevance: str,
+    recency: str = "current cycle",
+) -> dict[str, Any]:
+    return {
+        "id": evidence_id,
+        "source_ref": source_ref,
+        "source_type": source_type,
+        "snippet": snippet,
+        "recency": recency,
+        "relevance": relevance,
+    }
+
+
+def _dissent_entry(
+    dissent_id: str,
+    *,
+    claim_id: str,
+    challenger: str,
+    argument: str,
+    severity: str,
+    resolved: bool = False,
+    recommended_test: str = "",
+    resolution: str = "",
+) -> dict[str, Any]:
+    return {
+        "id": dissent_id,
+        "claim_id": claim_id,
+        "challenger": challenger,
+        "argument": argument,
+        "severity": severity,
+        "resolved": resolved,
+        "recommended_test": recommended_test,
+        "resolution": resolution,
+    }
+
+
+def _finding_entry(
+    finding_id: str,
+    *,
+    title: str,
+    challenger: str,
+    severity: str,
+    impact: str,
+    recommendation: str,
+    related_feature: str = "",
+) -> dict[str, Any]:
+    payload = {
+        "id": finding_id,
+        "title": title,
+        "challenger": challenger,
+        "severity": severity,
+        "impact": impact,
+        "recommendation": recommendation,
+    }
+    if related_feature:
+        payload["related_feature"] = related_feature
+    return payload
+
+
+def _negative_persona_entry(
+    persona_id: str,
+    *,
+    name: str,
+    scenario: str,
+    risk: str,
+    mitigation: str,
+) -> dict[str, Any]:
+    return {
+        "id": persona_id,
+        "name": name,
+        "scenario": scenario,
+        "risk": risk,
+        "mitigation": mitigation,
+    }
+
+
+def _collect_state_lists(
+    state: dict[str, Any],
+    *,
+    node_ids: list[str] | tuple[str, ...],
+    suffix: str,
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for node_id in node_ids:
+        for raw in _as_list(state.get(_node_state_key(node_id, suffix))):
+            record = _as_dict(raw)
+            if record:
+                items.append(record)
+    return items
+
+
+def _claim_confidence(
+    *,
+    evidence_count: int,
+    unresolved_dissent: list[dict[str, Any]],
+    default: float = 0.72,
+) -> float:
+    penalty = sum(_SEVERITY_WEIGHT.get(str(item.get("severity", "medium")), 0.08) for item in unresolved_dissent)
+    return _clamp_score(default + min(evidence_count * 0.06, 0.18) - penalty, default=default)
+
+
+def _claim_status(confidence: float, unresolved_dissent: list[dict[str, Any]]) -> str:
+    severities = {str(item.get("severity", "")) for item in unresolved_dissent}
+    if "critical" in severities or confidence < 0.58:
+        return "blocked"
+    if "high" in severities or confidence < 0.72:
+        return "contested"
+    return "accepted"
+
+
+def _winning_claims(claims: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ordered = sorted(
+        claims,
+        key=lambda item: (
+            0 if str(item.get("status")) == "accepted" else 1,
+            -float(item.get("confidence", 0.0) or 0.0),
+            str(item.get("statement", "")),
+        ),
+    )
+    winners = [item for item in ordered if str(item.get("status")) == "accepted"][:3]
+    return winners or ordered[:2]
+
+
+def _feature_supporting_claim_ids(state: dict[str, Any], *, limit: int = 2) -> list[str]:
+    research = _as_dict(state.get("research"))
+    winning = [_as_dict(item) for item in _as_list(research.get("claims")) if _as_dict(item).get("status") == "accepted"]
+    if not winning:
+        winning = [_as_dict(item) for item in _as_list(research.get("claims"))]
+    return [
+        str(item.get("id"))
+        for item in winning[:limit]
+        if str(item.get("id", "")).strip()
+    ]
+
+
+def _build_feature_decisions(state: dict[str, Any], features: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    supporting_claim_ids = _feature_supporting_claim_ids(state)
+    decisions: list[dict[str, Any]] = []
+    for item in features:
+        feature = str(item.get("feature", "")).strip()
+        if not feature:
+            continue
+        selected = item.get("selected") is True
+        cost = str(item.get("implementation_cost", "medium"))
+        decisions.append(
+            {
+                "feature": feature,
+                "selected": selected,
+                "supporting_claim_ids": supporting_claim_ids,
+                "counterarguments": [],
+                "rejection_reason": (
+                    ""
+                    if selected
+                    else "Deliberately held for later to keep the first release scope falsifiable."
+                ),
+                "uncertainty": round(0.42 if cost == "high" else 0.24 if selected else 0.33, 2),
+            }
+        )
+    return decisions
+
+
+def _build_traceability(state: dict[str, Any], features: list[dict[str, Any]], milestones: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    research = _as_dict(state.get("research"))
+    claims = [_as_dict(item) for item in _as_list(research.get("claims")) if _as_dict(item)]
+    use_cases = [_as_dict(item) for item in _as_list(state.get("use_cases")) if _as_dict(item)]
+    traces: list[dict[str, Any]] = []
+    for index, item in enumerate(features):
+        feature_name = str(item.get("feature", "")).strip()
+        if not feature_name or item.get("selected") is not True:
+            continue
+        claim = claims[min(index, len(claims) - 1)] if claims else {}
+        use_case = use_cases[min(index, len(use_cases) - 1)] if use_cases else {}
+        milestone = _as_dict(milestones[min(index, len(milestones) - 1)]) if milestones else {}
+        traces.append(
+            {
+                "claim_id": str(claim.get("id", "")),
+                "claim": str(claim.get("statement", "")),
+                "use_case_id": str(use_case.get("id", "")),
+                "use_case": str(use_case.get("title", "")),
+                "feature": feature_name,
+                "milestone_id": str(milestone.get("id", "")),
+                "milestone": str(milestone.get("name", "")),
+                "confidence": float(claim.get("confidence", 0.72) or 0.72),
+            }
+        )
+    return traces
+
+
 def _research_competitor_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
     urls = state.get("competitor_urls", []) or []
     spec = str(state.get("spec", ""))
     competitors: list[dict[str, Any]] = []
-    for raw_url in urls[:4]:
+    evidence: list[dict[str, Any]] = []
+    for index, raw_url in enumerate(urls[:4]):
         parsed = urlparse(str(raw_url))
         host = (parsed.hostname or "competitor").replace("www.", "")
         name = host.split(".")[0].replace("-", " ").title()
@@ -2154,21 +3081,57 @@ def _research_competitor_handler(node_id: str, state: dict[str, Any]) -> NodeRes
                 "target": _segment_from_spec(spec),
             }
         )
+        evidence.append(
+            _evidence_entry(
+                f"ev-competitor-{index + 1}",
+                source_ref=str(raw_url),
+                source_type="url",
+                snippet=f"{name or 'Competitor'} appears positioned for {_segment_from_spec(spec)} buyers with broad onboarding promises.",
+                relevance="Competitive positioning reference",
+            )
+        )
     if not competitors:
         base_names = ["Pulse", "Atlas", "Launchpad"]
-        for base_name in base_names:
+        for index, base_name in enumerate(base_names):
+            name = f"{base_name} {spec[:18].strip() or 'Suite'}".strip()
             competitors.append(
                 {
-                    "name": f"{base_name} {spec[:18].strip() or 'Suite'}".strip(),
+                    "name": name,
                     "strengths": ["セットアップが速い", "一貫した UI", "導入説明が明快"],
                     "weaknesses": ["深い制御が弱い", "運用品質の可視化が浅い"],
                     "pricing": "SaaS tier",
                     "target": _segment_from_spec(spec),
                 }
             )
+            evidence.append(
+                _evidence_entry(
+                    f"ev-competitor-{index + 1}",
+                    source_ref=f"synthetic://competitor/{_slug(name, prefix='competitor')}",
+                    source_type="synthetic-reference",
+                    snippet=f"{name} represents the common fast-setup but low-governance baseline in this segment.",
+                    relevance="Competitive baseline for differentiation",
+                )
+            )
+    claims = [
+        _claim_entry(
+            "claim-competitive-gap",
+            statement="Most adjacent products optimize onboarding and breadth before governed autonomous execution, leaving a differentiation gap around traceable decision-making.",
+            owner=node_id,
+            category="competition",
+            evidence_ids=[item["id"] for item in evidence[:2]],
+            confidence=0.71,
+        ),
+    ]
     return NodeResult(
-        state_patch={"competitor_report": competitors},
-        artifacts=_artifacts({"name": "competitor-map", "kind": "research", "items": competitors}),
+        state_patch={
+            "competitor_report": competitors,
+            _node_state_key(node_id, "claims"): claims,
+            _node_state_key(node_id, "evidence"): evidence,
+        },
+        artifacts=_artifacts(
+            {"name": "competitor-map", "kind": "research", "items": competitors},
+            {"name": "competitor-claims", "kind": "research", "claims": claims, "evidence": evidence},
+        ),
         metrics={"competitor_count": len(competitors)},
     )
 
@@ -2192,9 +3155,45 @@ def _research_market_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
             "UI と backend の契約ドリフトによる信頼低下",
         ],
     }
+    evidence = [
+        _evidence_entry(
+            "ev-market-size",
+            source_ref="derived://market-size",
+            source_type="derived-analysis",
+            snippet=payload["market_size"],
+            relevance="Market sizing thesis",
+        ),
+        *[
+            _evidence_entry(
+                f"ev-trend-{index + 1}",
+                source_ref=f"derived://trend/{index + 1}",
+                source_type="derived-analysis",
+                snippet=trend,
+                relevance="Observed market trend",
+            )
+            for index, trend in enumerate(trends[:2])
+        ],
+    ]
+    claims = [
+        _claim_entry(
+            "claim-market-demand",
+            statement="The segment is shifting toward evidence-backed automation and governance, so products that keep decisions and execution context in one loop have a timing advantage.",
+            owner=node_id,
+            category="market",
+            evidence_ids=[item["id"] for item in evidence],
+            confidence=0.74,
+        ),
+    ]
     return NodeResult(
-        state_patch={"market_report": payload},
-        artifacts=_artifacts({"name": "market-research", "kind": "research", **payload}),
+        state_patch={
+            "market_report": payload,
+            _node_state_key(node_id, "claims"): claims,
+            _node_state_key(node_id, "evidence"): evidence,
+        },
+        artifacts=_artifacts(
+            {"name": "market-research", "kind": "research", **payload},
+            {"name": "market-claims", "kind": "research", "claims": claims, "evidence": evidence},
+        ),
         metrics={"trend_count": len(trends)},
     )
 
@@ -2213,9 +3212,42 @@ def _research_user_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
         ],
         "segment": _segment_from_spec(spec),
     }
+    evidence = [
+        _evidence_entry(
+            "ev-user-signal-1",
+            source_ref="derived://user-signal/continuity",
+            source_type="derived-analysis",
+            snippet=payload["signals"][0],
+            relevance="Primary user demand signal",
+        ),
+        _evidence_entry(
+            "ev-user-pain-1",
+            source_ref="derived://user-pain/handoff",
+            source_type="derived-analysis",
+            snippet=payload["pain_points"][0],
+            relevance="Primary friction to solve",
+        ),
+    ]
+    claims = [
+        _claim_entry(
+            "claim-user-trust",
+            statement="The product must preserve context continuity and controllability, otherwise users will not trust autonomous execution beyond simple happy paths.",
+            owner=node_id,
+            category="user",
+            evidence_ids=[item["id"] for item in evidence],
+            confidence=0.76,
+        ),
+    ]
     return NodeResult(
-        state_patch={"user_research": payload},
-        artifacts=_artifacts({"name": "user-signals", "kind": "research", **payload}),
+        state_patch={
+            "user_research": payload,
+            _node_state_key(node_id, "claims"): claims,
+            _node_state_key(node_id, "evidence"): evidence,
+        },
+        artifacts=_artifacts(
+            {"name": "user-signals", "kind": "research", **payload},
+            {"name": "user-claims", "kind": "research", "claims": claims, "evidence": evidence},
+        ),
     )
 
 
@@ -2226,9 +3258,35 @@ def _research_tech_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
         "score": round(score, 2),
         "notes": "Reference implementation can be delivered quickly; production hardening depends on durable state, quality gates, and approval integration.",
     }
+    evidence = [
+        _evidence_entry(
+            "ev-tech-score",
+            source_ref="derived://technical-feasibility",
+            source_type="derived-analysis",
+            snippet=f"Technical feasibility score {payload['score']:.2f}. {payload['notes']}",
+            relevance="Delivery feasibility assessment",
+        )
+    ]
+    claims = [
+        _claim_entry(
+            "claim-technical-feasibility",
+            statement="The concept is technically feasible for a prototype, but autonomous quality depends on durable state, explicit quality gates, and operator-visible recovery paths.",
+            owner=node_id,
+            category="technical",
+            evidence_ids=[item["id"] for item in evidence],
+            confidence=0.79 if score >= 0.8 else 0.68,
+        ),
+    ]
     return NodeResult(
-        state_patch={"technical_report": payload},
-        artifacts=_artifacts({"name": "risk-register", "kind": "research", "tech_feasibility": payload}),
+        state_patch={
+            "technical_report": payload,
+            _node_state_key(node_id, "claims"): claims,
+            _node_state_key(node_id, "evidence"): evidence,
+        },
+        artifacts=_artifacts(
+            {"name": "risk-register", "kind": "research", "tech_feasibility": payload},
+            {"name": "tech-claims", "kind": "research", "claims": claims, "evidence": evidence},
+        ),
     )
 
 
@@ -2236,6 +3294,10 @@ def _research_synthesizer_handler(node_id: str, state: dict[str, Any]) -> NodeRe
     market = _as_dict(state.get("market_report"))
     technical = _as_dict(state.get("technical_report"))
     user_research = _as_dict(state.get("user_research"))
+    claims = _collect_state_lists(state, node_ids=_RESEARCH_PROPOSAL_NODES, suffix="claims")
+    evidence = _collect_state_lists(state, node_ids=_RESEARCH_PROPOSAL_NODES, suffix="evidence")
+    winning = _winning_claims(claims)
+    confidence_values = [float(item.get("confidence", 0.0) or 0.0) for item in claims]
     research = {
         "competitors": list(state.get("competitor_report", [])),
         "market_size": market.get("market_size", "Early but expanding operational market"),
@@ -2251,10 +3313,260 @@ def _research_synthesizer_handler(node_id: str, state: dict[str, Any]) -> NodeRe
             "score": technical.get("score", 0.75),
             "notes": technical.get("notes", ""),
         },
+        "claims": claims,
+        "evidence": evidence,
+        "dissent": [],
+        "open_questions": [],
+        "winning_theses": [str(item.get("statement", "")) for item in winning if str(item.get("statement", "")).strip()],
+        "confidence_summary": {
+            "average": round(sum(confidence_values) / len(confidence_values), 2) if confidence_values else 0.0,
+            "floor": round(min(confidence_values), 2) if confidence_values else 0.0,
+        },
+        "model_assignments": _phase_model_assignments(list(_RESEARCH_PROPOSAL_NODES) + list(_RESEARCH_REVIEW_NODES)),
+        "low_diversity_mode": _phase_low_diversity_mode(list(_RESEARCH_PROPOSAL_NODES) + list(_RESEARCH_REVIEW_NODES)),
     }
     return NodeResult(
-        state_patch={"research": research, "output": research},
+        state_patch={
+            _node_state_key(node_id, "claims"): claims,
+            _node_state_key(node_id, "evidence"): evidence,
+            "research": research,
+            "output": research,
+        },
         artifacts=_artifacts({"name": "research-report", "kind": "research", **research}),
+    )
+
+
+def _research_evidence_librarian_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
+    research = _as_dict(state.get("research"))
+    evidence = _collect_state_lists(state, node_ids=_RESEARCH_PROPOSAL_NODES + ("research-synthesizer",), suffix="evidence")
+    normalized: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for item in evidence:
+        evidence_id = str(item.get("id", "")).strip()
+        if not evidence_id or evidence_id in seen_ids:
+            continue
+        seen_ids.add(evidence_id)
+        normalized.append(item)
+    source_links = _dedupe_strings(
+        [
+            str(item.get("source_ref", "")).strip()
+            for item in normalized
+            if str(item.get("source_type", "")).strip() in {"url", "synthetic-reference", "derived-analysis"}
+        ]
+    )
+    return NodeResult(
+        state_patch={
+            _node_state_key(node_id, "evidence"): normalized,
+            _node_state_key(node_id, "source_links"): source_links,
+            "research": {**research, "evidence": normalized, "source_links": source_links},
+        },
+        artifacts=_artifacts({"name": "claim-ledger", "kind": "research", "evidence": normalized, "source_links": source_links}),
+    )
+
+
+async def _research_devils_advocate_handler(
+    node_id: str,
+    state: dict[str, Any],
+    *,
+    provider_registry: ProviderRegistry | None = None,
+    llm_runtime: LLMRuntime | None = None,
+) -> NodeResult:
+    research = _as_dict(state.get("research"))
+    claims = [_as_dict(item) for item in _as_list(research.get("claims")) if _as_dict(item)]
+    threats = [str(item) for item in _as_list(research.get("threats")) if str(item).strip()]
+    fallback_dissent = [
+        _dissent_entry(
+            f"dissent-{index + 1}",
+            claim_id=str(claim.get("id", "")),
+            challenger=node_id,
+            argument=(
+                threats[index % len(threats)]
+                if threats
+                else "This claim could collapse if the product becomes feature-broad before it proves operator trust and recovery."
+            ),
+            severity="high" if str(claim.get("category")) in {"competition", "technical"} else "medium",
+            recommended_test="Define the observable evidence that would falsify this claim in the first milestone.",
+        )
+        for index, claim in enumerate(claims[:3])
+        if str(claim.get("id", "")).strip()
+    ]
+    fallback_questions = _dedupe_strings(
+        [
+            "どの claim が外れていた場合に alpha scope を即座に縮小するか",
+            "競合優位が UI の見た目ではなく運用面で再現可能か",
+            "ユーザーは自律化より traceability を先に求めていないか",
+        ]
+    )
+    llm_events: list[dict[str, Any]] = []
+    if _provider_backed_lifecycle_available(provider_registry) and claims:
+        payload, llm_events, _ = await _lifecycle_llm_json(
+            provider_registry=provider_registry,
+            llm_runtime=llm_runtime,
+            preferred_model=_preferred_lifecycle_model(node_id, provider_registry),
+            purpose=f"lifecycle-research-{node_id}",
+            static_instruction=(
+                "You are a devil's advocate for product research. Return JSON only with keys dissent and open_questions. "
+                "Attack weak assumptions, not formatting."
+            ),
+            user_prompt=(
+                "Return JSON only.\n"
+                f"Claims: {claims}\n"
+                f"Threats: {threats}\n"
+                f"User signals: {_as_dict(research.get('user_research')).get('signals')}\n"
+                "dissent items must include claim_id, argument, severity, recommended_test."
+            ),
+        )
+        raw_dissent = [
+            _dissent_entry(
+                f"dissent-llm-{index + 1}",
+                claim_id=str(_as_dict(item).get("claim_id", "")),
+                challenger=node_id,
+                argument=str(_as_dict(item).get("argument", "")).strip(),
+                severity=str(_as_dict(item).get("severity", "medium")).strip() or "medium",
+                recommended_test=str(_as_dict(item).get("recommended_test", "")).strip(),
+            )
+            for index, item in enumerate(_as_list(_as_dict(payload).get("dissent")))
+            if str(_as_dict(item).get("claim_id", "")).strip() and str(_as_dict(item).get("argument", "")).strip()
+        ]
+        if raw_dissent:
+            fallback_dissent = raw_dissent
+        llm_questions = _dedupe_strings(
+            [str(item).strip() for item in _as_list(_as_dict(payload).get("open_questions")) if str(item).strip()]
+        )
+        if llm_questions:
+            fallback_questions = llm_questions
+    return NodeResult(
+        state_patch={
+            _node_state_key(node_id, "dissent"): fallback_dissent,
+            _node_state_key(node_id, "open_questions"): fallback_questions,
+        },
+        artifacts=_artifacts({"name": "research-dissent", "kind": "research", "dissent": fallback_dissent, "open_questions": fallback_questions}),
+        llm_events=llm_events,
+        metrics={"review_mode": "provider-backed" if llm_events else "deterministic-reference"},
+    )
+
+
+def _research_cross_examiner_handler(
+    node_id: str,
+    state: dict[str, Any],
+    *,
+    provider_registry: ProviderRegistry | None = None,
+    llm_runtime: LLMRuntime | None = None,
+) -> NodeResult:
+    del provider_registry, llm_runtime
+    research = _as_dict(state.get("research"))
+    claims = [_as_dict(item) for item in _as_list(research.get("claims")) if _as_dict(item)]
+    evidence = [_as_dict(item) for item in _as_list(research.get("evidence")) if _as_dict(item)]
+    evidence_map = {str(item.get("id")): item for item in evidence if str(item.get("id", "")).strip()}
+    dissent = _collect_state_lists(state, node_ids=("devils-advocate-researcher",), suffix="dissent")
+    updated_claims: list[dict[str, Any]] = []
+    updated_dissent: list[dict[str, Any]] = []
+    open_questions = _dedupe_strings(
+        [str(item) for item in _as_list(state.get(_node_state_key("devils-advocate-researcher", "open_questions"))) if str(item).strip()]
+    )
+    for claim in claims:
+        claim_id = str(claim.get("id", "")).strip()
+        claim_dissent = [item for item in dissent if str(item.get("claim_id", "")) == claim_id]
+        evidence_count = sum(1 for ev_id in _as_list(claim.get("evidence_ids")) if str(ev_id) in evidence_map)
+        resolved_claim_dissent: list[dict[str, Any]] = []
+        for item in claim_dissent:
+            patched = dict(item)
+            severity = str(item.get("severity", "medium"))
+            resolved = evidence_count >= 2 or (severity == "high" and evidence_count >= 1 and float(_as_dict(research.get("tech_feasibility")).get("score", 0.0) or 0.0) >= 0.8)
+            if resolved:
+                patched["resolved"] = True
+                patched["resolution"] = "Cross examination found enough evidence or delivery control to keep this claim alive."
+            resolved_claim_dissent.append(patched)
+        unresolved = [item for item in resolved_claim_dissent if item.get("resolved") is not True]
+        confidence = _claim_confidence(evidence_count=evidence_count, unresolved_dissent=unresolved, default=float(claim.get("confidence", 0.72) or 0.72))
+        updated_claims.append({**claim, "confidence": confidence, "status": _claim_status(confidence, unresolved)})
+        updated_dissent.extend(resolved_claim_dissent)
+        if evidence_count < 2:
+            open_questions.append(f"{claim.get('statement')} を裏づける追加 evidence が必要")
+    return NodeResult(
+        state_patch={
+            _node_state_key(node_id, "claims"): updated_claims,
+            _node_state_key(node_id, "dissent"): updated_dissent,
+            _node_state_key(node_id, "open_questions"): _dedupe_strings(open_questions),
+        },
+        artifacts=_artifacts({"name": "research-cross-examination", "kind": "research", "claims": updated_claims, "dissent": updated_dissent}),
+    )
+
+
+async def _research_judge_handler(
+    node_id: str,
+    state: dict[str, Any],
+    *,
+    provider_registry: ProviderRegistry | None = None,
+    llm_runtime: LLMRuntime | None = None,
+) -> NodeResult:
+    research = _as_dict(state.get("research"))
+    claims = _collect_state_lists(state, node_ids=("cross-examiner",), suffix="claims") or [_as_dict(item) for item in _as_list(research.get("claims")) if _as_dict(item)]
+    dissent = _collect_state_lists(state, node_ids=("cross-examiner",), suffix="dissent")
+    open_questions = _dedupe_strings(
+        [str(item) for item in _as_list(state.get(_node_state_key("cross-examiner", "open_questions"))) if str(item).strip()]
+    )
+    llm_events: list[dict[str, Any]] = []
+    llm_summary = ""
+    if _provider_backed_lifecycle_available(provider_registry) and claims:
+        payload, llm_events, _ = await _lifecycle_llm_json(
+            provider_registry=provider_registry,
+            llm_runtime=llm_runtime,
+            preferred_model=_preferred_lifecycle_model(node_id, provider_registry),
+            purpose=f"lifecycle-research-{node_id}",
+            static_instruction=(
+                "You are a research judge. Return JSON only with keys winning_theses, claim_confidence_overrides, summary, open_questions. "
+                "Use conservative confidence updates."
+            ),
+            user_prompt=(
+                "Return JSON only.\n"
+                f"Claims: {claims}\n"
+                f"Dissent: {dissent}\n"
+                f"Open questions: {open_questions}\n"
+            ),
+        )
+        llm_summary = str(_as_dict(payload).get("summary", "")).strip()
+        overrides = _as_dict(_as_dict(payload).get("claim_confidence_overrides"))
+        if overrides:
+            patched_claims = []
+            for claim in claims:
+                claim_id = str(claim.get("id", ""))
+                if claim_id in overrides:
+                    confidence = _clamp_score(overrides.get(claim_id), default=float(claim.get("confidence", 0.72) or 0.72))
+                    unresolved = [item for item in dissent if str(item.get("claim_id", "")) == claim_id and item.get("resolved") is not True]
+                    patched_claims.append({**claim, "confidence": confidence, "status": _claim_status(confidence, unresolved)})
+                else:
+                    patched_claims.append(claim)
+            claims = patched_claims
+        llm_questions = _dedupe_strings([str(item).strip() for item in _as_list(_as_dict(payload).get("open_questions")) if str(item).strip()])
+        if llm_questions:
+            open_questions = _dedupe_strings(open_questions + llm_questions)
+    winners = _winning_claims(claims)
+    confidence_values = [float(item.get("confidence", 0.0) or 0.0) for item in claims]
+    final_research = {
+        **research,
+        "claims": claims,
+        "evidence": _collect_state_lists(state, node_ids=("evidence-librarian",), suffix="evidence") or _as_list(research.get("evidence")),
+        "dissent": dissent,
+        "source_links": _as_list(state.get(_node_state_key("evidence-librarian", "source_links"))) or _as_list(research.get("source_links")),
+        "open_questions": open_questions,
+        "winning_theses": [str(item.get("statement", "")) for item in winners if str(item.get("statement", "")).strip()],
+        "confidence_summary": {
+            "average": round(sum(confidence_values) / len(confidence_values), 2) if confidence_values else 0.0,
+            "floor": round(min(confidence_values), 2) if confidence_values else 0.0,
+            "accepted": sum(1 for item in claims if str(item.get("status")) == "accepted"),
+        },
+        "judge_summary": llm_summary or "Claims that survived dissent are passed to planning together with unresolved questions.",
+        "critical_dissent_count": sum(1 for item in dissent if str(item.get("severity")) == "critical" and item.get("resolved") is not True),
+        "resolved_dissent_count": sum(1 for item in dissent if item.get("resolved") is True),
+        "model_assignments": _phase_model_assignments(list(_RESEARCH_PROPOSAL_NODES) + list(_RESEARCH_REVIEW_NODES)),
+        "low_diversity_mode": _phase_low_diversity_mode(list(_RESEARCH_PROPOSAL_NODES) + list(_RESEARCH_REVIEW_NODES)),
+    }
+    return NodeResult(
+        state_patch={"research": final_research, "output": final_research},
+        artifacts=_artifacts({"name": "research-judgement", "kind": "research", **final_research}),
+        llm_events=llm_events,
+        metrics={"review_mode": "provider-backed" if llm_events else "deterministic-reference"},
     )
 
 
@@ -2272,7 +3584,10 @@ def _planning_persona_handler(node_id: str, state: dict[str, Any]) -> NodeResult
 
 def _planning_story_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
     payload = _build_story_architecture_bundle(state)
-    return NodeResult(state_patch=payload, artifacts=_artifacts({"name": "story-architecture", "kind": "planning", **payload}))
+    return NodeResult(
+        state_patch=payload,
+        artifacts=_artifacts({"name": "story-architecture", "kind": "planning", **payload}),
+    )
 
 
 def _planning_feature_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
@@ -2300,7 +3615,11 @@ def _planning_feature_handler(node_id: str, state: dict[str, Any]) -> NodeResult
         for item in kano_features
     ]
     return NodeResult(
-        state_patch={"kano_report": kano_features, "feature_selections": features},
+        state_patch={
+            "kano_report": kano_features,
+            "feature_selections": features,
+            _node_state_key(node_id, "feature_decisions"): _build_feature_decisions(state, features),
+        },
         artifacts=_artifacts({"name": "feature-priority-matrix", "kind": "planning", "features": features}),
     )
 
@@ -2320,6 +3639,9 @@ def _planning_solution_handler(node_id: str, state: dict[str, Any]) -> NodeResul
 
 
 def _planning_synthesizer_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
+    features = list(state.get("feature_selections", []))
+    plan_estimates = list(state.get("plan_estimates_report", []))
+    milestones = list(state.get("recommended_milestones", []))
     analysis = {
         "personas": list(state.get("persona_report", [])),
         "user_stories": list(state.get("story_report", [])),
@@ -2332,16 +3654,27 @@ def _planning_synthesizer_handler(node_id: str, state: dict[str, Any]) -> NodeRe
         "roles": list(state.get("roles", [])),
         "use_cases": list(state.get("use_cases", [])),
         "ia_analysis": _as_dict(state.get("ia_analysis")),
-        "recommended_milestones": list(state.get("recommended_milestones", [])),
+        "recommended_milestones": milestones,
         "design_tokens": _as_dict(state.get("design_tokens_report")),
+        "feature_decisions": _build_feature_decisions(state, features),
+        "rejected_features": [
+            {
+                "feature": str(item.get("feature", "")),
+                "reason": "Held for later to preserve falsifiable scope and delivery confidence.",
+                "counterarguments": ["This feature increases complexity before the first evidence loop is validated."],
+            }
+            for item in features
+            if item.get("selected") is not True and str(item.get("feature", "")).strip()
+        ],
+        "assumptions": [],
+        "red_team_findings": [],
+        "negative_personas": [],
+        "kill_criteria": [],
+        "traceability": _build_traceability(state, features, milestones),
+        "model_assignments": _phase_model_assignments(list(_PLANNING_PROPOSAL_NODES) + list(_PLANNING_REVIEW_NODES)),
+        "low_diversity_mode": _phase_low_diversity_mode(list(_PLANNING_PROPOSAL_NODES) + list(_PLANNING_REVIEW_NODES)),
     }
-    features = list(state.get("feature_selections", []))
-    plan_estimates = list(state.get("plan_estimates_report", []))
-    planning_payload = {
-        **analysis,
-        "features": features,
-        "plan_estimates": plan_estimates,
-    }
+    planning_payload = {**analysis, "features": features, "plan_estimates": plan_estimates}
     return NodeResult(
         state_patch={
             "analysis": analysis,
@@ -2351,6 +3684,329 @@ def _planning_synthesizer_handler(node_id: str, state: dict[str, Any]) -> NodeRe
             "output": planning_payload,
         },
         artifacts=_artifacts({"name": "planning-summary", "kind": "planning", **planning_payload}),
+    )
+
+
+async def _planning_scope_skeptic_handler(
+    node_id: str,
+    state: dict[str, Any],
+    *,
+    provider_registry: ProviderRegistry | None = None,
+    llm_runtime: LLMRuntime | None = None,
+) -> NodeResult:
+    features = [_as_dict(item) for item in _as_list(state.get("feature_selections")) if _as_dict(item)]
+    fallback_rejected = [
+        {
+            "feature": str(item.get("feature", "")),
+            "reason": "Deferred because it adds breadth before the core evidence loop is validated.",
+            "counterarguments": ["Increases delivery surface without tightening the first milestone signal."],
+        }
+        for item in features
+        if item.get("selected") is not True and str(item.get("feature", "")).strip()
+    ]
+    fallback_findings = [
+        _finding_entry(
+            f"scope-{index + 1}",
+            title=f"Scope pressure around {item.get('feature')}",
+            challenger=node_id,
+            severity="high" if str(item.get("implementation_cost")) == "high" else "medium",
+            impact="If this remains in the first cut, the team may lose falsifiability and review speed.",
+            recommendation="Keep this out of the first release unless a research claim explicitly requires it.",
+            related_feature=str(item.get("feature", "")),
+        )
+        for index, item in enumerate(features)
+        if item.get("selected") is True and str(item.get("implementation_cost")) == "high"
+    ] or [
+        _finding_entry(
+            "scope-guardrail",
+            title="Protect first-release scope",
+            challenger=node_id,
+            severity="medium",
+            impact="Adding convenience features early would blur whether the core workflow is actually working.",
+            recommendation="Keep the first milestone focused on a single evidence-to-decision loop.",
+        )
+    ]
+    llm_events: list[dict[str, Any]] = []
+    if _provider_backed_lifecycle_available(provider_registry) and features:
+        payload, llm_events, _ = await _lifecycle_llm_json(
+            provider_registry=provider_registry,
+            llm_runtime=llm_runtime,
+            preferred_model=_preferred_lifecycle_model(node_id, provider_registry),
+            purpose=f"lifecycle-planning-{node_id}",
+            static_instruction=(
+                "You are a scope skeptic. Return JSON only with keys rejected_features and red_team_findings. "
+                "Prefer cutting scope over vague risk language."
+            ),
+            user_prompt=f"Features: {features}\nResearch: {_as_dict(state.get('research'))}\n",
+        )
+        raw_rejected = [
+            {
+                "feature": str(_as_dict(item).get("feature", "")).strip(),
+                "reason": str(_as_dict(item).get("reason", "")).strip(),
+                "counterarguments": [str(arg).strip() for arg in _as_list(_as_dict(item).get("counterarguments")) if str(arg).strip()],
+            }
+            for item in _as_list(_as_dict(payload).get("rejected_features"))
+            if str(_as_dict(item).get("feature", "")).strip() and str(_as_dict(item).get("reason", "")).strip()
+        ]
+        raw_findings = [
+            _finding_entry(
+                f"scope-llm-{index + 1}",
+                title=str(_as_dict(item).get("title", "")).strip() or "Scope finding",
+                challenger=node_id,
+                severity=str(_as_dict(item).get("severity", "medium")).strip() or "medium",
+                impact=str(_as_dict(item).get("impact", "")).strip(),
+                recommendation=str(_as_dict(item).get("recommendation", "")).strip(),
+                related_feature=str(_as_dict(item).get("related_feature", "")).strip(),
+            )
+            for index, item in enumerate(_as_list(_as_dict(payload).get("red_team_findings")))
+            if str(_as_dict(item).get("recommendation", "")).strip()
+        ]
+        if raw_rejected:
+            fallback_rejected = raw_rejected
+        if raw_findings:
+            fallback_findings = raw_findings
+    return NodeResult(
+        state_patch={
+            _node_state_key(node_id, "rejected_features"): fallback_rejected,
+            _node_state_key(node_id, "red_team_findings"): fallback_findings,
+        },
+        artifacts=_artifacts({"name": "scope-review", "kind": "planning", "rejected_features": fallback_rejected, "red_team_findings": fallback_findings}),
+        llm_events=llm_events,
+        metrics={"review_mode": "provider-backed" if llm_events else "deterministic-reference"},
+    )
+
+
+def _planning_assumption_auditor_handler(
+    node_id: str,
+    state: dict[str, Any],
+    *,
+    provider_registry: ProviderRegistry | None = None,
+    llm_runtime: LLMRuntime | None = None,
+) -> NodeResult:
+    del provider_registry, llm_runtime
+    personas = [_as_dict(item) for item in _as_list(state.get("persona_report")) if _as_dict(item)]
+    research = _research_context(state)
+    assumptions = _dedupe_strings(
+        [
+            f"{str(personas[0].get('name', 'Primary user')) if personas else 'Primary user'} will trade setup breadth for stronger control and traceability.",
+            "The first milestone can be validated before full-scale automation breadth is delivered.",
+            *(f"Research assumption: {item}" for item in research["user_signals"][:1]),
+        ]
+    )
+    findings = [
+        _finding_entry(
+            "assumption-gap",
+            title="Planning relies on a narrow trust assumption",
+            challenger=node_id,
+            severity="medium",
+            impact="If users actually value speed over governance, the proposed scope may be too heavy.",
+            recommendation="Validate control-plane depth against onboarding friction in the first user loop.",
+        )
+    ]
+    return NodeResult(
+        state_patch={
+            _node_state_key(node_id, "assumptions"): [{"id": f"assumption-{index + 1}", "statement": text, "severity": "medium"} for index, text in enumerate(assumptions)],
+            _node_state_key(node_id, "red_team_findings"): findings,
+        },
+        artifacts=_artifacts({"name": "assumption-audit", "kind": "planning", "assumptions": assumptions, "red_team_findings": findings}),
+    )
+
+
+def _planning_negative_persona_handler(
+    node_id: str,
+    state: dict[str, Any],
+    *,
+    provider_registry: ProviderRegistry | None = None,
+    llm_runtime: LLMRuntime | None = None,
+) -> NodeResult:
+    del provider_registry, llm_runtime
+    kind = _infer_product_kind(str(state.get("spec", "")))
+    if kind == "operations":
+        personas = [
+            _negative_persona_entry(
+                "negative-ops-1",
+                name="Shadow Automator",
+                scenario="Runs autonomous flows without reviewing evidence or approval states.",
+                risk="Can create silent drift between plan, approval, and build.",
+                mitigation="Keep approval status and lineage visible in every primary workflow.",
+            ),
+            _negative_persona_entry(
+                "negative-ops-2",
+                name="Audit Skeptic",
+                scenario="Needs traceability to trust the system but only sees generated output.",
+                risk="Rejects autonomous adoption if artifact lineage is not first-class.",
+                mitigation="Surface claim-to-feature traceability and unresolved dissent above the fold.",
+            ),
+        ]
+    else:
+        personas = [
+            _negative_persona_entry(
+                "negative-generic-1",
+                name="Impatient Evaluator",
+                scenario="Judges the product after one incomplete run.",
+                risk="Leaves before the core loop demonstrates value.",
+                mitigation="Make the first successful workflow obvious and measurable.",
+            )
+        ]
+    findings = [
+        _finding_entry(
+            "negative-persona-risk",
+            title="The plan does not naturally protect against the hardest-to-serve user",
+            challenger=node_id,
+            severity="medium",
+            impact="Without explicit handling, failure modes stay hidden until rollout.",
+            recommendation="Turn these negative personas into acceptance and instrumentation checks.",
+        )
+    ]
+    return NodeResult(
+        state_patch={
+            _node_state_key(node_id, "negative_personas"): personas,
+            _node_state_key(node_id, "red_team_findings"): findings,
+        },
+        artifacts=_artifacts({"name": "negative-persona-review", "kind": "planning", "negative_personas": personas}),
+    )
+
+
+def _planning_milestone_falsifier_handler(
+    node_id: str,
+    state: dict[str, Any],
+    *,
+    provider_registry: ProviderRegistry | None = None,
+    llm_runtime: LLMRuntime | None = None,
+) -> NodeResult:
+    del provider_registry, llm_runtime
+    milestones = [_as_dict(item) for item in _as_list(state.get("recommended_milestones")) if _as_dict(item)]
+    kill_criteria = [
+        {
+            "id": f"kill-{index + 1}",
+            "milestone_id": str(item.get("id", "")),
+            "condition": f"If {str(item.get('name', 'the milestone')).strip()} cannot show observable completion evidence, stop scope expansion and re-open planning.",
+            "rationale": "Milestones must be falsifiable instead of narrative.",
+        }
+        for index, item in enumerate(milestones[:3])
+    ]
+    findings = [
+        _finding_entry(
+            f"milestone-{index + 1}",
+            title=f"Milestone {str(item.get('name', 'Milestone'))} needs a failure condition",
+            challenger=node_id,
+            severity="medium",
+            impact="A milestone without a stop condition will let the team ship momentum instead of evidence.",
+            recommendation="Add the observable failure signal next to the success criteria.",
+        )
+        for index, item in enumerate(milestones[:2])
+    ]
+    return NodeResult(
+        state_patch={
+            _node_state_key(node_id, "kill_criteria"): kill_criteria,
+            _node_state_key(node_id, "red_team_findings"): findings,
+        },
+        artifacts=_artifacts({"name": "milestone-falsification", "kind": "planning", "kill_criteria": kill_criteria, "red_team_findings": findings}),
+    )
+
+
+async def _planning_judge_handler(
+    node_id: str,
+    state: dict[str, Any],
+    *,
+    provider_registry: ProviderRegistry | None = None,
+    llm_runtime: LLMRuntime | None = None,
+) -> NodeResult:
+    analysis = _as_dict(state.get("analysis"))
+    features = [_as_dict(item) for item in _as_list(state.get("feature_selections")) if _as_dict(item)]
+    milestones = [_as_dict(item) for item in _as_list(state.get("recommended_milestones")) if _as_dict(item)]
+    feature_decisions = [_as_dict(item) for item in _as_list(analysis.get("feature_decisions")) if _as_dict(item)] or _build_feature_decisions(state, features)
+    rejected_features = _collect_state_lists(state, node_ids=("scope-skeptic",), suffix="rejected_features") or _as_list(analysis.get("rejected_features"))
+    assumptions = _collect_state_lists(state, node_ids=("assumption-auditor",), suffix="assumptions")
+    negative_personas = _collect_state_lists(state, node_ids=("negative-persona-challenger",), suffix="negative_personas")
+    kill_criteria = _collect_state_lists(state, node_ids=("milestone-falsifier",), suffix="kill_criteria")
+    findings = (
+        _collect_state_lists(state, node_ids=("scope-skeptic", "assumption-auditor", "negative-persona-challenger", "milestone-falsifier"), suffix="red_team_findings")
+        or _as_list(analysis.get("red_team_findings"))
+    )
+    traceability = _build_traceability(state, features, milestones)
+    llm_events: list[dict[str, Any]] = []
+    judge_summary = ""
+    if _provider_backed_lifecycle_available(provider_registry) and feature_decisions:
+        payload, llm_events, _ = await _lifecycle_llm_json(
+            provider_registry=provider_registry,
+            llm_runtime=llm_runtime,
+            preferred_model=_preferred_lifecycle_model(node_id, provider_registry),
+            purpose=f"lifecycle-planning-{node_id}",
+            static_instruction=(
+                "You are a planning judge. Return JSON only with keys recommendations and headline_risks. "
+                "Focus on what should survive to design and development."
+            ),
+            user_prompt=(
+                "Return JSON only.\n"
+                f"Feature decisions: {feature_decisions}\n"
+                f"Red team findings: {findings}\n"
+                f"Assumptions: {assumptions}\n"
+                f"Negative personas: {negative_personas}\n"
+            ),
+        )
+        llm_recommendations = _dedupe_strings([str(item).strip() for item in _as_list(_as_dict(payload).get("recommendations")) if str(item).strip()])
+        if llm_recommendations:
+            analysis["recommendations"] = _dedupe_strings(llm_recommendations + [str(item) for item in _as_list(analysis.get("recommendations")) if str(item).strip()])
+        judge_summary = ", ".join(
+            str(item).strip() for item in _as_list(_as_dict(payload).get("headline_risks")) if str(item).strip()
+        )
+    decision_map = {str(item.get("feature", "")): dict(item) for item in feature_decisions if str(item.get("feature", "")).strip()}
+    rejected_map = {str(item.get("feature", "")): dict(item) for item in rejected_features if str(item.get("feature", "")).strip()}
+    for feature in features:
+        name = str(feature.get("feature", "")).strip()
+        if not name or name not in decision_map:
+            continue
+        decision = decision_map[name]
+        if name in rejected_map:
+            decision["selected"] = False
+            decision["rejection_reason"] = str(rejected_map[name].get("reason", decision.get("rejection_reason", "")))
+            decision["counterarguments"] = _dedupe_strings(
+                [str(item) for item in _as_list(decision.get("counterarguments")) if str(item).strip()]
+                + [str(item) for item in _as_list(rejected_map[name].get("counterarguments")) if str(item).strip()]
+            )
+        elif str(feature.get("implementation_cost")) == "high":
+            decision["counterarguments"] = _dedupe_strings(
+                [str(item) for item in _as_list(decision.get("counterarguments")) if str(item).strip()]
+                + ["High-cost scope must prove its necessity with a first-milestone signal."]
+            )
+    final_features = []
+    for feature in features:
+        name = str(feature.get("feature", "")).strip()
+        decision = decision_map.get(name, {})
+        final_features.append({**feature, "selected": decision.get("selected", feature.get("selected")) is True})
+    confidence_values = [1.0 - float(item.get("uncertainty", 0.3) or 0.3) for item in decision_map.values()] or [0.7]
+    final_analysis = {
+        **analysis,
+        "feature_decisions": list(decision_map.values()),
+        "rejected_features": list(rejected_map.values()),
+        "assumptions": assumptions,
+        "red_team_findings": findings,
+        "negative_personas": negative_personas,
+        "kill_criteria": kill_criteria,
+        "traceability": traceability,
+        "confidence_summary": {
+            "average": round(sum(confidence_values) / len(confidence_values), 2),
+            "floor": round(min(confidence_values), 2),
+            "critical_findings": sum(1 for item in findings if str(item.get("severity")) == "critical"),
+        },
+        "judge_summary": judge_summary or "The plan keeps only features that remain traceable to research claims and falsifiable milestones.",
+        "model_assignments": _phase_model_assignments(list(_PLANNING_PROPOSAL_NODES) + list(_PLANNING_REVIEW_NODES)),
+        "low_diversity_mode": _phase_low_diversity_mode(list(_PLANNING_PROPOSAL_NODES) + list(_PLANNING_REVIEW_NODES)),
+    }
+    final_plan_estimates = list(state.get("plan_estimates_report", []))
+    planning_payload = {**final_analysis, "features": final_features, "plan_estimates": final_plan_estimates}
+    return NodeResult(
+        state_patch={
+            "analysis": final_analysis,
+            "features": final_features,
+            "planEstimates": final_plan_estimates,
+            "planning": planning_payload,
+            "output": planning_payload,
+        },
+        artifacts=_artifacts({"name": "planning-judgement", "kind": "planning", **planning_payload}),
+        llm_events=llm_events,
+        metrics={"review_mode": "provider-backed" if llm_events else "deterministic-reference"},
     )
 
 
@@ -2388,6 +4044,7 @@ def _design_variant_handler(
             accent=accent,
             selected_features=selected_features,
             spec=spec,
+            analysis=_as_dict(state.get("analysis")),
             rationale=description,
         )
         return NodeResult(
@@ -2422,22 +4079,28 @@ def _design_variant_handler(
             "Design a high-quality product experience for the following product.\n"
             "Return a JSON object with keys: "
             "pattern_name, description, primary_color, accent_color, rationale, "
-            "quality_focus, scores.\n"
+            "quality_focus, scores, and optional prototype_kind, navigation_style, density, "
+            "screen_labels, interaction_principles.\n"
             "The scores object must include ux_quality, code_quality, performance, accessibility as 0-1 floats.\n"
             f"Current design theme anchor: {pattern_name} / {description}\n"
             f"Product spec: {spec}\n"
             f"Selected features: {selected_features}\n"
             f"Primary persona summary: {personas[:2]}\n"
             f"Design tokens: {design_tokens}\n"
+            f"IA analysis: {_as_dict(analysis.get('ia_analysis'))}\n"
+            f"Use cases: {_as_list(analysis.get('use_cases'))[:3]}\n"
+            f"Job stories: {_as_list(analysis.get('job_stories'))[:2]}\n"
             f"Selected skills: {plan.get('selected_skills')}\n"
             f"Quality targets: {plan.get('quality_targets')}\n"
             f"Delegation plan: {plan.get('delegations')}\n"
-            "Bias toward clarity, mobile resilience, accessibility, and differentiation."
+            "Bias toward clarity, mobile resilience, accessibility, and differentiation. "
+            "Treat this as a product prototype brief, not a marketing landing page. "
+            "Prefer app shells, task flows, and operational screens over hero-led storytelling."
         )
         proposal, llm_events, _ = await _lifecycle_llm_json(
             provider_registry=provider_registry,
             llm_runtime=llm_runtime,
-            preferred_model=_preferred_lifecycle_model(node_id),
+            preferred_model=_preferred_lifecycle_model(node_id, provider_registry),
             purpose=f"lifecycle-design-{node_id}",
             static_instruction=(
                 "You are a principal product designer improving a lifecycle artifact. "
@@ -2450,12 +4113,14 @@ def _design_variant_handler(
             "plus optional provider_note.\n"
             f"Original concept: {proposal or {'pattern_name': pattern_name, 'description': description}}\n"
             f"Selected features: {selected_features}\n"
-            "Raise the quality bar on hierarchy, contrast, responsiveness, and decision support."
+            f"IA analysis: {_as_dict(analysis.get('ia_analysis'))}\n"
+            "Raise the quality bar on hierarchy, contrast, responsiveness, decision support, and prototype fidelity. "
+            "Avoid landing-page hero compositions."
         )
         refined, critique_events, _ = await _lifecycle_llm_json(
             provider_registry=provider_registry,
             llm_runtime=llm_runtime,
-            preferred_model=_preferred_lifecycle_model(node_id),
+            preferred_model=_preferred_lifecycle_model(node_id, provider_registry),
             purpose=f"lifecycle-design-{node_id}-critique",
             static_instruction=(
                 "You are a design critic and reviser. Return JSON only. "
@@ -2502,6 +4167,7 @@ def _design_variant_handler(
             accent=_color_or(payload.get("accent_color"), accent),
             selected_features=selected_features,
             spec=spec,
+            analysis=analysis,
             rationale=_dedupe_strings(
                 [
                     str(payload.get("rationale") or description),
@@ -2523,6 +4189,7 @@ def _design_variant_handler(
                     *[str(_as_dict(item).get("summary", "")) for item in peer_feedback if isinstance(item, dict)],
                 ]
             ) else "",
+            prototype_overrides=_prototype_overrides_from_payload(payload),
         )
         return NodeResult(
             state_patch={
@@ -2591,7 +4258,7 @@ def _design_evaluator_handler(
         payload, llm_events, _ = await _lifecycle_llm_json(
             provider_registry=provider_registry,
             llm_runtime=llm_runtime,
-            preferred_model=_preferred_lifecycle_model(node_id),
+            preferred_model=_preferred_lifecycle_model(node_id, provider_registry),
             purpose="lifecycle-design-judge",
             static_instruction=(
                 "You are a principal design judge. Return JSON only. "
@@ -2703,7 +4370,7 @@ def _development_planner_handler(
             payload, llm_events, _ = await _lifecycle_llm_json(
                 provider_registry=provider_registry,
                 llm_runtime=llm_runtime,
-                preferred_model=_preferred_lifecycle_model(node_id),
+                preferred_model=_preferred_lifecycle_model(node_id, provider_registry),
                 purpose="lifecycle-development-plan",
                 static_instruction=(
                     "You are an autonomous build planner. Return JSON only. "
@@ -2781,17 +4448,41 @@ def _development_frontend_handler(
     llm_runtime: LLMRuntime | None = None,
 ) -> NodeResult:
     selected_features = _selected_feature_names(state)
+    analysis = _as_dict(state.get("analysis"))
+    selected_design = _as_dict(state.get("selected_design")) or _selected_design_from_state(state)
+    prototype = _as_dict(selected_design.get("prototype")) or _build_design_prototype(
+        spec=str(state.get("spec", "")),
+        analysis=analysis,
+        selected_features=selected_features,
+        pattern_name=str(selected_design.get("pattern_name") or "Prototype baseline"),
+        description=str(selected_design.get("description") or "Build-ready product prototype"),
+    )
+    prototype_screens = [dict(item) for item in _as_list(prototype.get("screens")) if isinstance(item, dict)]
     sections = [
-        "hero",
-        "decision-summary",
-        "lifecycle-timeline",
-        "quality-gates",
+        str(screen.get("id") or f"screen-{index + 1}")
+        for index, screen in enumerate(prototype_screens[:4])
+        if str(screen.get("id") or "").strip()
+    ] or [
+        "workspace",
+        "workflow-map",
+        "readiness-rail",
     ]
-    cards = selected_features or ["市場調査", "企画", "デザイン", "開発"]
+    cards = _dedupe_strings(
+        [str(screen.get("title") or screen.get("headline") or "") for screen in prototype_screens[:4]]
+        + selected_features
+    ) or ["Primary workspace", "Key flow", "Readiness rail"]
+    interaction_notes = [
+        str(item) for item in _as_list(prototype.get("interaction_principles")) if str(item).strip()
+    ][:4]
     payload = {
         "sections": sections,
         "feature_cards": cards,
-        "css_tokens": {"radius": "18px", "shadow": "0 20px 60px rgba(15,23,42,0.12)"},
+        "css_tokens": {
+            "radius": "18px",
+            "shadow": "0 20px 60px rgba(15,23,42,0.12)",
+            "layout": str(_as_dict(prototype.get("app_shell")).get("layout") or "sidebar"),
+        },
+        "interaction_notes": interaction_notes,
     }
     if _provider_backed_lifecycle_available(provider_registry):
         async def autonomous() -> NodeResult:
@@ -2806,7 +4497,7 @@ def _development_frontend_handler(
             llm_payload, llm_events, _ = await _lifecycle_llm_json(
                 provider_registry=provider_registry,
                 llm_runtime=llm_runtime,
-                preferred_model=_preferred_lifecycle_model(node_id),
+                preferred_model=_preferred_lifecycle_model(node_id, provider_registry),
                 purpose="lifecycle-development-frontend-plan",
                 static_instruction=(
                     "You are a principal frontend architect. Return JSON only. "
@@ -2816,8 +4507,10 @@ def _development_frontend_handler(
                     "Return JSON with keys sections, feature_cards, css_tokens, interaction_notes.\n"
                     f"Spec: {state.get('spec')}\n"
                     f"Selected features: {selected_features}\n"
+                    f"Design prototype: {prototype}\n"
                     f"Design context: {state.get('selected_design') or state.get('design')}\n"
                     f"Skill plan: {collaboration_plan}\n"
+                    "Bias toward application/workspace surfaces. Do not collapse the layout into a landing page."
                 ),
             )
             if not isinstance(llm_payload, dict):
@@ -2899,7 +4592,7 @@ def _development_backend_handler(
             llm_payload, llm_events, _ = await _lifecycle_llm_json(
                 provider_registry=provider_registry,
                 llm_runtime=llm_runtime,
-                preferred_model=_preferred_lifecycle_model(node_id),
+                preferred_model=_preferred_lifecycle_model(node_id, provider_registry),
                 purpose="lifecycle-development-backend-plan",
                 static_instruction=(
                     "You are a principal backend architect. Return JSON only. "
@@ -2968,51 +4661,42 @@ def _development_integrator_handler(
     llm_runtime: LLMRuntime | None = None,
 ) -> NodeResult:
     design = _as_dict(state.get("design"))
+    analysis = _as_dict(state.get("analysis"))
     selected_design = _as_dict(state.get("selected_design")) or _selected_design_from_state(state)
-    preview_html = str(selected_design.get("preview_html") or "")
-    if not preview_html:
-        preview_html = _build_preview_html(
-            title=str(state.get("spec", "Lifecycle Product"))[:48] or "Lifecycle Product",
-            subtitle="Integrated build artifact",
-            primary="#0f172a",
-            accent="#10b981",
-            features=_selected_feature_names(state),
-        )
+    selected_features = _selected_feature_names(state)
+    prototype = _as_dict(selected_design.get("prototype")) or _build_design_prototype(
+        spec=str(state.get("spec", "")),
+        analysis=analysis,
+        selected_features=selected_features,
+        pattern_name=str(selected_design.get("pattern_name") or "Integrated prototype"),
+        description=str(selected_design.get("description") or "Integrated build artifact"),
+    )
+    design_tokens = _as_dict(analysis.get("design_tokens"))
+    primary_color = _color_or(selected_design.get("primary_color"), _color_or(_as_dict(design_tokens.get("colors")).get("primary"), "#0f172a"))
+    accent_color = _color_or(selected_design.get("accent_color"), _color_or(_as_dict(design_tokens.get("colors")).get("cta"), "#10b981"))
     feature_cards = _as_dict(state.get("frontend_bundle")).get("feature_cards", [])
     frontend_sections = _as_dict(state.get("frontend_bundle")).get("sections", [])
+    interaction_notes = [str(item) for item in _as_list(_as_dict(state.get("frontend_bundle")).get("interaction_notes")) if str(item).strip()]
     backend_entities = _as_dict(state.get("backend_bundle")).get("entities", [])
-    extra_block = "".join(
-        f"<li>{item}</li>" for item in feature_cards if isinstance(item, str)
+    code = _build_preview_html(
+        title=_preview_title(str(state.get("spec", ""))),
+        subtitle=str(selected_design.get("description") or "Integrated build artifact aligned to the selected prototype."),
+        primary=primary_color,
+        accent=accent_color,
+        features=[str(item) for item in feature_cards if isinstance(item, str)] or selected_features,
+        prototype=prototype,
+        design_tokens=design_tokens,
+        backend_entities=[dict(item) for item in backend_entities if isinstance(item, dict)],
+        milestones=[dict(item) for item in state.get("milestones", []) if isinstance(item, dict)],
+        interaction_notes=interaction_notes,
+        section_focus=[str(item) for item in frontend_sections if str(item).strip()],
+        mode="build",
     )
-    entity_block = "".join(
-        f"<li>{entity.get('name', '')}</li>" for entity in backend_entities if isinstance(entity, dict)
-    )
-    milestone_block = "".join(
-        f"<li><strong>{raw.get('name', 'Milestone')}</strong><span>{raw.get('criteria', '')}</span></li>"
-        for raw in state.get("milestones", []) or []
-        if isinstance(raw, dict)
-    )
-    enhancement = f"""
-<section class="insights">
-  <div class="panel">
-    <h2>Selected Features</h2>
-    <ul>{extra_block}</ul>
-  </div>
-  <div class="panel">
-    <h2>System Model</h2>
-    <ul>{entity_block}</ul>
-  </div>
-</section>
-<section class="milestone-lineage" aria-label="Milestone lineage">
-  <div class="panel">
-    <h2>Milestone Lineage</h2>
-    <ul>{milestone_block}</ul>
-  </div>
-</section>
-<!-- sections:{",".join(frontend_sections)} -->
-"""
-    code = preview_html.replace("</main>", f"{enhancement}</main>") if "</main>" in preview_html else preview_html + enhancement
-    payload = {"code": code, "build_sections": frontend_sections}
+    payload = {
+        "code": code,
+        "build_sections": frontend_sections or [str(screen.get("id") or "") for screen in _as_list(prototype.get("screens")) if isinstance(screen, dict)],
+        "prototype": prototype,
+    }
     if _provider_backed_lifecycle_available(provider_registry):
         async def autonomous() -> NodeResult:
             collaboration_plan, plan_events = await _plan_node_collaboration(
@@ -3026,27 +4710,31 @@ def _development_integrator_handler(
             llm_payload, llm_events, _ = await _lifecycle_llm_json(
                 provider_registry=provider_registry,
                 llm_runtime=llm_runtime,
-                preferred_model=_preferred_lifecycle_model(node_id),
+                preferred_model=_preferred_lifecycle_model(node_id, provider_registry),
                 purpose="lifecycle-development-integrate",
                 static_instruction=(
                     "You are an autonomous product engineer. Return JSON only. "
-                    "Produce a single-file HTML app with embedded CSS and JS, strong accessibility, and responsive behavior."
+                    "Produce a single-file HTML app with embedded CSS and JS, strong accessibility, responsive behavior, "
+                    "and product-prototype fidelity."
                 ),
                 user_prompt=(
                     "Return JSON with keys code, build_sections, implementation_notes.\n"
                     f"Spec: {state.get('spec')}\n"
                     f"Selected design: {selected_design}\n"
+                    f"Prototype blueprint: {prototype}\n"
                     f"Frontend bundle: {_as_dict(state.get('frontend_bundle'))}\n"
                     f"Backend bundle: {_as_dict(state.get('backend_bundle'))}\n"
                     f"Milestones: {state.get('milestones')}\n"
                     f"Skill plan: {collaboration_plan}\n"
-                    "The code must be previewable HTML, include <main>, aria labels for primary actions, and a viewport meta tag."
+                    "The code must be previewable HTML, include <main>, aria labels for primary actions, "
+                    "a viewport meta tag, real application navigation, and multiple prototype screen surfaces. "
+                    "Do not return a landing page or hero-only layout."
                 ),
             )
             llm_code = str(_as_dict(llm_payload).get("code") or "")
             llm_sections = [str(item) for item in _as_list(_as_dict(llm_payload).get("build_sections")) if str(item).strip()] or frontend_sections
-            integrated_code = llm_code if "<html" in llm_code.lower() and "<main" in llm_code.lower() else code
-            integrated_payload = {"code": integrated_code, "build_sections": llm_sections}
+            integrated_code = llm_code if _looks_like_prototype_html(llm_code) else code
+            integrated_payload = {"code": integrated_code, "build_sections": llm_sections, "prototype": prototype}
             return NodeResult(
                 state_patch={
                     "integrated_build": integrated_payload,
@@ -3400,7 +5088,7 @@ def _development_reviewer_handler(
             payload, events, _ = await _lifecycle_llm_json(
                 provider_registry=provider_registry,
                 llm_runtime=llm_runtime,
-                preferred_model=_preferred_lifecycle_model(node_id),
+                preferred_model=_preferred_lifecycle_model(node_id, provider_registry),
                 purpose=f"lifecycle-development-review-{iteration_count}",
                 static_instruction=(
                     "You are an autonomous reviewer and reviser for a production-bound single-file app. "
@@ -3562,64 +5250,179 @@ def _build_preview_html(
     primary: str,
     accent: str,
     features: list[str],
+    prototype: dict[str, Any] | None = None,
+    design_tokens: dict[str, Any] | None = None,
+    backend_entities: list[dict[str, Any]] | None = None,
+    milestones: list[dict[str, Any]] | None = None,
+    interaction_notes: list[str] | None = None,
+    section_focus: list[str] | None = None,
+    mode: str = "design",
 ) -> str:
-    feature_list = "".join(f"<li>{feature}</li>" for feature in features[:6])
+    prototype_payload = _as_dict(prototype)
+    design_tokens_payload = _as_dict(design_tokens)
+    shell = _as_dict(prototype_payload.get("app_shell"))
+    screens = [dict(item) for item in _as_list(prototype_payload.get("screens")) if isinstance(item, dict)]
+    flows = [dict(item) for item in _as_list(prototype_payload.get("flows")) if isinstance(item, dict)]
+    primary_navigation = [dict(item) for item in _as_list(shell.get("primary_navigation")) if isinstance(item, dict)]
+    status_badges = [str(item) for item in _as_list(shell.get("status_badges")) if str(item).strip()] or features[:3]
+    focus_ids = {str(item).strip() for item in _as_list(section_focus) if str(item).strip()}
+    if focus_ids:
+        ordered = [screen for screen in screens if str(screen.get("id")) in focus_ids]
+        screens = ordered or screens
+    active_screen = screens[0] if screens else {}
+    active_modules = [dict(item) for item in _as_list(_as_dict(active_screen).get("modules")) if isinstance(item, dict)]
+    interaction_principles = [
+        str(item) for item in _as_list(prototype_payload.get("interaction_principles")) if str(item).strip()
+    ]
+    if interaction_notes:
+        interaction_principles = _dedupe_strings(interaction_principles + [str(item) for item in interaction_notes if str(item).strip()])
+    backend_modules = [dict(item) for item in _as_list(backend_entities) if isinstance(item, dict)]
+    milestone_payload = [dict(item) for item in _as_list(milestones) if isinstance(item, dict)]
+    body_font = str(_as_dict(design_tokens_payload.get("typography")).get("body") or "Noto Sans JP")
+    heading_font = str(_as_dict(design_tokens_payload.get("typography")).get("heading") or "IBM Plex Sans")
+    background = str(_as_dict(design_tokens_payload.get("colors")).get("background") or "#f8fafc")
+    prototype_kind = str(prototype_payload.get("kind") or "product-workspace")
+    shell_layout = str(shell.get("layout") or "sidebar")
+    density = str(shell.get("density") or "medium")
+
+    nav_items_html = "".join(
+        f'<li><a href="#{escape(str(item.get("id") or "screen"))}">{escape(str(item.get("label") or "Section"))}</a></li>'
+        for item in primary_navigation[:6]
+    )
+    badge_html = "".join(
+        f"<span class='status-badge'>{escape(item)}</span>"
+        for item in status_badges[:4]
+    )
+    action_html = "".join(
+        f'<button type="button" aria-label="{escape(str(action))}">{escape(str(action))}</button>'
+        for action in _as_list(_as_dict(active_screen).get("primary_actions"))[:3]
+        if str(action).strip()
+    )
+    active_module_html = "".join(
+        (
+            "<article class='module-card'>"
+            f"<p class='module-type'>{escape(str(module.get('type') or 'panel'))}</p>"
+            f"<h3>{escape(str(module.get('name') or 'Module'))}</h3>"
+            f"<ul>{''.join(f'<li>{escape(str(item))}</li>' for item in _as_list(module.get('items'))[:4] if str(item).strip())}</ul>"
+            "</article>"
+        )
+        for module in active_modules[:4]
+    )
+    screen_gallery_html = "".join(
+        (
+            f'<article class="screen-frame" id="{escape(str(screen.get("id") or "screen"))}" data-screen-id="{escape(str(screen.get("id") or "screen"))}">'
+            '<div class="screen-topbar">'
+            f"<span>{escape(str(screen.get('title') or 'Screen'))}</span>"
+            f"<span>{escape(str(screen.get('layout') or 'layout'))}</span>"
+            "</div>"
+            f"<h3>{escape(str(screen.get('headline') or screen.get('title') or 'Screen headline'))}</h3>"
+            f"<p>{escape(str(screen.get('purpose') or ''))}</p>"
+            '<div class="screen-modules">'
+            + "".join(
+                (
+                    '<div class="mini-module">'
+                    f"<p>{escape(str(module.get('name') or 'Module'))}</p>"
+                    f"<span>{escape(str((_as_list(module.get('items')) or [''])[0]))}</span>"
+                    "</div>"
+                )
+                for module in [dict(item) for item in _as_list(screen.get("modules")) if isinstance(item, dict)][:3]
+            )
+            + "</div>"
+            "</article>"
+        )
+        for screen in screens[:4]
+    )
+    flow_html = "".join(
+        (
+            "<article class='flow-card'>"
+            f"<h3>{escape(str(flow.get('name') or 'Flow'))}</h3>"
+            f"<ol>{''.join(f'<li>{escape(str(step))}</li>' for step in _as_list(flow.get('steps'))[:5] if str(step).strip())}</ol>"
+            f"<p>{escape(str(flow.get('goal') or ''))}</p>"
+            "</article>"
+        )
+        for flow in flows[:3]
+    )
+    principle_html = "".join(
+        f"<li>{escape(item)}</li>"
+        for item in interaction_principles[:4]
+    )
+    entity_html = "".join(
+        f"<li>{escape(str(entity.get('name') or entity.get('title') or 'Entity'))}</li>"
+        for entity in backend_modules[:6]
+    )
+    milestone_html = "".join(
+        (
+            "<li>"
+            f"<strong>{escape(str(item.get('name') or item.get('id') or 'Milestone'))}</strong>"
+            f"<span>{escape(str(item.get('criteria') or item.get('status') or ''))}</span>"
+            "</li>"
+        )
+        for item in milestone_payload[:4]
+    )
     return f"""<!doctype html>
 <html lang="ja">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title}</title>
+  <title>{escape(title)}</title>
   <style>
     :root {{
-      --bg: #f8fafc;
-      --panel: #ffffff;
+      --bg: {background};
+      --panel: rgba(255,255,255,0.88);
       --text: {primary};
       --accent: {accent};
-      --muted: #64748b;
-      --border: rgba(15, 23, 42, 0.08);
+      --muted: #5b6474;
+      --border: rgba(15, 23, 42, 0.12);
+      --surface: rgba(255,255,255,0.72);
+      --surface-strong: rgba(15, 23, 42, 0.05);
     }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
-      font-family: "IBM Plex Sans", "Hiragino Sans", sans-serif;
+      font-family: "{escape(body_font)}", "Hiragino Sans", sans-serif;
       color: var(--text);
       background:
-        radial-gradient(circle at top left, rgba(255,255,255,0.9), transparent 42%),
-        linear-gradient(160deg, #e2e8f0 0%, #f8fafc 48%, #eef2ff 100%);
+        linear-gradient(180deg, rgba(255,255,255,0.85), rgba(255,255,255,0.55)),
+        radial-gradient(circle at top left, rgba(59,130,246,0.08), transparent 28%),
+        linear-gradient(160deg, #e2e8f0 0%, {background} 58%, #eef2ff 100%);
     }}
     main {{
-      max-width: 1120px;
+      max-width: 1360px;
       margin: 0 auto;
-      padding: 40px 24px 64px;
+      padding: 28px 24px 56px;
     }}
-    .hero {{
+    .workspace {{
       display: grid;
-      grid-template-columns: 1.35fr 0.85fr;
+      grid-template-columns: {("260px 1fr" if shell_layout == "sidebar" else "1fr")};
       gap: 20px;
-      align-items: stretch;
+      align-items: start;
     }}
     .panel {{
-      background: rgba(255,255,255,0.82);
+      background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 24px;
       padding: 24px;
       box-shadow: 0 24px 60px rgba(15, 23, 42, 0.08);
       backdrop-filter: blur(10px);
     }}
-    h1 {{ margin: 0 0 12px; font-size: clamp(2rem, 5vw, 4rem); line-height: 1.02; }}
-    h2 {{ margin: 0 0 12px; font-size: 1rem; letter-spacing: 0.02em; }}
-    p {{ color: var(--muted); line-height: 1.7; }}
-    ul {{ margin: 0; padding-left: 18px; color: var(--text); }}
-    .badge {{
+    h1, h2, h3, h4 {{ font-family: "{escape(heading_font)}", "Hiragino Sans", sans-serif; }}
+    h1 {{ margin: 0; font-size: clamp(1.5rem, 3vw, 2.6rem); line-height: 1.05; }}
+    h2 {{ margin: 0 0 10px; font-size: 0.95rem; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }}
+    h3 {{ margin: 0; font-size: 1rem; }}
+    p {{ color: var(--muted); line-height: 1.6; margin: 0; }}
+    ul, ol {{ margin: 0; padding-left: 18px; color: var(--text); }}
+    .sidebar {{
+      position: sticky;
+      top: 24px;
+    }}
+    .eyebrow {{
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      padding: 8px 12px;
+      padding: 7px 11px;
       border-radius: 999px;
       background: rgba(255,255,255,0.72);
       border: 1px solid var(--border);
-      margin-bottom: 16px;
       font-size: 0.82rem;
     }}
     .accent {{
@@ -3629,29 +5432,288 @@ def _build_preview_html(
       background: var(--accent);
       box-shadow: 0 0 24px color-mix(in srgb, var(--accent) 60%, white);
     }}
-    .insights {{
+    .sidebar nav ul {{
+      list-style: none;
+      padding: 0;
+      margin: 18px 0 0;
+      display: grid;
+      gap: 10px;
+    }}
+    .sidebar nav a {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      text-decoration: none;
+      color: var(--text);
+      padding: 12px 14px;
+      border-radius: 16px;
+      border: 1px solid transparent;
+      background: rgba(15, 23, 42, 0.03);
+    }}
+    .sidebar nav a:hover {{
+      border-color: var(--border);
+      background: rgba(255,255,255,0.92);
+    }}
+    .status-row {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 18px;
+    }}
+    .status-badge {{
+      display: inline-flex;
+      align-items: center;
+      padding: 8px 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.8);
+      border: 1px solid var(--border);
+      font-size: 0.76rem;
+    }}
+    .content {{
+      display: grid;
+      gap: 20px;
+    }}
+    .topbar {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 20px;
+    }}
+    .topbar-copy {{
+      max-width: 640px;
+      display: grid;
+      gap: 12px;
+    }}
+    .topbar-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: flex-end;
+    }}
+    .topbar-actions button {{
+      appearance: none;
+      border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));
+      background: color-mix(in srgb, var(--accent) 16%, white);
+      color: var(--text);
+      border-radius: 14px;
+      padding: 11px 14px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+    }}
+    .hero-surface {{
+      display: grid;
+      gap: 16px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.94), rgba(255,255,255,0.78));
+    }}
+    .hero-metadata {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }}
+    .metric {{
+      border-radius: 16px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      padding: 14px;
+    }}
+    .metric p:first-child {{
+      font-size: 0.75rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }}
+    .metric strong {{
+      display: block;
+      margin-top: 6px;
+      font-size: 1rem;
+    }}
+    .module-grid {{
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin-top: 16px;
+    }}
+    .module-card {{
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.9);
+      padding: 16px;
+    }}
+    .module-card ul {{
+      margin-top: 12px;
+      display: grid;
+      gap: 8px;
+    }}
+    .module-type {{
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 0.72rem;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }}
+    .secondary-grid {{
+      display: grid;
+      grid-template-columns: 1.45fr 0.95fr;
       gap: 20px;
-      margin-top: 20px;
+    }}
+    .screen-gallery {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }}
+    .screen-frame {{
+      border-radius: 22px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.92);
+      padding: 16px;
+      min-height: 240px;
+      display: grid;
+      align-content: start;
+      gap: 12px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.5);
+    }}
+    .screen-topbar {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      color: var(--muted);
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }}
+    .screen-modules {{
+      display: grid;
+      gap: 10px;
+    }}
+    .mini-module {{
+      border-radius: 14px;
+      background: var(--surface-strong);
+      padding: 12px;
+      border: 1px solid rgba(15,23,42,0.06);
+    }}
+    .mini-module p {{
+      color: var(--text);
+      font-size: 0.82rem;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }}
+    .mini-module span {{
+      color: var(--muted);
+      font-size: 0.8rem;
+    }}
+    .flow-card {{
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.9);
+      padding: 16px;
+      display: grid;
+      gap: 12px;
+    }}
+    .flow-card ol {{
+      display: grid;
+      gap: 8px;
+    }}
+    .rail-list {{
+      display: grid;
+      gap: 10px;
+    }}
+    .rail-list li {{
+      border-radius: 14px;
+      background: var(--surface-strong);
+      padding: 12px;
+      display: grid;
+      gap: 6px;
+      list-style: none;
+    }}
+    .rail-list strong {{
+      font-size: 0.86rem;
+    }}
+    .principles {{
+      display: grid;
+      gap: 8px;
+    }}
+    .principles li {{
+      margin-left: 18px;
+    }}
+    .mode-chip {{
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }}
+    @media (max-width: 1100px) {{
+      .workspace, .secondary-grid, .screen-gallery, .module-grid, .hero-metadata {{
+        grid-template-columns: 1fr;
+      }}
+      .sidebar {{
+        position: static;
+      }}
     }}
     @media (max-width: 860px) {{
-      .hero, .insights {{ grid-template-columns: 1fr; }}
-      main {{ padding: 24px 16px 40px; }}
+      main {{ padding: 18px 14px 32px; }}
+      .panel, .screen-frame {{ border-radius: 18px; }}
     }}
   </style>
 </head>
-<body>
+<body data-prototype-kind="{escape(prototype_kind)}" data-density="{escape(density)}">
   <main>
-    <section class="hero">
-      <div class="panel">
-        <div class="badge"><span class="accent" aria-hidden="true"></span> Product Lifecycle Concept</div>
-        <h1>{title}</h1>
-        <p>{subtitle}</p>
-      </div>
-      <div class="panel">
-        <h2>Highlighted Capabilities</h2>
-        <ul>{feature_list}</ul>
+    <section class="workspace" aria-label="Prototype workspace">
+      <aside class="sidebar panel">
+        <div class="eyebrow"><span class="accent" aria-hidden="true"></span> Product Prototype</div>
+        <h1>{escape(title)}</h1>
+        <p style="margin-top:12px">{escape(subtitle)}</p>
+        <div class="status-row">{badge_html}</div>
+        <nav aria-label="Primary navigation">
+          <ul>{nav_items_html}</ul>
+        </nav>
+      </aside>
+      <div class="content">
+        <section class="panel hero-surface">
+          <div class="topbar">
+            <div class="topbar-copy">
+              <span class="mode-chip">{escape(mode)} prototype</span>
+              <h1>{escape(str(_as_dict(active_screen).get("headline") or title))}</h1>
+              <p>{escape(str(_as_dict(active_screen).get("purpose") or subtitle))}</p>
+            </div>
+            <div class="topbar-actions">{action_html}</div>
+          </div>
+          <div class="hero-metadata">
+            <div class="metric">
+              <p>Active Screen</p>
+              <strong>{escape(str(_as_dict(active_screen).get("title") or "Primary workspace"))}</strong>
+            </div>
+            <div class="metric">
+              <p>Primary Flow</p>
+              <strong>{escape(str(_as_dict((flows[0] if flows else {})).get("name") or "Core workflow"))}</strong>
+            </div>
+            <div class="metric">
+              <p>Layout</p>
+              <strong>{escape(str(_as_dict(active_screen).get("layout") or shell_layout))}</strong>
+            </div>
+          </div>
+          <div class="module-grid">{active_module_html}</div>
+        </section>
+        <section class="secondary-grid">
+          <div class="panel">
+            <h2>Prototype Screens</h2>
+            <div class="screen-gallery" aria-label="Prototype screens">{screen_gallery_html}</div>
+          </div>
+          <div class="panel">
+            <h2>Interaction Principles</h2>
+            <ul class="principles">{principle_html}</ul>
+          </div>
+        </section>
+        <section class="secondary-grid">
+          <div class="panel">
+            <h2>Primary Flows</h2>
+            <div class="rail-list">{flow_html}</div>
+          </div>
+          <div class="panel">
+            <h2>{escape("Milestone Readiness" if mode == "build" else "System Signals")}</h2>
+            <ul class="rail-list">{milestone_html or entity_html}</ul>
+          </div>
+        </section>
       </div>
     </section>
   </main>

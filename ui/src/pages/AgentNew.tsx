@@ -35,7 +35,8 @@ const FALLBACK_MODELS = [
   { provider: "anthropic", id: "anthropic/claude-haiku-4-5-20251001", name: "claude-haiku-4-5-20251001" },
   { provider: "openai", id: "openai/gpt-5-mini", name: "gpt-5-mini" },
   { provider: "moonshot", id: "moonshot/kimi-k2.5", name: "kimi-k2.5" },
-  { provider: "gemini", id: "gemini/gemini-3-flash-preview", name: "gemini-3-flash-preview" },
+  { provider: "zhipu", id: "zhipu/glm-4-plus", name: "glm-4-plus" },
+  { provider: "gemini", id: "gemini/gemini-3-pro-preview", name: "gemini-3-pro-preview" },
 ];
 
 export function AgentNew() {

@@ -1,5 +1,8 @@
 """Tests for lifecycle contracts and autonomous coordination."""
 
+import asyncio
+import inspect
+
 from pylon.lifecycle.contracts import (
     build_phase_contracts,
     lifecycle_phase_input,
@@ -13,6 +16,7 @@ from pylon.lifecycle.coordinator import (
 )
 from pylon.lifecycle.operator_console import sync_lifecycle_project_with_run
 from pylon.lifecycle.orchestrator import (
+    build_lifecycle_workflow_handlers,
     _design_evaluator_handler,
     _design_variant_handler,
     _planning_feature_handler,
@@ -30,18 +34,28 @@ def _project() -> dict[str, object]:
     return default_lifecycle_project_record("orbit", tenant_id="default")
 
 
+def _invoke_handler(handler, node_id: str, state: dict[str, object]):
+    result = handler(node_id, state)
+    if inspect.isawaitable(result):
+        return asyncio.run(result)
+    return result
+
+
 def _research_patch(spec: str) -> dict[str, object]:
     state: dict[str, object] = {"spec": spec}
-    state.update(_research_user_handler("user-researcher", state).state_patch)
-    state["market_report"] = {
-        "market_size": "Growing",
-        "trends": ["evidence-based delivery"],
-        "opportunities": ["context continuity"],
-        "threats": ["tool sprawl"],
-    }
-    state["competitor_report"] = [{"name": "demo"}]
-    state["technical_report"] = {"score": 0.84, "notes": "Feasible."}
-    state.update(_research_synthesizer_handler("research-synthesizer", state).state_patch)
+    handlers = build_lifecycle_workflow_handlers("research")
+    for node_id in (
+        "competitor-analyst",
+        "market-researcher",
+        "user-researcher",
+        "tech-evaluator",
+        "research-synthesizer",
+        "evidence-librarian",
+        "devils-advocate-researcher",
+        "cross-examiner",
+        "research-judge",
+    ):
+        state.update(_invoke_handler(handlers[node_id], node_id, state).state_patch)
     return sync_lifecycle_project_with_run(
         _project(),
         phase="research",
@@ -53,11 +67,20 @@ def _research_patch(spec: str) -> dict[str, object]:
 def _planning_patch(spec: str) -> dict[str, object]:
     state: dict[str, object] = {"spec": spec}
     state["research"] = _research_patch(spec)["research"]
-    state.update(_planning_persona_handler("persona-builder", state).state_patch)
-    state.update(_planning_story_handler("story-architect", state).state_patch)
-    state.update(_planning_feature_handler("feature-analyst", state).state_patch)
-    state.update(_planning_solution_handler("solution-architect", state).state_patch)
-    state.update(_planning_synthesizer_handler("planning-synthesizer", state).state_patch)
+    handlers = build_lifecycle_workflow_handlers("planning")
+    for node_id in (
+        "persona-builder",
+        "story-architect",
+        "feature-analyst",
+        "solution-architect",
+        "planning-synthesizer",
+        "scope-skeptic",
+        "assumption-auditor",
+        "negative-persona-challenger",
+        "milestone-falsifier",
+        "planning-judge",
+    ):
+        state.update(_invoke_handler(handlers[node_id], node_id, state).state_patch)
     project = _project()
     project["research"] = state["research"]
     return sync_lifecycle_project_with_run(
@@ -95,8 +118,16 @@ def _design_patch(spec: str) -> dict[str, object]:
 def _development_patch(spec: str) -> dict[str, object]:
     planning_patch = _planning_patch(spec)
     design_patch = _design_patch(spec)
+    selected_design = next(
+        (
+            variant
+            for variant in design_patch["designVariants"]
+            if variant["id"] == design_patch["selectedDesignId"]
+        ),
+        design_patch["designVariants"][0],
+    )
     return {
-        "buildCode": "<!doctype html><html><body><main>artifact lineage approval gate</main></body></html>",
+        "buildCode": selected_design["preview_html"],
         "buildCost": 1.2,
         "buildIteration": 1,
         "milestoneResults": [

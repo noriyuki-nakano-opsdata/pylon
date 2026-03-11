@@ -37,6 +37,7 @@ from pylon.api.factory import (
     TenantMiddlewareConfig,
     build_http_api_server,
 )
+from pylon.control_plane import ControlPlaneBackend, ControlPlaneStoreConfig
 from pylon.providers.anthropic import AnthropicProvider
 from pylon.runtime.llm import ProviderRegistry
 
@@ -443,7 +444,25 @@ def implement_handler(node_id: str, state: dict) -> dict:
 
 
 # ── Server ─────────────────────────────────────────────
+_DEFAULT_CONTROL_PLANE_PATH = project_root / ".pylon" / "ui-dev-control-plane.db"
+_control_plane_backend = os.environ.get(
+    "PYLON_CONTROL_PLANE_BACKEND",
+    ControlPlaneBackend.SQLITE.value,
+)
+_control_plane_path = os.environ.get(
+    "PYLON_CONTROL_PLANE_PATH",
+    str(_DEFAULT_CONTROL_PLANE_PATH),
+)
+
 config = APIServerConfig(
+    control_plane=ControlPlaneStoreConfig.from_mapping(
+        {
+            "backend": _control_plane_backend,
+            "path": _control_plane_path,
+        },
+        default_backend=ControlPlaneBackend.SQLITE,
+        default_path=str(_DEFAULT_CONTROL_PLANE_PATH),
+    ),
     middleware=APIMiddlewareConfig(
         auth=AuthMiddlewareConfig(backend=AuthBackend.NONE),
         tenant=TenantMiddlewareConfig(require_tenant=False),
@@ -451,6 +470,11 @@ config = APIServerConfig(
 )
 
 print("Starting Pylon API server on http://127.0.0.1:8080 ...")
+print(
+    "Control plane backend:",
+    config.control_plane.backend.value,
+    f"({config.control_plane.path or 'in-memory'})",
+)
 http_server, route_store = build_http_api_server(
     config,
     host="127.0.0.1",

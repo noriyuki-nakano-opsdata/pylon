@@ -99,6 +99,16 @@ export function ResearchPhase() {
       score: 0,
       notes: "データが不完全なため、調査結果を再取得してください。",
     },
+    claims: [],
+    evidence: [],
+    dissent: [],
+    open_questions: [],
+    winning_theses: [],
+    confidence_summary: {
+      average: 0,
+      floor: 0,
+      accepted: 0,
+    },
   };
   const r = stableResearch;
 
@@ -244,7 +254,7 @@ export function ResearchPhase() {
       <div className="flex-1 overflow-y-auto p-6">
         <div className="mx-auto max-w-5xl space-y-6">
           {/* Market overview */}
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
             <div className="rounded-xl border border-border bg-card p-5">
               <div className="flex items-center gap-2 text-sm font-medium text-muted-foreground mb-2">
                 <BarChart3 className="h-4 w-4" /> 市場規模
@@ -269,7 +279,30 @@ export function ResearchPhase() {
               </div>
               <p className="text-3xl font-bold text-foreground">{r.competitors.length}</p>
             </div>
+            <div className="rounded-xl border border-border bg-card p-5">
+              <div className="flex items-center gap-2 text-sm font-medium text-muted-foreground mb-2">
+                <Check className="h-4 w-4" /> 判定信頼度
+              </div>
+              <p className="text-3xl font-bold text-foreground">{((r.confidence_summary?.average ?? 0) * 100).toFixed(0)}%</p>
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                accepted {r.confidence_summary?.accepted ?? 0} / claims {r.claims?.length ?? 0}
+              </p>
+            </div>
           </div>
+
+          {!!r.winning_theses?.length && (
+            <div className="rounded-2xl border border-primary/20 bg-primary/5 p-5">
+              <p className="text-[11px] font-medium uppercase tracking-[0.16em] text-primary/80">Winning theses</p>
+              <div className="mt-3 grid gap-2 lg:grid-cols-3">
+                {r.winning_theses.map((thesis, index) => (
+                  <div key={index} className="rounded-xl border border-primary/10 bg-background/70 p-3 text-sm text-foreground">
+                    {thesis}
+                  </div>
+                ))}
+              </div>
+              {r.judge_summary && <p className="mt-3 text-xs text-muted-foreground">{r.judge_summary}</p>}
+            </div>
+          )}
 
           {/* Competitors */}
           <div>
@@ -318,6 +351,88 @@ export function ResearchPhase() {
               {r.trends.map((t, i) => (
                 <Badge key={i} variant="secondary" className="text-xs">{t}</Badge>
               ))}
+            </div>
+          </div>
+
+          {!!r.user_research && (
+            <div className="grid gap-4 lg:grid-cols-2">
+              <div className="rounded-xl border border-border bg-card p-4">
+                <h3 className="text-sm font-bold text-foreground mb-3">ユーザーシグナル</h3>
+                <div className="space-y-2">
+                  {r.user_research.signals.map((signal, index) => (
+                    <p key={index} className="text-xs text-foreground">• {signal}</p>
+                  ))}
+                </div>
+              </div>
+              <div className="rounded-xl border border-border bg-card p-4">
+                <h3 className="text-sm font-bold text-foreground mb-3">痛みと friction</h3>
+                <div className="space-y-2">
+                  {r.user_research.pain_points.map((pain, index) => (
+                    <p key={index} className="text-xs text-foreground">• {pain}</p>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {!!r.claims?.length && (
+            <div>
+              <h3 className="text-sm font-bold text-foreground mb-3">Claim ledger</h3>
+              <div className="grid gap-3 lg:grid-cols-2">
+                {r.claims.map((claim) => (
+                  <div key={claim.id} className="rounded-xl border border-border bg-card p-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-sm font-medium text-foreground">{claim.statement}</p>
+                        <p className="mt-1 text-[11px] text-muted-foreground">{claim.owner} · {claim.category}</p>
+                      </div>
+                      <Badge variant={claim.status === "accepted" ? "default" : "secondary"} className="shrink-0 text-[10px]">
+                        {claim.status}
+                      </Badge>
+                    </div>
+                    <div className="mt-3 flex items-center gap-3 text-[11px] text-muted-foreground">
+                      <span>confidence {(claim.confidence * 100).toFixed(0)}%</span>
+                      <span>evidence {claim.evidence_ids.length}</span>
+                      <span>counter {claim.counterevidence_ids.length}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="grid gap-4 lg:grid-cols-2">
+            <div className="rounded-xl border border-border bg-card p-4">
+              <h3 className="flex items-center gap-1.5 text-sm font-bold text-foreground mb-3">
+                <ShieldAlert className="h-4 w-4 text-destructive" /> Dissent
+              </h3>
+              <div className="space-y-2">
+                {(r.dissent ?? []).map((item) => (
+                  <div key={item.id} className="rounded-lg border border-border/80 bg-background px-3 py-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-xs font-medium text-foreground">{item.argument}</p>
+                      <Badge variant="outline" className="text-[10px]">{item.severity}</Badge>
+                    </div>
+                    <p className="mt-1 text-[11px] text-muted-foreground">
+                      {item.resolved ? "resolved" : "open"} · {item.recommended_test ?? "追加検証を定義"}
+                    </p>
+                  </div>
+                ))}
+                {!(r.dissent ?? []).length && <p className="text-xs text-muted-foreground">重大な dissent はありません。</p>}
+              </div>
+            </div>
+            <div className="rounded-xl border border-border bg-card p-4">
+              <h3 className="flex items-center gap-1.5 text-sm font-bold text-foreground mb-3">
+                <AlertCircle className="h-4 w-4 text-primary" /> Open questions
+              </h3>
+              <div className="space-y-2">
+                {(r.open_questions ?? []).map((question, index) => (
+                  <p key={index} className="rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground">
+                    {question}
+                  </p>
+                ))}
+                {!(r.open_questions ?? []).length && <p className="text-xs text-muted-foreground">未解決の問いはありません。</p>}
+              </div>
             </div>
           </div>
         </div>

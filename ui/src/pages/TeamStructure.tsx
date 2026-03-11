@@ -47,7 +47,13 @@ const FALLBACK_TEAMS: ApiTeamDef[] = [
   { id: "product", name: "Product & Ops", nameJa: "プロダクト & 運用", icon: "Network", color: "text-orange-400", bg: "bg-orange-600" },
 ];
 
-const AVAILABLE_MODELS = ["anthropic/claude-sonnet-4-6", "anthropic/claude-haiku-4-5-20251001", "openai/gpt-5-mini", "moonshot/kimi-k2.5", "gemini/gemini-3-flash-preview"];
+const AVAILABLE_MODELS = [
+  "anthropic/claude-sonnet-4-6",
+  "openai/gpt-5-mini",
+  "moonshot/kimi-k2.5",
+  "zhipu/glm-4-plus",
+  "gemini/gemini-3-pro-preview",
+];
 
 function buildMember(agent: AgentActivity, teamDefs: ApiTeamDef[]): AgentMember {
   const teamId = agent.team ?? "product";

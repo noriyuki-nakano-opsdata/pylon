@@ -40,3 +40,6 @@ logs/
 
 # Claude Flow cache
 .claude-flow/
+
+# Local durable control-plane state
+.pylon/

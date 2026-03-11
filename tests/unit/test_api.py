@@ -1262,8 +1262,11 @@ class TestLifecycleRoutes:
         elif phase == "design":
             assert len(state["variants"]) == 3
             assert state["design"]["variants"][0]["preview_html"].startswith("<!doctype html>")
+            assert state["design"]["variants"][0]["prototype"]["screens"]
+            assert 'data-screen-id=' in state["design"]["variants"][0]["preview_html"]
         else:
             assert state["development"]["code"].startswith("<!doctype html>")
+            assert 'data-prototype-kind=' in state["development"]["code"]
             assert state["development"]["review_summary"]["milestonesTotal"] >= 1
             assert state["_build_iteration"] in {1, 2}
 

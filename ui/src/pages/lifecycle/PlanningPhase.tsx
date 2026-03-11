@@ -419,7 +419,7 @@ function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
               { label: "ペルソナ", value: analysis.personas.length },
               { label: "ストーリー", value: analysis.user_stories.length },
               { label: "機能候補", value: analysis.kano_features.length },
-              { label: "推奨事項", value: analysis.recommendations.length },
+              { label: "Red-team", value: analysis.red_team_findings?.length ?? 0 },
             ].map((item) => (
               <div key={item.label} className="rounded-xl border border-border bg-background px-3 py-3 text-center">
                 <p className="text-lg font-semibold text-foreground">{item.value}</p>
@@ -428,10 +428,10 @@ function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
             ))}
           </div>
         </div>
-        {analysis.recommendations[0] && (
+        {(analysis.judge_summary || analysis.recommendations[0]) && (
           <div className="mt-4 rounded-xl border border-primary/20 bg-primary/5 px-4 py-3">
             <p className="text-[11px] font-medium uppercase tracking-[0.16em] text-primary/80">Recommended focus</p>
-            <p className="mt-1 text-sm text-foreground">{analysis.recommendations[0]}</p>
+            <p className="mt-1 text-sm text-foreground">{analysis.judge_summary ?? analysis.recommendations[0]}</p>
           </div>
         )}
       </div>
@@ -449,12 +449,14 @@ function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
 
       {tab === "overview" && (
         <div className="space-y-4">
-          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-6">
             {[
               { label: "Personas", value: analysis.personas.length },
               { label: "Stories", value: analysis.user_stories.length },
               { label: "Features", value: analysis.kano_features.length },
               { label: "Recommendations", value: analysis.recommendations.length },
+              { label: "Rejected", value: analysis.rejected_features?.length ?? 0 },
+              { label: "Findings", value: analysis.red_team_findings?.length ?? 0 },
             ].map((s) => (
               <div key={s.label} className="rounded-xl border border-border bg-card p-4 text-center">
                 <p className="text-2xl font-bold text-foreground">{s.value}</p>
@@ -489,6 +491,83 @@ function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
                 )}>{r}</div>
               );
             })}
+          </div>
+
+          <div className="grid gap-4 lg:grid-cols-2">
+            <div className="rounded-xl border border-border bg-card p-4">
+              <h3 className="mb-3 text-sm font-medium text-foreground">Decision table</h3>
+              <div className="space-y-2">
+                {(analysis.feature_decisions ?? []).map((decision) => (
+                  <div key={decision.feature} className="rounded-lg border border-border/80 bg-background px-3 py-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-xs font-medium text-foreground">{decision.feature}</p>
+                      <Badge variant={decision.selected ? "default" : "secondary"} className="text-[10px]">
+                        {decision.selected ? "selected" : "deferred"}
+                      </Badge>
+                    </div>
+                    <p className="mt-1 text-[11px] text-muted-foreground">
+                      uncertainty {(decision.uncertainty * 100).toFixed(0)}% · claims {decision.supporting_claim_ids.length}
+                    </p>
+                    {!!decision.counterarguments.length && (
+                      <p className="mt-1 text-[11px] text-muted-foreground">{decision.counterarguments[0]}</p>
+                    )}
+                    {!decision.selected && decision.rejection_reason && (
+                      <p className="mt-1 text-[11px] text-muted-foreground">{decision.rejection_reason}</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="rounded-xl border border-border bg-card p-4">
+              <h3 className="mb-3 text-sm font-medium text-foreground">Assumptions and red-team findings</h3>
+              <div className="space-y-2">
+                {(analysis.assumptions ?? []).map((assumption) => (
+                  <div key={assumption.id} className="rounded-lg border border-border/80 bg-background px-3 py-2">
+                    <p className="text-xs font-medium text-foreground">{assumption.statement}</p>
+                    <p className="mt-1 text-[11px] text-muted-foreground">{assumption.severity}</p>
+                  </div>
+                ))}
+                {(analysis.red_team_findings ?? []).map((finding) => (
+                  <div key={finding.id} className="rounded-lg border border-destructive/20 bg-destructive/5 px-3 py-2">
+                    <p className="text-xs font-medium text-foreground">{finding.title}</p>
+                    <p className="mt-1 text-[11px] text-muted-foreground">{finding.recommendation}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="grid gap-4 lg:grid-cols-2">
+            <div className="rounded-xl border border-border bg-card p-4">
+              <h3 className="mb-3 text-sm font-medium text-foreground">Traceability</h3>
+              <div className="space-y-2">
+                {(analysis.traceability ?? []).map((item, index) => (
+                  <div key={`${item.feature}-${index}`} className="rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground">
+                    <p>{item.feature}</p>
+                    <p className="mt-1 text-[11px] text-muted-foreground">
+                      claim {item.claim_id || "n/a"} → use case {item.use_case_id || "n/a"} → milestone {item.milestone_id || "n/a"}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="rounded-xl border border-border bg-card p-4">
+              <h3 className="mb-3 text-sm font-medium text-foreground">Negative personas and kill criteria</h3>
+              <div className="space-y-2">
+                {(analysis.negative_personas ?? []).map((persona) => (
+                  <div key={persona.id} className="rounded-lg border border-border/80 bg-background px-3 py-2">
+                    <p className="text-xs font-medium text-foreground">{persona.name}</p>
+                    <p className="mt-1 text-[11px] text-muted-foreground">{persona.mitigation}</p>
+                  </div>
+                ))}
+                {(analysis.kill_criteria ?? []).map((criterion) => (
+                  <div key={criterion.id} className="rounded-lg border border-border/80 bg-background px-3 py-2">
+                    <p className="text-xs font-medium text-foreground">{criterion.condition}</p>
+                    <p className="mt-1 text-[11px] text-muted-foreground">{criterion.rationale}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
           </div>
         </div>
       )}

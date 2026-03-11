@@ -8,6 +8,7 @@ from pylon.providers.base import Chunk, Message, Response
 from pylon.runtime.llm import ProviderRegistry
 from pylon.lifecycle.operator_console import sync_lifecycle_project_with_run
 from pylon.lifecycle.orchestrator import (
+    _development_integrator_handler,
     _infer_product_kind,
     _planning_feature_handler,
     _planning_persona_handler,
@@ -47,26 +48,38 @@ class _ScriptedProvider:
 
 def _research_state(spec: str) -> dict[str, object]:
     state: dict[str, object] = {"spec": spec}
-    state.update(_research_user_handler("user-researcher", state).state_patch)
-    state["competitor_report"] = [{"name": "demo", "positioning": "reference"}]
-    state["market_report"] = {
-        "market_size": "Growing",
-        "trends": ["evidence-based delivery"],
-        "opportunities": ["context continuity"],
-        "threats": ["tool sprawl"],
-    }
-    state["technical_report"] = {"score": 0.82, "notes": "Feasible with strong control-plane primitives."}
-    state.update(_research_synthesizer_handler("research-synthesizer", state).state_patch)
+    handlers = build_lifecycle_workflow_handlers("research")
+    for node_id in (
+        "competitor-analyst",
+        "market-researcher",
+        "user-researcher",
+        "tech-evaluator",
+        "research-synthesizer",
+        "evidence-librarian",
+        "devils-advocate-researcher",
+        "cross-examiner",
+        "research-judge",
+    ):
+        state.update(_invoke_handler(handlers[node_id], node_id, state).state_patch)
     return state
 
 
 def _planning_state(spec: str) -> dict[str, object]:
     state = _research_state(spec)
-    state.update(_planning_persona_handler("persona-builder", state).state_patch)
-    state.update(_planning_story_handler("story-architect", state).state_patch)
-    state.update(_planning_feature_handler("feature-analyst", state).state_patch)
-    state.update(_planning_solution_handler("solution-architect", state).state_patch)
-    state.update(_planning_synthesizer_handler("planning-synthesizer", state).state_patch)
+    handlers = build_lifecycle_workflow_handlers("planning")
+    for node_id in (
+        "persona-builder",
+        "story-architect",
+        "feature-analyst",
+        "solution-architect",
+        "planning-synthesizer",
+        "scope-skeptic",
+        "assumption-auditor",
+        "negative-persona-challenger",
+        "milestone-falsifier",
+        "planning-judge",
+    ):
+        state.update(_invoke_handler(handlers[node_id], node_id, state).state_patch)
     return state
 
 
@@ -86,6 +99,25 @@ def test_infer_product_kind_prefers_operations_for_lifecycle_specs():
     assert _infer_product_kind(spec) == "operations"
 
 
+def test_infer_product_kind_ignores_incidental_learning_examples_in_ops_specs():
+    spec = (
+        "Autonomous multi-agent workflow platform with governed approvals, "
+        "operator console visibility, and artifact lineage.\n"
+        "Appendix example: 学習アプリのような別ドメインにも応用できる。"
+    )
+
+    assert _infer_product_kind(spec) == "operations"
+
+
+def test_infer_product_kind_keeps_learning_platform_specs_as_learning():
+    spec = (
+        "Family learning platform for children with daily lessons, rewards, "
+        "guardian progress tracking, and adaptive difficulty."
+    )
+
+    assert _infer_product_kind(spec) == "learning"
+
+
 def test_research_sync_preserves_user_research_context():
     state = _research_state(
         "Family learning app for children with daily lessons, rewards, "
@@ -103,6 +135,22 @@ def test_research_sync_preserves_user_research_context():
     assert patch["research"]["user_research"]["signals"]
     assert patch["research"]["user_research"]["pain_points"]
     assert patch["research"]["user_research"]["segment"] == "Product"
+
+
+def test_research_flow_emits_claims_evidence_and_dissent():
+    research = _research_state(
+        "Autonomous multi-agent lifecycle platform for operator-led research, "
+        "approvals, artifact lineage, and governed delivery."
+    )["research"]
+
+    assert research["claims"]
+    assert research["evidence"]
+    assert research["dissent"]
+    assert research["winning_theses"]
+    assert research["confidence_summary"]["floor"] >= 0.6
+    assignment_values = set(research["model_assignments"].values())
+    assert any(value.startswith("moonshot/") for value in assignment_values)
+    assert any(value.startswith("zhipu/") for value in assignment_values)
 
 
 def test_planning_outputs_change_with_product_intent():
@@ -126,6 +174,22 @@ def test_planning_outputs_change_with_product_intent():
     assert learning["use_cases"][0]["id"] == "uc-learn-001"
     assert "artifact lineage" in ops["recommendations"][0]
     assert "5分" in learning["recommendations"][0]
+
+
+def test_planning_flow_emits_red_team_traceability_and_negative_personas():
+    planning = _planning_state(
+        "Autonomous multi-agent lifecycle platform for operator-led research, "
+        "approvals, artifact lineage, and governed delivery."
+    )["planning"]
+
+    assert planning["feature_decisions"]
+    assert planning["red_team_findings"]
+    assert planning["traceability"]
+    assert planning["negative_personas"]
+    assert planning["kill_criteria"]
+    assignment_values = set(planning["model_assignments"].values())
+    assert any(value.startswith("moonshot/") for value in assignment_values)
+    assert any(value.startswith("zhipu/") for value in assignment_values)
 
 
 def test_planning_sync_persists_information_architecture_and_design_tokens():
@@ -214,6 +278,30 @@ def test_provider_backed_design_handler_uses_llm_variant_payload():
     assert result.state_patch["claude-designer_skill_plan"]["selected_skills"] == ["ui-concepting", "design-critique"]
     assert result.state_patch["claude-designer_delegations"][0]["peer"] == "design-critic"
     assert result.state_patch["claude-designer_peer_feedback"][0]["recommendations"]
+    assert variant["prototype"]["screens"]
+    assert variant["prototype"]["flows"]
+    assert 'aria-label="Primary navigation"' in variant["preview_html"]
+    assert 'data-screen-id=' in variant["preview_html"]
+    assert "Highlighted Capabilities" not in variant["preview_html"]
+
+
+def test_design_handler_generates_screen_driven_prototype_html():
+    state = _planning_state(
+        "Autonomous multi-agent lifecycle platform for operator-led research, "
+        "approvals, artifact lineage, and governed delivery."
+    )
+    handlers = build_lifecycle_workflow_handlers("design")
+
+    result = _invoke_handler(handlers["claude-designer"], "claude-designer", state)
+    variant = result.state_patch["claude-designer_variant"]
+
+    assert len(variant["prototype"]["screens"]) >= 3
+    assert len(variant["prototype"]["flows"]) >= 1
+    assert len(variant["prototype"]["app_shell"]["primary_navigation"]) >= 3
+    assert 'data-prototype-kind="' in variant["preview_html"]
+    assert 'aria-label="Primary navigation"' in variant["preview_html"]
+    assert "landing page" not in variant["preview_html"].lower()
+    assert "Highlighted Capabilities" not in variant["preview_html"]
 
 
 def test_design_sync_respects_provider_selected_design_id():
@@ -293,6 +381,45 @@ def test_provider_backed_development_reviewer_runs_revision_iteration():
     assert result.state_patch["reviewer_skill_plan"]["delegations"][0]["peer"] == "build-craft"
     assert result.state_patch["reviewer_delegations"][0]["peer"] == "build-craft"
     assert development["peer_feedback"][0]["summary"].startswith("build-craft reviewed")
+
+
+def test_development_integrator_preserves_prototype_shell_in_build():
+    state = _planning_state(
+        "Autonomous multi-agent lifecycle platform for operator-led research, "
+        "approvals, artifact lineage, and governed delivery."
+    )
+    design_handlers = build_lifecycle_workflow_handlers("design")
+    design_result = _invoke_handler(design_handlers["claude-designer"], "claude-designer", state)
+    selected_design = design_result.state_patch["claude-designer_variant"]
+    state["selected_design"] = selected_design
+    state["selectedDesignId"] = selected_design["id"]
+    state["frontend_bundle"] = {
+        "sections": [screen["id"] for screen in selected_design["prototype"]["screens"][:3]],
+        "feature_cards": ["research workspace", "approval gate", "artifact lineage"],
+        "interaction_notes": ["Preserve app navigation", "Keep evidence and action in the same viewport"],
+    }
+    state["backend_bundle"] = {
+        "entities": [
+            {"name": "LifecycleRun"},
+            {"name": "ApprovalPacket"},
+            {"name": "ArtifactRecord"},
+        ]
+    }
+    state["milestones"] = [
+        {"id": "ms-alpha", "name": "Evidence loop", "criteria": "artifact lineage approval gate"},
+        {"id": "ms-beta", "name": "Operator clarity", "criteria": "primary navigation and screen surfaces"},
+    ]
+
+    result = _development_integrator_handler("integrator", state)
+    integrated = result.state_patch["integrated_build"]
+    code = integrated["code"]
+
+    assert integrated["prototype"]["screens"]
+    assert 'data-prototype-kind="' in code
+    assert 'aria-label="Primary navigation"' in code
+    assert 'data-screen-id="' in code
+    assert "Milestone Readiness" in code
+    assert "Highlighted Capabilities" not in code
 
 
 def test_sync_prefers_runtime_skill_plans_and_delegations():

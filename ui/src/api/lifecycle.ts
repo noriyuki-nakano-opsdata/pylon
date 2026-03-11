@@ -295,6 +295,8 @@ export function parseResearchOutput(
   };
 
   const techRaw = asRecord(raw.tech_feasibility);
+  const userResearch = asRecord(raw.user_research ?? raw.userResearch);
+  const confidenceSummary = asRecord(raw.confidence_summary ?? raw.confidenceSummary);
 
   return {
     competitors: asArray(raw.competitors).map(parseCompetitor),
@@ -306,6 +308,68 @@ export function parseResearchOutput(
       score: asNumber(techRaw.score, 0),
       notes: asString(techRaw.notes, ""),
     },
+    ...(Object.keys(userResearch).length > 0 ? {
+      user_research: {
+        signals: asArray<string>(userResearch.signals),
+        pain_points: asArray<string>(userResearch.pain_points ?? userResearch.painPoints),
+        segment: asString(userResearch.segment, "N/A"),
+      },
+    } : {}),
+    claims: asArray(raw.claims).map((item) => {
+      const r = asRecord(item);
+      return {
+        id: asString(r.id, `claim-${Math.random().toString(36).slice(2, 6)}`),
+        statement: asString(r.statement, ""),
+        owner: asString(r.owner, ""),
+        category: asString(r.category, ""),
+        evidence_ids: asArray<string>(r.evidence_ids ?? r.evidenceIds),
+        counterevidence_ids: asArray<string>(r.counterevidence_ids ?? r.counterevidenceIds),
+        confidence: asNumber(r.confidence, 0),
+        status: asString(r.status, "provisional"),
+      };
+    }),
+    evidence: asArray(raw.evidence).map((item) => {
+      const r = asRecord(item);
+      return {
+        id: asString(r.id, `evidence-${Math.random().toString(36).slice(2, 6)}`),
+        source_ref: asString(r.source_ref ?? r.sourceRef, ""),
+        source_type: asString(r.source_type ?? r.sourceType, ""),
+        snippet: asString(r.snippet, ""),
+        recency: asString(r.recency, ""),
+        relevance: asString(r.relevance, ""),
+      };
+    }),
+    dissent: asArray(raw.dissent).map((item) => {
+      const r = asRecord(item);
+      return {
+        id: asString(r.id, `dissent-${Math.random().toString(36).slice(2, 6)}`),
+        claim_id: asString(r.claim_id ?? r.claimId, ""),
+        challenger: asString(r.challenger, ""),
+        argument: asString(r.argument, ""),
+        severity: asString(r.severity, "medium"),
+        resolved: r.resolved === true,
+        recommended_test: asString(r.recommended_test ?? r.recommendedTest, "") || undefined,
+        resolution: asString(r.resolution, "") || undefined,
+      };
+    }),
+    open_questions: asArray<string>(raw.open_questions ?? raw.openQuestions),
+    winning_theses: asArray<string>(raw.winning_theses ?? raw.winningTheses),
+    source_links: asArray<string>(raw.source_links ?? raw.sourceLinks),
+    ...(Object.keys(confidenceSummary).length > 0 ? {
+      confidence_summary: {
+        average: asNumber(confidenceSummary.average, 0),
+        floor: asNumber(confidenceSummary.floor, 0),
+        accepted: asNumber(confidenceSummary.accepted, 0) || undefined,
+        critical_findings: asNumber(confidenceSummary.critical_findings ?? confidenceSummary.criticalFindings, 0) || undefined,
+      },
+    } : {}),
+    judge_summary: asString(raw.judge_summary ?? raw.judgeSummary, "") || undefined,
+    model_assignments: Object.keys(asRecord(raw.model_assignments ?? raw.modelAssignments)).length > 0
+      ? Object.fromEntries(Object.entries(asRecord(raw.model_assignments ?? raw.modelAssignments)).map(([key, value]) => [key, asString(value, "")]))
+      : undefined,
+    low_diversity_mode: raw.low_diversity_mode === true || raw.lowDiversityMode === true,
+    critical_dissent_count: asNumber(raw.critical_dissent_count ?? raw.criticalDissentCount, 0) || undefined,
+    resolved_dissent_count: asNumber(raw.resolved_dissent_count ?? raw.resolvedDissentCount, 0) || undefined,
   };
 }
 
@@ -500,6 +564,139 @@ function parseDesignTokens(raw: Record<string, unknown>): Pick<AnalysisResult, "
   };
 }
 
+function parseFeatureDecisions(raw: Record<string, unknown>): Pick<AnalysisResult, "feature_decisions"> {
+  const arr = asArray(raw.feature_decisions ?? raw.featureDecisions);
+  if (arr.length === 0) return {};
+  return {
+    feature_decisions: arr.map((item) => {
+      const r = asRecord(item);
+      return {
+        feature: asString(r.feature, ""),
+        selected: r.selected === true,
+        supporting_claim_ids: asArray<string>(r.supporting_claim_ids ?? r.supportingClaimIds),
+        counterarguments: asArray<string>(r.counterarguments),
+        rejection_reason: asString(r.rejection_reason ?? r.rejectionReason, ""),
+        uncertainty: asNumber(r.uncertainty, 0),
+      };
+    }),
+  };
+}
+
+function parseRejectedFeatures(raw: Record<string, unknown>): Pick<AnalysisResult, "rejected_features"> {
+  const arr = asArray(raw.rejected_features ?? raw.rejectedFeatures);
+  if (arr.length === 0) return {};
+  return {
+    rejected_features: arr.map((item) => {
+      const r = asRecord(item);
+      return {
+        feature: asString(r.feature, ""),
+        reason: asString(r.reason, ""),
+        counterarguments: asArray<string>(r.counterarguments),
+      };
+    }),
+  };
+}
+
+function parsePlanningAssumptions(raw: Record<string, unknown>): Pick<AnalysisResult, "assumptions"> {
+  const arr = asArray(raw.assumptions);
+  if (arr.length === 0) return {};
+  return {
+    assumptions: arr.map((item, index) => {
+      const r = asRecord(item);
+      return {
+        id: asString(r.id, `assumption-${index + 1}`),
+        statement: asString(r.statement, ""),
+        severity: asString(r.severity, "medium"),
+      };
+    }),
+  };
+}
+
+function parseRedTeamFindings(raw: Record<string, unknown>): Pick<AnalysisResult, "red_team_findings"> {
+  const arr = asArray(raw.red_team_findings ?? raw.redTeamFindings);
+  if (arr.length === 0) return {};
+  return {
+    red_team_findings: arr.map((item, index) => {
+      const r = asRecord(item);
+      return {
+        id: asString(r.id, `finding-${index + 1}`),
+        title: asString(r.title, ""),
+        challenger: asString(r.challenger, ""),
+        severity: asString(r.severity, "medium"),
+        impact: asString(r.impact, ""),
+        recommendation: asString(r.recommendation, ""),
+        related_feature: asString(r.related_feature ?? r.relatedFeature, "") || undefined,
+      };
+    }),
+  };
+}
+
+function parseNegativePersonas(raw: Record<string, unknown>): Pick<AnalysisResult, "negative_personas"> {
+  const arr = asArray(raw.negative_personas ?? raw.negativePersonas);
+  if (arr.length === 0) return {};
+  return {
+    negative_personas: arr.map((item, index) => {
+      const r = asRecord(item);
+      return {
+        id: asString(r.id, `negative-persona-${index + 1}`),
+        name: asString(r.name, ""),
+        scenario: asString(r.scenario, ""),
+        risk: asString(r.risk, ""),
+        mitigation: asString(r.mitigation, ""),
+      };
+    }),
+  };
+}
+
+function parseTraceability(raw: Record<string, unknown>): Pick<AnalysisResult, "traceability"> {
+  const arr = asArray(raw.traceability);
+  if (arr.length === 0) return {};
+  return {
+    traceability: arr.map((item) => {
+      const r = asRecord(item);
+      return {
+        claim_id: asString(r.claim_id ?? r.claimId, ""),
+        claim: asString(r.claim, ""),
+        use_case_id: asString(r.use_case_id ?? r.useCaseId, ""),
+        use_case: asString(r.use_case ?? r.useCase, ""),
+        feature: asString(r.feature, ""),
+        milestone_id: asString(r.milestone_id ?? r.milestoneId, ""),
+        milestone: asString(r.milestone, ""),
+        confidence: asNumber(r.confidence, 0),
+      };
+    }),
+  };
+}
+
+function parseKillCriteria(raw: Record<string, unknown>): Pick<AnalysisResult, "kill_criteria"> {
+  const arr = asArray(raw.kill_criteria ?? raw.killCriteria);
+  if (arr.length === 0) return {};
+  return {
+    kill_criteria: arr.map((item, index) => {
+      const r = asRecord(item);
+      return {
+        id: asString(r.id, `kill-${index + 1}`),
+        milestone_id: asString(r.milestone_id ?? r.milestoneId, ""),
+        condition: asString(r.condition, ""),
+        rationale: asString(r.rationale, ""),
+      };
+    }),
+  };
+}
+
+function parseConfidenceSummary(raw: Record<string, unknown>): Pick<AnalysisResult, "confidence_summary"> {
+  const summary = asRecord(raw.confidence_summary ?? raw.confidenceSummary);
+  if (Object.keys(summary).length === 0) return {};
+  return {
+    confidence_summary: {
+      average: asNumber(summary.average, 0),
+      floor: asNumber(summary.floor, 0),
+      accepted: asNumber(summary.accepted, 0) || undefined,
+      critical_findings: asNumber(summary.critical_findings ?? summary.criticalFindings, 0) || undefined,
+    },
+  };
+}
+
 export function parsePlanningOutput(
   state: Record<string, unknown>,
 ): { analysis: AnalysisResult; features: FeatureSelection[]; planEstimates: PlanEstimate[] } {
@@ -591,6 +788,19 @@ export function parsePlanningOutput(
     ...parseUseCases(raw),
     ...parseRecommendedMilestones(raw),
     ...parseDesignTokens(raw),
+    ...parseFeatureDecisions(raw),
+    ...parseRejectedFeatures(raw),
+    ...parsePlanningAssumptions(raw),
+    ...parseRedTeamFindings(raw),
+    ...parseNegativePersonas(raw),
+    ...parseTraceability(raw),
+    ...parseKillCriteria(raw),
+    ...parseConfidenceSummary(raw),
+    ...(asString(raw.judge_summary ?? raw.judgeSummary, "") ? { judge_summary: asString(raw.judge_summary ?? raw.judgeSummary, "") } : {}),
+    ...(Object.keys(asRecord(raw.model_assignments ?? raw.modelAssignments)).length > 0 ? {
+      model_assignments: Object.fromEntries(Object.entries(asRecord(raw.model_assignments ?? raw.modelAssignments)).map(([key, value]) => [key, asString(value, "")])),
+    } : {}),
+    ...(raw.low_diversity_mode === true || raw.lowDiversityMode === true ? { low_diversity_mode: true } : {}),
   };
 
   const features: FeatureSelection[] = asArray(
@@ -678,6 +888,8 @@ export function parseDesignOutput(
     const r = asRecord(v);
     const scores = asRecord(r.scores);
     const tokens = asRecord(r.tokens);
+    const prototype = asRecord(r.prototype);
+    const appShell = asRecord(prototype.app_shell);
 
     return {
       id: asString(r.id, `variant-${idx}`),
@@ -691,6 +903,64 @@ export function parseDesignOutput(
         r.preview_html ?? r.previewHtml ?? r.html,
         "",
       ),
+      primary_color: asString(r.primary_color ?? r.primaryColor, undefined),
+      accent_color: asString(r.accent_color ?? r.accentColor, undefined),
+      quality_focus: asArray<string>(r.quality_focus ?? r.qualityFocus),
+      prototype: prototype && Object.keys(prototype).length > 0 ? {
+        kind: asString(prototype.kind, "product-workspace"),
+        app_shell: {
+          layout: asString(appShell.layout, "sidebar"),
+          density: asString(appShell.density, "medium"),
+          primary_navigation: asArray(appShell.primary_navigation ?? appShell.primaryNavigation).map((item, navIdx) => {
+            const nav = asRecord(item);
+            return {
+              id: asString(nav.id, `nav-${navIdx}`),
+              label: asString(nav.label, "Section"),
+              priority: asString(nav.priority, "primary"),
+            };
+          }),
+          status_badges: asArray<string>(appShell.status_badges ?? appShell.statusBadges),
+        },
+        screens: asArray(prototype.screens).map((item, screenIdx) => {
+          const screen = asRecord(item);
+          return {
+            id: asString(screen.id, `screen-${screenIdx}`),
+            title: asString(screen.title, "Screen"),
+            purpose: asString(screen.purpose, ""),
+            layout: asString(screen.layout, "workspace"),
+            headline: asString(screen.headline, ""),
+            supporting_text: asString(screen.supporting_text ?? screen.supportingText, ""),
+            primary_actions: asArray<string>(screen.primary_actions ?? screen.primaryActions),
+            modules: asArray(screen.modules).map((module, moduleIdx) => {
+              const mod = asRecord(module);
+              return {
+                name: asString(mod.name, `Module ${moduleIdx + 1}`),
+                type: asString(mod.type, "panel"),
+                items: asArray<string>(mod.items),
+              };
+            }),
+            success_state: asString(screen.success_state ?? screen.successState, ""),
+          };
+        }),
+        flows: asArray(prototype.flows).map((item, flowIdx) => {
+          const flow = asRecord(item);
+          return {
+            id: asString(flow.id, `flow-${flowIdx}`),
+            name: asString(flow.name, "Flow"),
+            steps: asArray<string>(flow.steps),
+            goal: asString(flow.goal, ""),
+          };
+        }),
+        interaction_principles: asArray<string>(prototype.interaction_principles ?? prototype.interactionPrinciples),
+        design_anchor: (() => {
+          const anchor = asRecord(prototype.design_anchor ?? prototype.designAnchor);
+          return Object.keys(anchor).length > 0 ? {
+            pattern_name: asString(anchor.pattern_name ?? anchor.patternName, undefined),
+            description: asString(anchor.description, undefined),
+            style_name: asString(anchor.style_name ?? anchor.styleName, undefined),
+          } : undefined;
+        })(),
+      } : undefined,
       tokens: {
         in: asNumber(tokens.in ?? tokens.input, 0),
         out: asNumber(tokens.out ?? tokens.output, 0),

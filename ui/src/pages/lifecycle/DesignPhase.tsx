@@ -323,6 +323,13 @@ function DesignCard({ variant, deviceWidth, isSelected, isExpanded, onSelect, on
           <div>
             <p className="text-sm font-bold text-foreground">{variant.pattern_name}</p>
             <p className="text-[11px] text-muted-foreground">{variant.model}</p>
+            {variant.prototype && (
+              <div className="mt-1.5 flex flex-wrap gap-1.5">
+                <Badge variant="secondary" className="text-[10px]">{variant.prototype.screens.length} screens</Badge>
+                <Badge variant="secondary" className="text-[10px]">{variant.prototype.flows.length} flows</Badge>
+                <Badge variant="secondary" className="text-[10px]">{variant.prototype.app_shell.layout}</Badge>
+              </div>
+            )}
           </div>
           {!isExpanded && (
             <div className="flex gap-2 ml-4">

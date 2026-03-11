@@ -24,6 +24,23 @@ def _as_list(value: Any) -> list[Any]:
     return list(value) if isinstance(value, list) else []
 
 
+def _has_critical_research_dissent(project_record: dict[str, Any]) -> bool:
+    research = _as_dict(project_record.get("research"))
+    return any(
+        _as_dict(item).get("severity") == "critical"
+        and _as_dict(item).get("resolved") is not True
+        for item in _as_list(research.get("dissent"))
+    )
+
+
+def _has_critical_planning_findings(project_record: dict[str, Any]) -> bool:
+    analysis = _as_dict(project_record.get("analysis"))
+    return any(
+        _as_dict(item).get("severity") == "critical"
+        for item in _as_list(analysis.get("red_team_findings"))
+    )
+
+
 def _action(
     action_type: str,
     *,
@@ -232,6 +249,26 @@ def _derive_candidate_action(project_record: dict[str, Any]) -> dict[str, Any]:
             reason="A build baseline is not yet ready to pass through approval.",
             can_autorun=False,
             payload={"blockingIssues": readiness["design"]["blockingIssues"]},
+        )
+
+    if _has_critical_research_dissent(project_record):
+        return _action(
+            "review_phase",
+            phase="research",
+            title="Research has unresolved critical dissent",
+            reason="Critical research dissent must be resolved before approval or autonomous execution can continue.",
+            can_autorun=False,
+            payload={"blockingIssues": readiness["research"]["blockingIssues"]},
+        )
+
+    if _has_critical_planning_findings(project_record):
+        return _action(
+            "review_phase",
+            phase="planning",
+            title="Planning has critical red-team findings",
+            reason="Critical planning findings must be addressed before approval or development can continue.",
+            can_autorun=False,
+            payload={"blockingIssues": readiness["planning"]["blockingIssues"]},
         )
 
     if approval_status in {"rejected", "revision_requested"}:

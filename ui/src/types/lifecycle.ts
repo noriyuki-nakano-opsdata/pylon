@@ -200,6 +200,44 @@ export interface Competitor {
   target: string;
 }
 
+export interface ResearchClaim {
+  id: string;
+  statement: string;
+  owner: string;
+  category: string;
+  evidence_ids: string[];
+  counterevidence_ids: string[];
+  confidence: number;
+  status: string;
+}
+
+export interface ResearchEvidence {
+  id: string;
+  source_ref: string;
+  source_type: string;
+  snippet: string;
+  recency: string;
+  relevance: string;
+}
+
+export interface ResearchDissent {
+  id: string;
+  claim_id: string;
+  challenger: string;
+  argument: string;
+  severity: string;
+  resolved: boolean;
+  recommended_test?: string;
+  resolution?: string;
+}
+
+export interface ConfidenceSummary {
+  average: number;
+  floor: number;
+  accepted?: number;
+  critical_findings?: number;
+}
+
 export interface MarketResearch {
   competitors: Competitor[];
   market_size: string;
@@ -207,6 +245,23 @@ export interface MarketResearch {
   opportunities: string[];
   threats: string[];
   tech_feasibility: { score: number; notes: string };
+  user_research?: {
+    signals: string[];
+    pain_points: string[];
+    segment: string;
+  };
+  claims?: ResearchClaim[];
+  evidence?: ResearchEvidence[];
+  dissent?: ResearchDissent[];
+  open_questions?: string[];
+  winning_theses?: string[];
+  source_links?: string[];
+  confidence_summary?: ConfidenceSummary;
+  judge_summary?: string;
+  model_assignments?: Record<string, string>;
+  low_diversity_mode?: boolean;
+  critical_dissent_count?: number;
+  resolved_dissent_count?: number;
 }
 
 /* ── Planning (Analysis) ── */
@@ -316,6 +371,63 @@ export interface RecommendedMilestone {
   depends_on_use_cases?: string[];
 }
 
+export interface FeatureDecision {
+  feature: string;
+  selected: boolean;
+  supporting_claim_ids: string[];
+  counterarguments: string[];
+  rejection_reason: string;
+  uncertainty: number;
+}
+
+export interface RejectedFeature {
+  feature: string;
+  reason: string;
+  counterarguments: string[];
+}
+
+export interface PlanningAssumption {
+  id: string;
+  statement: string;
+  severity: string;
+}
+
+export interface RedTeamFinding {
+  id: string;
+  title: string;
+  challenger: string;
+  severity: string;
+  impact: string;
+  recommendation: string;
+  related_feature?: string;
+}
+
+export interface NegativePersona {
+  id: string;
+  name: string;
+  scenario: string;
+  risk: string;
+  mitigation: string;
+}
+
+export interface TraceabilityLink {
+  claim_id: string;
+  claim: string;
+  use_case_id: string;
+  use_case: string;
+  feature: string;
+  milestone_id: string;
+  milestone: string;
+  confidence: number;
+}
+
+export interface KillCriterion {
+  id: string;
+  milestone_id: string;
+  condition: string;
+  rationale: string;
+}
+
 export interface AnalysisResult {
   personas: Persona[];
   user_stories: UserStory[];
@@ -335,6 +447,17 @@ export interface AnalysisResult {
   use_cases?: UseCase[];
   recommended_milestones?: RecommendedMilestone[];
   design_tokens?: DesignTokenAnalysis;
+  feature_decisions?: FeatureDecision[];
+  rejected_features?: RejectedFeature[];
+  assumptions?: PlanningAssumption[];
+  red_team_findings?: RedTeamFinding[];
+  negative_personas?: NegativePersona[];
+  traceability?: TraceabilityLink[];
+  kill_criteria?: KillCriterion[];
+  confidence_summary?: ConfidenceSummary;
+  judge_summary?: string;
+  model_assignments?: Record<string, string>;
+  low_diversity_mode?: boolean;
 }
 
 /* ── Design Tokens (generated from persona/KANO analysis) ── */
@@ -366,12 +489,65 @@ export interface DesignTokenAnalysis {
 }
 
 /* ── Design ── */
+export interface PrototypeModule {
+  name: string;
+  type: string;
+  items: string[];
+}
+
+export interface PrototypeScreen {
+  id: string;
+  title: string;
+  purpose: string;
+  layout: string;
+  headline: string;
+  supporting_text: string;
+  primary_actions: string[];
+  modules: PrototypeModule[];
+  success_state: string;
+}
+
+export interface PrototypeFlow {
+  id: string;
+  name: string;
+  steps: string[];
+  goal: string;
+}
+
+export interface PrototypeAppShell {
+  layout: string;
+  density: string;
+  primary_navigation: Array<{
+    id: string;
+    label: string;
+    priority: string;
+  }>;
+  status_badges: string[];
+}
+
+export interface PrototypeBlueprint {
+  kind: string;
+  app_shell: PrototypeAppShell;
+  screens: PrototypeScreen[];
+  flows: PrototypeFlow[];
+  interaction_principles: string[];
+  design_anchor?: {
+    pattern_name?: string;
+    description?: string;
+    style_name?: string;
+  };
+}
+
 export interface DesignVariant {
   id: string;
   model: string;
   pattern_name: string;
   description: string;
   preview_html: string;
+  primary_color?: string;
+  accent_color?: string;
+  quality_focus?: string[];
+  prototype?: PrototypeBlueprint;
   tokens: { in: number; out: number };
   cost_usd: number;
   scores: {

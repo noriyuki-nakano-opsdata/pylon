@@ -36,6 +36,33 @@ def _selected_design_variant(project_record: dict[str, Any]) -> dict[str, Any]:
     return _as_dict(variants[0]) if variants else {}
 
 
+def _prototype_screen_count(variant: dict[str, Any]) -> int:
+    prototype = _as_dict(variant.get("prototype"))
+    return len(_as_list(prototype.get("screens")))
+
+
+def _prototype_flow_count(variant: dict[str, Any]) -> int:
+    prototype = _as_dict(variant.get("prototype"))
+    return len(_as_list(prototype.get("flows")))
+
+
+def _prototype_navigation_count(variant: dict[str, Any]) -> int:
+    prototype = _as_dict(variant.get("prototype"))
+    shell = _as_dict(prototype.get("app_shell"))
+    return len(_as_list(shell.get("primary_navigation")))
+
+
+def _looks_like_prototype_html(code: str) -> bool:
+    lowered = str(code or "").lower()
+    return (
+        "<html" in lowered
+        and "<main" in lowered
+        and "data-prototype-kind" in lowered
+        and "data-screen-id" in lowered
+        and "primary navigation" in lowered
+    )
+
+
 def lifecycle_phase_input(project_record: dict[str, Any], phase: str) -> dict[str, Any]:
     """Build normalized workflow input for the requested lifecycle phase."""
     spec = str(project_record.get("spec", "") or "")
@@ -115,24 +142,41 @@ def build_phase_contract(project_record: dict[str, Any], phase: str) -> dict[str
         if not research:
             return None
         user_research = _as_dict(research.get("user_research"))
+        claims = [_as_dict(item) for item in _as_list(research.get("claims")) if _as_dict(item)]
+        evidence = [_as_dict(item) for item in _as_list(research.get("evidence")) if _as_dict(item)]
+        dissent = [_as_dict(item) for item in _as_list(research.get("dissent")) if _as_dict(item)]
+        accepted_claims = [item for item in claims if item.get("status") == "accepted"]
+        critical_unresolved = [
+            item for item in dissent
+            if item.get("severity") == "critical" and item.get("resolved") is not True
+        ]
+        floor = float(_as_dict(research.get("confidence_summary")).get("floor", 0.0) or 0.0)
         gates = [
             _quality_gate(
-                "competitor-coverage",
-                "競合または市場の比較材料が揃っている",
-                bool(_as_list(research.get("competitors"))) or bool(_as_list(research.get("trends"))),
-                "research should include competitive or trend evidence",
+                "source-grounding",
+                "採択 thesis が evidence と source に接地している",
+                bool(accepted_claims or claims)
+                and bool(evidence)
+                and all(bool(_as_list(item.get("evidence_ids"))) for item in (accepted_claims or claims[:2])),
+                "research should keep accepted claims grounded in evidence",
             ),
             _quality_gate(
-                "user-signal-coverage",
-                "ユーザーシグナルが planning に渡せる",
-                bool(_as_list(user_research.get("signals"))) and bool(_as_list(user_research.get("pain_points"))),
-                "user research must retain signals and pain points",
+                "counterclaim-coverage",
+                "主要 claim に対する反証が残っている",
+                bool(dissent),
+                "research should preserve dissent instead of collapsing into consensus only",
             ),
             _quality_gate(
-                "feasibility",
-                "技術実現性が明示されている",
-                float(_as_dict(research.get("tech_feasibility")).get("score", 0.0) or 0.0) > 0.0,
-                "tech feasibility score must be present",
+                "critical-dissent-resolved",
+                "重大な dissent が未解決のまま残っていない",
+                not critical_unresolved,
+                "critical research dissent must be resolved before planning",
+            ),
+            _quality_gate(
+                "confidence-floor",
+                "planning に渡す信頼度の下限を満たしている",
+                floor >= 0.6 and bool(_as_list(research.get("winning_theses"))),
+                "research should carry at least one sufficiently supported thesis into planning",
             ),
         ]
         return _contract(
@@ -142,9 +186,11 @@ def build_phase_contract(project_record: dict[str, Any], phase: str) -> dict[str
             summary="Evidence bundle for planning.",
             outputs={
                 "competitorCount": len(_as_list(research.get("competitors"))),
-                "trendCount": len(_as_list(research.get("trends"))),
-                "signalCount": len(_as_list(user_research.get("signals"))),
-                "painPointCount": len(_as_list(user_research.get("pain_points"))),
+                "claimCount": len(claims),
+                "acceptedClaimCount": len(accepted_claims),
+                "evidenceCount": len(evidence),
+                "dissentCount": len(dissent),
+                "openQuestionCount": len(_as_list(research.get("open_questions"))),
                 "segment": user_research.get("segment"),
             },
             quality_gates=gates,
@@ -156,32 +202,42 @@ def build_phase_contract(project_record: dict[str, Any], phase: str) -> dict[str
         features = _as_list(project_record.get("features"))
         estimates = _as_list(project_record.get("planEstimates"))
         milestones = _as_list(project_record.get("milestones"))
+        traceability = _as_list(analysis.get("traceability"))
+        assumptions = _as_list(analysis.get("assumptions"))
+        negative_personas = _as_list(analysis.get("negative_personas"))
+        kill_criteria = _as_list(analysis.get("kill_criteria"))
+        selected_features = [
+            _as_dict(item)
+            for item in features
+            if _as_dict(item).get("selected") is True
+        ]
         if not analysis and not features and not estimates:
             return None
         gates = [
             _quality_gate(
-                "persona-coverage",
-                "ペルソナと利用文脈が定義されている",
-                bool(_as_list(analysis.get("personas"))) and bool(_as_list(analysis.get("user_journeys"))),
-                "planning should include personas and journeys",
+                "feature-traceability",
+                "主要 feature が research claim と use case に接続されている",
+                bool(selected_features)
+                and len(traceability) >= len(selected_features),
+                "planning should connect selected features to claim and use-case lineage",
             ),
             _quality_gate(
-                "scope-definition",
-                "feature scope と use case が揃っている",
-                bool(features) and bool(_as_list(analysis.get("use_cases"))),
-                "planning should include selected features and use cases",
+                "assumption-audit",
+                "主要前提に対する監査結果が残っている",
+                bool(assumptions) and bool(_as_list(analysis.get("red_team_findings"))),
+                "planning should include explicit assumptions and red-team findings",
             ),
             _quality_gate(
-                "delivery-plan",
-                "milestone と plan estimate が揃っている",
-                bool(milestones) and bool(estimates),
-                "planning should include milestones and effort presets",
+                "negative-persona-coverage",
+                "失敗しやすい利用文脈が明示されている",
+                bool(negative_personas),
+                "planning should keep at least one negative persona or failure scenario",
             ),
             _quality_gate(
-                "design-tokens",
-                "design system の前提が揃っている",
-                bool(_as_dict(analysis.get("design_tokens"))),
-                "design tokens should be available before design/development",
+                "milestone-falsifiability",
+                "milestone が検証条件と失敗条件を持っている",
+                bool(milestones) and bool(estimates) and len(kill_criteria) >= min(len(milestones), 1),
+                "planning should include falsifiable milestones and effort presets",
             ),
         ]
         return _contract(
@@ -192,9 +248,12 @@ def build_phase_contract(project_record: dict[str, Any], phase: str) -> dict[str
             outputs={
                 "personaCount": len(_as_list(analysis.get("personas"))),
                 "featureCount": len(features),
+                "selectedFeatureCount": len(selected_features),
+                "rejectedFeatureCount": len(_as_list(analysis.get("rejected_features"))),
                 "useCaseCount": len(_as_list(analysis.get("use_cases"))),
                 "milestoneCount": len(milestones),
                 "estimatePresetCount": len(estimates),
+                "redTeamFindingCount": len(_as_list(analysis.get("red_team_findings"))),
             },
             quality_gates=gates,
             handoff_targets=["design", "approval"],
@@ -205,6 +264,9 @@ def build_phase_contract(project_record: dict[str, Any], phase: str) -> dict[str
         selected = _selected_design_variant(project_record)
         if not variants:
             return None
+        screen_count = _prototype_screen_count(selected)
+        flow_count = _prototype_flow_count(selected)
+        navigation_count = _prototype_navigation_count(selected)
         gates = [
             _quality_gate(
                 "variant-exploration",
@@ -218,6 +280,18 @@ def build_phase_contract(project_record: dict[str, Any], phase: str) -> dict[str
                 bool(selected),
                 "a selected design baseline should be identifiable",
             ),
+            _quality_gate(
+                "prototype-coverage",
+                "selected design に複数 screen の prototype がある",
+                screen_count >= 2 and navigation_count >= 2,
+                "design should include an application shell and more than one prototype screen",
+            ),
+            _quality_gate(
+                "workflow-fidelity",
+                "selected design に主要 workflow が定義されている",
+                flow_count >= 1,
+                "design should carry at least one primary workflow into development",
+            ),
         ]
         return _contract(
             phase=phase,
@@ -228,6 +302,8 @@ def build_phase_contract(project_record: dict[str, Any], phase: str) -> dict[str
                 "variantCount": len(variants),
                 "selectedDesignId": selected.get("id"),
                 "selectedPattern": selected.get("pattern_name"),
+                "screenCount": screen_count,
+                "flowCount": flow_count,
             },
             quality_gates=gates,
             handoff_targets=["approval", "development"],
@@ -271,9 +347,15 @@ def build_phase_contract(project_record: dict[str, Any], phase: str) -> dict[str
         gates = [
             _quality_gate(
                 "build-artifact",
-                "previewable build artifact exists",
-                "<html" in build_code.lower(),
-                "development should produce previewable HTML output",
+                "previewable prototype artifact exists",
+                _looks_like_prototype_html(build_code),
+                "development should produce prototype-grade HTML with app shell markers",
+            ),
+            _quality_gate(
+                "navigation-shell",
+                "build に prototype navigation と screen surfaces がある",
+                "primary navigation" in build_code.lower() and "data-screen-id" in build_code.lower(),
+                "development should preserve navigation and multiple screen surfaces from design",
             ),
             _quality_gate(
                 "milestone-coverage",
