@@ -14,7 +14,7 @@ from typing import Any
 
 from pylon.autonomy.routing import ModelRouteDecision, ModelRouteRequest, ModelTier
 from pylon.cost.estimator import CostEstimator
-from pylon.cost.fallback_engine import FallbackEngine, ProviderCallError
+from pylon.cost.fallback_engine import FallbackEngine
 from pylon.cost.optimizer import CostOptimizer
 from pylon.providers.base import Message, Response
 from pylon.providers.health import ProviderHealthTracker

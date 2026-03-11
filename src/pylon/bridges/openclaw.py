@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import urllib.request
 import urllib.error
+import urllib.request
 from typing import Any
 
 

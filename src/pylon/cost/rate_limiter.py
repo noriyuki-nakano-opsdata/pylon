@@ -11,7 +11,6 @@ observability and routing decisions.
 
 from __future__ import annotations
 
-import asyncio
 import math
 import random
 import threading
@@ -334,7 +333,7 @@ class RateLimitManager:
         if breaker and status_code in _RETRYABLE_STATUS_CODES:
             try:
                 breaker.call(_raise_failure)
-            except (CircuitOpenError, _SyntheticFailure):
+            except (CircuitOpenError, _SyntheticError):
                 pass
 
     def update_quota_from_headers(
@@ -451,12 +450,12 @@ class RateLimitManager:
             self._windows.pop(provider, None)
 
 
-class _SyntheticFailure(Exception):
+class _SyntheticError(Exception):
     """Raised internally to trip the circuit breaker on recorded failures."""
 
 
 def _raise_failure() -> None:
-    raise _SyntheticFailure()
+    raise _SyntheticError()
 
 
 def _int_header(headers: dict[str, str], key: str) -> int:

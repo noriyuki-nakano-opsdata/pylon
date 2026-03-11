@@ -5,8 +5,8 @@ HTTP services (OpenClaw), and protocol clients (MCP) behind the unified
 LLMProvider interface.
 """
 
-from pylon.bridges.cli_bridge import CLIBridge, CLIBridgeProvider
 from pylon.bridges.claude_code import ClaudeCodeBridge, ClaudeCodeProvider
+from pylon.bridges.cli_bridge import CLIBridge, CLIBridgeProvider
 from pylon.bridges.codex import CodexBridge, CodexProvider
 from pylon.bridges.gemini_cli import GeminiCLIBridge, GeminiCLIProvider
 from pylon.bridges.kimi_code import KimiCodeBridge, KimiCodeProvider

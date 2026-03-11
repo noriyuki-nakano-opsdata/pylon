@@ -7,12 +7,20 @@ from pylon.lifecycle.contracts import (
     lifecycle_phase_input,
 )
 from pylon.lifecycle.coordinator import (
-    build_lifecycle_autonomy_projection,
     build_lifecycle_approval_binding,
+    build_lifecycle_autonomy_projection,
     derive_lifecycle_next_action,
     lifecycle_action_execution_budget,
     resolve_lifecycle_autonomy_level,
     resolve_lifecycle_orchestration_mode,
+)
+from pylon.lifecycle.operator_console import (
+    build_lifecycle_peer_registry,
+    build_lifecycle_skill_catalog,
+    lifecycle_artifact,
+    lifecycle_decision,
+    merge_operator_records,
+    sync_lifecycle_project_with_run,
 )
 from pylon.lifecycle.orchestrator import (
     PHASE_ORDER,
@@ -29,14 +37,6 @@ from pylon.lifecycle.state import (
     build_lifecycle_invalidation_patch,
     prune_lifecycle_records_from_phase,
     rebuild_lifecycle_phase_statuses,
-)
-from pylon.lifecycle.operator_console import (
-    build_lifecycle_peer_registry,
-    build_lifecycle_skill_catalog,
-    lifecycle_artifact,
-    lifecycle_decision,
-    merge_operator_records,
-    sync_lifecycle_project_with_run,
 )
 
 __all__ = [

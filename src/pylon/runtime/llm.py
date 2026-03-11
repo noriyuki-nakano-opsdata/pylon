@@ -1,8 +1,8 @@
-"""Provider-backed LLM runtime with model routing and cost telemetry."""
+"""Provider-backed LLM runtime with model routing, cost telemetry, and fallback."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -13,8 +13,10 @@ from pylon.autonomy.routing import (
     ModelRouteRequest,
     ModelTier,
 )
+from pylon.cost.fallback_engine import FallbackEngine, FallbackResult, FallbackTarget
 from pylon.observability.metrics import MetricsCollector
-from pylon.providers.base import LLMProvider, Message, Response, TokenUsage
+from pylon.providers.base import Chunk, LLMProvider, Message, Response, TokenUsage
+from pylon.providers.health import ProviderHealthTracker
 from pylon.runtime.context import ContextManager
 
 
@@ -73,12 +75,18 @@ def parse_model_ref(model_ref: str) -> tuple[str | None, str]:
 
 @dataclass
 class LLMRuntime:
-    """Routes provider-backed chat calls and standardizes telemetry."""
+    """Routes provider-backed chat calls and standardizes telemetry.
+
+    Integrates FallbackEngine for automatic cross-provider failover
+    and ProviderHealthTracker for health-aware routing.
+    """
 
     router: ModelRouter = field(default_factory=ModelRouter)
     pricing: dict[tuple[str, str], ModelPricing] = field(default_factory=dict)
     metrics: MetricsCollector | None = None
     context_manager: ContextManager = field(default_factory=ContextManager)
+    fallback_engine: FallbackEngine | None = None
+    health_tracker: ProviderHealthTracker | None = None
 
     async def chat(
         self,
@@ -89,6 +97,7 @@ class LLMRuntime:
         preferred_model: str = "",
         tools: list[dict[str, Any]] | None = None,
         static_instruction: str = "",
+        use_fallback: bool = True,
     ) -> RoutedChatResult:
         prepared_context = self.context_manager.prepare(
             messages,
@@ -104,32 +113,149 @@ class LLMRuntime:
             request=effective_request,
             preferred_model=preferred_model,
         )
+
+        # Use FallbackEngine if available and enabled
+        if use_fallback and self.fallback_engine is not None:
+            response, fallback_result = await self._chat_with_fallback(
+                registry=registry,
+                route=route,
+                messages=prepared_context.messages,
+                tools=tools,
+            )
+        else:
+            provider = registry.resolve(route.provider_name, route.model_id)
+            response = await provider.chat(
+                prepared_context.messages,
+                model=route.model_id,
+                tools=tools or None,
+                cache_strategy=route.cache_strategy.value,
+                batch_eligible=route.batch_eligible,
+                context_compacted=prepared_context.was_compacted,
+                original_input_tokens=prepared_context.original_input_tokens,
+                prepared_input_tokens=prepared_context.prepared_input_tokens,
+            )
+            fallback_result = None
+
+        effective_route = route
+        if fallback_result is not None:
+            effective_route = ModelRouteDecision(
+                provider_name=fallback_result.provider,
+                model_id=fallback_result.model_id,
+                tier=fallback_result.tier,
+                reasoning=(
+                    f"{route.reasoning}; fallback chain attempt {fallback_result.attempt}"
+                    if fallback_result.was_fallback
+                    else route.reasoning
+                ),
+                cache_strategy=route.cache_strategy,
+                batch_eligible=route.batch_eligible,
+            )
+
+        # Track health
+        if self.health_tracker is not None:
+            self.health_tracker.record_success(
+                effective_route.provider_name, effective_route.model_id,
+            )
+
+        usage = response.usage or TokenUsage()
+        estimated_cost = self._estimate_cost(
+            effective_route.provider_name,
+            effective_route.model_id,
+            usage,
+        )
+        self._record_metrics(effective_route, usage, estimated_cost)
+
+        context: dict[str, Any] = {
+            "compacted": prepared_context.was_compacted,
+            "original_input_tokens": prepared_context.original_input_tokens,
+            "prepared_input_tokens": prepared_context.prepared_input_tokens,
+            "cacheable_prefix": prepared_context.cacheable_prefix,
+            "summary": prepared_context.summary,
+            "requested_route": route.to_dict(),
+        }
+        if fallback_result is not None and fallback_result.was_fallback:
+            context["fallback"] = {
+                "was_fallback": True,
+                "attempts": fallback_result.attempt,
+                "final_provider": fallback_result.provider,
+                "final_model": fallback_result.model_id,
+                "events": [e.to_dict() for e in fallback_result.events],
+            }
+
+        return RoutedChatResult(
+            response=response,
+            route=effective_route,
+            estimated_cost_usd=estimated_cost,
+            context=context,
+        )
+
+    async def stream(
+        self,
+        *,
+        registry: ProviderRegistry,
+        request: ModelRouteRequest,
+        messages: list[Message],
+        preferred_model: str = "",
+        tools: list[dict[str, Any]] | None = None,
+        static_instruction: str = "",
+    ) -> AsyncIterator[Chunk]:
+        """Stream a chat completion through the routed provider."""
+        prepared_context = self.context_manager.prepare(
+            messages,
+            static_instruction=static_instruction,
+        )
+        effective_request = replace(
+            request,
+            input_tokens_estimate=prepared_context.prepared_input_tokens,
+            cacheable_prefix=request.cacheable_prefix or prepared_context.cacheable_prefix,
+        )
+        route = self._select_route(
+            registry=registry,
+            request=effective_request,
+            preferred_model=preferred_model,
+        )
         provider = registry.resolve(route.provider_name, route.model_id)
-        response = await provider.chat(
+        async for chunk in provider.stream(
             prepared_context.messages,
             model=route.model_id,
             tools=tools or None,
             cache_strategy=route.cache_strategy.value,
-            batch_eligible=route.batch_eligible,
-            context_compacted=prepared_context.was_compacted,
-            original_input_tokens=prepared_context.original_input_tokens,
-            prepared_input_tokens=prepared_context.prepared_input_tokens,
+        ):
+            yield chunk
+
+    async def _chat_with_fallback(
+        self,
+        *,
+        registry: ProviderRegistry,
+        route: ModelRouteDecision,
+        messages: list[Message],
+        tools: list[dict[str, Any]] | None,
+    ) -> tuple[Response, FallbackResult]:
+        """Execute chat with automatic cross-provider fallback."""
+        assert self.fallback_engine is not None
+
+        async def call_fn(
+            provider_name: str,
+            model_id: str,
+            msgs: list[Message],
+            **kwargs: Any,
+        ) -> Response:
+            provider = registry.resolve(provider_name, model_id)
+            return await provider.chat(msgs, model=model_id, **kwargs)
+
+        result = await self.fallback_engine.execute(
+            tier=route.tier,
+            messages=messages,
+            call_fn=call_fn,
+            primary_override=FallbackTarget(
+                provider=route.provider_name,
+                model_id=route.model_id,
+                tier=route.tier,
+            ),
+            tools=tools,
+            cache_strategy=route.cache_strategy.value,
         )
-        usage = response.usage or TokenUsage()
-        estimated_cost = self._estimate_cost(route.provider_name, route.model_id, usage)
-        self._record_metrics(route, usage, estimated_cost)
-        return RoutedChatResult(
-            response=response,
-            route=route,
-            estimated_cost_usd=estimated_cost,
-            context={
-                "compacted": prepared_context.was_compacted,
-                "original_input_tokens": prepared_context.original_input_tokens,
-                "prepared_input_tokens": prepared_context.prepared_input_tokens,
-                "cacheable_prefix": prepared_context.cacheable_prefix,
-                "summary": prepared_context.summary,
-            },
-        )
+        return result.response, result
 
     def _select_route(
         self,

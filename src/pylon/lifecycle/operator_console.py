@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any, Iterable
+from collections.abc import Iterable
+from datetime import UTC, datetime
+from typing import Any
 
 from pylon.lifecycle.orchestrator import PHASE_ORDER, build_lifecycle_phase_blueprints
 from pylon.protocols.a2a.card import AgentCardRegistry, generate_card
@@ -12,15 +13,17 @@ from pylon.protocols.a2a.types import (
     A2ATask,
     AgentCapabilities,
     AgentSkill,
-    Artifact as A2AArtifact,
     Part,
     TaskState,
+)
+from pylon.protocols.a2a.types import (
+    Artifact as A2AArtifact,
 )
 
 
 def _utc_now_iso() -> str:
     return (
-        datetime.now(timezone.utc)
+        datetime.now(UTC)
         .replace(microsecond=0)
         .isoformat()
         .replace("+00:00", "Z")

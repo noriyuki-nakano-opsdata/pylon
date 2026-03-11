@@ -9,8 +9,7 @@ cost-aware constraints into the routing decision.
 
 from __future__ import annotations
 
-import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 

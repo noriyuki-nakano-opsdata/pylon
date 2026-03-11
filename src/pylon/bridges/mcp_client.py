@@ -103,7 +103,7 @@ class MCPClientBridge:
                 self._process.stdin.close()
             self._process.terminate()
             await asyncio.wait_for(self._process.wait(), timeout=10.0)
-        except (ProcessLookupError, asyncio.TimeoutError):
+        except (TimeoutError, ProcessLookupError):
             self._process.kill()
             await asyncio.wait_for(self._process.wait(), timeout=5.0)
         finally:

@@ -52,7 +52,7 @@ class GeminiCLIBridge(CLIBridge):
                 proc.communicate(),
                 timeout=self._timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             proc.kill()
             await asyncio.wait_for(proc.wait(), timeout=5.0)
             raise RuntimeError(

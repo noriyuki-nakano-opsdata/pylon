@@ -5,6 +5,12 @@ from dataclasses import dataclass
 import pytest
 
 from pylon.autonomy.routing import ModelProfile, ModelRouter, ModelRouteRequest, ModelTier
+from pylon.cost.fallback_engine import (
+    FallbackChainConfig,
+    FallbackEngine,
+    FallbackTarget,
+    ProviderCallError,
+)
 from pylon.dsl.parser import PylonProject
 from pylon.providers.base import Message, Response, TokenUsage
 from pylon.runtime import LLMRuntime, ModelPricing, ProviderRegistry, execute_project_sync
@@ -35,6 +41,22 @@ class FakeProvider:
         del messages, kwargs
         if False:
             yield None
+
+
+@dataclass
+class FailingProvider(FakeProvider):
+    status_code: int = 503
+    call_count: int = 0
+
+    async def chat(self, messages: list[Message], **kwargs: object) -> Response:
+        del messages, kwargs
+        self.call_count += 1
+        raise ProviderCallError(
+            "provider unavailable",
+            status_code=self.status_code,
+            provider=self.provider_name,
+            model_id=self.model,
+        )
 
 
 def test_message_helpers() -> None:
@@ -172,6 +194,63 @@ async def test_llm_runtime_falls_back_to_available_profile_before_cross_provider
 
     assert result.route.provider_name == "google"
     assert result.route.model_id == "google-standard"
+
+
+@pytest.mark.asyncio
+async def test_llm_runtime_uses_selected_route_as_fallback_primary_and_records_effective_route() -> None:
+    primary = FailingProvider("primary-model", provider_name="fake")
+    secondary = FakeProvider("secondary-model", provider_name="backup")
+    registry = ProviderRegistry(
+        {
+            "fake": lambda _model_id: primary,
+            "backup": lambda _model_id: secondary,
+        }
+    )
+    router = ModelRouter(
+        profiles=(
+            ModelProfile(
+                provider_name="fake",
+                model_id="primary-model",
+                tier=ModelTier.STANDARD,
+            ),
+        )
+    )
+    fallback_engine = FallbackEngine(
+        chains={
+            ModelTier.STANDARD: FallbackChainConfig(
+                primary_provider="unused",
+                primary_model="unused-model",
+                primary_tier=ModelTier.STANDARD,
+                same_tier=(
+                    FallbackTarget("backup", "secondary-model", ModelTier.STANDARD),
+                ),
+                max_attempts=2,
+            )
+        }
+    )
+    runtime = LLMRuntime(
+        router=router,
+        fallback_engine=fallback_engine,
+        pricing={
+            ("backup", "secondary-model"): ModelPricing(
+                input_per_million=10.0,
+                output_per_million=20.0,
+            )
+        },
+    )
+
+    result = await runtime.chat(
+        registry=registry,
+        request=ModelRouteRequest(purpose="unit-test", input_tokens_estimate=100),
+        messages=[Message(role="user", content="hello")],
+    )
+
+    assert primary.call_count == 1
+    assert result.route.provider_name == "backup"
+    assert result.route.model_id == "secondary-model"
+    assert result.context["requested_route"]["provider_name"] == "fake"
+    assert result.context["fallback"]["final_provider"] == "backup"
+    assert result.estimated_cost_usd > 0
 
 
 def test_execute_project_sync_records_model_route_and_usage() -> None:

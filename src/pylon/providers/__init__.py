@@ -5,6 +5,8 @@ Built-in providers: Anthropic, OpenAI, Ollama, AWS Bedrock, Google Vertex.
 
 from pylon.providers.base import (
     Chunk,
+    HealthCheckResult,
+    HealthStatus,
     LLMProvider,
     Message,
     ReasoningOutput,
@@ -14,6 +16,8 @@ from pylon.providers.base import (
 
 __all__ = [
     "Chunk",
+    "HealthCheckResult",
+    "HealthStatus",
     "LLMProvider",
     "Message",
     "ReasoningOutput",

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import enum
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from pylon.types import AutonomyLevel
 

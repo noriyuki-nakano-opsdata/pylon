@@ -11,7 +11,7 @@ from typing import Any
 from pylon.autonomy.routing import ModelTier
 from pylon.cost.estimator import Currency, ProviderPricing
 from pylon.cost.fallback_engine import FallbackChainConfig, FallbackTarget
-from pylon.cost.optimizer import CostCeiling, QualityFloor, TaskComplexity
+from pylon.cost.optimizer import CostCeiling, QualityFloor
 from pylon.cost.rate_limiter import ProviderQuota
 
 

@@ -32,6 +32,7 @@ from pylon.api.routes import RouteStore, register_routes
 from pylon.api.server import APIServer
 from pylon.control_plane import ControlPlaneStoreConfig, WorkflowControlPlaneStore
 from pylon.errors import ConfigError
+from pylon.runtime.llm import ProviderRegistry
 
 
 class AuthBackend(enum.StrEnum):
@@ -642,7 +643,7 @@ def build_api_server(
     *,
     store: RouteStore | None = None,
     control_plane_store: WorkflowControlPlaneStore | None = None,
-    provider_registry: "ProviderRegistry | None" = None,
+    provider_registry: ProviderRegistry | None = None,
 ) -> tuple[APIServer, RouteStore]:
     """Build an APIServer with the standard middleware stack and routes."""
 
@@ -710,7 +711,7 @@ def build_http_api_server(
     port: int = 8080,
     store: RouteStore | None = None,
     control_plane_store: WorkflowControlPlaneStore | None = None,
-    provider_registry: "ProviderRegistry | None" = None,
+    provider_registry: ProviderRegistry | None = None,
 ) -> tuple[PylonHTTPServer, RouteStore]:
     """Build an HTTP server around the standard APIServer wiring."""
 

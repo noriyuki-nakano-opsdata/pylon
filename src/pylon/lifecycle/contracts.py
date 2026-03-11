@@ -6,7 +6,6 @@ from typing import Any
 
 from pylon.lifecycle.orchestrator import PHASE_ORDER
 
-
 EXECUTABLE_PHASES: tuple[str, ...] = ("research", "planning", "design", "development")
 
 

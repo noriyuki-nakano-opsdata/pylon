@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from html import escape
 from typing import Any
 from urllib.parse import urlparse
@@ -65,7 +65,7 @@ _MUTABLE_PROJECT_FIELDS = frozenset(
 
 def _utc_now_iso() -> str:
     return (
-        datetime.now(timezone.utc)
+        datetime.now(UTC)
         .replace(microsecond=0)
         .isoformat()
         .replace("+00:00", "Z")
@@ -741,7 +741,6 @@ def _build_story_architecture_bundle(state: dict[str, Any]) -> dict[str, Any]:
 def _feature_catalog_for_spec(state: dict[str, Any]) -> list[tuple[str, str, str, str]]:
     spec = str(state.get("spec", ""))
     kind = _infer_product_kind(spec)
-    context = _research_context(state)
     if kind == "learning":
         return [
             ("日次レッスン", "must-be", "medium", "短時間でも継続しやすい学習ループを作る"),
@@ -1717,9 +1716,11 @@ async def _delegate_to_lifecycle_peer(
     from pylon.protocols.a2a.types import (
         A2AMessage,
         A2ATask,
-        Artifact as A2AArtifact,
         Part,
         TaskState,
+    )
+    from pylon.protocols.a2a.types import (
+        Artifact as A2AArtifact,
     )
 
     peer_registry = build_lifecycle_peer_registry()
@@ -1815,7 +1816,10 @@ async def _plan_node_collaboration(
     provider_registry: ProviderRegistry | None,
     llm_runtime: LLMRuntime | None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    from pylon.lifecycle.operator_console import build_lifecycle_peer_registry, build_lifecycle_skill_catalog
+    from pylon.lifecycle.operator_console import (
+        build_lifecycle_peer_registry,
+        build_lifecycle_skill_catalog,
+    )
 
     agent = _phase_blueprint_for_node(phase, node_id)
     skill_catalog = build_lifecycle_skill_catalog()
@@ -4660,7 +4664,6 @@ def _development_integrator_handler(
     provider_registry: ProviderRegistry | None = None,
     llm_runtime: LLMRuntime | None = None,
 ) -> NodeResult:
-    design = _as_dict(state.get("design"))
     analysis = _as_dict(state.get("analysis"))
     selected_design = _as_dict(state.get("selected_design")) or _selected_design_from_state(state)
     selected_features = _selected_feature_names(state)
@@ -5685,7 +5688,7 @@ def _build_preview_html(
             </div>
             <div class="metric">
               <p>Primary Flow</p>
-              <strong>{escape(str(_as_dict((flows[0] if flows else {})).get("name") or "Core workflow"))}</strong>
+              <strong>{escape(str(_as_dict(flows[0] if flows else {}).get("name") or "Core workflow"))}</strong>
             </div>
             <div class="metric">
               <p>Layout</p>

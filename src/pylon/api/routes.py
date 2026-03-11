@@ -12,7 +12,7 @@ import logging
 import time
 import uuid
 from collections.abc import MutableMapping
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pylon.api.authz import require_scopes
@@ -24,13 +24,6 @@ from pylon.api.public_contract import (
     register_public_route,
     v1,
 )
-from pylon.approval import ApprovalManager
-from pylon.approval.manager import (
-    ApprovalAlreadyDecidedError,
-    ApprovalBindingMismatchError,
-    ApprovalNotFoundError,
-)
-from pylon.approval.types import compute_approval_binding_hash
 from pylon.api.schemas import (
     APPROVAL_DECISION_SCHEMA,
     CREATE_AGENT_SCHEMA,
@@ -41,6 +34,13 @@ from pylon.api.schemas import (
     validate,
 )
 from pylon.api.server import APIServer, HandlerFunc, Request, Response
+from pylon.approval import ApprovalManager
+from pylon.approval.manager import (
+    ApprovalAlreadyDecidedError,
+    ApprovalBindingMismatchError,
+    ApprovalNotFoundError,
+)
+from pylon.approval.types import compute_approval_binding_hash
 from pylon.control_plane import (
     ControlPlaneBackend,
     ControlPlaneStoreConfig,
@@ -56,30 +56,31 @@ from pylon.dsl.parser import PylonProject
 from pylon.lifecycle import (
     PHASE_ORDER,
     build_deploy_checks,
-    build_lifecycle_autonomy_projection,
     build_lifecycle_approval_binding,
+    build_lifecycle_autonomy_projection,
     build_lifecycle_invalidation_patch,
     build_lifecycle_phase_blueprints,
     build_lifecycle_skill_catalog,
     build_lifecycle_workflow_definition,
     build_lifecycle_workflow_handlers,
     build_release_record,
-    derive_lifecycle_next_action,
     default_lifecycle_project_record,
+    derive_lifecycle_next_action,
     lifecycle_action_execution_budget,
-    lifecycle_phase_input,
     lifecycle_artifact,
     lifecycle_decision,
-    merge_operator_records,
+    lifecycle_phase_input,
     merge_lifecycle_project_record,
+    merge_operator_records,
     refresh_lifecycle_recommendations,
     resolve_lifecycle_autonomy_level,
     resolve_lifecycle_orchestration_mode,
     sync_lifecycle_project_with_run,
 )
-from pylon.repository.audit import default_hmac_key
-from pylon.types import AutonomyLevel
 from pylon.providers.base import Message, TokenUsage
+from pylon.repository.audit import default_hmac_key
+from pylon.runtime.llm import ProviderRegistry
+from pylon.types import AutonomyLevel
 
 logger = logging.getLogger(__name__)
 
@@ -268,7 +269,7 @@ ADS_BENCHMARKS: dict[str, dict[str, Any]] = {
 
 def _utc_now_iso() -> str:
     return (
-        datetime.now(timezone.utc)
+        datetime.now(UTC)
         .replace(microsecond=0)
         .isoformat()
         .replace("+00:00", "Z")
@@ -696,7 +697,7 @@ def register_routes(
     observability: APIObservabilityBundle | None = None,
     readiness_route_enabled: bool = True,
     metrics_route_enabled: bool = True,
-    provider_registry: "ProviderRegistry | None" = None,
+    provider_registry: ProviderRegistry | None = None,
 ) -> RouteStore:
     """Register all API routes on the server. Returns the store."""
     s = store or RouteStore(
@@ -2211,7 +2212,7 @@ def register_routes(
         created_at = str(agent.get("created_at") or _utc_now_iso())
         uptime_seconds = max(
             0,
-            int((datetime.now(timezone.utc) - _parse_iso_datetime(created_at)).total_seconds()),
+            int((datetime.now(UTC) - _parse_iso_datetime(created_at)).total_seconds()),
         )
         return {
             "id": str(agent.get("id", "")),

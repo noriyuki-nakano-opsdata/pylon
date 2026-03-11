@@ -55,11 +55,11 @@ class CLIBridge:
                 self._process.stdin.close()
             self._process.terminate()
             await asyncio.wait_for(self._process.wait(), timeout=10.0)
-        except (ProcessLookupError, asyncio.TimeoutError):
+        except (TimeoutError, ProcessLookupError):
             try:
                 self._process.kill()
                 await asyncio.wait_for(self._process.wait(), timeout=5.0)
-            except (ProcessLookupError, asyncio.TimeoutError, OSError):
+            except (TimeoutError, ProcessLookupError, OSError):
                 pass
         finally:
             self._process = None

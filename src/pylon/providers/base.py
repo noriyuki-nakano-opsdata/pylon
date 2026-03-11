@@ -6,9 +6,31 @@ Built-in providers: Anthropic, OpenAI, Ollama, AWS Bedrock, Google Vertex.
 
 from __future__ import annotations
 
+import enum
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
+
+
+class HealthStatus(enum.Enum):
+    """Provider endpoint health status."""
+
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    UNHEALTHY = "unhealthy"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class HealthCheckResult:
+    """Result of a provider health check."""
+
+    status: HealthStatus
+    latency_ms: float = 0.0
+    model_id: str = ""
+    provider_name: str = ""
+    error: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -52,6 +74,7 @@ class Chunk:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     finish_reason: str | None = None
     usage: TokenUsage | None = None
+    reasoning_content: str | None = None
 
 
 @dataclass
@@ -74,6 +97,7 @@ class LLMProvider(Protocol):
     """Protocol for LLM providers.
 
     All providers must implement chat() and stream().
+    Optionally implement health_check() for proactive health monitoring.
     Fallback chains are configurable (e.g., Anthropic -> OpenAI -> Ollama).
     """
 
@@ -86,3 +110,15 @@ class LLMProvider(Protocol):
 
     @property
     def provider_name(self) -> str: ...
+
+    async def health_check(self) -> HealthCheckResult:
+        """Check if the provider endpoint is reachable and responsive.
+
+        Default implementation returns UNKNOWN. Providers that support
+        health checks should override this method.
+        """
+        return HealthCheckResult(
+            status=HealthStatus.UNKNOWN,
+            model_id=self.model_id,
+            provider_name=self.provider_name,
+        )

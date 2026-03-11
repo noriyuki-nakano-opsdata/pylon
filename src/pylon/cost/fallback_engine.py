@@ -17,10 +17,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from pylon.autonomy.routing import CacheStrategy, ModelRouteDecision, ModelTier
+from pylon.autonomy.routing import ModelTier
 from pylon.cost.rate_limiter import RateLimitManager
-from pylon.providers.base import Message, Response, TokenUsage
-
+from pylon.providers.base import Message, Response
 
 # Status codes that trigger fallback.
 _FALLBACK_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
@@ -220,6 +219,7 @@ class FallbackEngine:
         tier: ModelTier,
         messages: list[Message],
         call_fn: Any,
+        primary_override: FallbackTarget | None = None,
         tools: list[dict[str, Any]] | None = None,
         cache_strategy: str = "none",
         **kwargs: Any,
@@ -230,6 +230,9 @@ class FallbackEngine:
             tier: The model tier to use (determines fallback chain).
             messages: Pylon messages to send.
             call_fn: Async callable(provider, model_id, messages, **kw) -> Response.
+            primary_override: Optional primary target to use for the first
+                attempt while preserving the configured same-tier and downgrade
+                fallbacks for the selected tier.
             tools: Tool definitions to pass through.
             cache_strategy: Cache strategy value string.
             **kwargs: Additional arguments passed to call_fn.
@@ -244,6 +247,28 @@ class FallbackEngine:
         chain_config = self._chains.get(tier)
         if chain_config is None:
             raise ValueError(f"No fallback chain configured for tier {tier.value}")
+
+        if primary_override is not None:
+            filtered_same_tier = tuple(
+                target
+                for target in chain_config.same_tier
+                if (target.provider, target.model_id)
+                != (primary_override.provider, primary_override.model_id)
+            )
+            filtered_downgrade = tuple(
+                target
+                for target in chain_config.downgrade
+                if (target.provider, target.model_id)
+                != (primary_override.provider, primary_override.model_id)
+            )
+            chain_config = FallbackChainConfig(
+                primary_provider=primary_override.provider,
+                primary_model=primary_override.model_id,
+                primary_tier=primary_override.tier,
+                same_tier=filtered_same_tier,
+                downgrade=filtered_downgrade,
+                max_attempts=chain_config.max_attempts,
+            )
 
         chain = chain_config.chain()
         events: list[FallbackEvent] = []
