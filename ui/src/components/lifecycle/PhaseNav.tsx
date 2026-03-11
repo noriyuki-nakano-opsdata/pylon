@@ -30,15 +30,24 @@ interface PhaseNavProps {
   basePath: string;
   phaseStatuses: PhaseStatus[];
   collapsed?: boolean;
+  className?: string;
+  onItemClick?: () => void;
 }
 
-export function PhaseNav({ basePath, phaseStatuses, collapsed }: PhaseNavProps) {
+export function PhaseNav({
+  basePath,
+  phaseStatuses,
+  collapsed,
+  className,
+  onItemClick,
+}: PhaseNavProps) {
   const location = useLocation();
 
   return (
     <nav className={cn(
-      "flex flex-col gap-0.5 border-r border-border bg-card/50 py-3",
+      "flex h-full flex-col gap-0.5 border-r border-border bg-card/70 py-3",
       collapsed ? "w-14 px-1" : "w-56 px-2",
+      className,
     )}>
       {!collapsed && (
         <p className="px-3 pb-2 pt-1 text-[10px] font-semibold uppercase tracking-widest text-muted-foreground/60">
@@ -71,6 +80,7 @@ export function PhaseNav({ basePath, phaseStatuses, collapsed }: PhaseNavProps) 
               label={phase.label}
               description={phase.description}
               collapsed={collapsed}
+              onClick={onItemClick}
             />
           </div>
         );
@@ -116,9 +126,20 @@ interface PhaseNavItemProps {
   label: string;
   description: string;
   collapsed?: boolean;
+  onClick?: () => void;
 }
 
-function PhaseNavItem({ isLocked, to, isActive, status, icon: Icon, label, description, collapsed }: PhaseNavItemProps) {
+function PhaseNavItem({
+  isLocked,
+  to,
+  isActive,
+  status,
+  icon: Icon,
+  label,
+  description,
+  collapsed,
+  onClick,
+}: PhaseNavItemProps) {
   const inner = (
     <>
       <div className={cn(
@@ -170,6 +191,7 @@ function PhaseNavItem({ isLocked, to, isActive, status, icon: Icon, label, descr
   return (
     <NavLink
       to={to}
+      onClick={onClick}
       className={cn(
         baseClassName,
         isActive ? "bg-accent shadow-sm" : "hover:bg-accent/50",

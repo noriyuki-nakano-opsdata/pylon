@@ -1,58 +1,45 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
   ShieldCheck, Check, X, ArrowRight, ArrowLeft, MessageSquare,
   FileText, Users, Palette, Flag, CheckCircle2, XCircle,
-  Clock, AlertTriangle,
+  Clock, AlertTriangle, Loader2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
-import { useLifecycle } from "./LifecycleLayout";
-
-type ApprovalComment = { text: string; type: "comment" | "approve" | "reject"; time: string };
-
-function loadComments(projectSlug: string | undefined): ApprovalComment[] {
-  if (!projectSlug) return [];
-  try {
-    const raw = localStorage.getItem(`pylon_approval_comments_${projectSlug}`);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveComments(projectSlug: string | undefined, comments: ApprovalComment[]) {
-  if (!projectSlug) return;
-  localStorage.setItem(`pylon_approval_comments_${projectSlug}`, JSON.stringify(comments));
-}
+import { lifecycleApi } from "@/api/lifecycle";
+import { useLifecycle } from "./LifecycleContext";
 
 export function ApprovalPhase() {
   const navigate = useNavigate();
   const { projectSlug } = useParams();
   const lc = useLifecycle();
   const [comment, setComment] = useState("");
-  const [comments, setComments] = useState<ApprovalComment[]>(() => loadComments(projectSlug));
-
-  useEffect(() => {
-    saveComments(projectSlug, comments);
-  }, [comments, projectSlug]);
+  const [submitting, setSubmitting] = useState<"comment" | "approve" | "reject" | null>(null);
 
   const selectedFeatureCount = lc.features.filter((f) => f.selected).length;
   const selectedDesign = lc.designVariants.find((v) => v.id === lc.selectedDesignId);
   const milestoneCount = lc.milestones.length;
+  const reviewLinks = [
+    { label: "調査を確認", phase: "research", ready: !!lc.research },
+    { label: "企画を修正", phase: "planning", ready: !!lc.analysis },
+    { label: "デザインを修正", phase: "design", ready: !!lc.selectedDesignId },
+  ] as const;
 
-  const addComment = (type: "comment" | "approve" | "reject") => {
+  const submitComment = async (type: "comment" | "approve" | "reject") => {
+    if (!projectSlug) return;
     if (type === "comment" && !comment.trim()) return;
-    setComments([
-      ...comments,
-      { text: comment || (type === "approve" ? "承認しました" : "差し戻しました"), type, time: new Date().toLocaleTimeString() },
-    ]);
-    setComment("");
-    if (type === "approve") {
-      lc.setApprovalStatus("approved");
-      lc.completePhase("approval");
-    } else if (type === "reject") {
-      lc.setApprovalStatus("revision_requested");
+    setSubmitting(type);
+    try {
+      const payload = {
+        text: comment || (type === "approve" ? "承認しました" : "差し戻しました"),
+        type,
+      } as const;
+      const project = await lifecycleApi.addApprovalComment(projectSlug, payload);
+      lc.applyProject(project);
+      setComment("");
+    } finally {
+      setSubmitting(null);
     }
   };
 
@@ -60,17 +47,17 @@ export function ApprovalPhase() {
   const goBack = () => navigate(`/p/${projectSlug}/lifecycle/design`);
 
   const checkItems = [
-    { label: "プロダクト仕様が明確", done: !!lc.spec.trim() },
-    { label: "UX分析が完了", done: !!lc.analysis },
-    { label: "機能スコープが確定", done: selectedFeatureCount > 0 },
-    { label: "デザインパターンが選択済み", done: !!lc.selectedDesignId },
-    { label: "マイルストーンが定義済み", done: milestoneCount > 0 },
+    { label: "プロダクト仕様が明確", done: !!lc.spec.trim(), phase: "research" },
+    { label: "UX分析が完了", done: !!lc.analysis, phase: "planning" },
+    { label: "機能スコープが確定", done: selectedFeatureCount > 0, phase: "planning" },
+    { label: "デザインパターンが選択済み", done: !!lc.selectedDesignId, phase: "design" },
+    { label: "マイルストーンが定義済み", done: milestoneCount > 0, phase: "planning" },
   ];
   const allChecked = checkItems.every((c) => c.done);
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center gap-2 border-b border-border px-6 py-3">
+      <div className="flex flex-wrap items-center gap-2 border-b border-border px-6 py-3">
         <button onClick={goBack} className="text-muted-foreground hover:text-foreground"><ArrowLeft className="h-4 w-4" /></button>
         <h1 className="flex items-center gap-2 text-sm font-bold text-foreground">
           <ShieldCheck className="h-4 w-4 text-primary" /> 企画承認
@@ -109,12 +96,30 @@ export function ApprovalPhase() {
                      lc.approvalStatus === "revision_requested" ? "企画内容に修正が必要です。前のフェーズに戻って修正してください。" :
                      "以下の企画内容をレビューし、承認または差し戻してください。"}
                   </p>
+                  {lc.approvalStatus === "revision_requested" && (
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {reviewLinks.map((link) => (
+                        <button
+                          key={link.phase}
+                          onClick={() => navigate(`/p/${projectSlug}/lifecycle/${link.phase}`)}
+                          className={cn(
+                            "rounded-md border px-3 py-1.5 text-xs transition-colors",
+                            link.ready
+                              ? "border-destructive/30 bg-background text-foreground hover:bg-destructive/10"
+                              : "border-border text-muted-foreground hover:bg-accent",
+                          )}
+                        >
+                          {link.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
 
             {/* Summary cards */}
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <SummaryCard icon={FileText} title="プロダクト仕様" content={lc.spec} />
               <SummaryCard icon={Users} title="ペルソナ" content={`${lc.analysis?.personas.length ?? 0}名のペルソナを定義`} />
               <SummaryCard icon={Palette} title="デザインパターン" content={selectedDesign ? `${selectedDesign.pattern_name} (${selectedDesign.model})` : "未選択"} />
@@ -141,12 +146,12 @@ export function ApprovalPhase() {
               <h3 className="flex items-center gap-2 text-sm font-bold text-foreground mb-3">
                 <MessageSquare className="h-4 w-4" /> コメント
               </h3>
-              {comments.length === 0 && (
+              {lc.approvalComments.length === 0 && (
                 <p className="text-xs text-muted-foreground py-4 text-center">コメントはまだありません</p>
               )}
               <div className="space-y-2 mb-3">
-                {comments.map((c, i) => (
-                  <div key={i} className={cn("rounded-lg p-3 text-sm",
+                {lc.approvalComments.map((c) => (
+                  <div key={c.id} className={cn("rounded-lg p-3 text-sm",
                     c.type === "approve" ? "bg-success/10 text-success" :
                     c.type === "reject" ? "bg-destructive/10 text-destructive" :
                     "bg-accent text-foreground",
@@ -155,7 +160,9 @@ export function ApprovalPhase() {
                       <span className="text-xs font-medium">
                         {c.type === "approve" ? "✓ 承認" : c.type === "reject" ? "✗ 差し戻し" : "コメント"}
                       </span>
-                      <span className="text-[10px] text-muted-foreground">{c.time}</span>
+                      <span className="text-[10px] text-muted-foreground">
+                        {new Date(c.time).toLocaleString("ja-JP")}
+                      </span>
                     </div>
                     <p className="text-xs">{c.text}</p>
                   </div>
@@ -172,18 +179,26 @@ export function ApprovalPhase() {
                     className="w-full rounded-lg border border-border bg-background p-3 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring resize-none"
                   />
                   <div className="flex gap-2">
-                    <button onClick={() => addComment("comment")} disabled={!comment.trim()} className="rounded-md border border-border px-3 py-1.5 text-xs text-muted-foreground hover:text-foreground disabled:opacity-50">
-                      コメント
+                    <button
+                      onClick={() => void submitComment("comment")}
+                      disabled={!comment.trim() || submitting !== null}
+                      className="rounded-md border border-border px-3 py-1.5 text-xs text-muted-foreground hover:text-foreground disabled:opacity-50"
+                    >
+                      {submitting === "comment" ? <span className="inline-flex items-center gap-1"><Loader2 className="h-3 w-3 animate-spin" />送信中</span> : "コメント"}
                     </button>
                     <div className="flex-1" />
-                    <button onClick={() => addComment("reject")} className="flex items-center gap-1 rounded-md border border-destructive/30 px-3 py-1.5 text-xs text-destructive hover:bg-destructive/10">
-                      <X className="h-3 w-3" /> 差し戻し
+                    <button
+                      onClick={() => void submitComment("reject")}
+                      disabled={submitting !== null}
+                      className="flex items-center gap-1 rounded-md border border-destructive/30 px-3 py-1.5 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-50"
+                    >
+                      {submitting === "reject" ? <Loader2 className="h-3 w-3 animate-spin" /> : <X className="h-3 w-3" />} 差し戻し
                     </button>
-                    <button onClick={() => addComment("approve")} disabled={!allChecked} className={cn(
+                    <button onClick={() => void submitComment("approve")} disabled={!allChecked || submitting !== null} className={cn(
                       "flex items-center gap-1 rounded-md px-4 py-1.5 text-xs font-medium transition-colors",
-                      allChecked ? "bg-success text-white hover:bg-success/90" : "bg-muted text-muted-foreground cursor-not-allowed",
+                      allChecked && submitting === null ? "bg-success text-white hover:bg-success/90" : "bg-muted text-muted-foreground cursor-not-allowed",
                     )}>
-                      <Check className="h-3 w-3" /> 承認
+                      {submitting === "approve" ? <Loader2 className="h-3 w-3 animate-spin" /> : <Check className="h-3 w-3" />} 承認
                     </button>
                   </div>
                 </div>
@@ -198,10 +213,15 @@ export function ApprovalPhase() {
               <h3 className="text-sm font-bold text-foreground mb-3">承認チェックリスト</h3>
               <div className="space-y-2">
                 {checkItems.map((item, i) => (
-                  <div key={i} className="flex items-center gap-2 text-sm">
+                  <button
+                    key={i}
+                    onClick={() => navigate(`/p/${projectSlug}/lifecycle/${item.phase}`)}
+                    className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-sm transition-colors hover:bg-accent"
+                  >
                     {item.done ? <CheckCircle2 className="h-4 w-4 text-success shrink-0" /> : <AlertTriangle className="h-4 w-4 text-warning shrink-0" />}
-                    <span className={cn(item.done ? "text-foreground" : "text-muted-foreground")}>{item.label}</span>
-                  </div>
+                    <span className={cn("flex-1", item.done ? "text-foreground" : "text-muted-foreground")}>{item.label}</span>
+                    <span className="text-[10px] text-muted-foreground">開く</span>
+                  </button>
                 ))}
               </div>
               <div className="mt-3 h-2 rounded-full bg-muted overflow-hidden">

@@ -1,17 +1,17 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
-  Palette, Loader2, Check, ArrowRight, ArrowLeft,
-  Eye, Code2, Merge, Star, ExternalLink, Zap,
+  Palette, ArrowRight, ArrowLeft,
+  Eye, Code2, Star, ExternalLink, Zap,
   Monitor, Tablet, Smartphone, BarChart3, AlertCircle,
   ChevronDown, ChevronUp, Maximize2, Minimize2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { useLifecycle } from "./LifecycleLayout";
+import { useLifecycle } from "./LifecycleContext";
 import { useWorkflowRun } from "@/hooks/useWorkflowRun";
-import { parseDesignOutput } from "@/api/lifecycle";
+import { lifecycleApi } from "@/api/lifecycle";
 import { AgentProgressView } from "@/components/lifecycle/AgentProgressView";
 import type { DesignVariant } from "@/types/lifecycle";
 
@@ -19,7 +19,7 @@ const DESIGN_AGENTS = [
   { id: "claude-designer", label: "Claude Sonnet 4.6" },
   { id: "openai-designer", label: "GPT-5 Mini" },
   { id: "gemini-designer", label: "Gemini 3 Flash" },
-  { id: "design-evaluator", label: "評価・スコアリング" },
+  { id: "design-evaluator", label: "Design Judge" },
 ];
 
 export function DesignPhase() {
@@ -27,20 +27,21 @@ export function DesignPhase() {
   const { projectSlug } = useParams();
   const lc = useLifecycle();
   const workflow = useWorkflowRun("design", projectSlug ?? "");
+  const designAgents = lc.blueprints.design.team.length > 0
+    ? lc.blueprints.design.team.map((agent) => ({ id: agent.id, label: agent.label }))
+    : DESIGN_AGENTS;
   const [previewDevice, setPreviewDevice] = useState<"desktop" | "tablet" | "mobile">("desktop");
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const syncedRunRef = useRef<string | null>(null);
 
-  // Handle workflow completion — stable dependency via JSON key check
-  const stateHasVariants = "variants" in workflow.state || "design" in workflow.state;
   useEffect(() => {
-    if (workflow.status === "completed" && stateHasVariants) {
-      const variants = parseDesignOutput(workflow.state);
-      if (variants.length > 0) {
-        lc.setDesignVariants(variants);
-      }
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workflow.status, stateHasVariants]);
+    if (workflow.status !== "completed" || !workflow.runId || !projectSlug) return;
+    if (syncedRunRef.current === workflow.runId) return;
+    syncedRunRef.current = workflow.runId;
+    void lifecycleApi.syncPhaseRun(projectSlug, "design", workflow.runId).then(({ project }) => {
+      lc.applyProject(project);
+    });
+  }, [workflow.runId, workflow.status, projectSlug, lc]);
 
   const isGenerating = workflow.status === "starting" || workflow.status === "running";
 
@@ -63,30 +64,84 @@ export function DesignPhase() {
     setExpandedId((prev) => (prev === id ? null : id));
   };
 
+  const selectDesign = (designId: string) => {
+    if (!projectSlug) {
+      lc.setSelectedDesignId(designId);
+      return;
+    }
+    void lifecycleApi.saveProject(projectSlug, { selectedDesignId: designId }).then((project) => {
+      lc.applyProject(project);
+    });
+  };
+
   if (lc.designVariants.length === 0 && !isGenerating) {
+    const selectedFeatureCount = lc.features.filter((f) => f.selected).length;
+    const planningReady = Boolean(lc.analysis);
     return (
       <div className="flex h-full items-center justify-center p-6">
-        <div className="max-w-xl w-full space-y-6 text-center">
-          <Palette className="h-12 w-12 text-primary mx-auto" />
-          <h2 className="text-xl font-bold text-foreground">デザインパターン比較</h2>
-          <p className="text-sm text-muted-foreground">
-            複数のAIモデルが同時にデザインパターンを生成。Side-by-Sideで比較し、ベストを選択できます。
-          </p>
-          <div className="rounded-lg border border-border bg-card p-4 text-left">
-            <p className="text-xs font-medium text-muted-foreground mb-2">生成モデル</p>
-            <div className="flex flex-wrap gap-2">
-              {["Claude Sonnet 4.6", "GPT-5 Mini", "Gemini 3 Flash"].map((m) => (
-                <Badge key={m} variant="secondary">{m}</Badge>
-              ))}
+        <div className="max-w-3xl w-full space-y-6">
+          <div className="text-center">
+            <Palette className="h-12 w-12 text-primary mx-auto" />
+            <h2 className="text-xl font-bold text-foreground">デザインパターン比較</h2>
+            <p className="text-sm text-muted-foreground">
+              複数のAIモデルが同時にデザインパターンを生成。Side-by-Sideで比較し、ベストを選択できます。
+            </p>
+          </div>
+          <div className="grid gap-4 md:grid-cols-[1.4fr_1fr]">
+            <div className="rounded-xl border border-border bg-card p-5 text-left">
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground/70">handoff summary</p>
+              <h3 className="mt-2 text-base font-semibold text-foreground">企画から design に渡る材料</h3>
+              <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                <div className="rounded-lg border border-border bg-background p-3">
+                  <p className="text-xs text-muted-foreground">分析結果</p>
+                  <p className="mt-1 text-lg font-semibold text-foreground">{planningReady ? "Ready" : "Pending"}</p>
+                </div>
+                <div className="rounded-lg border border-border bg-background p-3">
+                  <p className="text-xs text-muted-foreground">選択機能</p>
+                  <p className="mt-1 text-lg font-semibold text-foreground">{selectedFeatureCount}</p>
+                </div>
+                <div className="rounded-lg border border-border bg-background p-3">
+                  <p className="text-xs text-muted-foreground">マイルストーン</p>
+                  <p className="mt-1 text-lg font-semibold text-foreground">{lc.milestones.length}</p>
+                </div>
+              </div>
+              <div className="mt-4 rounded-lg border border-border bg-background p-4">
+                <p className="text-xs font-medium text-muted-foreground mb-2">生成モデル</p>
+                <div className="flex flex-wrap gap-2">
+                  {["Claude Sonnet 4.6", "GPT-5 Mini", "Gemini 3 Flash"].map((m) => (
+                    <Badge key={m} variant="secondary">{m}</Badge>
+                  ))}
+                </div>
+                <p className="mt-3 text-sm text-muted-foreground">
+                  planning で選んだ機能と分析結果をもとに、比較可能な 3 案を一度に生成します。
+                </p>
+              </div>
+            </div>
+            <div className="rounded-xl border border-border bg-card p-5 text-left">
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground/70">readiness</p>
+              <h3 className="mt-2 text-base font-semibold text-foreground">開始前チェック</h3>
+              <div className="mt-4 space-y-2">
+                {[
+                  { label: "planning analysis が存在する", done: planningReady },
+                  { label: "少なくとも 1 つ機能が選択されている", done: selectedFeatureCount > 0 },
+                  { label: "比較対象となる spec が入力されている", done: lc.spec.trim().length > 0 },
+                ].map((item) => (
+                  <div key={item.label} className="flex items-center gap-2 rounded-lg border border-border bg-background px-3 py-2 text-sm">
+                    <span className={cn("h-2.5 w-2.5 rounded-full", item.done ? "bg-success" : "bg-warning")} />
+                    <span className={item.done ? "text-foreground" : "text-muted-foreground"}>{item.label}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-4 flex gap-2">
+                <Button variant="outline" onClick={goBack} className="flex-1">
+                  企画に戻る
+                </Button>
+                <Button onClick={generate} className="flex-1 gap-2">
+                  <Zap className="h-4 w-4" /> 3パターン生成
+                </Button>
+              </div>
             </div>
           </div>
-          <div className="rounded-lg border border-border bg-card p-4 text-left">
-            <p className="text-xs font-medium text-muted-foreground mb-1">選択中の機能</p>
-            <p className="text-sm text-foreground">{lc.features.filter((f) => f.selected).length}個の機能が選択されています</p>
-          </div>
-          <Button onClick={generate} className="w-full gap-2" size="lg">
-            <Zap className="h-4 w-4" /> 3パターンを並行生成
-          </Button>
         </div>
       </div>
     );
@@ -108,11 +163,11 @@ export function DesignPhase() {
   if (isGenerating) {
     return (
       <AgentProgressView
-        agents={DESIGN_AGENTS}
+        agents={designAgents}
         progress={workflow.agentProgress}
         elapsedMs={workflow.elapsedMs}
         title="3つのAIモデルが並行生成中..."
-        subtitle="Claude Sonnet 4.6 / GPT-5 Mini / Gemini 3 Flash がそれぞれ異なるデザインパターンを生成し、品質評価を行います"
+        subtitle="Design jury が複数案を生成し、judge が品質比較を行っています"
       />
     );
   }
@@ -123,7 +178,7 @@ export function DesignPhase() {
   return (
     <div className="flex h-full flex-col">
       {/* Toolbar */}
-      <div className="flex items-center gap-2 border-b border-border px-6 py-2.5">
+      <div className="flex flex-wrap items-center gap-2 border-b border-border px-6 py-2.5">
         <button onClick={goBack} className="text-muted-foreground hover:text-foreground"><ArrowLeft className="h-4 w-4" /></button>
         <h1 className="flex items-center gap-2 text-sm font-bold text-foreground">
           <Palette className="h-4 w-4 text-primary" /> デザインパターン比較
@@ -163,7 +218,7 @@ export function DesignPhase() {
               deviceWidth={deviceWidth}
               isSelected={lc.selectedDesignId === v.id}
               isExpanded={expandedId === v.id}
-              onSelect={() => lc.setSelectedDesignId(v.id)}
+              onSelect={() => selectDesign(v.id)}
               onToggleExpand={() => toggleExpand(v.id)}
             />
           ))}

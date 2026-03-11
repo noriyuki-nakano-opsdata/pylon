@@ -1,68 +1,87 @@
-import { useState, createContext, useContext, useEffect, useRef } from "react";
-import { Outlet, useParams } from "react-router-dom";
+import { useEffect, useRef, useState } from "react";
+import { Outlet, useLocation, useParams } from "react-router-dom";
+import { Loader2 } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { lifecycleApi } from "@/api/lifecycle";
+import { LifecycleOperatorConsole } from "@/components/lifecycle/LifecycleOperatorConsole";
 import { PhaseNav } from "@/components/lifecycle/PhaseNav";
+import { LifecycleWorkspaceHeader } from "@/components/lifecycle/LifecycleWorkspaceHeader";
+import { LifecycleContext } from "./LifecycleContext";
 import type {
-  LifecyclePhase, PhaseStatus, AnalysisResult, FeatureSelection,
-  Milestone, DesignVariant, MarketResearch, MilestoneResult,
-  PlanEstimate, PlanPreset,
+  ApprovalComment,
+  AnalysisResult,
+  DeployCheck,
+  DesignVariant,
+  FeatureSelection,
+  FeedbackItem,
+  LifecycleArtifact,
+  LifecycleDecision,
+  LifecycleDelegation,
+  LifecyclePhase,
+  LifecyclePhaseRun,
+  LifecycleProject,
+  LifecycleRecommendation,
+  LifecycleSkillInvocation,
+  MarketResearch,
+  Milestone,
+  MilestoneResult,
+  PhaseBlueprint,
+  PhaseStatus,
+  PlanEstimate,
+  PlanPreset,
+  ReleaseRecord,
 } from "@/types/lifecycle";
-
-/* ── Context for sharing state across phases ── */
-interface LifecycleState {
-  spec: string;
-  setSpec: (s: string) => void;
-  research: MarketResearch | null;
-  setResearch: (r: MarketResearch | null) => void;
-  analysis: AnalysisResult | null;
-  setAnalysis: (a: AnalysisResult | null) => void;
-  features: FeatureSelection[];
-  setFeatures: (f: FeatureSelection[]) => void;
-  milestones: Milestone[];
-  setMilestones: (m: Milestone[]) => void;
-  designVariants: DesignVariant[];
-  setDesignVariants: (v: DesignVariant[]) => void;
-  selectedDesignId: string | null;
-  setSelectedDesignId: (id: string | null) => void;
-  approvalStatus: "pending" | "approved" | "rejected" | "revision_requested";
-  setApprovalStatus: (s: "pending" | "approved" | "rejected" | "revision_requested") => void;
-  buildCode: string | null;
-  setBuildCode: (c: string | null) => void;
-  buildCost: number;
-  setBuildCost: (c: number) => void;
-  buildIteration: number;
-  setBuildIteration: (i: number) => void;
-  milestoneResults: MilestoneResult[];
-  setMilestoneResults: (r: MilestoneResult[]) => void;
-  planEstimates: PlanEstimate[];
-  setPlanEstimates: (e: PlanEstimate[]) => void;
-  selectedPreset: PlanPreset;
-  setSelectedPreset: (p: PlanPreset) => void;
-  phaseStatuses: PhaseStatus[];
-  setPhaseStatuses: (s: PhaseStatus[]) => void;
-  advancePhase: (phase: LifecyclePhase) => void;
-  completePhase: (phase: LifecyclePhase) => void;
-}
-
-const LifecycleContext = createContext<LifecycleState | null>(null);
-
-export function useLifecycle() {
-  const ctx = useContext(LifecycleContext);
-  if (!ctx) throw new Error("useLifecycle must be used within LifecycleLayout");
-  return ctx;
-}
+import type { LifecycleState } from "./LifecycleContext";
 
 const PHASE_ORDER: LifecyclePhase[] = [
-  "research", "planning", "design", "approval", "development", "deploy", "iterate",
+  "research",
+  "planning",
+  "design",
+  "approval",
+  "development",
+  "deploy",
+  "iterate",
 ];
 
-const defaultStatuses = (): PhaseStatus[] => PHASE_ORDER.map((phase, i) => ({
+const defaultStatuses = (): PhaseStatus[] => PHASE_ORDER.map((phase, index) => ({
   phase,
-  status: i === 0 ? "available" : "locked",
+  status: index === 0 ? "available" : "locked",
   version: 1,
 }));
 
-/* ── localStorage persistence per project ── */
-interface PersistedState {
+function emptyBlueprint(phase: LifecyclePhase): PhaseBlueprint {
+  return {
+    phase,
+    title: phase,
+    summary: "",
+    team: [],
+    artifacts: [],
+    quality_gates: [],
+  };
+}
+
+function defaultBlueprints(): Record<LifecyclePhase, PhaseBlueprint> {
+  return {
+    research: emptyBlueprint("research"),
+    planning: emptyBlueprint("planning"),
+    design: emptyBlueprint("design"),
+    approval: emptyBlueprint("approval"),
+    development: emptyBlueprint("development"),
+    deploy: emptyBlueprint("deploy"),
+    iterate: emptyBlueprint("iterate"),
+  };
+}
+
+function normalizeBlueprints(
+  blueprints?: Partial<Record<LifecyclePhase, PhaseBlueprint>>,
+): Record<LifecyclePhase, PhaseBlueprint> {
+  return {
+    ...defaultBlueprints(),
+    ...(blueprints ?? {}),
+  };
+}
+
+function toProjectPatch(state: {
   spec: string;
   research: MarketResearch | null;
   analysis: AnalysisResult | null;
@@ -70,7 +89,8 @@ interface PersistedState {
   milestones: Milestone[];
   designVariants: DesignVariant[];
   selectedDesignId: string | null;
-  approvalStatus: "pending" | "approved" | "rejected" | "revision_requested";
+  approvalStatus: LifecycleProject["approvalStatus"];
+  approvalComments: ApprovalComment[];
   buildCode: string | null;
   buildCost: number;
   buildIteration: number;
@@ -78,50 +98,45 @@ interface PersistedState {
   planEstimates: PlanEstimate[];
   selectedPreset: PlanPreset;
   phaseStatuses: PhaseStatus[];
-  savedAt: string;
+  deployChecks: DeployCheck[];
+  releases: ReleaseRecord[];
+  feedbackItems: FeedbackItem[];
+  recommendations: LifecycleRecommendation[];
+  artifacts: LifecycleArtifact[];
+  decisionLog: LifecycleDecision[];
+  skillInvocations: LifecycleSkillInvocation[];
+  delegations: LifecycleDelegation[];
+  phaseRuns: LifecyclePhaseRun[];
+}): Partial<LifecycleProject> {
+  return {
+    spec: state.spec,
+    research: state.research ?? undefined,
+    analysis: state.analysis ?? undefined,
+    features: state.features,
+    milestones: state.milestones,
+    designVariants: state.designVariants,
+    selectedDesignId: state.selectedDesignId ?? undefined,
+    approvalStatus: state.approvalStatus,
+    approvalComments: state.approvalComments,
+    buildCode: state.buildCode ?? undefined,
+    buildCost: state.buildCost,
+    buildIteration: state.buildIteration,
+    milestoneResults: state.milestoneResults,
+    planEstimates: state.planEstimates,
+    selectedPreset: state.selectedPreset,
+    phaseStatuses: state.phaseStatuses,
+    deployChecks: state.deployChecks,
+    releases: state.releases,
+    feedbackItems: state.feedbackItems,
+    recommendations: state.recommendations,
+    artifacts: state.artifacts,
+    decisionLog: state.decisionLog,
+    skillInvocations: state.skillInvocations,
+    delegations: state.delegations,
+    phaseRuns: state.phaseRuns,
+  };
 }
 
-function storageKey(projectSlug: string) {
-  return `pylon:lifecycle:${projectSlug}`;
-}
-
-function loadState(projectSlug: string): Partial<PersistedState> | null {
-  try {
-    const raw = localStorage.getItem(storageKey(projectSlug));
-    return raw ? JSON.parse(raw) : null;
-  } catch {
-    return null;
-  }
-}
-
-function saveState(projectSlug: string, state: PersistedState) {
-  try {
-    localStorage.setItem(storageKey(projectSlug), JSON.stringify(state));
-  } catch {
-    // storage full — silently ignore
-  }
-}
-
-export type { PersistedState };
-
-/** List all projects that have saved lifecycle data */
-export function listSavedProjects(): { slug: string; data: PersistedState }[] {
-  const results: { slug: string; data: PersistedState }[] = [];
-  for (let i = 0; i < localStorage.length; i++) {
-    const key = localStorage.key(i);
-    if (!key?.startsWith("pylon:lifecycle:")) continue;
-    try {
-      const data = JSON.parse(localStorage.getItem(key)!) as PersistedState;
-      results.push({ slug: key.replace("pylon:lifecycle:", ""), data });
-    } catch { /* skip corrupted */ }
-  }
-  return results.sort((a, b) => b.data.savedAt.localeCompare(a.data.savedAt));
-}
-
-/** Load full lifecycle data for a specific project */
-export { loadState as loadLifecycleState };
-
-/** Wrapper that remounts inner layout when projectSlug changes */
 export function LifecycleLayout() {
   const { projectSlug } = useParams();
   return <LifecycleLayoutInner key={projectSlug} projectSlug={projectSlug ?? ""} />;
@@ -129,59 +144,218 @@ export function LifecycleLayout() {
 
 function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
   const basePath = `/p/${projectSlug}`;
-  const saved = projectSlug ? loadState(projectSlug) : null;
+  const location = useLocation();
 
-  const [spec, setSpec] = useState(saved?.spec ?? "");
-  const [research, setResearch] = useState<MarketResearch | null>(saved?.research ?? null);
-  const [analysis, setAnalysis] = useState<AnalysisResult | null>(saved?.analysis ?? null);
-  const [features, setFeatures] = useState<FeatureSelection[]>(saved?.features ?? []);
-  const [milestones, setMilestones] = useState<Milestone[]>(saved?.milestones ?? []);
-  const [designVariants, setDesignVariants] = useState<DesignVariant[]>(saved?.designVariants ?? []);
-  const [selectedDesignId, setSelectedDesignId] = useState<string | null>(saved?.selectedDesignId ?? null);
-  const [approvalStatus, setApprovalStatus] = useState<"pending" | "approved" | "rejected" | "revision_requested">(saved?.approvalStatus ?? "pending");
-  const [buildCode, setBuildCode] = useState<string | null>(saved?.buildCode ?? null);
-  const [buildCost, setBuildCost] = useState(saved?.buildCost ?? 0);
-  const [buildIteration, setBuildIteration] = useState(saved?.buildIteration ?? 0);
-  const [milestoneResults, setMilestoneResults] = useState<MilestoneResult[]>(saved?.milestoneResults ?? []);
-  const [planEstimates, setPlanEstimates] = useState<PlanEstimate[]>(saved?.planEstimates ?? []);
-  const [selectedPreset, setSelectedPreset] = useState<PlanPreset>(saved?.selectedPreset ?? "standard");
-  const [phaseStatuses, setPhaseStatuses] = useState<PhaseStatus[]>(saved?.phaseStatuses ?? defaultStatuses());
+  const [spec, setSpec] = useState("");
+  const [research, setResearch] = useState<MarketResearch | null>(null);
+  const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
+  const [features, setFeatures] = useState<FeatureSelection[]>([]);
+  const [milestones, setMilestones] = useState<Milestone[]>([]);
+  const [designVariants, setDesignVariants] = useState<DesignVariant[]>([]);
+  const [selectedDesignId, setSelectedDesignId] = useState<string | null>(null);
+  const [approvalStatus, setApprovalStatus] = useState<LifecycleProject["approvalStatus"]>("pending");
+  const [approvalComments, setApprovalComments] = useState<ApprovalComment[]>([]);
+  const [buildCode, setBuildCode] = useState<string | null>(null);
+  const [buildCost, setBuildCost] = useState(0);
+  const [buildIteration, setBuildIteration] = useState(0);
+  const [milestoneResults, setMilestoneResults] = useState<MilestoneResult[]>([]);
+  const [planEstimates, setPlanEstimates] = useState<PlanEstimate[]>([]);
+  const [selectedPreset, setSelectedPreset] = useState<PlanPreset>("standard");
+  const [phaseStatuses, setPhaseStatuses] = useState<PhaseStatus[]>(defaultStatuses());
+  const [deployChecks, setDeployChecks] = useState<DeployCheck[]>([]);
+  const [releases, setReleases] = useState<ReleaseRecord[]>([]);
+  const [feedbackItems, setFeedbackItems] = useState<FeedbackItem[]>([]);
+  const [recommendations, setRecommendations] = useState<LifecycleRecommendation[]>([]);
+  const [artifacts, setArtifacts] = useState<LifecycleArtifact[]>([]);
+  const [decisionLog, setDecisionLog] = useState<LifecycleDecision[]>([]);
+  const [skillInvocations, setSkillInvocations] = useState<LifecycleSkillInvocation[]>([]);
+  const [delegations, setDelegations] = useState<LifecycleDelegation[]>([]);
+  const [phaseRuns, setPhaseRuns] = useState<LifecyclePhaseRun[]>([]);
+  const [blueprints, setBlueprints] = useState<Record<LifecyclePhase, PhaseBlueprint>>(defaultBlueprints);
+  const [isHydrating, setIsHydrating] = useState(true);
+  const [isMobile, setIsMobile] = useState(false);
+  const [phaseNavCollapsed, setPhaseNavCollapsed] = useState(false);
+  const [mobilePhaseNavOpen, setMobilePhaseNavOpen] = useState(false);
+  const [consoleOpen, setConsoleOpen] = useState(false);
+  const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [lastSavedAt, setLastSavedAt] = useState<string | null>(null);
 
-  // Auto-save to localStorage on state changes (debounced)
   const saveTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
-  const isInitialMount = useRef(true);
+  const hydratedRef = useRef(false);
+  const applyingRemoteRef = useRef(false);
+
   useEffect(() => {
-    if (!projectSlug) return;
-    // Skip saving on initial mount (state came from localStorage already)
-    if (isInitialMount.current) { isInitialMount.current = false; return; }
+    const mq = window.matchMedia("(max-width: 1024px)");
+    const onChange = (event: MediaQueryListEvent | MediaQueryList) => {
+      setIsMobile(event.matches);
+      if (event.matches) {
+        setPhaseNavCollapsed(false);
+        setConsoleOpen(false);
+      }
+    };
+    onChange(mq);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+
+  useEffect(() => {
+    if (!isMobile) return;
+    setMobilePhaseNavOpen(false);
+    setConsoleOpen(false);
+  }, [isMobile, location.pathname]);
+
+  const applyProject = (project: LifecycleProject) => {
+    applyingRemoteRef.current = true;
+    setSpec(project.spec ?? "");
+    setResearch(project.research ?? null);
+    setAnalysis(project.analysis ?? null);
+    setFeatures(project.features ?? []);
+    setMilestones(project.milestones ?? []);
+    setDesignVariants(project.designVariants ?? []);
+    setSelectedDesignId(project.selectedDesignId ?? null);
+    setApprovalStatus(project.approvalStatus ?? "pending");
+    setApprovalComments(project.approvalComments ?? []);
+    setBuildCode(project.buildCode ?? null);
+    setBuildCost(project.buildCost ?? 0);
+    setBuildIteration(project.buildIteration ?? 0);
+    setMilestoneResults(project.milestoneResults ?? []);
+    setPlanEstimates(project.planEstimates ?? []);
+    setSelectedPreset(project.selectedPreset ?? "standard");
+    setPhaseStatuses(project.phaseStatuses ?? defaultStatuses());
+    setDeployChecks(project.deployChecks ?? []);
+    setReleases(project.releases ?? []);
+    setFeedbackItems(project.feedbackItems ?? []);
+    setRecommendations(project.recommendations ?? []);
+    setArtifacts(project.artifacts ?? []);
+    setDecisionLog(project.decisionLog ?? []);
+    setSkillInvocations(project.skillInvocations ?? []);
+    setDelegations(project.delegations ?? []);
+    setPhaseRuns(project.phaseRuns ?? []);
+    setBlueprints(normalizeBlueprints(project.blueprints));
+    setSaveState("idle");
+    hydratedRef.current = true;
+    queueMicrotask(() => {
+      applyingRemoteRef.current = false;
+    });
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!projectSlug) {
+      setIsHydrating(false);
+      return;
+    }
+    setIsHydrating(true);
+    hydratedRef.current = false;
+    applyingRemoteRef.current = true;
+
+    lifecycleApi.getProject(projectSlug)
+      .then((project) => {
+        if (cancelled) return;
+        applyProject(project);
+        setIsHydrating(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        hydratedRef.current = true;
+        applyingRemoteRef.current = false;
+        setIsHydrating(false);
+      });
+
+    return () => {
+      cancelled = true;
+      clearTimeout(saveTimer.current);
+    };
+  }, [projectSlug]);
+
+  useEffect(() => {
+    if (!projectSlug || !hydratedRef.current || applyingRemoteRef.current) return;
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
-      saveState(projectSlug, {
-        spec, research, analysis, features, milestones,
-        designVariants, selectedDesignId, approvalStatus,
-        buildCode, buildCost, buildIteration, milestoneResults,
-        planEstimates, selectedPreset,
-        phaseStatuses, savedAt: new Date().toISOString(),
-      });
+      setSaveState("saving");
+      void lifecycleApi.saveProject(
+        projectSlug,
+        toProjectPatch({
+          spec,
+          research,
+          analysis,
+          features,
+          milestones,
+          designVariants,
+          selectedDesignId,
+          approvalStatus,
+          approvalComments,
+          buildCode,
+          buildCost,
+          buildIteration,
+          milestoneResults,
+          planEstimates,
+          selectedPreset,
+          phaseStatuses,
+          deployChecks,
+          releases,
+          feedbackItems,
+          recommendations,
+          artifacts,
+          decisionLog,
+          skillInvocations,
+          delegations,
+          phaseRuns,
+        }),
+      )
+        .then(() => {
+          setSaveState("saved");
+          setLastSavedAt(new Date().toISOString());
+        })
+        .catch(() => {
+          setSaveState("error");
+        });
     }, 500);
     return () => clearTimeout(saveTimer.current);
   }, [
-    projectSlug, spec, research, analysis, features, milestones,
-    designVariants, selectedDesignId, approvalStatus,
-    buildCode, buildCost, buildIteration, milestoneResults,
-    planEstimates, selectedPreset, phaseStatuses,
+    projectSlug,
+    spec,
+    research,
+    analysis,
+    features,
+    milestones,
+    designVariants,
+    selectedDesignId,
+    approvalStatus,
+    approvalComments,
+    buildCode,
+    buildCost,
+    buildIteration,
+    milestoneResults,
+    planEstimates,
+    selectedPreset,
+    phaseStatuses,
+    deployChecks,
+    releases,
+    feedbackItems,
+    recommendations,
+    artifacts,
+    decisionLog,
+    skillInvocations,
+    delegations,
+    phaseRuns,
   ]);
+
+  useEffect(() => {
+    if (saveState !== "saved") return;
+    const timer = setTimeout(() => setSaveState("idle"), 2400);
+    return () => clearTimeout(timer);
+  }, [saveState]);
 
   const advancePhase = (phase: LifecyclePhase) => {
     setPhaseStatuses((prev) => {
       const next = [...prev];
-      const idx = PHASE_ORDER.indexOf(phase);
-      const ps = next.find((s) => s.phase === phase);
-      if (ps) ps.status = "in_progress";
-      // unlock next
-      if (idx + 1 < PHASE_ORDER.length) {
-        const nextPs = next.find((s) => s.phase === PHASE_ORDER[idx + 1]);
-        if (nextPs && nextPs.status === "locked") nextPs.status = "available";
+      const index = PHASE_ORDER.indexOf(phase);
+      const entry = next.find((item) => item.phase === phase);
+      if (entry) entry.status = "in_progress";
+      if (index + 1 < PHASE_ORDER.length) {
+        const nextEntry = next.find((item) => item.phase === PHASE_ORDER[index + 1]);
+        if (nextEntry && nextEntry.status === "locked") nextEntry.status = "available";
       }
       return next;
     });
@@ -190,40 +364,172 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
   const completePhase = (phase: LifecyclePhase) => {
     setPhaseStatuses((prev) => {
       const next = [...prev];
-      const idx = PHASE_ORDER.indexOf(phase);
-      const ps = next.find((s) => s.phase === phase);
-      if (ps) {
-        ps.status = "completed";
-        ps.completedAt = new Date().toISOString();
+      const index = PHASE_ORDER.indexOf(phase);
+      const entry = next.find((item) => item.phase === phase);
+      if (entry) {
+        entry.status = "completed";
+        entry.completedAt = new Date().toISOString();
       }
-      // unlock next
-      if (idx + 1 < PHASE_ORDER.length) {
-        const nextPs = next.find((s) => s.phase === PHASE_ORDER[idx + 1]);
-        if (nextPs && nextPs.status === "locked") nextPs.status = "available";
+      if (index + 1 < PHASE_ORDER.length) {
+        const nextEntry = next.find((item) => item.phase === PHASE_ORDER[index + 1]);
+        if (nextEntry && nextEntry.status === "locked") nextEntry.status = "available";
       }
       return next;
     });
   };
 
   const ctx: LifecycleState = {
-    spec, setSpec, research, setResearch, analysis, setAnalysis,
-    features, setFeatures, milestones, setMilestones,
-    designVariants, setDesignVariants, selectedDesignId, setSelectedDesignId,
-    approvalStatus, setApprovalStatus,
-    buildCode, setBuildCode, buildCost, setBuildCost,
-    buildIteration, setBuildIteration, milestoneResults, setMilestoneResults,
-    planEstimates, setPlanEstimates, selectedPreset, setSelectedPreset,
-    phaseStatuses, setPhaseStatuses, advancePhase, completePhase,
+    spec,
+    setSpec,
+    research,
+    setResearch,
+    analysis,
+    setAnalysis,
+    features,
+    setFeatures,
+    milestones,
+    setMilestones,
+    designVariants,
+    setDesignVariants,
+    selectedDesignId,
+    setSelectedDesignId,
+    approvalStatus,
+    setApprovalStatus,
+    approvalComments,
+    setApprovalComments,
+    buildCode,
+    setBuildCode,
+    buildCost,
+    setBuildCost,
+    buildIteration,
+    setBuildIteration,
+    milestoneResults,
+    setMilestoneResults,
+    planEstimates,
+    setPlanEstimates,
+    selectedPreset,
+    setSelectedPreset,
+    phaseStatuses,
+    setPhaseStatuses,
+    deployChecks,
+    setDeployChecks,
+    releases,
+    setReleases,
+    feedbackItems,
+    setFeedbackItems,
+    recommendations,
+    setRecommendations,
+    artifacts,
+    decisionLog,
+    skillInvocations,
+    delegations,
+    phaseRuns,
+    blueprints,
+    isHydrating,
+    applyProject,
+    advancePhase,
+    completePhase,
   };
+
+  const currentPhase = PHASE_ORDER.find((phase) =>
+    location.pathname.endsWith(`/lifecycle/${phase}`),
+  ) ?? null;
+
+  if (isHydrating) {
+    return (
+      <div className="flex h-full items-center justify-center">
+        <div className="flex items-center gap-3 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          Lifecycle state を読み込み中...
+        </div>
+      </div>
+    );
+  }
 
   return (
     <LifecycleContext.Provider value={ctx}>
       <div className="flex h-full">
-        <PhaseNav basePath={basePath} phaseStatuses={phaseStatuses} />
-        <div className="flex-1 overflow-hidden">
-          <Outlet />
+        {!isMobile && (
+          <PhaseNav
+            basePath={basePath}
+            phaseStatuses={phaseStatuses}
+            collapsed={phaseNavCollapsed}
+            className="shrink-0"
+          />
+        )}
+        <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+          <LifecycleWorkspaceHeader
+            currentPhase={currentPhase ?? "research"}
+            projectLabel={projectSlug}
+            phaseStatuses={phaseStatuses}
+            phaseNavCollapsed={phaseNavCollapsed}
+            isMobile={isMobile}
+            consoleOpen={consoleOpen}
+            saveState={saveState}
+            lastSavedAt={lastSavedAt}
+            onTogglePhaseNav={() => {
+              if (isMobile) setMobilePhaseNavOpen(true);
+              else setPhaseNavCollapsed((value) => !value);
+            }}
+            onToggleConsole={() => setConsoleOpen((value) => !value)}
+          />
+          <div className="flex min-h-0 flex-1 overflow-hidden">
+            <div className="min-w-0 flex-1 overflow-hidden">
+              <div className="h-full overflow-y-auto">
+                <Outlet />
+              </div>
+            </div>
+            {!isMobile && consoleOpen && (
+              <LifecycleOperatorConsole
+                currentPhase={currentPhase}
+                artifacts={artifacts}
+                decisions={decisionLog}
+                skillInvocations={skillInvocations}
+                delegations={delegations}
+                phaseRuns={phaseRuns}
+                className="hidden w-[22rem] shrink-0 xl:flex"
+              />
+            )}
+          </div>
         </div>
       </div>
+
+      {isMobile && mobilePhaseNavOpen && (
+        <>
+          <div
+            className="fixed inset-0 z-40 bg-black/60"
+            onClick={() => setMobilePhaseNavOpen(false)}
+          />
+          <div className="fixed inset-y-0 left-0 z-50">
+            <PhaseNav
+              basePath={basePath}
+              phaseStatuses={phaseStatuses}
+              className="w-72 max-w-[85vw] shadow-2xl"
+              onItemClick={() => setMobilePhaseNavOpen(false)}
+            />
+          </div>
+        </>
+      )}
+
+      {isMobile && consoleOpen && (
+        <>
+          <div
+            className="fixed inset-0 z-40 bg-black/60"
+            onClick={() => setConsoleOpen(false)}
+          />
+          <div className="fixed inset-y-0 right-0 z-50 w-[22rem] max-w-[92vw]">
+            <LifecycleOperatorConsole
+              currentPhase={currentPhase}
+              artifacts={artifacts}
+              decisions={decisionLog}
+              skillInvocations={skillInvocations}
+              delegations={delegations}
+              phaseRuns={phaseRuns}
+              className={cn("h-full w-full shadow-2xl")}
+            />
+          </div>
+        </>
+      )}
     </LifecycleContext.Provider>
   );
 }

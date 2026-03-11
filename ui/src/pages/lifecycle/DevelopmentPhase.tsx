@@ -1,16 +1,16 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
-  Code2, Loader2, Check, ArrowRight, ArrowLeft, Rocket,
+  Loader2, Check, ArrowRight, Rocket,
   Flag, RefreshCw, Bot, CircleCheck, CircleX, Eye,
-  ExternalLink, RotateCcw, Zap, BarChart3, AlertCircle,
+  ExternalLink, Zap, BarChart3, AlertCircle,
   Maximize2, Minimize2, FileCode2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
-import { useLifecycle } from "./LifecycleLayout";
+import { useLifecycle } from "./LifecycleContext";
 import { useWorkflowRun } from "@/hooks/useWorkflowRun";
-import { parseDevelopmentOutput } from "@/api/lifecycle";
+import { lifecycleApi } from "@/api/lifecycle";
 
 /* ── Utility: extract CSS / JS / body sections from a single HTML string ── */
 interface HtmlSections {
@@ -54,36 +54,31 @@ function estimateQuality(sections: HtmlSections): { label: string; score: number
 
 type CodeTab = "full" | "css" | "js" | "body";
 
-const DEV_AGENTS = [
-  { id: "planner", label: "Planner" },
-  { id: "coder", label: "Coder" },
-  { id: "reviewer", label: "Reviewer" },
-];
-
 export function DevelopmentPhase() {
   const navigate = useNavigate();
   const { projectSlug } = useParams();
   const lc = useLifecycle();
   const workflow = useWorkflowRun("development", projectSlug ?? "");
+  const buildTeam = lc.blueprints.development.team.length > 0
+    ? lc.blueprints.development.team
+    : [
+        { id: "planner", label: "Build Planner", role: "作業分解", autonomy: "A2", tools: [], skills: [] },
+        { id: "frontend-builder", label: "Frontend Builder", role: "UI 実装", autonomy: "A2", tools: [], skills: [] },
+        { id: "backend-builder", label: "Backend Builder", role: "Domain 設計", autonomy: "A2", tools: [], skills: [] },
+        { id: "integrator", label: "Integrator", role: "統合", autonomy: "A2", tools: [], skills: [] },
+        { id: "reviewer", label: "Release Reviewer", role: "品質判定", autonomy: "A2", tools: [], skills: [] },
+      ];
+  const syncedRunRef = useRef<string | null>(null);
 
   // Handle workflow completion
-  const stateHasDev = "code" in workflow.state || "development" in workflow.state || Object.keys(workflow.state).length > 3;
   useEffect(() => {
-    if (workflow.status === "completed" && stateHasDev) {
-      const { code, milestoneResults } = parseDevelopmentOutput(workflow.state);
-      lc.setBuildCode(code || null);
-      lc.setBuildCost(
-        typeof workflow.state.estimated_cost_usd === "number"
-          ? workflow.state.estimated_cost_usd
-          : 0,
-      );
-      if (milestoneResults.length > 0) {
-        lc.setMilestoneResults(milestoneResults);
-      }
-      lc.completePhase("development");
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workflow.status, stateHasDev]);
+    if (workflow.status !== "completed" || !workflow.runId || !projectSlug) return;
+    if (syncedRunRef.current === workflow.runId) return;
+    syncedRunRef.current = workflow.runId;
+    void lifecycleApi.syncPhaseRun(projectSlug, "development", workflow.runId).then(({ project }) => {
+      lc.applyProject(project);
+    });
+  }, [workflow.runId, workflow.status, projectSlug, lc]);
 
   // Track build iteration from workflow state
   useEffect(() => {
@@ -96,6 +91,7 @@ export function DevelopmentPhase() {
         lc.setMilestoneResults(review.milestone_results as any);
       }
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workflow.state]);
 
   const isBuilding = workflow.status === "starting" || workflow.status === "running";
@@ -120,7 +116,6 @@ export function DevelopmentPhase() {
   };
 
   const goNext = () => navigate(`/p/${projectSlug}/lifecycle/deploy`);
-  const goBack = () => navigate(`/p/${projectSlug}/lifecycle/approval`);
 
   // Error view
   if (workflow.status === "failed") {
@@ -138,60 +133,109 @@ export function DevelopmentPhase() {
 
   // Pre-build view
   if (!isBuilding && !lc.buildCode) {
+    const selectedFeatureCount = lc.features.filter((f) => f.selected).length;
+    const selectedDesign = lc.designVariants.find((variant) => variant.id === lc.selectedDesignId);
     return (
       <div className="flex h-full items-center justify-center p-6">
-        <div className="max-w-xl w-full space-y-6 text-center">
-          <Rocket className="h-12 w-12 text-primary mx-auto" />
-          <h2 className="text-xl font-bold text-foreground">自律開発</h2>
-          <p className="text-sm text-muted-foreground">
-            {lc.milestones.length > 0
-              ? `${lc.milestones.length}個のマイルストーン達成まで、AIエージェントが自律的に改善を繰り返します`
-              : "AIエージェントがプロダクトを構築します"}
-          </p>
-
-          {/* Build summary */}
-          <div className="grid grid-cols-3 gap-3 text-left">
-            <div className="rounded-lg border border-border bg-card p-3">
-              <p className="text-xs text-muted-foreground">機能数</p>
-              <p className="text-lg font-bold text-foreground">{lc.features.filter((f) => f.selected).length}</p>
-            </div>
-            <div className="rounded-lg border border-border bg-card p-3">
-              <p className="text-xs text-muted-foreground">マイルストーン</p>
-              <p className="text-lg font-bold text-foreground">{lc.milestones.length}</p>
-            </div>
-            <div className="rounded-lg border border-border bg-card p-3">
-              <p className="text-xs text-muted-foreground">最大イテレーション</p>
-              <p className="text-lg font-bold text-foreground">{lc.milestones.length > 0 ? 5 : 1}</p>
-            </div>
+        <div className="max-w-4xl w-full space-y-6">
+          <div className="text-center">
+            <Rocket className="h-12 w-12 text-primary mx-auto" />
+            <h2 className="text-xl font-bold text-foreground">自律開発</h2>
+            <p className="text-sm text-muted-foreground">
+              {lc.milestones.length > 0
+                ? `${lc.milestones.length}個のマイルストーン達成まで、AIエージェントが自律的に改善を繰り返します`
+                : "AIエージェントがプロダクトを構築します"}
+            </p>
           </div>
 
-          {/* Agent team */}
-          <div className="rounded-lg border border-border bg-card p-4">
-            <p className="text-xs font-medium text-muted-foreground mb-3">エージェントチーム</p>
-            <div className="flex justify-center gap-3">
-              {[
-                { name: "Architect", desc: "設計" },
-                { name: "Builder", desc: "実装" },
-                ...(lc.milestones.length > 0 ? [{ name: "Reviewer", desc: "評価" }] : []),
-              ].map((agent, i, arr) => (
-                <div key={agent.name} className="flex items-center gap-2">
-                  <div className="flex flex-col items-center">
-                    <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/10">
-                      <Bot className="h-5 w-5 text-primary" />
-                    </div>
-                    <p className="text-[10px] font-medium text-foreground mt-1">{agent.name}</p>
-                    <p className="text-[9px] text-muted-foreground">{agent.desc}</p>
-                  </div>
-                  {i < arr.length - 1 && <ArrowRight className="h-3 w-3 text-muted-foreground mt-[-16px]" />}
+          <div className="grid gap-4 xl:grid-cols-[1.35fr_1fr]">
+            <div className="space-y-4 rounded-xl border border-border bg-card p-5 text-left">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <div className="rounded-lg border border-border bg-background p-3">
+                  <p className="text-xs text-muted-foreground">機能数</p>
+                  <p className="text-lg font-bold text-foreground">{selectedFeatureCount}</p>
                 </div>
-              ))}
-              {lc.milestones.length > 0 && <RefreshCw className="h-3 w-3 text-primary mt-[-16px] ml-1" />}
+                <div className="rounded-lg border border-border bg-background p-3">
+                  <p className="text-xs text-muted-foreground">マイルストーン</p>
+                  <p className="text-lg font-bold text-foreground">{lc.milestones.length}</p>
+                </div>
+                <div className="rounded-lg border border-border bg-background p-3">
+                  <p className="text-xs text-muted-foreground">最大イテレーション</p>
+                  <p className="text-lg font-bold text-foreground">{lc.milestones.length > 0 ? 5 : 1}</p>
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-border bg-background p-4">
+                <p className="text-xs font-medium text-muted-foreground mb-2">handoff summary</p>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div>
+                    <p className="text-xs text-muted-foreground">承認状態</p>
+                    <p className="mt-1 text-sm font-medium text-foreground">
+                      {lc.approvalStatus === "approved" ? "承認済み" : "未承認"}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-muted-foreground">選択デザイン</p>
+                    <p className="mt-1 text-sm font-medium text-foreground">
+                      {selectedDesign ? `${selectedDesign.pattern_name} / ${selectedDesign.model}` : "未選択"}
+                    </p>
+                  </div>
+                </div>
+                <p className="mt-3 text-sm text-muted-foreground">
+                  設計意図、選択機能、マイルストーンをまとめて build team に渡し、reviewer が品質判定まで閉じます。
+                </p>
+              </div>
+
+              <div className="rounded-lg border border-border bg-background p-4">
+                <p className="text-xs font-medium text-muted-foreground mb-3">エージェントチーム</p>
+                <div className="flex flex-wrap justify-center gap-3">
+                  {buildTeam.map((agent, i, arr) => (
+                    <div key={agent.id} className="flex items-center gap-2">
+                      <div className="flex flex-col items-center">
+                        <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/10">
+                          <Bot className="h-5 w-5 text-primary" />
+                        </div>
+                        <p className="mt-1 text-[10px] font-medium text-foreground">{agent.label}</p>
+                        <p className="text-[9px] text-muted-foreground">{agent.role}</p>
+                      </div>
+                      {i < arr.length - 1 && <ArrowRight className="mt-[-16px] h-3 w-3 text-muted-foreground" />}
+                    </div>
+                  ))}
+                  {lc.milestones.length > 0 && <RefreshCw className="ml-1 mt-[-16px] h-3 w-3 text-primary" />}
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-border bg-card p-5 text-left">
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground/70">readiness</p>
+              <h3 className="mt-2 text-base font-semibold text-foreground">開始前チェック</h3>
+              <div className="mt-4 space-y-2">
+                {[
+                  { label: "選択機能が存在する", done: selectedFeatureCount > 0 },
+                  { label: "比較済みの design が選択されている", done: selectedDesign != null },
+                  { label: "approval gate を通過している", done: lc.approvalStatus === "approved" },
+                ].map((item) => (
+                  <div key={item.label} className="flex items-center gap-2 rounded-lg border border-border bg-background px-3 py-2 text-sm">
+                    <span className={cn("h-2.5 w-2.5 rounded-full", item.done ? "bg-success" : "bg-warning")} />
+                    <span className={item.done ? "text-foreground" : "text-muted-foreground"}>{item.label}</span>
+                  </div>
+                ))}
+              </div>
+              {lc.approvalStatus !== "approved" && (
+                <p className="mt-3 rounded-lg border border-warning/20 bg-warning/5 px-3 py-2 text-xs text-warning">
+                  本来は approval 後に進むフェーズです。設計確認が未完了なら先に承認へ戻してください。
+                </p>
+              )}
+              <div className="mt-4 flex gap-2">
+                <button onClick={() => navigate(`/p/${projectSlug}/lifecycle/approval`)} className="flex-1 rounded-lg border border-border px-4 py-3 text-sm font-medium text-foreground hover:bg-accent transition-colors">
+                  承認に戻る
+                </button>
+                <button onClick={startBuild} className="flex-1 flex items-center justify-center gap-2 rounded-lg bg-primary py-3 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors">
+                  <Zap className="h-4 w-4" /> 開発を開始
+                </button>
+              </div>
             </div>
           </div>
-
-          <button onClick={startBuild} className="w-full flex items-center justify-center gap-2 rounded-lg bg-primary py-3 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors">
-            <Zap className="h-4 w-4" /> 開発を開始
-          </button>
         </div>
       </div>
     );
@@ -215,11 +259,11 @@ export function DevelopmentPhase() {
             </p>
           </div>
 
-          <div className={cn("grid gap-6", lc.milestones.length > 0 ? "grid-cols-2" : "grid-cols-1 max-w-md mx-auto")}>
+          <div className={cn("grid gap-6", lc.milestones.length > 0 ? "grid-cols-1 lg:grid-cols-2" : "grid-cols-1 max-w-md mx-auto")}>
             {/* Agent progress */}
             <div className="space-y-2">
               <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2">エージェント進捗</h3>
-              {DEV_AGENTS.map((agent) => {
+              {buildTeam.map((agent) => {
                 const p = workflow.agentProgress.find((a) => a.nodeId === agent.id || a.agent === agent.id);
                 const status = p?.status ?? "pending";
                 return (
@@ -269,14 +313,15 @@ export function DevelopmentPhase() {
                 {/* Agent flow */}
                 <div className="mt-3 rounded-md border border-border bg-card p-3">
                   <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider mb-2">エージェント連携</p>
-                  <div className="flex items-center gap-2 text-xs">
-                    <div className="flex items-center gap-1 rounded-full bg-accent px-2 py-1"><Bot className="h-3 w-3" /> Planner</div>
-                    <ArrowRight className="h-3 w-3 text-muted-foreground" />
-                    <div className="flex items-center gap-1 rounded-full bg-accent px-2 py-1"><Bot className="h-3 w-3" /> Coder</div>
-                    <ArrowRight className="h-3 w-3 text-muted-foreground" />
-                    <div className={cn("flex items-center gap-1 rounded-full px-2 py-1", lc.buildIteration > 0 ? "bg-primary/10 text-primary" : "bg-accent")}>
-                      <Bot className="h-3 w-3" /> Reviewer
-                    </div>
+                  <div className="flex flex-wrap items-center gap-2 text-xs">
+                    {buildTeam.map((agent, index) => (
+                      <div key={agent.id} className="flex items-center gap-2">
+                        <div className={cn("flex items-center gap-1 rounded-full px-2 py-1", index === buildTeam.length - 1 && lc.buildIteration > 0 ? "bg-primary/10 text-primary" : "bg-accent")}>
+                          <Bot className="h-3 w-3" /> {agent.label}
+                        </div>
+                        {index < buildTeam.length - 1 && <ArrowRight className="h-3 w-3 text-muted-foreground" />}
+                      </div>
+                    ))}
                     {lc.buildIteration > 0 && <RefreshCw className="h-3 w-3 text-primary" />}
                   </div>
                 </div>
@@ -289,10 +334,10 @@ export function DevelopmentPhase() {
   }
 
   // Complete view
-  return <BuildCompleteView onNext={goNext} onRebuild={startBuild} />;
+  return <BuildCompleteView onNext={goNext} />;
 }
 
-function BuildCompleteView({ onNext, onRebuild }: { onNext: () => void; onRebuild: () => void }) {
+function BuildCompleteView({ onNext }: { onNext: () => void }) {
   const lc = useLifecycle();
   const [viewMode, setViewMode] = useState<"preview" | "code">("preview");
   const [codeTab, setCodeTab] = useState<CodeTab>("full");

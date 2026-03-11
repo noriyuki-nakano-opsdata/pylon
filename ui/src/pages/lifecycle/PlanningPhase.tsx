@@ -1,30 +1,31 @@
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
-  Lightbulb, Loader2, Check, ArrowRight, ArrowLeft, Users,
+  Lightbulb, Check, ArrowRight, ArrowLeft, Users,
   BarChart3, BookOpen, Target, AlertTriangle, Eye,
   CheckSquare, Square, Zap, Flag, Plus, Trash2, AlertCircle,
   Layers, GanttChart, DollarSign, Clock, Bot, Wrench,
   ArrowDown, ChevronRight, Route, Briefcase, Network,
   Smile, Meh, Frown, MapPin, ChevronsUpDown,
-  UserCheck, Shield, FileText, CircleDot, ArrowRightCircle,
+  UserCheck, Shield, FileText, CircleDot,
   FolderOpen, Sparkles, Palette,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { useLifecycle } from "./LifecycleLayout";
+import { useLifecycle } from "./LifecycleContext";
 import { useWorkflowRun } from "@/hooks/useWorkflowRun";
-import { parsePlanningOutput } from "@/api/lifecycle";
+import { lifecycleApi } from "@/api/lifecycle";
 import { AgentProgressView } from "@/components/lifecycle/AgentProgressView";
-import type { AnalysisResult, KanoFeature, FeatureSelection, Milestone, UserStory, PlanEstimate, PlanPreset, WbsItem, Epic, UserJourneyMap, JourneyTouchpoint, JourneyPhase, JobStory, IAAnalysis, IANode, Actor, Role, UseCase, RecommendedMilestone, DesignTokenAnalysis } from "@/types/lifecycle";
+import type { AnalysisResult, KanoFeature, FeatureSelection, Milestone, PlanEstimate, PlanPreset, WbsItem, UserJourneyMap, JourneyTouchpoint, JourneyPhase, JobStory, IAAnalysis, IANode, Actor, Role, UseCase, RecommendedMilestone, DesignTokenAnalysis } from "@/types/lifecycle";
 
 /* ── Sub-step within planning ── */
 type PlanningStep = "analyze" | "analyzing" | "review" | "features" | "milestones" | "epics" | "gantt";
 
 const PLANNING_AGENTS = [
   { id: "persona-builder", label: "ペルソナ分析" },
+  { id: "story-architect", label: "ユースケース設計" },
   { id: "feature-analyst", label: "KANO分析" },
+  { id: "solution-architect", label: "実装設計" },
   { id: "planning-synthesizer", label: "企画統合" },
 ];
 
@@ -33,30 +34,27 @@ export function PlanningPhase() {
   const { projectSlug } = useParams();
   const lc = useLifecycle();
   const workflow = useWorkflowRun("planning", projectSlug ?? "");
+  const planningAgents = lc.blueprints.planning.team.length > 0
+    ? lc.blueprints.planning.team.map((agent) => ({ id: agent.id, label: agent.label }))
+    : PLANNING_AGENTS;
   const [subStep, setSubStep] = useState<PlanningStep>(lc.analysis ? "review" : "analyze");
+  const syncedRunRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (lc.analysis && subStep === "analyze") setSubStep("review");
-  }, [lc.analysis]);
+  }, [lc.analysis, subStep]);
 
   // Handle workflow completion
-  const stateHasPlanning = "analysis" in workflow.state || "planning" in workflow.state || Object.keys(workflow.state).length > 3;
   useEffect(() => {
-    if (workflow.status === "completed" && stateHasPlanning) {
-      const { analysis, features, planEstimates } = parsePlanningOutput(workflow.state);
-      lc.setAnalysis(analysis);
-      if (features.length > 0) {
-        lc.setFeatures(features);
-      } else {
-        initFeatures(analysis);
-      }
-      if (planEstimates.length > 0) {
-        lc.setPlanEstimates(planEstimates);
-      }
+    if (workflow.status === "completed" && workflow.runId && projectSlug) {
+      if (syncedRunRef.current === workflow.runId) return;
+      syncedRunRef.current = workflow.runId;
+      void lifecycleApi.syncPhaseRun(projectSlug, "planning", workflow.runId).then(({ project }) => {
+        lc.applyProject(project);
+      });
       setSubStep("review");
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workflow.status, stateHasPlanning]);
+  }, [workflow.runId, workflow.status, projectSlug, lc]);
 
   // Handle workflow failure
   useEffect(() => {
@@ -72,18 +70,6 @@ export function PlanningPhase() {
       spec: lc.spec,
       research: lc.research,
     });
-  };
-
-  const initFeatures = (result: AnalysisResult) => {
-    lc.setFeatures(result.kano_features.map((k) => ({
-      feature: k.feature,
-      category: k.category,
-      selected: k.category === "must-be" || k.category === "one-dimensional",
-      priority: k.category === "must-be" ? "must" : k.category === "one-dimensional" ? "should" : "could",
-      user_delight: k.user_delight,
-      implementation_cost: k.implementation_cost,
-      rationale: k.rationale,
-    })));
   };
 
   const goNext = () => {
@@ -140,11 +126,11 @@ export function PlanningPhase() {
     }
     return (
       <AgentProgressView
-        agents={PLANNING_AGENTS}
+        agents={planningAgents}
         progress={workflow.agentProgress}
         elapsedMs={workflow.elapsedMs}
         title="AIが徹底分析中..."
-        subtitle="ペルソナ分析とKANO分析を並列実行し、MoSCoW優先度で統合します"
+        subtitle="Planning council がペルソナ、ユースケース、優先度、delivery plan を統合しています"
       />
     );
   }
@@ -154,26 +140,27 @@ export function PlanningPhase() {
   return (
     <div className="flex h-full flex-col">
       {/* Sub-nav */}
-      <div className="flex items-center gap-1 border-b border-border px-6 py-2">
-        <button onClick={goBack} className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground mr-2">
+      <div className="flex flex-wrap items-center gap-2 border-b border-border px-4 py-3 sm:px-6">
+        <button onClick={goBack} className="mr-1 flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground">
           <ArrowLeft className="h-3.5 w-3.5" />
         </button>
-        {([
-          { key: "review" as const, label: "分析結果", icon: Eye },
-          { key: "features" as const, label: "機能選択", icon: CheckSquare },
-          { key: "epics" as const, label: "エピック/WBS", icon: Layers },
-          { key: "gantt" as const, label: "ガントチャート", icon: GanttChart },
-          { key: "milestones" as const, label: "マイルストーン", icon: Flag },
-        ]).map((tab) => (
-          <button key={tab.key} onClick={() => setSubStep(tab.key)} className={cn(
-            "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
-            subStep === tab.key ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground",
-          )}>
-            <tab.icon className="h-3.5 w-3.5" />{tab.label}
-          </button>
-        ))}
-        <div className="flex-1" />
-        <button onClick={goNext} className="flex items-center gap-1.5 rounded-md bg-primary px-4 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 transition-colors">
+        <div className="-mx-1 flex min-w-0 flex-1 gap-1 overflow-x-auto px-1 pb-1">
+          {([
+            { key: "review" as const, label: "分析結果", icon: Eye },
+            { key: "features" as const, label: "機能選択", icon: CheckSquare },
+            { key: "epics" as const, label: "エピック/WBS", icon: Layers },
+            { key: "gantt" as const, label: "ガントチャート", icon: GanttChart },
+            { key: "milestones" as const, label: "マイルストーン", icon: Flag },
+          ]).map((tab) => (
+            <button key={tab.key} onClick={() => setSubStep(tab.key)} className={cn(
+              "shrink-0 flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
+              subStep === tab.key ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground",
+            )}>
+              <tab.icon className="h-3.5 w-3.5" />{tab.label}
+            </button>
+          ))}
+        </div>
+        <button onClick={goNext} className="inline-flex w-full items-center justify-center gap-1.5 rounded-md bg-primary px-4 py-2 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 sm:w-auto">
           デザイン比較へ <ArrowRight className="h-3.5 w-3.5" />
         </button>
       </div>
@@ -201,34 +188,6 @@ export function PlanningPhase() {
   );
 }
 
-/* ── Analyzing animation ── */
-function AnalyzingView({ phases }: { phases: string[] }) {
-  const [current, setCurrent] = useState(0);
-  useEffect(() => {
-    const t = setInterval(() => setCurrent((c) => Math.min(c + 1, phases.length - 1)), 1200);
-    return () => clearInterval(t);
-  }, []);
-
-  return (
-    <div className="flex h-full items-center justify-center p-6">
-      <div className="w-full max-w-md space-y-6 text-center">
-        <Loader2 className="h-12 w-12 text-primary mx-auto animate-spin" />
-        <h2 className="text-lg font-bold text-foreground">AIが徹底分析中...</h2>
-        <div className="space-y-2">
-          {phases.map((p, i) => (
-            <div key={i} className={cn("flex items-center gap-2 rounded-md px-4 py-2 text-sm transition-all",
-              i < current && "text-success", i === current && "text-primary font-medium", i > current && "text-muted-foreground/50",
-            )}>
-              {i < current ? <Check className="h-4 w-4" /> : i === current ? <Loader2 className="h-4 w-4 animate-spin" /> : <div className="h-4 w-4" />}
-              {p}
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
 /* ── KANO Bubble Chart ── */
 const KANO_CAT_STYLE: Record<string, { fill: string; stroke: string; text: string; label: string }> = {
   "must-be": { fill: "rgba(239,68,68,0.25)", stroke: "rgba(239,68,68,0.7)", text: "#f87171", label: "Must-Be" },
@@ -237,21 +196,25 @@ const KANO_CAT_STYLE: Record<string, { fill: string; stroke: string; text: strin
   "indifferent": { fill: "rgba(148,163,184,0.2)", stroke: "rgba(148,163,184,0.5)", text: "#94a3b8", label: "Indifferent" },
   "reverse": { fill: "rgba(168,85,247,0.25)", stroke: "rgba(168,85,247,0.7)", text: "#a855f7", label: "Reverse" },
 };
+const KANO_CHART_WIDTH = 720;
+const KANO_CHART_HEIGHT = 400;
+const KANO_CHART_PADDING = { top: 30, right: 30, bottom: 50, left: 60 } as const;
+const KANO_COST_BASE: Record<string, number> = { low: 0.15, medium: 0.5, high: 0.85 };
 
 function KanoBubbleChart({ features, hoveredIdx, onHover }: { features: KanoFeature[]; hoveredIdx: number | null; onHover: (i: number | null) => void }) {
 
   // Chart dimensions
-  const W = 720, H = 400;
-  const pad = { top: 30, right: 30, bottom: 50, left: 60 };
+  const W = KANO_CHART_WIDTH;
+  const H = KANO_CHART_HEIGHT;
+  const pad = KANO_CHART_PADDING;
   const plotW = W - pad.left - pad.right;
   const plotH = H - pad.top - pad.bottom;
 
   // Map cost to X: low=0.15, medium=0.5, high=0.85 with jitter to avoid overlap
-  const costBase: Record<string, number> = { low: 0.15, medium: 0.5, high: 0.85 };
   const positions = useMemo(() => {
     const placed: { x: number; y: number }[] = [];
-    return features.map((f, i) => {
-      let x = costBase[f.implementation_cost] ?? 0.5;
+    return features.map((f) => {
+      let x = KANO_COST_BASE[f.implementation_cost] ?? 0.5;
       let y = f.user_delight;
       // Jitter to separate overlapping bubbles
       const R = 22;
@@ -263,7 +226,7 @@ function KanoBubbleChart({ features, hoveredIdx, onHover }: { features: KanoFeat
         // Apply spiral jitter
         const angle = (attempt * 137.5 * Math.PI) / 180;
         const dist = 6 + attempt * 4;
-        x = (costBase[f.implementation_cost] ?? 0.5) + (Math.cos(angle) * dist) / plotW;
+        x = (KANO_COST_BASE[f.implementation_cost] ?? 0.5) + (Math.cos(angle) * dist) / plotW;
         y = f.user_delight + (Math.sin(angle) * dist) / plotH;
         x = Math.max(0.03, Math.min(0.97, x));
         y = Math.max(0.02, Math.min(0.98, y));
@@ -273,7 +236,7 @@ function KanoBubbleChart({ features, hoveredIdx, onHover }: { features: KanoFeat
       placed.push({ x: px, y: py });
       return { x: px, y: py };
     });
-  }, [features]);
+  }, [features, pad.left, pad.top, plotH, plotW]);
 
   // Quadrant labels
   const quadrants = [
@@ -430,10 +393,46 @@ function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
 
   return (
     <div className="max-w-5xl mx-auto">
-      <div className="flex gap-1 mb-4 flex-wrap">
+      <div className="mb-4 rounded-2xl border border-border bg-card p-4 sm:p-5">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div className="space-y-2">
+            <div className="inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/5 px-3 py-1 text-[11px] font-medium text-primary">
+              <Sparkles className="h-3.5 w-3.5" />
+              Planning synthesis
+            </div>
+            <div>
+              <h2 className="text-lg font-semibold text-foreground">調査結果を実装可能な企画に圧縮</h2>
+              <p className="mt-1 text-sm text-muted-foreground">
+                ペルソナ、ユースケース、KANO、IA を横断して、次の design phase に渡すスコープと判断材料を揃えます。
+              </p>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:w-[26rem]">
+            {[
+              { label: "ペルソナ", value: analysis.personas.length },
+              { label: "ストーリー", value: analysis.user_stories.length },
+              { label: "機能候補", value: analysis.kano_features.length },
+              { label: "推奨事項", value: analysis.recommendations.length },
+            ].map((item) => (
+              <div key={item.label} className="rounded-xl border border-border bg-background px-3 py-3 text-center">
+                <p className="text-lg font-semibold text-foreground">{item.value}</p>
+                <p className="text-[11px] text-muted-foreground">{item.label}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+        {analysis.recommendations[0] && (
+          <div className="mt-4 rounded-xl border border-primary/20 bg-primary/5 px-4 py-3">
+            <p className="text-[11px] font-medium uppercase tracking-[0.16em] text-primary/80">Recommended focus</p>
+            <p className="mt-1 text-sm text-foreground">{analysis.recommendations[0]}</p>
+          </div>
+        )}
+      </div>
+
+      <div className="mb-4 -mx-1 flex gap-1 overflow-x-auto px-1 pb-1">
         {tabs.filter((t) => !t.hidden).map((t) => (
           <button key={t.key} onClick={() => setTab(t.key)} className={cn(
-            "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
+            "shrink-0 flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
             tab === t.key ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground",
           )}>
             <t.icon className="h-3.5 w-3.5" />{t.label}
@@ -443,7 +442,7 @@ function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
 
       {tab === "overview" && (
         <div className="space-y-4">
-          <div className="grid grid-cols-4 gap-3">
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
             {[
               { label: "Personas", value: analysis.personas.length },
               { label: "Stories", value: analysis.user_stories.length },
@@ -459,7 +458,7 @@ function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
           {/* KANO distribution */}
           <div className="rounded-xl border border-border bg-card p-4">
             <h3 className="text-sm font-medium text-foreground mb-3">KANO分布</h3>
-            <div className="flex gap-3">
+            <div className="grid gap-3 sm:grid-cols-3">
               {[
                 { label: "Must-Be", count: analysis.kano_features.filter((f) => f.category === "must-be").length, color: "bg-destructive/10 text-destructive" },
                 { label: "One-Dim", count: analysis.kano_features.filter((f) => f.category === "one-dimensional").length, color: "bg-primary/10 text-primary" },
@@ -510,8 +509,8 @@ function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
         <div className="space-y-4">
           <KanoBubbleChart features={analysis.kano_features} hoveredIdx={kanoHovered} onHover={setKanoHovered} />
           {/* Sortable Table */}
-          <div className="rounded-xl border border-border bg-card overflow-hidden">
-            <table className="w-full text-sm">
+          <div className="overflow-x-auto rounded-xl border border-border bg-card">
+            <table className="min-w-[40rem] w-full text-sm">
               <thead>
                 <tr className="border-b border-border bg-muted/30">
                   {([
@@ -614,7 +613,7 @@ function DesignTokenContent({ tokens }: { tokens: DesignTokenAnalysis }) {
             <Badge key={kw} variant="secondary" className="text-[10px]">{kw}</Badge>
           ))}
         </div>
-        <div className="grid grid-cols-3 gap-3 text-xs text-muted-foreground">
+        <div className="grid grid-cols-1 gap-3 text-xs text-muted-foreground sm:grid-cols-3">
           <div><span className="block text-foreground/70 font-medium">適用先</span>{style.best_for || "—"}</div>
           <div><span className="block text-foreground/70 font-medium">パフォーマンス</span>{style.performance || "—"}</div>
           <div><span className="block text-foreground/70 font-medium">アクセシビリティ</span>{style.accessibility || "—"}</div>
@@ -624,7 +623,7 @@ function DesignTokenContent({ tokens }: { tokens: DesignTokenAnalysis }) {
       {/* Colors */}
       <div className="rounded-lg bg-card/60 border border-border/40 p-4 space-y-3">
         <h4 className="text-sm font-semibold">カラーパレット</h4>
-        <div className="grid grid-cols-5 gap-3">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
           {colorEntries.map(([key, hex]) => (
             <div key={key} className="space-y-1.5">
               <div
@@ -645,7 +644,7 @@ function DesignTokenContent({ tokens }: { tokens: DesignTokenAnalysis }) {
       {/* Typography */}
       <div className="rounded-lg bg-card/60 border border-border/40 p-4 space-y-3">
         <h4 className="text-sm font-semibold">タイポグラフィ</h4>
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div>
             <span className="text-[10px] text-muted-foreground block mb-1">見出し</span>
             <span className="text-lg font-semibold" style={{ fontFamily: typography.heading }}>{typography.heading}</span>
@@ -668,7 +667,7 @@ function DesignTokenContent({ tokens }: { tokens: DesignTokenAnalysis }) {
       </div>
 
       {/* Effects & Anti-patterns */}
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <div className="rounded-lg bg-card/60 border border-border/40 p-4 space-y-2">
           <h4 className="text-sm font-semibold flex items-center gap-1.5">
             <Sparkles className="h-3.5 w-3.5 text-amber-400" /> エフェクト
@@ -822,7 +821,8 @@ function UseCaseContent({ useCases }: { useCases: UseCase[] }) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const toggle = (id: string) => setExpanded((prev) => {
     const next = new Set(prev);
-    next.has(id) ? next.delete(id) : next.add(id);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
     return next;
   });
 
@@ -934,7 +934,7 @@ function UseCaseContent({ useCases }: { useCases: UseCase[] }) {
   return (
     <div className="space-y-3">
       {/* Summary bar */}
-      <div className="flex gap-3">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
         {(["must", "should", "could"] as const).map((p) => {
           const count = useCases.filter((uc) => uc.priority === p).length;
           const labels: Record<string, string> = { must: "Must", should: "Should", could: "Could" };
@@ -997,7 +997,7 @@ function JourneyContent({ journeys }: { journeys: UserJourneyMap[] }) {
     <div className="space-y-4">
       {/* Persona selector */}
       {journeys.length > 1 && (
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           {journeys.map((j, i) => (
             <button key={i} onClick={() => setActivePersona(i)} className={cn(
               "flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-medium transition-colors cursor-pointer",
@@ -1011,7 +1011,8 @@ function JourneyContent({ journeys }: { journeys: UserJourneyMap[] }) {
       )}
 
       {/* Journey map */}
-      <div className="rounded-xl border border-border bg-card overflow-hidden">
+      <div className="overflow-x-auto rounded-xl border border-border bg-card">
+        <div className="min-w-[48rem] overflow-hidden">
         {/* Phase header */}
         <div className="grid grid-cols-5 border-b border-border">
           {phases.map((p) => (
@@ -1092,6 +1093,7 @@ function JourneyContent({ journeys }: { journeys: UserJourneyMap[] }) {
             );
           })}
         </div>
+        </div>
       </div>
     </div>
   );
@@ -1119,7 +1121,7 @@ function JTBDContent({ stories }: { stories: JobStory[] }) {
   return (
     <div className="max-w-4xl mx-auto space-y-6">
       {/* Summary */}
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
         {sections.map((s) => (
           <div key={s.key} className={cn("rounded-xl border p-4 text-center", JTBD_COLORS[s.key].border)}>
             <p className="text-2xl font-bold text-foreground">{grouped[s.key].length}</p>
@@ -1188,7 +1190,7 @@ function IAContent({ ia }: { ia: IAAnalysis }) {
   return (
     <div className="max-w-4xl mx-auto space-y-6">
       {/* Navigation model badge */}
-      <div className="flex items-center gap-3">
+      <div className="flex flex-wrap items-center gap-3">
         <div className="rounded-lg border border-border bg-card px-4 py-3 flex items-center gap-2">
           <Network className="h-4 w-4 text-primary" />
           <div>
@@ -1274,9 +1276,9 @@ function FeaturesContent({ features, setFeatures }: { features: FeatureSelection
 
   return (
     <div className="max-w-4xl mx-auto space-y-6">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <span className="text-xs text-muted-foreground">{selectedCount}/{features.length} 選択中</span>
-        <div className="flex gap-1">
+        <div className="flex flex-wrap gap-1">
           {(["minimal", "recommended", "full"] as const).map((p) => (
             <button key={p} onClick={() => selectPreset(p)} className="rounded-md border border-border px-2.5 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-accent transition-colors">
               {p === "minimal" ? "最小" : p === "recommended" ? "推奨" : "全機能"}
@@ -1363,7 +1365,7 @@ function MilestonesContent({ milestones, setMilestones, recommended }: { milesto
 
   return (
     <div className="max-w-3xl mx-auto space-y-4">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h3 className="flex items-center gap-2 text-sm font-bold text-foreground"><Flag className="h-4 w-4 text-primary" />マイルストーン（完成条件）</h3>
           <p className="text-xs text-muted-foreground">条件をクリアするまでAIが自律的に改善を繰り返します（最大5回）</p>
@@ -1430,7 +1432,7 @@ function MilestonesContent({ milestones, setMilestones, recommended }: { milesto
         <div className="rounded-lg border-2 border-dashed border-border p-8 text-center">
           <Flag className="h-8 w-8 text-muted-foreground/30 mx-auto mb-2" />
           <p className="text-sm text-muted-foreground mb-3">マイルストーン未定義（定義しなくても開発は可能）</p>
-          <div className="flex items-center justify-center gap-2">
+          <div className="flex flex-wrap items-center justify-center gap-2">
             <button onClick={() => addPreset("feature")} className="rounded-md bg-primary/10 px-3 py-1.5 text-xs font-medium text-primary hover:bg-primary/20 cursor-pointer">全機能実装</button>
             <button onClick={() => addPreset("quality")} className="rounded-md bg-primary/10 px-3 py-1.5 text-xs font-medium text-primary hover:bg-primary/20 cursor-pointer">コード品質</button>
             <button onClick={() => addPreset("responsive")} className="rounded-md bg-primary/10 px-3 py-1.5 text-xs font-medium text-primary hover:bg-primary/20 cursor-pointer">レスポンシブ</button>

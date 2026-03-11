@@ -1,12 +1,14 @@
 import { useState, useEffect } from "react";
-import { Outlet } from "react-router-dom";
+import { Outlet, useLocation } from "react-router-dom";
 import { Sidebar } from "@/components/Sidebar";
 import { cn } from "@/lib/utils";
 
 export function Layout() {
+  const location = useLocation();
   const [collapsed, setCollapsed] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
+  const isLifecycleRoute = location.pathname.includes("/lifecycle/");
 
   useEffect(() => {
     const mq = window.matchMedia("(max-width: 768px)");
@@ -18,6 +20,15 @@ export function Layout() {
     mq.addEventListener("change", handler);
     return () => mq.removeEventListener("change", handler);
   }, []);
+
+  useEffect(() => {
+    if (!isMobile && isLifecycleRoute) {
+      setCollapsed(true);
+    }
+  }, [isLifecycleRoute, isMobile]);
+
+  const sidebarCollapsed = isMobile ? false : isLifecycleRoute ? true : collapsed;
+  const sidebarLocked = isLifecycleRoute && !isMobile;
 
   return (
     <div className="flex h-dvh overflow-hidden bg-background">
@@ -37,9 +48,11 @@ export function Layout() {
         )}
       >
         <Sidebar
-          collapsed={isMobile ? false : collapsed}
+          collapsed={sidebarCollapsed}
+          lockCollapsed={sidebarLocked}
           onToggle={() => {
             if (isMobile) setMobileOpen(false);
+            else if (sidebarLocked) setCollapsed(true);
             else setCollapsed((c) => !c);
           }}
         />

@@ -1,20 +1,21 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
-  Search, Loader2, Check, ArrowRight, Globe, TrendingUp,
+  Search, Check, ArrowRight, Globe, TrendingUp,
   ShieldAlert, Lightbulb, BarChart3, Zap, Plus, X, AlertCircle,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { useLifecycle } from "./LifecycleLayout";
+import { useLifecycle } from "./LifecycleContext";
 import { useWorkflowRun } from "@/hooks/useWorkflowRun";
-import { parseResearchOutput } from "@/api/lifecycle";
+import { lifecycleApi } from "@/api/lifecycle";
 import { AgentProgressView } from "@/components/lifecycle/AgentProgressView";
 
 const RESEARCH_AGENTS = [
   { id: "competitor-analyst", label: "競合分析" },
   { id: "market-researcher", label: "市場調査" },
+  { id: "user-researcher", label: "ユーザー調査" },
   { id: "tech-evaluator", label: "技術評価" },
   { id: "research-synthesizer", label: "統合分析" },
 ];
@@ -24,20 +25,23 @@ export function ResearchPhase() {
   const { projectSlug } = useParams();
   const lc = useLifecycle();
   const workflow = useWorkflowRun("research", projectSlug ?? "");
+  const researchAgents = lc.blueprints.research.team.length > 0
+    ? lc.blueprints.research.team.map((agent) => ({ id: agent.id, label: agent.label }))
+    : RESEARCH_AGENTS;
   const [competitorUrls, setCompetitorUrls] = useState<string[]>([]);
   const [newUrl, setNewUrl] = useState("");
   const [depth, setDepth] = useState<"quick" | "standard" | "deep">("standard");
+  const syncedRunRef = useRef<string | null>(null);
 
   // Handle workflow completion
-  const stateHasData = "research" in workflow.state || "output" in workflow.state || Object.keys(workflow.state).length > 3;
   useEffect(() => {
-    if (workflow.status === "completed" && stateHasData) {
-      const result = parseResearchOutput(workflow.state);
-      lc.setResearch(result);
-      lc.completePhase("research");
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workflow.status, stateHasData]);
+    if (workflow.status !== "completed" || !workflow.runId || !projectSlug) return;
+    if (syncedRunRef.current === workflow.runId) return;
+    syncedRunRef.current = workflow.runId;
+    void lifecycleApi.syncPhaseRun(projectSlug, "research", workflow.runId).then(({ project }) => {
+      lc.applyProject(project);
+    });
+  }, [workflow.runId, workflow.status, projectSlug, lc]);
 
   const runResearch = () => {
     if (!lc.spec.trim()) return;
@@ -174,11 +178,11 @@ export function ResearchPhase() {
   if (isRunning) {
     return (
       <AgentProgressView
-        agents={RESEARCH_AGENTS}
+        agents={researchAgents}
         progress={workflow.agentProgress}
         elapsedMs={workflow.elapsedMs}
         title="市場調査中..."
-        subtitle="3つのAIエージェントが並列で競合分析・市場調査・技術評価を実施しています"
+        subtitle="Research swarm が競合・市場・ユーザー・技術の観点から並列に証拠を集めています"
       />
     );
   }
@@ -187,7 +191,7 @@ export function ResearchPhase() {
   const r = lc.research!;
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center justify-between border-b border-border px-6 py-3">
+      <div className="flex flex-col gap-3 border-b border-border px-6 py-3 sm:flex-row sm:items-center sm:justify-between">
         <h1 className="flex items-center gap-2 text-lg font-bold text-foreground">
           <Check className="h-5 w-5 text-success" />
           調査結果
@@ -199,7 +203,7 @@ export function ResearchPhase() {
       <div className="flex-1 overflow-y-auto p-6">
         <div className="mx-auto max-w-5xl space-y-6">
           {/* Market overview */}
-          <div className="grid grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
             <div className="rounded-xl border border-border bg-card p-5">
               <div className="flex items-center gap-2 text-sm font-medium text-muted-foreground mb-2">
                 <BarChart3 className="h-4 w-4" /> 市場規模
@@ -255,7 +259,7 @@ export function ResearchPhase() {
           </div>
 
           {/* SWOT-like grid */}
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
             <div className="rounded-xl border-2 border-success/20 bg-success/5 p-4">
               <h3 className="flex items-center gap-1.5 text-sm font-bold text-success mb-2"><Lightbulb className="h-4 w-4" /> 機会</h3>
               {r.opportunities.map((o, i) => <p key={i} className="text-xs text-foreground py-0.5">• {o}</p>)}

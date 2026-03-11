@@ -35,6 +35,7 @@ import { useState, useRef, useCallback } from "react";
 interface SidebarProps {
   collapsed: boolean;
   onToggle: () => void;
+  lockCollapsed?: boolean;
 }
 
 const PROJECT_NAV = [
@@ -66,7 +67,7 @@ const BOTTOM_ITEMS = [
   { to: "/settings", icon: Settings, label: "設定", feature: "settings" },
 ] as const;
 
-export function Sidebar({ collapsed, onToggle }: SidebarProps) {
+export function Sidebar({ collapsed, onToggle, lockCollapsed = false }: SidebarProps) {
   const { currentProject } = useTenantProject();
   const { isEnabled } = useFeatureFlags();
   const projectBase = currentProject ? `/p/${currentProject.slug}` : "/p/_";
@@ -86,14 +87,16 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
         {!collapsed && (
           <span className="text-lg font-bold tracking-tight text-foreground">Pylon</span>
         )}
-        <Button
-          variant="ghost"
-          size="icon"
-          className={cn("ml-auto h-8 w-8", collapsed && "mx-auto")}
-          onClick={onToggle}
-        >
-          <ChevronLeft className={cn("h-4 w-4 transition-transform", collapsed && "rotate-180")} />
-        </Button>
+        {!lockCollapsed && (
+          <Button
+            variant="ghost"
+            size="icon"
+            className={cn("ml-auto h-8 w-8", collapsed && "mx-auto")}
+            onClick={onToggle}
+          >
+            <ChevronLeft className={cn("h-4 w-4 transition-transform", collapsed && "rotate-180")} />
+          </Button>
+        )}
       </div>
 
       {/* Tenant & Project selectors */}
