@@ -35,6 +35,7 @@ const AuditRunner = lazy(() => import("@/pages/ads/AuditRunner").then(m => ({ de
 const AuditReport = lazy(() => import("@/pages/ads/AuditReport").then(m => ({ default: m.AuditReport })));
 const AdPlanGenerator = lazy(() => import("@/pages/ads/AdPlanGenerator").then(m => ({ default: m.AdPlanGenerator })));
 const BudgetOptimizer = lazy(() => import("@/pages/ads/BudgetOptimizer").then(m => ({ default: m.BudgetOptimizer })));
+const ProjectNew = lazy(() => import("@/pages/ProjectNew").then(m => ({ default: m.ProjectNew })));
 const ResearchPhase = lazy(() => import("@/pages/lifecycle/ResearchPhase").then(m => ({ default: m.ResearchPhase })));
 const PlanningPhase = lazy(() => import("@/pages/lifecycle/PlanningPhase").then(m => ({ default: m.PlanningPhase })));
 const DesignPhase = lazy(() => import("@/pages/lifecycle/DesignPhase").then(m => ({ default: m.DesignPhase })));
@@ -164,6 +165,7 @@ export function App() {
           <Route path="providers" element={isEnabled("admin", "providers") ? <Providers /> : <FeatureUnavailable title="Providers are disabled" description="This surface is not enabled in the current backend." />} />
           <Route path="models" element={isEnabled("admin", "models") ? <Models /> : <FeatureUnavailable title="Models are disabled" description="This surface is not enabled in the current backend." />} />
           <Route path="skills" element={isEnabled("admin", "skills") ? <Skills /> : <FeatureUnavailable title="Skills are disabled" description="This surface is not enabled in the current backend." />} />
+          <Route path="projects/new" element={<ProjectNew />} />
           <Route path="settings" element={isEnabled("admin", "settings") ? <Settings /> : <FeatureUnavailable title="Settings are disabled" description="This surface is not enabled in the current backend." />} />
 
           {/* Legacy redirects */}

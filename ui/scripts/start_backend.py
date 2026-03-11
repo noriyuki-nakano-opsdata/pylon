@@ -1448,19 +1448,31 @@ def _infer_product_type(spec: str, features: list) -> str:
     return " ".join(keywords[:5])
 
 
+def _research_depth_config(state: dict) -> dict:
+    """Return depth-aware config: token budget, competitor count, detail level."""
+    depth = state.get("depth", "standard")
+    if depth == "quick":
+        return {"max_tokens": 2048, "competitor_count": "2-3", "detail": "brief", "analysis_scope": "basic competitive landscape", "extra_instructions": "Keep analysis concise and focused on key points only."}
+    if depth == "deep":
+        return {"max_tokens": 12288, "competitor_count": "5-8", "detail": "comprehensive with data points", "analysis_scope": "comprehensive SWOT analysis with market sizing, strategic positioning, and actionable insights", "extra_instructions": "Be thorough. Include data estimates, market share %, pricing tiers, growth rates, and strategic recommendations."}
+    # standard
+    return {"max_tokens": 4096, "competitor_count": "3-5", "detail": "detailed", "analysis_scope": "market analysis with technology evaluation", "extra_instructions": ""}
+
+
 def research_competitor_handler(node_id: str, state: dict) -> dict:
     spec = state.get("spec", "")
+    dc = _research_depth_config(state)
     _track_task(task_id=f"wf_{node_id}", title="競合分析", description="競合他社の強み・弱み・価格を分析", status="in_progress", assignee="researcher", priority="high", phase="market-research", node_id=node_id)
-    # Use Gemini for competitor analysis (cheap, fast)
     prov, mdl = _pick_cheap_provider("gemini", "moonshot", "zhipu", "anthropic")
-    print(f"[research:competitor] Analyzing competitors with {prov}/{mdl}...")
+    print(f"[research:competitor] Analyzing competitors (depth={state.get('depth','standard')}) with {prov}/{mdl}...")
     text, tin, tout = _call_llm(mdl, (
         "You are a competitive intelligence analyst. "
-        "Research and analyze competitors for this product. "
+        f"Research and analyze competitors for this product. Depth: {dc['detail']}.\n"
         "Output JSON with key 'competitors': [{name, url, strengths:[], weaknesses:[], pricing, target}]. "
-        "Include 3-5 realistic competitors. Output ONLY valid JSON.\n\n"
+        f"Include {dc['competitor_count']} realistic competitors. {dc['extra_instructions']}\n"
+        "Output ONLY valid JSON.\n\n"
         f"Product:\n{spec}"
-    ), provider=prov)
+    ), max_tokens=dc["max_tokens"], provider=prov)
     try:
         data = _json.loads(_strip_json_fences(text))
     except Exception:
@@ -1472,18 +1484,19 @@ def research_competitor_handler(node_id: str, state: dict) -> dict:
 
 def research_market_handler(node_id: str, state: dict) -> dict:
     spec = state.get("spec", "")
+    dc = _research_depth_config(state)
     _track_task(task_id=f"wf_{node_id}", title="市場調査", description="市場規模・トレンド・機会を調査", status="in_progress", assignee="researcher", priority="high", phase="market-research", node_id=node_id)
-    # Use Moonshot/KIMI for market research (different provider for parallelism)
     prov, mdl = _pick_cheap_provider("moonshot", "zhipu", "gemini", "anthropic")
-    print(f"[research:market] Researching market with {prov}/{mdl}...")
+    print(f"[research:market] Researching market (depth={state.get('depth','standard')}) with {prov}/{mdl}...")
     text, tin, tout = _call_llm(mdl, (
-        "You are a market research analyst. "
+        f"You are a market research analyst. Depth: {dc['analysis_scope']}.\n"
         "Analyze the market for this product/service. "
         "Output JSON with keys: market_size (string), trends (array of strings), "
         "opportunities (array of strings), growth_rate (string). "
+        f"{dc['extra_instructions']}\n"
         "Output ONLY valid JSON.\n\n"
         f"Product:\n{spec}"
-    ), provider=prov)
+    ), max_tokens=dc["max_tokens"], provider=prov)
     try:
         data = _json.loads(_strip_json_fences(text))
     except Exception:
@@ -1495,18 +1508,19 @@ def research_market_handler(node_id: str, state: dict) -> dict:
 
 def research_tech_handler(node_id: str, state: dict) -> dict:
     spec = state.get("spec", "")
+    dc = _research_depth_config(state)
     _track_task(task_id=f"wf_{node_id}", title="技術評価", description="技術的実現可能性の評価", status="in_progress", assignee="researcher", priority="high", phase="market-research", node_id=node_id)
-    # Use ZhipuAI/GLM for tech evaluation (different provider for parallelism)
     prov, mdl = _pick_cheap_provider("zhipu", "gemini", "moonshot", "anthropic")
-    print(f"[research:tech] Evaluating tech feasibility with {prov}/{mdl}...")
+    print(f"[research:tech] Evaluating tech feasibility (depth={state.get('depth','standard')}) with {prov}/{mdl}...")
     text, tin, tout = _call_llm(mdl, (
-        "You are a senior technology evaluator. "
+        f"You are a senior technology evaluator. Depth: {dc['detail']}.\n"
         "Assess the technical feasibility of this product. "
         "Output JSON with keys: score (0.0-1.0), notes (string), "
         "recommended_stack (object), risks (array of strings), threats (array of strings). "
+        f"{dc['extra_instructions']}\n"
         "Output ONLY valid JSON.\n\n"
         f"Product:\n{spec}"
-    ), provider=prov)
+    ), max_tokens=dc["max_tokens"], provider=prov)
     try:
         data = _json.loads(_strip_json_fences(text))
     except Exception:
@@ -1516,10 +1530,39 @@ def research_tech_handler(node_id: str, state: dict) -> dict:
     return {"tech_data": data, "tech_tokens_in": tin, "tech_tokens_out": tout}
 
 
+def research_user_handler(node_id: str, state: dict) -> dict:
+    """user-researcher: Persona-level user research with behavioral insights."""
+    spec = state.get("spec", "")
+    dc = _research_depth_config(state)
+    _track_task(task_id=f"wf_{node_id}", title="ユーザー調査", description="ターゲットユーザーの行動・ニーズ分析", status="in_progress", assignee="researcher", priority="high", phase="market-research", node_id=node_id)
+    prov, mdl = _pick_cheap_provider("anthropic", "gemini", "moonshot", "zhipu")
+    print(f"[research:user] Researching user needs (depth={state.get('depth','standard')}) with {prov}/{mdl}...")
+    segment_count = "1-2" if dc["detail"] == "brief" else ("4-6" if dc["detail"] == "comprehensive with data points" else "2-4")
+    text, tin, tout = _call_llm(mdl, (
+        f"You are a user experience researcher. Depth: {dc['detail']}.\n"
+        "Research target users, their behaviors, needs, pain points, and contexts of use.\n\n"
+        "Output JSON with keys:\n"
+        "- user_segments: [{name, size_estimate, demographics, behaviors:[], needs:[], pain_points:[], willingness_to_pay}]\n"
+        "- usage_contexts: [{context, frequency, device, environment, emotional_state}]\n"
+        "- adoption_barriers: [{barrier, severity:'high'|'medium'|'low', mitigation}]\n\n"
+        f"Identify {segment_count} user segments. {dc['extra_instructions']}\n"
+        "Output ONLY valid JSON.\n\n"
+        f"Product:\n{spec}"
+    ), max_tokens=dc["max_tokens"], provider=prov)
+    try:
+        data = _json.loads(_strip_json_fences(text))
+    except Exception:
+        data = {"user_segments": [], "usage_contexts": [], "adoption_barriers": []}
+    print(f"[research:user] Done. {tin}in/{tout}out (provider: {prov})")
+    _track_task(task_id=f"wf_{node_id}", title="ユーザー調査", description="", status="done", assignee="researcher")
+    return {"user_data": data, "user_tokens_in": tin, "user_tokens_out": tout}
+
+
 def research_synthesizer_handler(node_id: str, state: dict) -> dict:
     competitor_data = state.get("competitor_data", {})
     market_data = state.get("market_data", {})
     tech_data = state.get("tech_data", {})
+    user_data = state.get("user_data", {})
     spec = state.get("spec", "")
     _track_task(task_id=f"wf_{node_id}", title="リサーチ統合", description="調査結果の統合分析", status="in_progress", assignee="researcher", priority="high", phase="market-research", node_id=node_id)
     synth_prov, synth_mdl = _pick_cheap_provider("gemini", "anthropic", "moonshot")
@@ -1532,12 +1575,15 @@ def research_synthesizer_handler(node_id: str, state: dict) -> dict:
         "- trends: [string]\n"
         "- opportunities: [string]\n"
         "- threats: [string]\n"
-        "- tech_feasibility: {score: 0.0-1.0, notes: string}\n\n"
+        "- tech_feasibility: {score: 0.0-1.0, notes: string}\n"
+        "- user_segments: [{name, size_estimate, demographics, behaviors:[], needs:[], pain_points:[]}]\n"
+        "- usage_contexts: [{context, frequency, device, environment}]\n\n"
         "Output ONLY valid JSON.\n\n"
         f"Product: {spec}\n\n"
         f"Competitor Analysis:\n{_json.dumps(competitor_data, ensure_ascii=False)[:4000]}\n\n"
         f"Market Research:\n{_json.dumps(market_data, ensure_ascii=False)[:3000]}\n\n"
-        f"Tech Evaluation:\n{_json.dumps(tech_data, ensure_ascii=False)[:3000]}"
+        f"Tech Evaluation:\n{_json.dumps(tech_data, ensure_ascii=False)[:3000]}\n\n"
+        f"User Research:\n{_json.dumps(user_data, ensure_ascii=False)[:3000]}"
     ), provider=synth_prov)
     try:
         research = _json.loads(_strip_json_fences(text))
@@ -1621,9 +1667,81 @@ def planning_feature_handler(node_id: str, state: dict) -> dict:
     return {"feature_data": data, "feature_tokens_in": tin, "feature_tokens_out": tout}
 
 
+def planning_story_architect_handler(node_id: str, state: dict) -> dict:
+    """story-architect: User journey mapping, JTBD analysis, and story decomposition."""
+    spec = state.get("spec", "")
+    research = state.get("research", state.get("analysis", {}))
+    _track_task(task_id=f"wf_{node_id}", title="ストーリー設計", description="ユーザージャーニー・JTBD・ストーリー分解", status="in_progress", assignee="product-manager", priority="high", phase="product-planning", node_id=node_id)
+    prov, mdl = _pick_cheap_provider("zhipu", "gemini", "moonshot", "anthropic")
+    print(f"[planning:story-architect] Designing journeys & JTBD with {prov}/{mdl}...")
+    text, tin, tout = _call_llm(mdl, (
+        "You are a senior UX strategist specializing in story mapping and Jobs-to-be-Done framework.\n\n"
+        "Output JSON with these exact keys:\n"
+        "- user_journeys: [{persona_name, touchpoints:[{phase:'awareness'|'consideration'|'acquisition'|'usage'|'advocacy',\n"
+        "    persona, action, touchpoint, emotion:'positive'|'neutral'|'negative', pain_point?, opportunity?}]}]\n"
+        "  Create 2-3 journey maps with 5 phases each.\n"
+        "- job_stories: JTBD format:\n"
+        "  [{situation:'When...', motivation:'I want to...', outcome:'So I can...',\n"
+        "    priority:'core'|'supporting'|'aspirational', related_features:[]}]\n"
+        "  Generate 5-8 job stories covering core needs.\n"
+        "- story_map: {backbone:[], walking_skeleton:[], iterations:[{name, stories:[]}]}\n\n"
+        "Output ONLY valid JSON, no markdown fences.\n\n"
+        f"Product:\n{spec}\n\n"
+        f"Research Context:\n{_json.dumps(research, ensure_ascii=False)[:4000]}"
+    ), max_tokens=8192, provider=prov)
+    try:
+        repaired = _repair_truncated_json(text)
+        data = _json.loads(repaired)
+    except Exception as e:
+        print(f"[planning:story-architect] JSON parse failed: {e}")
+        data = {"user_journeys": [], "job_stories": [], "story_map": {}}
+    print(f"[planning:story-architect] Done. {tin}in/{tout}out (provider: {prov}), journeys={len(data.get('user_journeys',[]))}, jtbd={len(data.get('job_stories',[]))}")
+    _track_task(task_id=f"wf_{node_id}", title="ストーリー設計", description="", status="done", assignee="product-manager")
+    return {"story_data": data, "story_tokens_in": tin, "story_tokens_out": tout}
+
+
+def planning_solution_architect_handler(node_id: str, state: dict) -> dict:
+    """solution-architect: IA analysis, actor/role modeling, use case catalog."""
+    spec = state.get("spec", "")
+    research = state.get("research", state.get("analysis", {}))
+    _track_task(task_id=f"wf_{node_id}", title="ソリューション設計", description="IA分析・アクター/ロールモデリング・ユースケース設計", status="in_progress", assignee="architect", priority="high", phase="product-planning", node_id=node_id)
+    prov, mdl = _pick_cheap_provider("anthropic", "gemini", "moonshot", "zhipu")
+    print(f"[planning:solution-architect] Designing IA & use cases with {prov}/{mdl}...")
+    text, tin, tout = _call_llm(mdl, (
+        "You are a senior solution architect specializing in information architecture and system design.\n\n"
+        "Output JSON with these exact keys:\n"
+        "- ia_analysis: {site_map:[{id, label, description?, children?:[], priority:'primary'|'secondary'|'utility'}],\n"
+        "   navigation_model:'hierarchical'|'flat'|'hub-and-spoke'|'matrix',\n"
+        "   key_paths:[{name, steps:[]}]}\n"
+        "  Design the app's navigation structure and 3-5 key user flows.\n"
+        "- actors: [{name, type:'primary'|'secondary'|'external_system', description, goals:[], interactions:[]}]\n"
+        "  Identify 3-6 actors including end users, admins, and external systems.\n"
+        "- roles: [{name, responsibilities:[], permissions:[], related_actors:[]}]\n"
+        "  Define 2-5 roles with clear permission boundaries.\n"
+        "- use_cases: [{id, title, actor, category, sub_category,\n"
+        "    preconditions:[], main_flow:[], alternative_flows?:[{condition, steps:[]}],\n"
+        "    postconditions:[], priority:'must'|'should'|'could', related_stories?:[]}]\n"
+        "  Generate 6-10 use cases covering core functionality.\n\n"
+        "Output ONLY valid JSON, no markdown fences.\n\n"
+        f"Product:\n{spec}\n\n"
+        f"Research Context:\n{_json.dumps(research, ensure_ascii=False)[:4000]}"
+    ), max_tokens=12288, provider=prov)
+    try:
+        repaired = _repair_truncated_json(text)
+        data = _json.loads(repaired)
+    except Exception as e:
+        print(f"[planning:solution-architect] JSON parse failed: {e}")
+        data = {"ia_analysis": {}, "actors": [], "roles": [], "use_cases": []}
+    print(f"[planning:solution-architect] Done. {tin}in/{tout}out (provider: {prov}), actors={len(data.get('actors',[]))}, use_cases={len(data.get('use_cases',[]))}")
+    _track_task(task_id=f"wf_{node_id}", title="ソリューション設計", description="", status="done", assignee="architect")
+    return {"solution_data": data, "solution_tokens_in": tin, "solution_tokens_out": tout}
+
+
 def planning_synthesizer_handler(node_id: str, state: dict) -> dict:
     persona_data = state.get("persona_data", {})
     feature_data = state.get("feature_data", {})
+    story_data = state.get("story_data", {})
+    solution_data = state.get("solution_data", {})
     spec = state.get("spec", "")
     _track_task(task_id=f"wf_{node_id}", title="プランニング統合", description="計画結果の統合", status="in_progress", assignee="product-manager", priority="high", phase="product-planning", node_id=node_id)
     print(f"[planning:synthesizer] Synthesizing planning results...")
@@ -1692,7 +1810,9 @@ def planning_synthesizer_handler(node_id: str, state: dict) -> dict:
         f"Available AI Agents: {_json.dumps(agent_names[:20], ensure_ascii=False)}\n"
         f"Available Skills: {_json.dumps(skill_names[:30], ensure_ascii=False)}\n\n"
         f"Persona Analysis:\n{_json.dumps(persona_data, ensure_ascii=False)[:5000]}\n\n"
-        f"Feature Analysis:\n{_json.dumps(feature_data, ensure_ascii=False)[:5000]}"
+        f"Feature Analysis:\n{_json.dumps(feature_data, ensure_ascii=False)[:5000]}\n\n"
+        f"Story/Journey Analysis:\n{_json.dumps(story_data, ensure_ascii=False)[:5000]}\n\n"
+        f"Solution Architecture:\n{_json.dumps(solution_data, ensure_ascii=False)[:5000]}"
     ), max_tokens=16384, provider=synth_prov)
     try:
         repaired = _repair_truncated_json(text)
@@ -1703,6 +1823,8 @@ def planning_synthesizer_handler(node_id: str, state: dict) -> dict:
         planning = {
             **persona_data,
             **feature_data,
+            **story_data,
+            **solution_data,
         }
     print(f"[planning:synthesizer] Done. {tin}in/{tout}out, personas={len(planning.get('personas',[]))}, kano={len(planning.get('kano_features',[]))}")
     _track_task(task_id=f"wf_{node_id}", title="プランニング統合", description="", status="done", assignee="product-manager")
@@ -2071,10 +2193,165 @@ def dev_coder_handler(node_id: str, state: dict) -> dict:
     print(f"[dev:coder] Done. {len(code)} chars, saved to {output_path}")
     _track_task(task_id=f"wf_{node_id}", title="コーディング", description="", status="review", assignee="fullstack-builder")
     return {
+        "frontend_code": code,
         "code": code,
         "build_tokens_in": tin,
         "build_tokens_out": tout,
         "generated_file": str(output_path),
+    }
+
+
+def dev_backend_builder_handler(node_id: str, state: dict) -> dict:
+    """backend-builder: Generates API design, data models, and backend logic."""
+    spec = state.get("spec", "")
+    build_plan = state.get("build_plan", {})
+    analysis = state.get("analysis", {})
+    iteration = state.get("_build_iteration", 0)
+
+    _track_task(task_id=f"wf_{node_id}", title="バックエンド実装", description="API設計・データモデル・ビジネスロジック", status="in_progress", assignee="backend-builder", priority="high", phase="iterative-development", node_id=node_id)
+    print(f"[dev:backend-builder] Iteration {iteration}, building backend...")
+
+    ia_analysis = analysis.get("ia_analysis", {})
+    use_cases = analysis.get("use_cases", [])
+
+    text, tin, tout = _agent_call_llm("backend-builder", MODEL, (
+        "You are an expert backend architect. Design the complete backend for this product.\n\n"
+        "Output JSON with these keys:\n"
+        "- api_endpoints: [{method, path, description, request_body?, response, auth_required:boolean}]\n"
+        "- data_models: [{name, fields:[{name, type, required, description}], relationships:[]}]\n"
+        "- business_rules: [{name, description, trigger, conditions:[], actions:[]}]\n"
+        "- integrations: [{service, purpose, api_type:'REST'|'GraphQL'|'WebSocket'|'gRPC'}]\n"
+        "- error_handling: [{error_code, description, http_status, user_message}]\n\n"
+        "Output ONLY valid JSON.\n\n"
+        f"Product:\n{spec}\n\n"
+        f"Build Plan:\n{_json.dumps(build_plan, ensure_ascii=False)[:4000]}\n\n"
+        f"IA Analysis:\n{_json.dumps(ia_analysis, ensure_ascii=False)[:2000]}\n\n"
+        f"Use Cases:\n{_json.dumps(use_cases, ensure_ascii=False)[:3000]}"
+    ), max_tokens=12288)
+    try:
+        backend = _json.loads(_strip_json_fences(text))
+    except Exception:
+        backend = {"api_endpoints": [], "data_models": [], "business_rules": []}
+    print(f"[dev:backend-builder] Done. {tin}in/{tout}out, endpoints={len(backend.get('api_endpoints',[]))}")
+    _track_task(task_id=f"wf_{node_id}", title="バックエンド実装", description="", status="done", assignee="backend-builder")
+    return {
+        "backend_design": backend,
+        "backend_tokens_in": tin,
+        "backend_tokens_out": tout,
+    }
+
+
+def dev_integrator_handler(node_id: str, state: dict) -> dict:
+    """integrator: Merges frontend + backend into unified artifact."""
+    frontend_code = state.get("frontend_code", state.get("code", ""))
+    backend_design = state.get("backend_design", {})
+    build_plan = state.get("build_plan", {})
+    spec = state.get("spec", "")
+    iteration = state.get("_build_iteration", 0)
+
+    _track_task(task_id=f"wf_{node_id}", title="統合", description="フロントエンド・バックエンドの統合", status="in_progress", assignee="integrator", priority="high", phase="iterative-development", node_id=node_id)
+    print(f"[dev:integrator] Iteration {iteration}, integrating...")
+
+    text, tin, tout = _agent_call_llm("integrator", MODEL, (
+        "You are a senior integration engineer. Merge the frontend HTML application with the backend API design.\n\n"
+        "Take the existing frontend HTML and enhance it by:\n"
+        "1. Adding JavaScript fetch() calls to the designed API endpoints\n"
+        "2. Implementing realistic data loading with mock responses\n"
+        "3. Adding error handling for all API interactions\n"
+        "4. Ensuring the data models align between frontend display and backend schema\n"
+        "5. Adding loading states for all async operations\n\n"
+        "Output the COMPLETE integrated HTML file. Output ONLY raw HTML code.\n\n"
+        f"Product:\n{spec}\n\n"
+        f"Backend API Design:\n{_json.dumps(backend_design, ensure_ascii=False)[:6000]}\n\n"
+        f"Frontend HTML ({len(frontend_code)} chars):\n{frontend_code[:12000]}"
+    ), max_tokens=16384)
+    code = _strip_html_fences(text)
+
+    output_path = project_root / "output" / f"lifecycle-integrated-v{iteration}.html"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(code)
+
+    print(f"[dev:integrator] Done. {len(code)} chars, saved to {output_path}")
+    _track_task(task_id=f"wf_{node_id}", title="統合", description="", status="done", assignee="integrator")
+    return {
+        "code": code,
+        "integrated_code": code,
+        "integration_tokens_in": tin,
+        "integration_tokens_out": tout,
+        "generated_file": str(output_path),
+    }
+
+
+def dev_qa_engineer_handler(node_id: str, state: dict) -> dict:
+    """qa-engineer: Quality assurance review with test scenarios."""
+    code = state.get("code", state.get("integrated_code", ""))
+    milestones = state.get("milestones", [])
+    selected_features = state.get("selected_features", [])
+    iteration = state.get("_build_iteration", 0)
+
+    _track_task(task_id=f"wf_{node_id}", title="QAテスト", description="品質保証テストシナリオの設計と評価", status="in_progress", assignee="qa-engineer", priority="high", phase="iterative-development", node_id=node_id)
+    print(f"[dev:qa-engineer] Iteration {iteration}, testing...")
+
+    prov, mdl = _pick_cheap_provider("gemini", "anthropic", "moonshot")
+    text, tin, tout = _call_llm(mdl, (
+        "You are a senior QA engineer. Review the application code and create test evaluation.\n\n"
+        "Output JSON with these keys:\n"
+        "- test_scenarios: [{id, name, category:'functional'|'ui'|'integration'|'edge-case', steps:[], expected_result, status:'pass'|'fail'|'untestable', notes}]\n"
+        "- coverage_score: 0.0-1.0 (what % of features are implemented)\n"
+        "- qa_issues: [{severity:'critical'|'major'|'minor', component, description, recommendation}]\n"
+        "- accessibility_audit: [{element, issue, wcag_criterion, fix}]\n"
+        "- performance_notes: [{area, concern, recommendation}]\n\n"
+        "Output ONLY valid JSON.\n\n"
+        f"Features:\n{_json.dumps(selected_features, ensure_ascii=False)[:3000]}\n\n"
+        f"Milestones:\n{_json.dumps(milestones, ensure_ascii=False)[:2000]}\n\n"
+        f"Code ({len(code)} chars):\n{code[:14000]}"
+    ), max_tokens=8192, provider=prov)
+    try:
+        qa_result = _json.loads(_strip_json_fences(text))
+    except Exception:
+        qa_result = {"test_scenarios": [], "coverage_score": 0.5, "qa_issues": []}
+    print(f"[dev:qa-engineer] Done. {tin}in/{tout}out, scenarios={len(qa_result.get('test_scenarios',[]))}")
+    _track_task(task_id=f"wf_{node_id}", title="QAテスト", description="", status="done", assignee="qa-engineer")
+    return {
+        "qa_result": qa_result,
+        "qa_tokens_in": tin,
+        "qa_tokens_out": tout,
+    }
+
+
+def dev_security_reviewer_handler(node_id: str, state: dict) -> dict:
+    """security-reviewer: OWASP-based security review."""
+    code = state.get("code", state.get("integrated_code", ""))
+    backend_design = state.get("backend_design", {})
+    iteration = state.get("_build_iteration", 0)
+
+    _track_task(task_id=f"wf_{node_id}", title="セキュリティレビュー", description="OWASPベースのセキュリティ監査", status="in_progress", assignee="security-reviewer", priority="high", phase="iterative-development", node_id=node_id)
+    print(f"[dev:security-reviewer] Iteration {iteration}, auditing...")
+
+    prov, mdl = _pick_cheap_provider("anthropic", "gemini", "moonshot")
+    text, tin, tout = _call_llm(mdl, (
+        "You are a senior application security reviewer (OWASP specialist).\n"
+        "Audit this application for security vulnerabilities.\n\n"
+        "Output JSON with these keys:\n"
+        "- vulnerabilities: [{id, severity:'critical'|'high'|'medium'|'low', category (OWASP Top 10 category), description, location, recommendation, cwe_id?}]\n"
+        "- security_score: 0.0-1.0 (overall security posture)\n"
+        "- auth_review: {has_auth:boolean, method, issues:[]}\n"
+        "- data_handling: {pii_detected:boolean, encryption:boolean, issues:[]}\n"
+        "- recommendations: [{priority:'immediate'|'short-term'|'long-term', action, rationale}]\n\n"
+        "Output ONLY valid JSON.\n\n"
+        f"Backend API Design:\n{_json.dumps(backend_design, ensure_ascii=False)[:4000]}\n\n"
+        f"Code ({len(code)} chars):\n{code[:12000]}"
+    ), max_tokens=8192, provider=prov)
+    try:
+        security_result = _json.loads(_strip_json_fences(text))
+    except Exception:
+        security_result = {"vulnerabilities": [], "security_score": 0.5, "recommendations": []}
+    print(f"[dev:security-reviewer] Done. {tin}in/{tout}out, vulns={len(security_result.get('vulnerabilities',[]))}")
+    _track_task(task_id=f"wf_{node_id}", title="セキュリティレビュー", description="", status="done", assignee="security-reviewer")
+    return {
+        "security_result": security_result,
+        "security_tokens_in": tin,
+        "security_tokens_out": tout,
     }
 
 
@@ -2083,30 +2360,51 @@ def dev_reviewer_handler(node_id: str, state: dict) -> dict:
     milestones = state.get("milestones", [])
     selected_features = state.get("selected_features", [])
     iteration = state.get("_build_iteration", 0)
+    qa_result = state.get("qa_result", {})
+    security_result = state.get("security_result", {})
 
-    _track_task(task_id=f"wf_{node_id}", title="コードレビュー", description="マイルストーン達成度とコード品質の評価", status="in_progress", assignee="reviewer", priority="high", phase="iterative-development", node_id=node_id)
-    print(f"[dev:reviewer] Iteration {iteration}, reviewing...")
-    # Use Sonnet for accurate review (Haiku was too permissive)
+    _track_task(task_id=f"wf_{node_id}", title="リリースレビュー", description="QA・セキュリティ結果を統合した最終評価", status="in_progress", assignee="reviewer", priority="high", phase="iterative-development", node_id=node_id)
+    print(f"[dev:reviewer] Iteration {iteration}, reviewing (with QA + security context)...")
+
+    # Build QA/Security summary for reviewer context
+    qa_summary = ""
+    if qa_result:
+        qa_summary = (
+            f"\n\nQA Results: coverage={qa_result.get('coverage_score', 'N/A')}, "
+            f"issues={len(qa_result.get('qa_issues', []))}\n"
+            f"{_json.dumps(qa_result, ensure_ascii=False)[:3000]}"
+        )
+    sec_summary = ""
+    if security_result:
+        sec_summary = (
+            f"\n\nSecurity Audit: score={security_result.get('security_score', 'N/A')}, "
+            f"vulns={len(security_result.get('vulnerabilities', []))}\n"
+            f"{_json.dumps(security_result, ensure_ascii=False)[:3000]}"
+        )
+
     text, tin, tout = _agent_call_llm("reviewer", MODEL, (
-        "You are a senior code reviewer and UX quality auditor.\n"
-        "Review this HTML application against milestones and feature requirements.\n"
-        "Be STRICT in your evaluation. Only mark milestones as 'satisfied' if the code clearly implements them.\n\n"
+        "You are a senior release reviewer. You have QA and security audit results to incorporate.\n"
+        "Review the application code, QA findings, and security audit for release readiness.\n"
+        "Be STRICT in evaluation. Only mark milestones as 'satisfied' if code clearly implements them.\n\n"
         "Evaluate:\n"
-        "1. Does the code implement each milestone's criteria?\n"
-        "2. Code quality: proper HTML semantics, CSS architecture, JS patterns\n"
-        "3. UX quality: visual hierarchy, spacing consistency, interaction states\n"
-        "4. Accessibility: contrast ratios, semantic elements, ARIA attributes\n"
-        "5. Responsiveness: mobile/tablet/desktop layouts\n\n"
+        "1. Milestone completion against criteria\n"
+        "2. Code quality: HTML semantics, CSS architecture, JS patterns\n"
+        "3. QA findings: unresolved issues blocking release\n"
+        "4. Security posture: critical/high vulnerabilities must be addressed\n"
+        "5. UX quality: visual hierarchy, interaction states\n"
+        "6. Accessibility and responsiveness\n\n"
         "Output JSON:\n"
         "- milestone_results: [{id, name, status:'satisfied'|'not_satisfied', reason}]\n"
         "- all_milestones_met: boolean\n"
         "- quality_score: 0.0-1.0 (be honest, 0.7+ means production-ready)\n"
-        "- feedback: string (specific improvements needed with code examples)\n"
-        "- ux_issues: [{element, issue, suggestion}] (specific UX problems found)\n\n"
+        "- feedback: string (specific improvements needed)\n"
+        "- ux_issues: [{element, issue, suggestion}]\n"
+        "- release_blockers: [{source:'qa'|'security'|'code', description, severity}]\n\n"
         "Output ONLY valid JSON.\n\n"
         f"Milestones:\n{_json.dumps(milestones, ensure_ascii=False)}\n\n"
         f"Features:\n{_json.dumps(selected_features, ensure_ascii=False)}\n\n"
-        f"Code ({len(code)} chars, reviewing full code):\n{code[:16000]}"
+        f"Code ({len(code)} chars):\n{code[:14000]}"
+        f"{qa_summary}{sec_summary}"
     ))
     try:
         review = _json.loads(_strip_json_fences(text))
@@ -2135,29 +2433,55 @@ def dev_reviewer_handler(node_id: str, state: dict) -> dict:
 
 # ── Handler Registry (keyed by project name) ──
 
+# LLM handlers keyed by DAG node IDs — shared between standalone and lifecycle workflows
+_RESEARCH_HANDLERS = {
+    "competitor-analyst": research_competitor_handler,
+    "market-researcher": research_market_handler,
+    "user-researcher": research_user_handler,
+    "tech-evaluator": research_tech_handler,
+    "research-synthesizer": research_synthesizer_handler,
+}
+
+_PLANNING_HANDLERS = {
+    "persona-builder": planning_persona_handler,
+    "story-architect": planning_story_architect_handler,
+    "feature-analyst": planning_feature_handler,
+    "solution-architect": planning_solution_architect_handler,
+    "planning-synthesizer": planning_synthesizer_handler,
+}
+
+_DESIGN_HANDLERS = {
+    "claude-designer": design_claude_handler,
+    "openai-designer": design_openai_handler,
+    "gemini-designer": design_gemini_handler,
+    "design-evaluator": design_evaluator_handler,
+}
+
+_DEVELOPMENT_HANDLERS = {
+    "planner": dev_planner_handler,
+    "frontend-builder": dev_coder_handler,
+    "backend-builder": dev_backend_builder_handler,
+    "integrator": dev_integrator_handler,
+    "qa-engineer": dev_qa_engineer_handler,
+    "security-reviewer": dev_security_reviewer_handler,
+    "reviewer": dev_reviewer_handler,
+}
+
 LIFECYCLE_HANDLERS: dict[str, dict[str, object]] = {
-    "market-research": {
-        "competitor-analyst": research_competitor_handler,
-        "market-researcher": research_market_handler,
-        "tech-evaluator": research_tech_handler,
-        "research-synthesizer": research_synthesizer_handler,
-    },
-    "product-planning": {
-        "persona-builder": planning_persona_handler,
-        "feature-analyst": planning_feature_handler,
-        "planning-synthesizer": planning_synthesizer_handler,
-    },
-    "design-generation": {
-        "claude-designer": design_claude_handler,
-        "openai-designer": design_openai_handler,
-        "gemini-designer": design_gemini_handler,
-        "design-evaluator": design_evaluator_handler,
-    },
+    # Standalone workflows (backward compat)
+    "market-research": _RESEARCH_HANDLERS,
+    "product-planning": _PLANNING_HANDLERS,
+    "design-generation": _DESIGN_HANDLERS,
     "iterative-development": {
         "planner": dev_planner_handler,
         "coder": dev_coder_handler,
         "reviewer": dev_reviewer_handler,
     },
+    # Lifecycle workflows — NOW use real LLM handlers instead of deterministic stubs
+    "lifecycle-research": _RESEARCH_HANDLERS,
+    "lifecycle-planning": _PLANNING_HANDLERS,
+    "lifecycle-design": _DESIGN_HANDLERS,
+    "lifecycle-development": _DEVELOPMENT_HANDLERS,
 }
 
 # Monkey-patch register_workflow_project to auto-attach handlers

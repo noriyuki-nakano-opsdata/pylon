@@ -13,6 +13,7 @@ import { approvalsApi } from "../approvals";
 import { adsApi } from "../ads";
 import { costsApi } from "../costs";
 import { featuresApi } from "../features";
+import { lifecycleApi } from "../lifecycle";
 import {
   createContent,
   createEvent,
@@ -443,5 +444,104 @@ describe("stable API contract", () => {
 
     apiFetch.mockResolvedValueOnce([]);
     await expectApiCall(adsApi.getTemplates(), "/v1/ads/templates");
+  });
+
+  it("keeps lifecycle routes on the canonical v1 surface", async () => {
+    apiFetch.mockResolvedValueOnce({ projects: [], count: 0 });
+    await expectApiCall(lifecycleApi.listProjects(), "/v1/lifecycle/projects");
+
+    apiFetch.mockResolvedValueOnce({});
+    await expectApiCall(lifecycleApi.getProject("orbit"), "/v1/lifecycle/projects/orbit");
+
+    apiFetch.mockResolvedValueOnce({});
+    await expectApiCall(
+      lifecycleApi.saveProject("orbit", { spec: "Autonomous lifecycle cockpit" }),
+      "/v1/lifecycle/projects/orbit",
+      { method: "PATCH", body: JSON.stringify({ spec: "Autonomous lifecycle cockpit" }) },
+    );
+
+    apiFetch.mockResolvedValueOnce({});
+    await expectApiCall(
+      lifecycleApi.advanceProject("orbit", { orchestrationMode: "autonomous", maxSteps: 8 }),
+      "/v1/lifecycle/projects/orbit/advance",
+      { method: "POST", body: JSON.stringify({ orchestration_mode: "autonomous", max_steps: 8 }) },
+    );
+
+    apiFetch.mockResolvedValueOnce({});
+    await expectApiCall(
+      lifecycleApi.getBlueprints("orbit"),
+      "/v1/lifecycle/projects/orbit/blueprint",
+    );
+
+    apiFetch.mockResolvedValueOnce({});
+    await expectApiCall(
+      lifecycleApi.preparePhase("research", "orbit"),
+      "/v1/lifecycle/projects/orbit/phases/research/prepare",
+      { method: "POST" },
+    );
+
+    apiFetch.mockResolvedValueOnce({});
+    await expectApiCall(
+      lifecycleApi.syncPhaseRun("orbit", "research", "run-1"),
+      "/v1/lifecycle/projects/orbit/phases/research/sync",
+      { method: "POST", body: JSON.stringify({ run_id: "run-1" }) },
+    );
+
+    apiFetch.mockResolvedValueOnce({});
+    await expectApiCall(
+      lifecycleApi.addApprovalComment("orbit", { text: "Ship it", type: "approve" }),
+      "/v1/lifecycle/projects/orbit/approval/comments",
+      { method: "POST", body: JSON.stringify({ text: "Ship it", type: "approve" }) },
+    );
+
+    apiFetch.mockResolvedValueOnce({});
+    await expectApiCall(
+      lifecycleApi.decideApproval("orbit", "approved", "Ready for build"),
+      "/v1/lifecycle/projects/orbit/approval/decision",
+      { method: "POST", body: JSON.stringify({ decision: "approved", comment: "Ready for build" }) },
+    );
+
+    apiFetch.mockResolvedValueOnce({});
+    await expectApiCall(
+      lifecycleApi.runDeployChecks("orbit", "<html></html>"),
+      "/v1/lifecycle/projects/orbit/deploy/checks",
+      { method: "POST", body: JSON.stringify({ buildCode: "<html></html>" }) },
+    );
+
+    apiFetch.mockResolvedValueOnce({});
+    await expectApiCall(
+      lifecycleApi.createRelease("orbit", "release note"),
+      "/v1/lifecycle/projects/orbit/releases",
+      { method: "POST", body: JSON.stringify({ note: "release note" }) },
+    );
+
+    apiFetch.mockResolvedValueOnce({});
+    await expectApiCall(
+      lifecycleApi.listFeedback("orbit"),
+      "/v1/lifecycle/projects/orbit/feedback",
+    );
+
+    apiFetch.mockResolvedValueOnce({});
+    await expectApiCall(
+      lifecycleApi.addFeedback("orbit", { text: "Improve mobile nav", type: "improvement", impact: "medium" }),
+      "/v1/lifecycle/projects/orbit/feedback",
+      {
+        method: "POST",
+        body: JSON.stringify({ text: "Improve mobile nav", type: "improvement", impact: "medium" }),
+      },
+    );
+
+    apiFetch.mockResolvedValueOnce({});
+    await expectApiCall(
+      lifecycleApi.voteFeedback("orbit", "fb-1", 1),
+      "/v1/lifecycle/projects/orbit/feedback/fb-1/vote",
+      { method: "POST", body: JSON.stringify({ delta: 1 }) },
+    );
+
+    apiFetch.mockResolvedValueOnce({});
+    await expectApiCall(
+      lifecycleApi.getRecommendations("orbit"),
+      "/v1/lifecycle/projects/orbit/recommendations",
+    );
   });
 });

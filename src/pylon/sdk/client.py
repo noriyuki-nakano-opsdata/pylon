@@ -425,6 +425,9 @@ class PylonClient:
             offset=offset,
         )
 
+    def allocate_sequence_value(self, name: str) -> int:
+        return self._control_plane_store.allocate_sequence_value(name)
+
     def get_queue_task_record(self, task_id: str) -> dict[str, Any] | None:
         return self._control_plane_store.get_queue_task_record(task_id)
 

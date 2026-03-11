@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
-import { Bot, GitBranch, DollarSign, ShieldCheck } from "lucide-react";
+import { Link } from "react-router-dom";
+import { Bot, GitBranch, DollarSign, FolderPlus, ShieldCheck } from "lucide-react";
 import { MetricCard } from "@/components/MetricCard";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
@@ -80,6 +81,26 @@ export function Dashboard() {
           description={`${approvals.length} total approvals`}
         />
       </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">クイック操作</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-3 text-sm">
+            <p className="text-muted-foreground">
+              まずは新しいプロジェクトを作成して、ライフサイクルのリサーチから開始してください。
+            </p>
+            <Link
+              to="/projects/new"
+              className="inline-flex items-center gap-2 rounded-md border border-border px-3 py-2 text-sm font-medium text-foreground hover:bg-accent hover:text-foreground transition-colors"
+            >
+              <FolderPlus className="h-4 w-4" />
+              新規プロジェクトを作成
+            </Link>
+          </div>
+        </CardContent>
+      </Card>
 
       {/* Two columns */}
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">

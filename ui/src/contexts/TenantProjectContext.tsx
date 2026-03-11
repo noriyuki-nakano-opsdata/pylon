@@ -1,6 +1,8 @@
 import { createContext, useContext, useState, useCallback, useEffect, type ReactNode } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { setTenantId } from "@/api/client";
+import { lifecycleApi } from "@/api/lifecycle";
+import type { LifecycleProject } from "@/types/lifecycle";
 
 export interface Tenant {
   id: string;
@@ -18,13 +20,23 @@ export interface Project {
   createdAt: string;
 }
 
+export interface CreateProjectInput {
+  name: string;
+  slug?: string;
+  description?: string;
+  githubRepo?: string;
+}
+
 interface TenantProjectState {
   tenants: Tenant[];
   currentTenant: Tenant | null;
   projects: Project[];
   currentProject: Project | null;
+  projectsLoading: boolean;
   setCurrentTenant: (tenant: Tenant) => void;
   setCurrentProject: (project: Project) => void;
+  createProject: (input: CreateProjectInput) => Promise<Project>;
+  refreshProjects: () => Promise<void>;
 }
 
 const TenantProjectContext = createContext<TenantProjectState | null>(null);
@@ -34,88 +46,166 @@ const DEMO_TENANTS: Tenant[] = [
   { id: "acme", name: "Acme Corp", slug: "acme" },
 ];
 
-const DEMO_PROJECTS: Project[] = [
-  {
-    id: "proj-1",
-    name: "todo-app-builder",
-    slug: "todo-app-builder",
-    tenantId: "default",
-    description: "AI-powered todo app generator",
-    githubRepo: "acme/todo-app",
-    createdAt: "2026-03-01T00:00:00Z",
-  },
-  {
-    id: "proj-2",
-    name: "api-service",
-    slug: "api-service",
-    tenantId: "default",
-    description: "Backend API microservice",
-    githubRepo: "acme/api-service",
-    createdAt: "2026-03-05T00:00:00Z",
-  },
-  {
-    id: "proj-3",
-    name: "landing-page",
-    slug: "landing-page",
-    tenantId: "acme",
-    description: "Marketing landing page",
-    githubRepo: "acme/landing-page",
-    createdAt: "2026-03-08T00:00:00Z",
-  },
-];
+const PROJECT_SLUG_MAX_LENGTH = 48;
+
+function slugifyProject(value: string): string {
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/-{2,}/g, "-");
+  return (normalized || `project-${Date.now().toString(36)}`).slice(0, PROJECT_SLUG_MAX_LENGTH);
+}
+
+function mapLifecycleProject(project: LifecycleProject, tenantId: string): Project {
+  return {
+    id: project.projectId,
+    name: project.name?.trim() || project.projectId,
+    slug: project.projectId,
+    tenantId: project.tenant_id ?? tenantId,
+    description: project.description?.trim() || project.spec?.trim() || undefined,
+    githubRepo: project.githubRepo?.trim() || undefined,
+    createdAt: project.createdAt,
+  };
+}
+
+function upsertProjects(projects: Project[], nextProject: Project): Project[] {
+  const withoutCurrent = projects.filter((project) => project.slug !== nextProject.slug);
+  return [nextProject, ...withoutCurrent].sort((left, right) => left.name.localeCompare(right.name, "en"));
+}
 
 export function TenantProjectProvider({ children }: { children: ReactNode }) {
   const navigate = useNavigate();
   const location = useLocation();
   const [currentTenant, setCurrentTenantState] = useState<Tenant>(DEMO_TENANTS[0]);
-  const [currentProject, setCurrentProjectState] = useState<Project>(DEMO_PROJECTS[0]);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [currentProject, setCurrentProjectState] = useState<Project | null>(null);
+  const [projectsLoading, setProjectsLoading] = useState(true);
 
-  const tenantProjects = DEMO_PROJECTS.filter((p) => p.tenantId === currentTenant.id);
+  const fetchProjects = useCallback(async (tenantId: string) => {
+    setTenantId(tenantId);
+    const response = await lifecycleApi.listProjects();
+    return response.projects.map((project) => mapLifecycleProject(project, tenantId));
+  }, []);
 
-  // Sync context from URL: when URL has /p/:slug, update context to match
+  const refreshProjects = useCallback(async () => {
+    setProjectsLoading(true);
+    try {
+      const tenantProjects = await fetchProjects(currentTenant.id);
+      setProjects(tenantProjects);
+    } finally {
+      setProjectsLoading(false);
+    }
+  }, [currentTenant.id, fetchProjects]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setProjectsLoading(true);
+    void fetchProjects(currentTenant.id)
+      .then((tenantProjects) => {
+        if (cancelled) return;
+        setProjects(tenantProjects);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setProjects([]);
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setProjectsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentTenant.id, fetchProjects]);
+
   useEffect(() => {
     const match = location.pathname.match(/^\/p\/([^/]+)/);
-    if (!match) return;
-    const slug = match[1];
-    if (slug === currentProject?.slug) return;
-    const project = DEMO_PROJECTS.find((p) => p.slug === slug);
-    if (project) {
-      setCurrentProjectState(project);
-      const tenant = DEMO_TENANTS.find((t) => t.id === project.tenantId);
-      if (tenant && tenant.id !== currentTenant.id) {
-        setCurrentTenantState(tenant);
-        setTenantId(tenant.id);
-      }
+    if (!match) {
+      setCurrentProjectState((prev) => {
+        if (prev && projects.some((project) => project.slug === prev.slug)) {
+          return prev;
+        }
+        return projects[0] ?? null;
+      });
+      return;
     }
-  }, [location.pathname, currentProject?.slug, currentTenant.id]);
+    const slug = match[1];
+    const matchedProject = projects.find((project) => project.slug === slug);
+    if (matchedProject) {
+      if (matchedProject.slug !== currentProject?.slug) {
+        setCurrentProjectState(matchedProject);
+      }
+      return;
+    }
+
+    let cancelled = false;
+    void lifecycleApi.getProject(slug)
+      .then((project) => {
+        if (cancelled) return;
+        const mapped = mapLifecycleProject(project, currentTenant.id);
+        setProjects((prev) => upsertProjects(prev, mapped));
+        setCurrentProjectState(mapped);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setCurrentProjectState(null);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [location.pathname, projects, currentProject?.slug, currentTenant.id]);
 
   const setCurrentTenant = useCallback((tenant: Tenant) => {
     setCurrentTenantState(tenant);
     setTenantId(tenant.id);
-    const firstProject = DEMO_PROJECTS.find((p) => p.tenantId === tenant.id);
-    if (firstProject) {
-      setCurrentProjectState(firstProject);
-      // Navigate to the new project's lifecycle
-      navigate(`/p/${firstProject.slug}/lifecycle`);
-    }
+    setProjects([]);
+    setCurrentProjectState(null);
+    navigate("/dashboard");
   }, [navigate]);
 
   const setCurrentProject = useCallback((project: Project) => {
     setCurrentProjectState(project);
-    // Preserve current sub-path under /p/:slug/
     const subPath = location.pathname.replace(/^\/p\/[^/]+/, "");
     navigate(`/p/${project.slug}${subPath || "/lifecycle"}`);
   }, [navigate, location.pathname]);
+
+  const createProject = useCallback(async (input: CreateProjectInput) => {
+    const name = input.name.trim();
+    if (!name) {
+      throw new Error("Project name is required");
+    }
+    const slug = slugifyProject(input.slug?.trim() || name);
+    if (projects.some((project) => project.slug === slug)) {
+      throw new Error(`Project already exists: ${slug}`);
+    }
+
+    const response = await lifecycleApi.saveProject(slug, {
+      name,
+      description: input.description?.trim() || "",
+      githubRepo: input.githubRepo?.trim() || null,
+    });
+    const project = mapLifecycleProject(response.project, currentTenant.id);
+    setProjects((prev) => upsertProjects(prev, project));
+    setCurrentProjectState(project);
+    navigate(`/p/${project.slug}/lifecycle/research`);
+    return project;
+  }, [currentTenant.id, navigate, projects]);
 
   return (
     <TenantProjectContext.Provider
       value={{
         tenants: DEMO_TENANTS,
         currentTenant,
-        projects: tenantProjects,
+        projects,
         currentProject,
+        projectsLoading,
         setCurrentTenant,
         setCurrentProject,
+        createProject,
+        refreshProjects,
       }}
     >
       {children}

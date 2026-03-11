@@ -179,8 +179,15 @@ src/pylon/
 ## Development
 
 ```bash
-# Install with dev dependencies
-pip install -e ".[dev]"
+# Create a local virtualenv and install with dev dependencies
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
+
+# Or use the Make targets, which prefer .venv/bin/python automatically
+make venv
+make install
 
 # Run tests
 make test          # Unit tests

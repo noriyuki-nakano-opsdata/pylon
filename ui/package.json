@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "lint": "eslint src/App.tsx src/main.tsx src/api src/components src/contexts src/pages/{Agents,AgentDetail,AgentNew,Approvals,Calendar,ContentPipeline,Costs,Dashboard,Memory,Models,Providers,Runs,Settings,Skills,TasksBoard,TeamStructure,Workflows}.tsx src/pages/ads/*.tsx",
+    "lint": "eslint src/App.tsx src/main.tsx src/api src/components src/contexts src/pages/{Agents,AgentDetail,AgentNew,Approvals,Calendar,ContentPipeline,Costs,Dashboard,Memory,Models,Providers,Runs,Settings,Skills,TasksBoard,TeamStructure,Workflows}.tsx src/pages/ads/*.tsx src/pages/lifecycle/*.tsx",
     "typecheck": "tsc -b",
     "test": "vitest",
     "test:contract": "vitest --run src/api/__tests__/client.test.ts src/api/__tests__/contract.test.ts",

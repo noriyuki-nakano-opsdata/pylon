@@ -69,8 +69,8 @@ export function DesignPhase() {
       lc.setSelectedDesignId(designId);
       return;
     }
-    void lifecycleApi.saveProject(projectSlug, { selectedDesignId: designId }).then((project) => {
-      lc.applyProject(project);
+    void lifecycleApi.saveProject(projectSlug, { selectedDesignId: designId }).then((response) => {
+      lc.applyProject(response.project);
     });
   };
 

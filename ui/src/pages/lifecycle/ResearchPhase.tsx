@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
   Search, Check, ArrowRight, Globe, TrendingUp,
@@ -8,7 +8,6 @@ import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useLifecycle } from "./LifecycleContext";
-import { useWorkflowRun } from "@/hooks/useWorkflowRun";
 import { lifecycleApi } from "@/api/lifecycle";
 import { AgentProgressView } from "@/components/lifecycle/AgentProgressView";
 
@@ -20,42 +19,65 @@ const RESEARCH_AGENTS = [
   { id: "research-synthesizer", label: "統合分析" },
 ];
 
+function formatCompetitorHost(raw: string): string {
+  try {
+    return new URL(raw).hostname || raw;
+  } catch {
+    return raw;
+  }
+}
+
 export function ResearchPhase() {
   const navigate = useNavigate();
   const { projectSlug } = useParams();
   const lc = useLifecycle();
-  const workflow = useWorkflowRun("research", projectSlug ?? "");
   const researchAgents = lc.blueprints.research.team.length > 0
     ? lc.blueprints.research.team.map((agent) => ({ id: agent.id, label: agent.label }))
     : RESEARCH_AGENTS;
-  const [competitorUrls, setCompetitorUrls] = useState<string[]>([]);
   const [newUrl, setNewUrl] = useState("");
-  const [depth, setDepth] = useState<"quick" | "standard" | "deep">("standard");
-  const syncedRunRef = useRef<string | null>(null);
-
-  // Handle workflow completion
-  useEffect(() => {
-    if (workflow.status !== "completed" || !workflow.runId || !projectSlug) return;
-    if (syncedRunRef.current === workflow.runId) return;
-    syncedRunRef.current = workflow.runId;
-    void lifecycleApi.syncPhaseRun(projectSlug, "research", workflow.runId).then(({ project }) => {
-      lc.applyProject(project);
-    });
-  }, [workflow.runId, workflow.status, projectSlug, lc]);
+  const [launchError, setLaunchError] = useState<string | null>(null);
+  const [isLaunching, setIsLaunching] = useState(false);
+  const competitorUrls = lc.researchConfig.competitorUrls;
+  const depth = lc.researchConfig.depth;
 
   const runResearch = () => {
-    if (!lc.spec.trim()) return;
-    lc.advancePhase("research");
-    workflow.start({
-      spec: lc.spec,
-      competitor_urls: competitorUrls,
+    if (!lc.spec.trim() || !projectSlug) return;
+    setLaunchError(null);
+    setIsLaunching(true);
+    const researchConfig = {
+      competitorUrls,
       depth,
-    });
+    };
+    lc.setOrchestrationMode("autonomous");
+    lc.setAutonomyLevel("A4");
+    lc.setResearchConfig(researchConfig);
+    void lifecycleApi.saveProject(
+      projectSlug,
+      {
+        spec: lc.spec,
+        orchestrationMode: "autonomous",
+        autonomyLevel: "A4",
+        researchConfig,
+      },
+      { autoRun: true, maxSteps: 8 },
+    )
+      .then((response) => {
+        lc.applyProject(response.project);
+      })
+      .catch((err) => {
+        setLaunchError(err instanceof Error ? err.message : "自律実行の開始に失敗しました");
+      })
+      .finally(() => {
+        setIsLaunching(false);
+      });
   };
 
   const addUrl = () => {
     if (newUrl.trim()) {
-      setCompetitorUrls([...competitorUrls, newUrl.trim()]);
+      lc.setResearchConfig({
+        ...lc.researchConfig,
+        competitorUrls: [...competitorUrls, newUrl.trim()],
+      });
       setNewUrl("");
     }
   };
@@ -64,10 +86,24 @@ export function ResearchPhase() {
     navigate(`/p/${projectSlug}/lifecycle/planning`);
   };
 
-  const isRunning = workflow.status === "starting" || workflow.status === "running";
+  const isRunning = isLaunching;
+  const research = lc.research;
+
+  const stableResearch = research ?? {
+    competitors: [],
+    market_size: "調査結果を取得できませんでした",
+    trends: [],
+    opportunities: [],
+    threats: [],
+    tech_feasibility: {
+      score: 0,
+      notes: "データが不完全なため、調査結果を再取得してください。",
+    },
+  };
+  const r = stableResearch;
 
   // Input state
-  if (!lc.research && !isRunning && workflow.status !== "failed") {
+  if (!lc.research && !isRunning && !launchError) {
     return (
       <div className="flex h-full flex-col">
         <div className="border-b border-border px-6 py-4">
@@ -76,7 +112,7 @@ export function ResearchPhase() {
             市場調査・競合分析
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            プロダクトアイデアを入力すると、AIが市場調査と競合分析を実施します
+            プロダクトアイデアを入力すると、A4 自律モードで調査からリリース準備までを一気通貫で進めます
           </p>
         </div>
         <div className="flex-1 overflow-y-auto p-6">
@@ -113,8 +149,14 @@ export function ResearchPhase() {
                 <div className="mt-2 flex flex-wrap gap-1.5">
                   {competitorUrls.map((url, i) => (
                     <Badge key={i} variant="secondary" className="gap-1 pr-1">
-                      <Globe className="h-3 w-3" />{new URL(url).hostname}
-                      <button onClick={() => setCompetitorUrls(competitorUrls.filter((_, j) => j !== i))} className="ml-0.5 rounded-full hover:bg-foreground/10 p-0.5">
+                      <Globe className="h-3 w-3" />{formatCompetitorHost(url)}
+                      <button
+                        onClick={() => lc.setResearchConfig({
+                          ...lc.researchConfig,
+                          competitorUrls: competitorUrls.filter((_, j) => j !== i),
+                        })}
+                        className="ml-0.5 rounded-full hover:bg-foreground/10 p-0.5"
+                      >
                         <X className="h-3 w-3" />
                       </button>
                     </Badge>
@@ -127,10 +169,10 @@ export function ResearchPhase() {
             <div>
               <label className="block text-sm font-medium text-foreground mb-1.5">調査深度</label>
               <div className="grid grid-cols-3 gap-2">
-                {([["quick", "Quick", "基本的な競合分析"], ["standard", "Standard", "市場分析 + 技術評価"], ["deep", "Deep", "包括的調査 + SWOT"]] as const).map(([val, label, desc]) => (
+                {([["quick", "Quick", "競合2-3社の基本分析（最速・低コスト）"], ["standard", "Standard", "競合3-5社 + 市場調査 + 技術評価"], ["deep", "Deep", "競合5-8社 + 包括的SWOT + 戦略提言（最高品質）"]] as const).map(([val, label, desc]) => (
                   <button
                     key={val}
-                    onClick={() => setDepth(val)}
+                    onClick={() => lc.setResearchConfig({ ...lc.researchConfig, depth: val })}
                     className={cn(
                       "rounded-lg border p-3 text-left transition-colors",
                       depth === val ? "border-primary bg-primary/5" : "border-border hover:bg-accent/50",
@@ -145,12 +187,12 @@ export function ResearchPhase() {
 
             <Button
               onClick={runResearch}
-              disabled={!lc.spec.trim()}
+              disabled={!lc.spec.trim() || isLaunching}
               className="w-full gap-2"
               size="lg"
             >
               <Search className="h-4 w-4" />
-              調査を開始
+              完全自律で開始
             </Button>
           </div>
         </div>
@@ -159,14 +201,14 @@ export function ResearchPhase() {
   }
 
   // Error state
-  if (workflow.status === "failed") {
+  if (launchError) {
     return (
       <div className="flex h-full items-center justify-center p-6">
         <div className="max-w-md w-full space-y-4 text-center">
           <AlertCircle className="h-12 w-12 text-destructive mx-auto" />
           <h2 className="text-lg font-bold text-foreground">エラーが発生しました</h2>
-          <p className="text-sm text-muted-foreground">{workflow.error ?? "ワークフローの実行に失敗しました"}</p>
-          <Button variant="default" onClick={() => workflow.reset()}>
+          <p className="text-sm text-muted-foreground">{launchError}</p>
+          <Button variant="default" onClick={() => setLaunchError(null)}>
             やり直す
           </Button>
         </div>
@@ -179,16 +221,15 @@ export function ResearchPhase() {
     return (
       <AgentProgressView
         agents={researchAgents}
-        progress={workflow.agentProgress}
-        elapsedMs={workflow.elapsedMs}
-        title="市場調査中..."
-        subtitle="Research swarm が競合・市場・ユーザー・技術の観点から並列に証拠を集めています"
+        progress={researchAgents.map((agent) => ({ nodeId: agent.id, agent: agent.label, status: "running" as const }))}
+        elapsedMs={0}
+        title="Lifecycle を自律実行中..."
+        subtitle="Research から release gate までを A4 full-autonomy で連続実行しています"
       />
     );
   }
 
   // Results
-  const r = lc.research!;
   return (
     <div className="flex h-full flex-col">
       <div className="flex flex-col gap-3 border-b border-border px-6 py-3 sm:flex-row sm:items-center sm:justify-between">

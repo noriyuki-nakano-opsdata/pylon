@@ -2,6 +2,7 @@ import { apiFetch, ApiError } from "./client";
 import type { WorkflowRun } from "./workflows";
 import type {
   LifecyclePhase,
+  LifecycleNextAction,
   MarketResearch,
   Competitor,
   AnalysisResult,
@@ -25,345 +26,132 @@ import type {
   Role,
   UseCase,
   RecommendedMilestone,
+  PhaseBlueprint,
+  LifecycleProject,
+  LifecycleOrchestrationMode,
+  ApprovalComment,
+  DeployCheck,
+  ReleaseRecord,
+  FeedbackItem,
+  LifecycleRecommendation,
 } from "@/types/lifecycle";
 
-/* ── PylonProject DSL Types ── */
+/* ── API Functions ── */
 
-interface PylonAgent {
-  model: string;
-  role: string;
-  autonomy: string;
-  tools?: string[];
-  sandbox?: string;
+interface LifecycleProjectListResponse {
+  projects: LifecycleProject[];
+  count: number;
 }
 
-type NodeNext =
-  | "END"
-  | string[]
-  | Array<{ target: string; condition: string }>;
-
-interface PylonNode {
-  agent: string;
-  next: NodeNext;
-  join_policy?: string;
-  node_type?: string;
-  loop_max_iterations?: number;
-  loop_criterion?: string;
-  loop_threshold?: number;
+interface LifecyclePhasePreparation {
+  project_id: string;
+  phase: LifecyclePhase;
+  workflow_id: string;
+  blueprint: PhaseBlueprint;
+  workflow: Record<string, unknown>;
 }
 
-interface PylonWorkflowProject {
-  version: string;
-  name: string;
-  description: string;
-  agents: Record<string, PylonAgent>;
-  workflow: {
-    type: "graph";
-    nodes: Record<string, PylonNode>;
+interface LifecyclePhaseSyncResponse {
+  project: LifecycleProject;
+  phase_run: Record<string, unknown> | null;
+}
+
+interface LifecycleBlueprintResponse {
+  project_id: string;
+  tenant_id: string;
+  blueprints: Record<LifecyclePhase, PhaseBlueprint>;
+}
+
+interface LifecycleDeployChecksResponse {
+  checks: DeployCheck[];
+  summary: {
+    overallScore: number;
+    releaseReady: boolean;
+    passed: number;
+    warnings: number;
+    failed: number;
   };
-  policy: {
-    max_cost_usd: number;
-    max_duration: string;
-    require_approval_above?: string;
-  };
+  project: LifecycleProject;
 }
 
-interface PylonWorkflowDefinition {
-  id: string;
-  project: PylonWorkflowProject;
+interface LifecycleMutationResponse extends LifecycleProject {
+  project: LifecycleProject;
+  actions: Record<string, unknown>[];
+  nextAction: LifecycleNextAction;
 }
 
-/* ── Workflow Definitions ── */
-
-function buildWorkflowId(
+export function lifecycleWorkflowId(
   phase: LifecyclePhase,
   projectSlug: string,
 ): string {
   return `lifecycle-${phase}-${projectSlug}`;
 }
 
-function buildResearchWorkflow(
-  projectSlug: string,
-): PylonWorkflowDefinition {
-  return {
-    id: buildWorkflowId("research", projectSlug),
-    project: {
-      version: "1",
-      name: "market-research",
-      description:
-        "競合分析・市場調査・技術評価を並列実行し、結果を統合してSWOT分析を生成",
-      agents: {
-        "competitor-analyst": {
-          model: "anthropic/claude-haiku-4-5-20251001",
-          role: "競合情報の収集と構造化",
-          autonomy: "A2",
-          tools: ["http", "browser"],
-          sandbox: "gvisor",
-        },
-        "market-researcher": {
-          model: "anthropic/claude-haiku-4-5-20251001",
-          role: "市場規模・トレンド調査",
-          autonomy: "A2",
-          tools: ["http", "browser"],
-          sandbox: "gvisor",
-        },
-        "tech-evaluator": {
-          model: "anthropic/claude-haiku-4-5-20251001",
-          role: "技術的実現性評価",
-          autonomy: "A2",
-          tools: ["http"],
-          sandbox: "gvisor",
-        },
-        "research-synthesizer": {
-          model: "anthropic/claude-sonnet-4-6",
-          role: "調査結果の統合とSWOT分析",
-          autonomy: "A2",
-        },
-      },
-      workflow: {
-        type: "graph",
-        nodes: {
-          "competitor-analyst": {
-            agent: "competitor-analyst",
-            next: ["research-synthesizer"],
-          },
-          "market-researcher": {
-            agent: "market-researcher",
-            next: ["research-synthesizer"],
-          },
-          "tech-evaluator": {
-            agent: "tech-evaluator",
-            next: ["research-synthesizer"],
-          },
-          "research-synthesizer": {
-            agent: "research-synthesizer",
-            next: "END",
-            join_policy: "all_resolved",
-          },
-        },
-      },
-      policy: {
-        max_cost_usd: 0.5,
-        max_duration: "5m",
-      },
-    },
-  };
-}
-
-function buildPlanningWorkflow(
-  projectSlug: string,
-): PylonWorkflowDefinition {
-  return {
-    id: buildWorkflowId("planning", projectSlug),
-    project: {
-      version: "1",
-      name: "product-planning",
-      description:
-        "ペルソナ・ユーザーストーリー作成とKANO分析を並列実行し、MoSCoW優先度で統合",
-      agents: {
-        "persona-builder": {
-          model: "anthropic/claude-haiku-4-5-20251001",
-          role: "ペルソナ定義とユーザーストーリー作成",
-          autonomy: "A2",
-        },
-        "feature-analyst": {
-          model: "anthropic/claude-haiku-4-5-20251001",
-          role: "KANO分析と機能優先度評価",
-          autonomy: "A2",
-        },
-        "planning-synthesizer": {
-          model: "anthropic/claude-sonnet-4-6",
-          role: "企画統合とMoSCoW優先度設定",
-          autonomy: "A2",
-        },
-      },
-      workflow: {
-        type: "graph",
-        nodes: {
-          "persona-builder": {
-            agent: "persona-builder",
-            next: ["planning-synthesizer"],
-          },
-          "feature-analyst": {
-            agent: "feature-analyst",
-            next: ["planning-synthesizer"],
-          },
-          "planning-synthesizer": {
-            agent: "planning-synthesizer",
-            next: "END",
-            join_policy: "all_resolved",
-          },
-        },
-      },
-      policy: {
-        max_cost_usd: 0.3,
-        max_duration: "5m",
-      },
-    },
-  };
-}
-
-function buildDesignWorkflow(
-  projectSlug: string,
-): PylonWorkflowDefinition {
-  return {
-    id: buildWorkflowId("design", projectSlug),
-    project: {
-      version: "1",
-      name: "design-generation",
-      description:
-        "3モデルで異なるデザインパターンを並列生成し、UX/コード品質/パフォーマンス/アクセシビリティを評価",
-      agents: {
-        "claude-designer": {
-          model: "anthropic/claude-sonnet-4-6",
-          role: "UIデザインパターン生成(Modern Minimal)",
-          autonomy: "A2",
-        },
-        "openai-designer": {
-          model: "openai/gpt-5-mini",
-          role: "UIデザインパターン生成(Dashboard-First)",
-          autonomy: "A2",
-        },
-        "gemini-designer": {
-          model: "gemini/gemini-3-flash-preview",
-          role: "UIデザインパターン生成(Card-Based)",
-          autonomy: "A2",
-        },
-        "design-evaluator": {
-          model: "anthropic/claude-sonnet-4-6",
-          role: "デザインパターンのUX/コード品質/パフォーマンス/アクセシビリティ評価とスコアリング",
-          autonomy: "A2",
-        },
-      },
-      workflow: {
-        type: "graph",
-        nodes: {
-          "claude-designer": {
-            agent: "claude-designer",
-            next: ["design-evaluator"],
-          },
-          "openai-designer": {
-            agent: "openai-designer",
-            next: ["design-evaluator"],
-          },
-          "gemini-designer": {
-            agent: "gemini-designer",
-            next: ["design-evaluator"],
-          },
-          "design-evaluator": {
-            agent: "design-evaluator",
-            next: "END",
-            join_policy: "all_resolved",
-          },
-        },
-      },
-      policy: {
-        max_cost_usd: 1.0,
-        max_duration: "10m",
-        require_approval_above: "A3",
-      },
-    },
-  };
-}
-
-function buildDevelopmentWorkflow(
-  projectSlug: string,
-): PylonWorkflowDefinition {
-  return {
-    id: buildWorkflowId("development", projectSlug),
-    project: {
-      version: "1",
-      name: "iterative-development",
-      description:
-        "計画→実装→レビューのループを最大5回繰り返し、全マイルストーン達成まで反復",
-      agents: {
-        planner: {
-          model: "anthropic/claude-sonnet-4-6",
-          role: "実装計画とマイルストーン定義",
-          autonomy: "A2",
-        },
-        coder: {
-          model: "anthropic/claude-sonnet-4-6",
-          role: "コード実装",
-          autonomy: "A2",
-          tools: ["code-edit", "file-write", "shell"],
-          sandbox: "gvisor",
-        },
-        reviewer: {
-          model: "anthropic/claude-haiku-4-5-20251001",
-          role: "コードレビューとマイルストーン検証",
-          autonomy: "A2",
-        },
-      },
-      workflow: {
-        type: "graph",
-        nodes: {
-          planner: {
-            agent: "planner",
-            next: ["coder"],
-          },
-          coder: {
-            agent: "coder",
-            next: ["reviewer"],
-          },
-          reviewer: {
-            agent: "reviewer",
-            next: ["END"],
-          },
-        },
-      },
-      policy: {
-        max_cost_usd: 3.0,
-        max_duration: "30m",
-        require_approval_above: "A3",
-      },
-    },
-  };
-}
-
-const WORKFLOW_BUILDERS: Partial<
-  Record<LifecyclePhase, (slug: string) => PylonWorkflowDefinition>
-> = {
-  research: buildResearchWorkflow,
-  planning: buildPlanningWorkflow,
-  design: buildDesignWorkflow,
-  development: buildDevelopmentWorkflow,
-};
-
-/* ── API Functions ── */
-
 export const lifecycleApi = {
-  async ensureWorkflow(
+  listProjects(): Promise<LifecycleProjectListResponse> {
+    return apiFetch<LifecycleProjectListResponse>("/v1/lifecycle/projects");
+  },
+
+  getProject(projectSlug: string): Promise<LifecycleProject> {
+    return apiFetch<LifecycleProject>(`/v1/lifecycle/projects/${projectSlug}`);
+  },
+
+  saveProject(
+    projectSlug: string,
+    payload: Partial<LifecycleProject>,
+    options: { autoRun?: boolean; maxSteps?: number } = {},
+  ): Promise<LifecycleMutationResponse> {
+    const body: Record<string, unknown> = { ...payload };
+    if (options.autoRun !== undefined) body.auto_run = options.autoRun;
+    if (options.maxSteps !== undefined) body.max_steps = options.maxSteps;
+    return apiFetch<LifecycleMutationResponse>(`/v1/lifecycle/projects/${projectSlug}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    });
+  },
+
+  advanceProject(
+    projectSlug: string,
+    options: {
+      orchestrationMode?: LifecycleOrchestrationMode;
+      maxSteps?: number;
+    } = {},
+  ): Promise<LifecycleMutationResponse> {
+    const body: Record<string, unknown> = {};
+    if (options.orchestrationMode) body.orchestration_mode = options.orchestrationMode;
+    if (options.maxSteps !== undefined) body.max_steps = options.maxSteps;
+    return apiFetch<LifecycleMutationResponse>(`/v1/lifecycle/projects/${projectSlug}/advance`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  },
+
+  getBlueprints(projectSlug: string): Promise<LifecycleBlueprintResponse> {
+    return apiFetch<LifecycleBlueprintResponse>(`/v1/lifecycle/projects/${projectSlug}/blueprint`);
+  },
+
+  async preparePhase(
     phase: LifecyclePhase,
     projectSlug: string,
-  ): Promise<void> {
-    const builder = WORKFLOW_BUILDERS[phase];
-    if (!builder) return;
-
-    const definition = builder(projectSlug);
+  ): Promise<LifecyclePhasePreparation> {
     try {
-      await apiFetch<unknown>("/v1/workflows", {
-        method: "POST",
-        body: JSON.stringify(definition),
-      });
+      return await apiFetch<LifecyclePhasePreparation>(
+        `/v1/lifecycle/projects/${projectSlug}/phases/${phase}/prepare`,
+        { method: "POST" },
+      );
     } catch (err) {
-      if (err instanceof ApiError && err.status === 409) {
-        return;
-      }
       if (err instanceof ApiError && err.body) {
         const detail = JSON.stringify(err.body, null, 2);
-        throw new Error(`Workflow registration failed (${err.status}): ${detail}`);
+        throw new Error(`Lifecycle phase preparation failed (${err.status}): ${detail}`);
       }
       throw err;
     }
   },
 
   async startRun(
-    phase: LifecyclePhase,
-    projectSlug: string,
+    workflowId: string,
     input: Record<string, unknown>,
   ): Promise<{ runId: string }> {
-    const workflowId = buildWorkflowId(phase, projectSlug);
     const res = await apiFetch<{ id: string }>(
       `/v1/workflows/${workflowId}/runs`,
       {
@@ -374,15 +162,24 @@ export const lifecycleApi = {
     return { runId: res.id };
   },
 
+  syncPhaseRun(
+    projectSlug: string,
+    phase: LifecyclePhase,
+    runId: string,
+  ): Promise<LifecyclePhaseSyncResponse> {
+    return apiFetch<LifecyclePhaseSyncResponse>(`/v1/lifecycle/projects/${projectSlug}/phases/${phase}/sync`, {
+      method: "POST",
+      body: JSON.stringify({ run_id: runId }),
+    });
+  },
+
   async getRun(runId: string): Promise<WorkflowRun> {
     return apiFetch<WorkflowRun>(`/v1/runs/${runId}`);
   },
 
   async getLatestRun(
-    phase: LifecyclePhase,
-    projectSlug: string,
+    workflowId: string,
   ): Promise<WorkflowRun | null> {
-    const workflowId = buildWorkflowId(phase, projectSlug);
     try {
       const res = await apiFetch<{ runs: WorkflowRun[] }>(`/v1/workflows/${workflowId}/runs`);
       if (!res.runs || res.runs.length === 0) return null;
@@ -391,6 +188,70 @@ export const lifecycleApi = {
     } catch {
       return null;
     }
+  },
+
+  addApprovalComment(
+    projectSlug: string,
+    payload: Pick<ApprovalComment, "text" | "type">,
+  ): Promise<LifecycleProject> {
+    return apiFetch<LifecycleProject>(`/v1/lifecycle/projects/${projectSlug}/approval/comments`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  decideApproval(
+    projectSlug: string,
+    decision: LifecycleProject["approvalStatus"],
+    comment = "",
+  ): Promise<LifecycleProject> {
+    return apiFetch<LifecycleProject>(`/v1/lifecycle/projects/${projectSlug}/approval/decision`, {
+      method: "POST",
+      body: JSON.stringify({ decision, comment }),
+    });
+  },
+
+  runDeployChecks(projectSlug: string, buildCode?: string): Promise<LifecycleDeployChecksResponse> {
+    return apiFetch<LifecycleDeployChecksResponse>(`/v1/lifecycle/projects/${projectSlug}/deploy/checks`, {
+      method: "POST",
+      body: JSON.stringify(buildCode ? { buildCode } : {}),
+    });
+  },
+
+  createRelease(projectSlug: string, note = ""): Promise<{ project: LifecycleProject; release: ReleaseRecord }> {
+    return apiFetch<{ project: LifecycleProject; release: ReleaseRecord }>(`/v1/lifecycle/projects/${projectSlug}/releases`, {
+      method: "POST",
+      body: JSON.stringify({ note }),
+    });
+  },
+
+  listFeedback(projectSlug: string): Promise<{ feedbackItems: FeedbackItem[]; recommendations: LifecycleRecommendation[] }> {
+    return apiFetch<{ feedbackItems: FeedbackItem[]; recommendations: LifecycleRecommendation[] }>(`/v1/lifecycle/projects/${projectSlug}/feedback`);
+  },
+
+  addFeedback(
+    projectSlug: string,
+    payload: Pick<FeedbackItem, "text" | "type" | "impact">,
+  ): Promise<{ project: LifecycleProject; feedbackItems: FeedbackItem[] }> {
+    return apiFetch<{ project: LifecycleProject; feedbackItems: FeedbackItem[] }>(`/v1/lifecycle/projects/${projectSlug}/feedback`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  voteFeedback(
+    projectSlug: string,
+    feedbackId: string,
+    delta: number,
+  ): Promise<{ project: LifecycleProject; feedbackItems: FeedbackItem[] }> {
+    return apiFetch<{ project: LifecycleProject; feedbackItems: FeedbackItem[] }>(`/v1/lifecycle/projects/${projectSlug}/feedback/${feedbackId}/vote`, {
+      method: "POST",
+      body: JSON.stringify({ delta }),
+    });
+  },
+
+  getRecommendations(projectSlug: string): Promise<{ recommendations: LifecycleRecommendation[] }> {
+    return apiFetch<{ recommendations: LifecycleRecommendation[] }>(`/v1/lifecycle/projects/${projectSlug}/recommendations`);
   },
 };
 

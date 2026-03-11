@@ -26,7 +26,14 @@ Or, for development (includes test and lint dependencies):
 ```bash
 git clone https://github.com/noriyuki-nakano-opsdata/pylon.git
 cd pylon
-pip install -e ".[dev]"
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
+
+# or use the Make targets
+make venv
+make install
 ```
 
 After installation, confirm the CLI is available:

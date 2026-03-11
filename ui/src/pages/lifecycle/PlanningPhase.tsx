@@ -40,6 +40,13 @@ export function PlanningPhase() {
   const [subStep, setSubStep] = useState<PlanningStep>(lc.analysis ? "review" : "analyze");
   const syncedRunRef = useRef<string | null>(null);
 
+  const normalizedAnalysis = lc.analysis ?? {
+    personas: [],
+    user_stories: [],
+    kano_features: [],
+    recommendations: [],
+  };
+
   useEffect(() => {
     if (lc.analysis && subStep === "analyze") setSubStep("review");
   }, [lc.analysis, subStep]);
@@ -136,7 +143,7 @@ export function PlanningPhase() {
   }
 
   // Review / Features / Milestones
-  const a = lc.analysis!;
+  const a = normalizedAnalysis;
   return (
     <div className="flex h-full flex-col">
       {/* Sub-nav */}

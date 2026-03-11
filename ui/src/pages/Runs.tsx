@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -13,10 +13,10 @@ import { StatusBadge } from "@/components/StatusBadge";
 import { EmptyState } from "@/components/EmptyState";
 import { PageSkeleton } from "@/components/PageSkeleton";
 import { queryKeys } from "@/lib/queryKeys";
+import { lifecycleApi } from "@/api/lifecycle";
 import { apiFetch } from "@/api/client";
-import { listSavedProjects, type PersistedState } from "./lifecycle/LifecycleLayout";
 import type { WorkflowRun } from "@/api/workflows";
-import type { LifecyclePhase, PhaseStatus } from "@/types/lifecycle";
+import type { LifecyclePhase, LifecycleProject, PhaseStatus } from "@/types/lifecycle";
 
 interface RunListResponse {
   runs: WorkflowRun[];
@@ -82,7 +82,17 @@ export function Runs() {
 function LifecycleHistory() {
   const navigate = useNavigate();
   const [selectedSlug, setSelectedSlug] = useState<string | null>(null);
-  const projects = useMemo(() => listSavedProjects(), []);
+  const query = useQuery({
+    queryKey: ["lifecycle", "projects"],
+    queryFn: async () => {
+      const response = await lifecycleApi.listProjects();
+      return response.projects;
+    },
+  });
+
+  if (query.isLoading) return <PageSkeleton />;
+
+  const projects = query.data ?? [];
 
   if (projects.length === 0) {
     return (
@@ -95,15 +105,16 @@ function LifecycleHistory() {
     );
   }
 
-  const selected = projects.find((p) => p.slug === selectedSlug);
+  const selected = projects.find((project) => project.projectId === selectedSlug);
 
   return (
     <div className="flex gap-6">
       {/* Project list */}
       <div className={cn("space-y-2", selected ? "w-80 shrink-0" : "flex-1 max-w-3xl")}>
-        {projects.map(({ slug, data }) => {
-          const completedPhases = data.phaseStatuses.filter((s) => s.status === "completed").length;
-          const totalPhases = data.phaseStatuses.length;
+        {projects.map((project) => {
+          const completedPhases = project.phaseStatuses.filter((status) => status.status === "completed").length;
+          const totalPhases = project.phaseStatuses.length;
+          const slug = project.projectId;
           const isActive = slug === selectedSlug;
 
           return (
@@ -124,7 +135,7 @@ function LifecycleHistory() {
                     )}
                   </div>
                   <p className="mt-0.5 text-xs text-muted-foreground truncate">
-                    {data.spec ? data.spec.slice(0, 80) + (data.spec.length > 80 ? "..." : "") : "（仕様未入力）"}
+                    {project.spec ? project.spec.slice(0, 80) + (project.spec.length > 80 ? "..." : "") : "（仕様未入力）"}
                   </p>
                 </div>
                 <ChevronRight className={cn("h-4 w-4 shrink-0 text-muted-foreground transition-transform", isActive && "rotate-90")} />
@@ -132,7 +143,7 @@ function LifecycleHistory() {
 
               {/* Phase progress bar */}
               <div className="mt-3 flex gap-0.5">
-                {data.phaseStatuses.map((ps) => (
+                {project.phaseStatuses.map((ps) => (
                   <div
                     key={ps.phase}
                     className={cn(
@@ -150,7 +161,7 @@ function LifecycleHistory() {
               <div className="mt-2 flex items-center justify-between text-[10px] text-muted-foreground">
                 <span className="flex items-center gap-1">
                   <Clock className="h-3 w-3" />
-                  {new Date(data.savedAt).toLocaleString("ja-JP")}
+                  {new Date(project.savedAt).toLocaleString("ja-JP")}
                 </span>
                 <span>
                   {completedPhases}/{totalPhases} フェーズ完了
@@ -164,10 +175,10 @@ function LifecycleHistory() {
       {/* Detail panel */}
       {selected && (
         <LifecycleDetail
-          slug={selected.slug}
-          data={selected.data}
+          slug={selected.projectId}
+          data={selected}
           onClose={() => setSelectedSlug(null)}
-          onNavigate={(phase) => navigate(`/p/${selected.slug}/lifecycle/${phase}`)}
+          onNavigate={(phase) => navigate(`/p/${selected.projectId}/lifecycle/${phase}`)}
         />
       )}
     </div>
@@ -177,7 +188,7 @@ function LifecycleHistory() {
 /* ── Lifecycle Detail ── */
 function LifecycleDetail({ slug, data, onClose, onNavigate }: {
   slug: string;
-  data: PersistedState;
+  data: LifecycleProject;
   onClose: () => void;
   onNavigate: (phase: LifecyclePhase) => void;
 }) {
@@ -262,7 +273,7 @@ function LifecycleDetail({ slug, data, onClose, onNavigate }: {
 }
 
 /* ── Phase Detail Content ── */
-function PhaseDetail({ phase, data }: { phase: LifecyclePhase; data: PersistedState }) {
+function PhaseDetail({ phase, data }: { phase: LifecyclePhase; data: LifecycleProject }) {
   switch (phase) {
     case "research":
       if (!data.research) return <p className="text-xs text-muted-foreground">データなし</p>;
@@ -431,8 +442,41 @@ function PhaseDetail({ phase, data }: { phase: LifecyclePhase; data: PersistedSt
       );
 
     case "deploy":
+      return data.deployChecks.length > 0 || data.releases.length > 0 ? (
+        <div className="space-y-2">
+          {data.deployChecks.length > 0 && (
+            <div>
+              <p className="text-[10px] font-medium text-muted-foreground mb-1">品質ゲート</p>
+              {data.deployChecks.map((check) => (
+                <div key={check.id} className="flex items-center gap-1.5 text-[10px]">
+                  <Badge variant="outline" className="text-[9px] capitalize">{check.status}</Badge>
+                  <span className="text-foreground">{check.label}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {data.releases[0] && (
+            <div className="text-[10px] text-foreground">
+              最新 release: <span className="font-mono">{data.releases[0].version}</span>
+            </div>
+          )}
+        </div>
+      ) : <p className="text-xs text-muted-foreground">データなし</p>;
     case "iterate":
-      return <p className="text-xs text-muted-foreground">詳細データなし</p>;
+      return data.feedbackItems.length > 0 || data.recommendations.length > 0 ? (
+        <div className="space-y-2">
+          {data.feedbackItems.slice(0, 3).map((feedback) => (
+            <div key={feedback.id} className="text-[10px] text-foreground">
+              <span className="font-medium">{feedback.votes}票</span> {feedback.text}
+            </div>
+          ))}
+          {data.recommendations.slice(0, 2).map((recommendation) => (
+            <div key={recommendation.id} className="text-[10px] text-muted-foreground">
+              {recommendation.title}
+            </div>
+          ))}
+        </div>
+      ) : <p className="text-xs text-muted-foreground">データなし</p>;
   }
 }
 
@@ -445,14 +489,15 @@ function MiniCard({ label, value }: { label: string; value: string }) {
   );
 }
 
-function phaseHasData(phase: LifecyclePhase, data: PersistedState): boolean {
+function phaseHasData(phase: LifecyclePhase, data: LifecycleProject): boolean {
   switch (phase) {
     case "research": return !!data.research;
     case "planning": return !!data.analysis || data.features.length > 0;
     case "design": return data.designVariants.length > 0;
     case "approval": return data.approvalStatus !== "pending";
     case "development": return data.buildIteration > 0 || !!data.buildCode;
-    default: return false;
+    case "deploy": return data.deployChecks.length > 0 || data.releases.length > 0;
+    case "iterate": return data.feedbackItems.length > 0 || data.recommendations.length > 0;
   }
 }
 

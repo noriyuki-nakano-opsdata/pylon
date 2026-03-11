@@ -9,11 +9,185 @@ export type LifecyclePhase =
   | "deploy"
   | "iterate";
 
+export type LifecycleOrchestrationMode = "workflow" | "guided" | "autonomous";
+export type LifecycleAutonomyLevel = "A3" | "A4";
+export type LifecycleResearchDepth = "quick" | "standard" | "deep";
+
 export interface PhaseStatus {
   phase: LifecyclePhase;
   status: "locked" | "available" | "in_progress" | "review" | "completed";
   completedAt?: string;
   version: number;
+}
+
+export interface LifecycleAgentBlueprint {
+  id: string;
+  label: string;
+  role: string;
+  autonomy: string;
+  tools: string[];
+  skills: string[];
+}
+
+export interface LifecycleArtifactDescriptor {
+  id: string;
+  phase: LifecyclePhase;
+  title: string;
+}
+
+export interface LifecycleQualityGate {
+  id: string;
+  title: string;
+}
+
+export interface PhaseBlueprint {
+  phase: LifecyclePhase;
+  title: string;
+  summary: string;
+  team: LifecycleAgentBlueprint[];
+  artifacts: LifecycleArtifactDescriptor[];
+  quality_gates: LifecycleQualityGate[];
+}
+
+export interface LifecycleResearchConfig {
+  competitorUrls: string[];
+  depth: LifecycleResearchDepth;
+}
+
+export interface ApprovalComment {
+  id: string;
+  text: string;
+  type: "comment" | "approve" | "reject";
+  time: string;
+}
+
+export interface DeployCheck {
+  id: string;
+  label: string;
+  status: "pass" | "warning" | "fail";
+  detail: string;
+}
+
+export interface ReleaseRecord {
+  id: string;
+  createdAt: string;
+  version: string;
+  note: string;
+  selectedDesignId?: string;
+  artifactBytes: number;
+  qualitySummary: {
+    overallScore: number;
+    releaseReady: boolean;
+    passed: number;
+    warnings: number;
+    failed: number;
+  };
+}
+
+export interface FeedbackItem {
+  id: string;
+  type: "bug" | "feature" | "improvement" | "praise";
+  text: string;
+  impact: "low" | "medium" | "high";
+  votes: number;
+  createdAt?: string;
+}
+
+export interface LifecycleRecommendation {
+  id: string;
+  title: string;
+  reason: string;
+  priority: "medium" | "high" | "critical";
+}
+
+export interface LifecycleArtifact {
+  id: string;
+  phase: LifecyclePhase;
+  kind: string;
+  title: string;
+  summary: string;
+  createdAt: string;
+  runId?: string;
+  nodeId?: string;
+  producer?: string;
+  skillIds: string[];
+  payload: Record<string, unknown>;
+}
+
+export interface LifecycleDecision {
+  id: string;
+  phase: LifecyclePhase;
+  kind: string;
+  title: string;
+  rationale: string;
+  status: string;
+  createdAt: string;
+  runId?: string;
+  details: Record<string, unknown>;
+}
+
+export interface LifecycleSkillInvocation {
+  id: string;
+  phase: LifecyclePhase;
+  agentId: string;
+  agentLabel: string;
+  skill: string;
+  status: string;
+  mode: "local" | "a2a";
+  provider: string;
+  toolIds: string[];
+  outputArtifactIds: string[];
+  delegatedTo?: string;
+  createdAt: string;
+  summary: string;
+}
+
+export interface LifecycleDelegation {
+  id: string;
+  phase: LifecyclePhase;
+  agentId: string;
+  peer: string;
+  peerCard: Record<string, unknown>;
+  skill: string;
+  status: string;
+  runId: string;
+  createdAt: string;
+  task: Record<string, unknown>;
+}
+
+export interface LifecyclePhaseRun {
+  id: string;
+  runId: string;
+  projectId: string;
+  phase: LifecyclePhase;
+  workflowId: string;
+  status: string;
+  startedAt?: string;
+  completedAt?: string;
+  createdAt: string;
+  artifactCount: number;
+  decisionCount: number;
+  costUsd: number;
+  executionSummary: Record<string, unknown>;
+}
+
+export interface LifecycleNextAction {
+  type: string;
+  phase: LifecyclePhase | null;
+  title: string;
+  reason: string;
+  canAutorun: boolean;
+  requiresTrigger?: boolean;
+  orchestrationMode?: LifecycleOrchestrationMode;
+  payload: Record<string, unknown>;
+}
+
+export interface LifecycleAutonomyState {
+  orchestrationMode: LifecycleOrchestrationMode;
+  completedExecutablePhases: LifecyclePhase[];
+  blockedPhases: Partial<Record<LifecyclePhase, string[]>>;
+  approvalRequired: boolean;
+  canAdvanceAutonomously: boolean;
 }
 
 /* ── Research ── */
@@ -288,7 +462,15 @@ export interface BuildProgress {
 /* ── Project Data (persisted per lifecycle) ── */
 export interface LifecycleProject {
   id: string;
+  projectId: string;
+  tenant_id?: string;
+  name?: string;
+  description?: string;
+  githubRepo?: string | null;
   spec: string;
+  orchestrationMode: LifecycleOrchestrationMode;
+  autonomyLevel: LifecycleAutonomyLevel;
+  researchConfig: LifecycleResearchConfig;
   research?: MarketResearch;
   analysis?: AnalysisResult;
   features: FeatureSelection[];
@@ -296,11 +478,27 @@ export interface LifecycleProject {
   designVariants: DesignVariant[];
   selectedDesignId?: string;
   approvalStatus: "pending" | "approved" | "rejected" | "revision_requested";
-  approvalComments: string[];
+  approvalComments: ApprovalComment[];
   buildCode?: string;
   buildCost: number;
   buildIteration: number;
+  milestoneResults: MilestoneResult[];
+  planEstimates: PlanEstimate[];
+  selectedPreset: PlanPreset;
   phaseStatuses: PhaseStatus[];
+  deployChecks: DeployCheck[];
+  releases: ReleaseRecord[];
+  feedbackItems: FeedbackItem[];
+  recommendations: LifecycleRecommendation[];
+  artifacts: LifecycleArtifact[];
+  decisionLog: LifecycleDecision[];
+  skillInvocations: LifecycleSkillInvocation[];
+  delegations: LifecycleDelegation[];
+  phaseRuns: LifecyclePhaseRun[];
+  blueprints?: Record<LifecyclePhase, PhaseBlueprint>;
+  nextAction?: LifecycleNextAction;
+  autonomyState?: LifecycleAutonomyState;
   createdAt: string;
   updatedAt: string;
+  savedAt: string;
 }

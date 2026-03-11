@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { Outlet, useLocation, useParams } from "react-router-dom";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Outlet, useLocation, useNavigate, useParams } from "react-router-dom";
 import { Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { lifecycleApi } from "@/api/lifecycle";
@@ -15,11 +15,16 @@ import type {
   FeatureSelection,
   FeedbackItem,
   LifecycleArtifact,
+  LifecycleAutonomyLevel,
+  LifecycleAutonomyState,
   LifecycleDecision,
   LifecycleDelegation,
+  LifecycleNextAction,
+  LifecycleOrchestrationMode,
   LifecyclePhase,
   LifecyclePhaseRun,
   LifecycleProject,
+  LifecycleResearchConfig,
   LifecycleRecommendation,
   LifecycleSkillInvocation,
   MarketResearch,
@@ -48,6 +53,11 @@ const defaultStatuses = (): PhaseStatus[] => PHASE_ORDER.map((phase, index) => (
   status: index === 0 ? "available" : "locked",
   version: 1,
 }));
+
+const defaultResearchConfig = (): LifecycleResearchConfig => ({
+  competitorUrls: [],
+  depth: "standard",
+});
 
 function emptyBlueprint(phase: LifecyclePhase): PhaseBlueprint {
   return {
@@ -83,6 +93,9 @@ function normalizeBlueprints(
 
 function toProjectPatch(state: {
   spec: string;
+  orchestrationMode: LifecycleOrchestrationMode;
+  autonomyLevel: LifecycleAutonomyLevel;
+  researchConfig: LifecycleResearchConfig;
   research: MarketResearch | null;
   analysis: AnalysisResult | null;
   features: FeatureSelection[];
@@ -110,6 +123,9 @@ function toProjectPatch(state: {
 }): Partial<LifecycleProject> {
   return {
     spec: state.spec,
+    orchestrationMode: state.orchestrationMode,
+    autonomyLevel: state.autonomyLevel,
+    researchConfig: state.researchConfig,
     research: state.research ?? undefined,
     analysis: state.analysis ?? undefined,
     features: state.features,
@@ -145,8 +161,12 @@ export function LifecycleLayout() {
 function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
   const basePath = `/p/${projectSlug}`;
   const location = useLocation();
+  const navigate = useNavigate();
 
   const [spec, setSpec] = useState("");
+  const [orchestrationMode, setOrchestrationMode] = useState<LifecycleOrchestrationMode>("workflow");
+  const [autonomyLevel, setAutonomyLevel] = useState<LifecycleAutonomyLevel>("A3");
+  const [researchConfig, setResearchConfig] = useState<LifecycleResearchConfig>(defaultResearchConfig);
   const [research, setResearch] = useState<MarketResearch | null>(null);
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
   const [features, setFeatures] = useState<FeatureSelection[]>([]);
@@ -171,6 +191,8 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
   const [skillInvocations, setSkillInvocations] = useState<LifecycleSkillInvocation[]>([]);
   const [delegations, setDelegations] = useState<LifecycleDelegation[]>([]);
   const [phaseRuns, setPhaseRuns] = useState<LifecyclePhaseRun[]>([]);
+  const [nextAction, setNextAction] = useState<LifecycleNextAction | null>(null);
+  const [autonomyState, setAutonomyState] = useState<LifecycleAutonomyState | null>(null);
   const [blueprints, setBlueprints] = useState<Record<LifecyclePhase, PhaseBlueprint>>(defaultBlueprints);
   const [isHydrating, setIsHydrating] = useState(true);
   const [isMobile, setIsMobile] = useState(false);
@@ -183,6 +205,7 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
   const saveTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const hydratedRef = useRef(false);
   const applyingRemoteRef = useRef(false);
+  const autoAdvanceInFlightRef = useRef(false);
 
   useEffect(() => {
     const mq = window.matchMedia("(max-width: 1024px)");
@@ -204,9 +227,12 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
     setConsoleOpen(false);
   }, [isMobile, location.pathname]);
 
-  const applyProject = (project: LifecycleProject) => {
+  const applyProject = useCallback((project: LifecycleProject) => {
     applyingRemoteRef.current = true;
     setSpec(project.spec ?? "");
+    setOrchestrationMode(project.orchestrationMode ?? "workflow");
+    setAutonomyLevel(project.autonomyLevel ?? "A3");
+    setResearchConfig(project.researchConfig ?? defaultResearchConfig());
     setResearch(project.research ?? null);
     setAnalysis(project.analysis ?? null);
     setFeatures(project.features ?? []);
@@ -231,13 +257,16 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
     setSkillInvocations(project.skillInvocations ?? []);
     setDelegations(project.delegations ?? []);
     setPhaseRuns(project.phaseRuns ?? []);
+    setNextAction(project.nextAction ?? null);
+    setAutonomyState(project.autonomyState ?? null);
     setBlueprints(normalizeBlueprints(project.blueprints));
     setSaveState("idle");
+    setLastSavedAt(project.savedAt ?? null);
     hydratedRef.current = true;
     queueMicrotask(() => {
       applyingRemoteRef.current = false;
     });
-  };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -266,7 +295,7 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
       cancelled = true;
       clearTimeout(saveTimer.current);
     };
-  }, [projectSlug]);
+  }, [applyProject, projectSlug]);
 
   useEffect(() => {
     if (!projectSlug || !hydratedRef.current || applyingRemoteRef.current) return;
@@ -277,6 +306,9 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
         projectSlug,
         toProjectPatch({
           spec,
+          orchestrationMode,
+          autonomyLevel,
+          researchConfig,
           research,
           analysis,
           features,
@@ -302,6 +334,7 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
           delegations,
           phaseRuns,
         }),
+        { autoRun: false },
       )
         .then(() => {
           setSaveState("saved");
@@ -315,6 +348,9 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
   }, [
     projectSlug,
     spec,
+    orchestrationMode,
+    autonomyLevel,
+    researchConfig,
     research,
     analysis,
     features,
@@ -378,9 +414,66 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
     });
   };
 
+  const currentPhase = PHASE_ORDER.find((phase) =>
+    location.pathname.endsWith(`/lifecycle/${phase}`),
+  ) ?? null;
+
+  const prevNextActionRef = useRef(nextAction);
+  useEffect(() => {
+    if (isHydrating || !projectSlug || orchestrationMode !== "autonomous" || !nextAction?.phase) return;
+    if (nextAction.type === "collect_input") return;
+
+    // Only auto-redirect when nextAction actually changes, not on every route change.
+    // This allows users to freely navigate to completed phases.
+    const changed = prevNextActionRef.current?.phase !== nextAction.phase
+      || prevNextActionRef.current?.type !== nextAction.type;
+    prevNextActionRef.current = nextAction;
+    if (!changed) return;
+
+    if (nextAction.type === "done") {
+      if (currentPhase !== "iterate") navigate(`${basePath}/lifecycle/iterate`, { replace: true });
+      return;
+    }
+    if (currentPhase !== nextAction.phase) {
+      navigate(`${basePath}/lifecycle/${nextAction.phase}`, { replace: true });
+    }
+  }, [basePath, currentPhase, isHydrating, navigate, nextAction, orchestrationMode, projectSlug]);
+
+  useEffect(() => {
+    if (
+      isHydrating
+      || !projectSlug
+      || orchestrationMode !== "autonomous"
+      || !nextAction?.canAutorun
+      || autoAdvanceInFlightRef.current
+    ) {
+      return;
+    }
+    autoAdvanceInFlightRef.current = true;
+    void lifecycleApi.advanceProject(projectSlug, {
+      orchestrationMode,
+      maxSteps: 8,
+    })
+      .then((response) => {
+        applyProject(response.project);
+      })
+      .catch(() => {
+        autoAdvanceInFlightRef.current = false;
+      })
+      .finally(() => {
+        autoAdvanceInFlightRef.current = false;
+      });
+  }, [applyProject, isHydrating, nextAction, orchestrationMode, projectSlug]);
+
   const ctx: LifecycleState = {
     spec,
     setSpec,
+    orchestrationMode,
+    setOrchestrationMode,
+    autonomyLevel,
+    setAutonomyLevel,
+    researchConfig,
+    setResearchConfig,
     research,
     setResearch,
     analysis,
@@ -424,16 +517,14 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
     skillInvocations,
     delegations,
     phaseRuns,
+    nextAction,
+    autonomyState,
     blueprints,
     isHydrating,
     applyProject,
     advancePhase,
     completePhase,
   };
-
-  const currentPhase = PHASE_ORDER.find((phase) =>
-    location.pathname.endsWith(`/lifecycle/${phase}`),
-  ) ?? null;
 
   if (isHydrating) {
     return (

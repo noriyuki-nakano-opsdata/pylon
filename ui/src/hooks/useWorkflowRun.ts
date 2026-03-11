@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
-import { lifecycleApi } from "@/api/lifecycle";
+import { lifecycleApi, lifecycleWorkflowId } from "@/api/lifecycle";
 import type { WorkflowRun } from "@/api/workflows";
 import type { LifecyclePhase } from "@/types/lifecycle";
 
@@ -69,6 +69,7 @@ function isTerminal(status: string): boolean {
 }
 
 export function useWorkflowRun(phase: LifecyclePhase, projectSlug: string) {
+  const workflowId = lifecycleWorkflowId(phase, projectSlug);
   const [runId, setRunId] = useState<string | null>(null);
   const [hookStatus, setHookStatus] = useState<
     WorkflowRunState["status"]
@@ -87,7 +88,7 @@ export function useWorkflowRun(phase: LifecyclePhase, projectSlug: string) {
     if (restoredRef.current || !projectSlug) return;
     restoredRef.current = true;
 
-    lifecycleApi.getLatestRun(phase, projectSlug).then((run) => {
+    lifecycleApi.getLatestRun(workflowId).then((run) => {
       if (!run) return;
       if (run.status === "completed" || run.status === "failed") {
         setRunId(run.id);
@@ -102,7 +103,7 @@ export function useWorkflowRun(phase: LifecyclePhase, projectSlug: string) {
         setElapsedMs(Date.now() - startTimeRef.current);
       }
     });
-  }, [phase, projectSlug]);
+  }, [projectSlug, workflowId]);
 
   // Elapsed-time ticker (independent of polling)
   useEffect(() => {
@@ -144,8 +145,8 @@ export function useWorkflowRun(phase: LifecyclePhase, projectSlug: string) {
   // Start mutation: ensure workflow + start run
   const startMutation = useMutation({
     mutationFn: async (input: Record<string, unknown>) => {
-      await lifecycleApi.ensureWorkflow(phase, projectSlug);
-      return lifecycleApi.startRun(phase, projectSlug, input);
+      const preparation = await lifecycleApi.preparePhase(phase, projectSlug);
+      return lifecycleApi.startRun(preparation.workflow_id, input);
     },
     onMutate: () => {
       setHookStatus("starting");

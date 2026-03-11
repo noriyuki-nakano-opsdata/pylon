@@ -1,4 +1,4 @@
-import { NavLink } from "react-router-dom";
+import { NavLink, useNavigate } from "react-router-dom";
 import {
   LayoutDashboard,
   Bot,
@@ -23,14 +23,18 @@ import {
   CalendarDays,
   FileText,
   Megaphone,
+  FolderPlus,
+  Search,
   Wand2,
+  Loader2,
+  X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { useFeatureFlags } from "@/contexts/FeatureFlagsContext";
 import { useTenantProject } from "@/contexts/TenantProjectContext";
 import { useClickOutside } from "@/hooks/useClickOutside";
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useMemo } from "react";
 
 interface SidebarProps {
   collapsed: boolean;
@@ -62,6 +66,9 @@ const ADMIN_ITEMS = [
   { to: "/models", icon: Cpu, label: "モデル管理", feature: "models" },
   { to: "/skills", icon: Wand2, label: "スキル", feature: "skills" },
 ] as const;
+const QUICK_ADMIN_ITEMS = [
+  { to: "/projects/new", icon: FolderPlus, label: "新規プロジェクト" },
+] as const;
 
 const BOTTOM_ITEMS = [
   { to: "/settings", icon: Settings, label: "設定", feature: "settings" },
@@ -70,7 +77,7 @@ const BOTTOM_ITEMS = [
 export function Sidebar({ collapsed, onToggle, lockCollapsed = false }: SidebarProps) {
   const { currentProject } = useTenantProject();
   const { isEnabled } = useFeatureFlags();
-  const projectBase = currentProject ? `/p/${currentProject.slug}` : "/p/_";
+  const projectBase = currentProject ? `/p/${currentProject.slug}` : null;
   const projectItems = PROJECT_NAV.filter((item) => isEnabled("project", item.feature));
   const adminItems = ADMIN_ITEMS.filter((item) => isEnabled("admin", item.feature));
   const bottomItems = BOTTOM_ITEMS.filter((item) => isEnabled("admin", item.feature));
@@ -117,10 +124,11 @@ export function Sidebar({ collapsed, onToggle, lockCollapsed = false }: SidebarP
         {projectItems.map((item) => (
           <SidebarNavItem
             key={item.to}
-            to={`${projectBase}/${item.to}`}
+            to={projectBase ? `${projectBase}/${item.to}` : ""}
             icon={item.icon}
             label={item.label}
             collapsed={collapsed}
+            disabled={!projectBase}
             badge={"badge" in item ? item.badge : undefined}
           />
         ))}
@@ -133,6 +141,9 @@ export function Sidebar({ collapsed, onToggle, lockCollapsed = false }: SidebarP
             Admin
           </p>
         )}
+        {QUICK_ADMIN_ITEMS.map((item) => (
+          <SidebarNavItem key={item.to} to={item.to} icon={item.icon} label={item.label} collapsed={collapsed} />
+        ))}
         {adminItems.map((item) => (
           <SidebarNavItem key={item.to} to={item.to} icon={item.icon} label={item.label} collapsed={collapsed} />
         ))}
@@ -192,45 +203,138 @@ function TenantSelector() {
 
 /* ── Project Selector ── */
 function ProjectSelector() {
-  const { projects, currentProject, setCurrentProject } = useTenantProject();
+  const { projects, currentProject, setCurrentProject, projectsLoading } = useTenantProject();
   const [open, setOpen] = useState(false);
+  const [projectFilter, setProjectFilter] = useState("");
+  const navigate = useNavigate();
   const ref = useRef<HTMLDivElement>(null);
   const close = useCallback(() => setOpen(false), []);
+  const toggleOpen = useCallback(() => {
+    setOpen((prev) => {
+      if (!prev) {
+        setProjectFilter("");
+      }
+      return !prev;
+    });
+  }, []);
 
   useClickOutside(ref, close);
+
+  const filteredProjects = useMemo(() => {
+    const normalized = projectFilter.trim().toLowerCase();
+    if (!normalized) return projects;
+    return projects.filter((project) => {
+      const target = `${project.name} ${project.description ?? ""}`.toLowerCase();
+      return target.includes(normalized);
+    });
+  }, [projects, projectFilter]);
+
+  const goCreateProject = useCallback(() => {
+    setOpen(false);
+    navigate("/projects/new");
+  }, [navigate]);
 
   return (
     <div ref={ref} className="relative">
       <button
-        onClick={() => setOpen(!open)}
+        onClick={toggleOpen}
         className="flex w-full items-center gap-2 rounded-md px-3 py-1.5 text-sm text-sidebar-foreground hover:bg-accent hover:text-sidebar-active transition-colors"
       >
         <FolderKanban className="h-3.5 w-3.5 shrink-0" />
-        <span className="truncate flex-1 text-left">{currentProject?.name ?? "Select project"}</span>
+        <span className="truncate flex-1 text-left">{currentProject?.name ?? "プロジェクトを選択"}</span>
         <ChevronsUpDown className="h-3 w-3 shrink-0 text-muted-foreground" />
       </button>
       {open && (
-        <div className="absolute left-0 right-0 top-full z-50 mt-1 rounded-md border border-border bg-card py-1 shadow-lg">
-          {projects.map((p) => (
+        <div className="absolute left-0 right-0 top-full z-50 mt-1 max-h-80 min-w-0 overflow-hidden rounded-md border border-border bg-card shadow-lg">
+          <div className="flex items-center justify-between border-b border-border px-3 py-2">
+            <p className="text-xs font-medium text-foreground">プロジェクト</p>
             <button
-              key={p.id}
-              onClick={() => { setCurrentProject(p); setOpen(false); }}
-              className={cn(
-                "flex w-full items-center gap-2 px-3 py-1.5 text-sm transition-colors",
-                p.id === currentProject?.id
-                  ? "bg-accent text-foreground"
-                  : "text-muted-foreground hover:bg-accent hover:text-foreground",
-              )}
+              type="button"
+              onClick={goCreateProject}
+              className="flex items-center gap-1 text-xs font-medium text-primary transition-colors hover:text-primary/80"
             >
-              <FolderKanban className="h-3.5 w-3.5" />
-              <div className="text-left">
-                <div>{p.name}</div>
-                {p.description && (
-                  <div className="text-[11px] text-muted-foreground">{p.description}</div>
-                )}
-              </div>
+              <FolderPlus className="h-3.5 w-3.5" />
+              新規作成
             </button>
-          ))}
+          </div>
+          <div className="border-b border-border p-2">
+            <label className="relative block">
+              <Search className="pointer-events-none absolute left-2 top-2 h-3.5 w-3.5 text-muted-foreground" />
+              <input
+                value={projectFilter}
+                onChange={(event) => setProjectFilter(event.target.value)}
+                placeholder="プロジェクトを検索"
+                className="w-full rounded-md border border-input bg-background py-1.5 pl-7 pr-7 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+              />
+              {projectFilter && (
+                <button
+                  type="button"
+                  onClick={() => setProjectFilter("")}
+                  className="absolute right-2 top-1.5 text-muted-foreground hover:text-foreground"
+                  aria-label="検索条件をクリア"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </label>
+          </div>
+          {projectsLoading && (
+            <div className="flex items-center gap-2 px-3 py-3 text-sm text-muted-foreground">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              プロジェクトを読み込み中...
+            </div>
+          )}
+          {!projectsLoading && projects.length === 0 && (
+            <div className="px-3 py-3 text-xs text-muted-foreground">
+              まだプロジェクトがありません。
+              <button
+                type="button"
+                onClick={goCreateProject}
+                className="ml-1 text-primary underline-offset-4 hover:underline"
+              >
+                新規作成
+              </button>
+            </div>
+          )}
+          {filteredProjects.length === 0 ? (
+            <div className="px-3 py-3 text-xs text-muted-foreground">
+              該当するプロジェクトが見つかりませんでした。
+            </div>
+          ) : (
+            <div className="max-h-56 overflow-y-auto">
+              {filteredProjects.map((p) => (
+                <button
+                  key={p.id}
+                  onClick={() => { setCurrentProject(p); setOpen(false); }}
+                  className={cn(
+                    "flex w-full items-center gap-2 px-3 py-1.5 text-sm transition-colors",
+                    p.id === currentProject?.id
+                      ? "bg-accent text-foreground"
+                      : "text-muted-foreground hover:bg-accent hover:text-foreground",
+                  )}
+                >
+                  <FolderKanban className="h-3.5 w-3.5" />
+                  <div className="text-left">
+                    <div>{p.name}</div>
+                    {p.description && (
+                      <div className="text-[11px] text-muted-foreground">{p.description}</div>
+                    )}
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+          {projectFilter && filteredProjects.length > 0 && filteredProjects.length < projects.length && (
+            <p className="px-3 py-2 text-xs text-muted-foreground">
+              {filteredProjects.length}件の表示
+            </p>
+          )}
+          <p className="rounded-b-md border-t border-border px-3 py-2 text-xs text-muted-foreground">
+            {projectsLoading ? "読み込み中..." : `${projects.length}件`}
+            {projectFilter.trim() && filteredProjects.length !== projects.length
+              ? ` / 条件に一致: ${filteredProjects.length}件`
+              : ""}
+          </p>
         </div>
       )}
     </div>
@@ -243,10 +347,24 @@ interface SidebarNavItemProps {
   icon: React.ElementType;
   label: string;
   collapsed: boolean;
+  disabled?: boolean;
   badge?: number | string;
 }
 
-function SidebarNavItem({ to, icon: Icon, label, collapsed, badge }: SidebarNavItemProps) {
+function SidebarNavItem({ to, icon: Icon, label, collapsed, disabled = false, badge }: SidebarNavItemProps) {
+  if (disabled) {
+    return (
+      <div
+        className={cn(
+          "flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium text-muted-foreground/50",
+          collapsed && "justify-center px-2",
+        )}
+      >
+        <Icon className="h-4 w-4 shrink-0" />
+        {!collapsed && <span className="truncate">{label}</span>}
+      </div>
+    );
+  }
   return (
     <NavLink
       to={to}

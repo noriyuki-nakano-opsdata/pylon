@@ -1009,6 +1009,357 @@ class TestProjectOperationsRoutes:
 
 
 # ---------------------------------------------------------------------------
+# Lifecycle routes
+# ---------------------------------------------------------------------------
+
+class TestLifecycleRoutes:
+    def test_lifecycle_project_routes_and_operational_surfaces(self):
+        server, _ = _server_with_routes()
+
+        fetched = server.handle_request("GET", "/api/v1/lifecycle/projects/orbit")
+        assert fetched.status_code == 200
+        assert fetched.body["projectId"] == "orbit"
+        assert fetched.body["phaseStatuses"][0]["phase"] == "research"
+
+        updated = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/orbit",
+            body={
+                "spec": "Autonomous product lifecycle cockpit for operator-led multi-agent delivery.",
+                "features": [
+                    {"feature": "自律開発", "selected": True, "priority": "must", "category": "must-be"},
+                    {"feature": "承認ゲート", "selected": True, "priority": "must", "category": "must-be"},
+                ],
+                "buildCode": (
+                    "<!doctype html><html lang='ja'><head><meta name='viewport' "
+                    "content='width=device-width, initial-scale=1' /></head>"
+                    "<body><main><button aria-label='Launch'>Launch</button></main></body></html>"
+                ),
+                "selectedDesignId": "claude-designer",
+            },
+        )
+        assert updated.status_code == 200
+        assert updated.body["spec"].startswith("Autonomous product lifecycle cockpit")
+        assert updated.body["recommendations"]
+
+        blueprints = server.handle_request("GET", "/api/v1/lifecycle/projects/orbit/blueprint")
+        assert blueprints.status_code == 200
+        assert blueprints.body["blueprints"]["development"]["team"][0]["id"] == "planner"
+        assert blueprints.body["blueprints"]["iterate"]["artifacts"][0]["id"] == "feedback-backlog"
+
+        approval = server.handle_request(
+            "POST",
+            "/api/v1/lifecycle/projects/orbit/approval/comments",
+            body={"type": "approve", "text": "Ready for implementation"},
+        )
+        assert approval.status_code == 200
+        assert approval.body["approvalStatus"] == "approved"
+        assert approval.body["decisionLog"]
+        assert approval.body["artifacts"]
+        approval_phase = next(item for item in approval.body["phaseStatuses"] if item["phase"] == "approval")
+        assert approval_phase["status"] == "completed"
+
+        checks = server.handle_request("POST", "/api/v1/lifecycle/projects/orbit/deploy/checks", body={})
+        assert checks.status_code == 200
+        assert checks.body["summary"]["releaseReady"] is True
+        assert checks.body["summary"]["failed"] == 0
+        assert checks.body["project"]["artifacts"]
+
+        release = server.handle_request(
+            "POST",
+            "/api/v1/lifecycle/projects/orbit/releases",
+            body={"note": "Initial operator preview"},
+        )
+        assert release.status_code == 201
+        assert release.body["release"]["version"].startswith("v")
+        assert release.body["release"]["qualitySummary"]["releaseReady"] is True
+        assert release.body["project"]["decisionLog"]
+
+        feedback = server.handle_request(
+            "POST",
+            "/api/v1/lifecycle/projects/orbit/feedback",
+            body={"text": "Mobile navigation needs a stronger hierarchy.", "type": "improvement", "impact": "medium"},
+        )
+        assert feedback.status_code == 201
+        feedback_id = feedback.body["feedbackItems"][0]["id"]
+        assert feedback.body["project"]["artifacts"]
+
+        voted = server.handle_request(
+            "POST",
+            f"/api/v1/lifecycle/projects/orbit/feedback/{feedback_id}/vote",
+            body={"delta": 2},
+        )
+        assert voted.status_code == 200
+        assert voted.body["feedbackItems"][0]["votes"] == 2
+
+        listed_feedback = server.handle_request("GET", "/api/v1/lifecycle/projects/orbit/feedback")
+        assert listed_feedback.status_code == 200
+        assert listed_feedback.body["feedbackItems"][0]["id"] == feedback_id
+
+        recommendations = server.handle_request("GET", "/api/v1/lifecycle/projects/orbit/recommendations")
+        assert recommendations.status_code == 200
+        assert recommendations.body["recommendations"][0]["priority"] in {"medium", "high", "critical"}
+
+        listed_projects = server.handle_request("GET", "/api/v1/lifecycle/projects")
+        assert listed_projects.status_code == 200
+        assert any(project["projectId"] == "orbit" for project in listed_projects.body["projects"])
+
+    def test_lifecycle_projects_support_project_metadata_for_selector_creation(self):
+        server, _ = _server_with_routes()
+
+        created = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/focus-board",
+            headers={"X-Tenant-ID": "tenant-a"},
+            body={
+                "name": "Focus Board",
+                "description": "AI-assisted task planning workspace",
+                "githubRepo": "acme/focus-board",
+            },
+        )
+        assert created.status_code == 200
+        assert created.body["project"]["projectId"] == "focus-board"
+        assert created.body["project"]["name"] == "Focus Board"
+        assert created.body["project"]["description"] == "AI-assisted task planning workspace"
+        assert created.body["project"]["githubRepo"] == "acme/focus-board"
+
+        fetched = server.handle_request(
+            "GET",
+            "/api/v1/lifecycle/projects/focus-board",
+            headers={"X-Tenant-ID": "tenant-a"},
+        )
+        assert fetched.status_code == 200
+        assert fetched.body["name"] == "Focus Board"
+        assert fetched.body["description"] == "AI-assisted task planning workspace"
+        assert fetched.body["githubRepo"] == "acme/focus-board"
+
+        listed = server.handle_request(
+            "GET",
+            "/api/v1/lifecycle/projects",
+            headers={"X-Tenant-ID": "tenant-a"},
+        )
+        assert listed.status_code == 200
+        assert listed.body["count"] == 1
+        assert listed.body["projects"][0]["name"] == "Focus Board"
+
+    def test_lifecycle_patch_can_run_full_autonomy_inline(self):
+        server, _ = _server_with_routes()
+
+        updated = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/api-service",
+            body={
+                "spec": "API lifecycle service for governed multi-agent delivery with approval-bound release gates.",
+                "orchestrationMode": "autonomous",
+                "autonomyLevel": "A4",
+                "researchConfig": {
+                    "competitorUrls": ["https://example.com"],
+                    "depth": "deep",
+                },
+                "auto_run": True,
+                "max_steps": 8,
+            },
+        )
+
+        assert updated.status_code == 200
+        assert updated.body["project"]["orchestrationMode"] == "autonomous"
+        assert updated.body["project"]["autonomyLevel"] == "A4"
+        assert updated.body["project"]["research"]["competitors"][0]["url"] == "https://example.com"
+        assert updated.body["project"]["analysis"] is not None
+        assert updated.body["project"]["buildCode"].startswith("<!doctype html>")
+        assert updated.body["project"]["releases"]
+        assert updated.body["project"]["approvalStatus"] == "approved"
+        assert any(action["action"]["type"] == "auto_approve" for action in updated.body["actions"])
+        assert updated.body["nextAction"]["phase"] == "iterate"
+
+    @pytest.mark.parametrize(
+        ("phase", "input_data"),
+        [
+            (
+                "research",
+                {
+                    "spec": "Autonomous multi-agent product lifecycle for AI platform teams.",
+                    "competitor_urls": ["https://example.com", "https://acme.dev"],
+                },
+            ),
+            (
+                "planning",
+                {
+                    "spec": "Autonomous multi-agent product lifecycle for AI platform teams.",
+                },
+            ),
+            (
+                "design",
+                {
+                    "spec": "Autonomous multi-agent product lifecycle for AI platform teams.",
+                    "selected_features": [
+                        {"feature": "自律開発", "selected": True},
+                        {"feature": "承認ゲート", "selected": True},
+                    ],
+                },
+            ),
+            (
+                "development",
+                {
+                    "spec": "Autonomous multi-agent product lifecycle for AI platform teams.",
+                    "selected_features": [
+                        {"feature": "自律開発", "selected": True},
+                        {"feature": "承認ゲート", "selected": True},
+                    ],
+                    "selected_design": {
+                        "preview_html": (
+                            "<!doctype html><html lang='ja'><head><meta name='viewport' "
+                            "content='width=device-width, initial-scale=1' /></head>"
+                            "<body><main><button aria-label='Start'>Start</button></main></body></html>"
+                        )
+                    },
+                    "milestones": [
+                        {
+                            "id": "ms-alpha",
+                            "name": "Alpha readiness",
+                            "criteria": "previewable build with quality gates",
+                        }
+                    ],
+                },
+            ),
+        ],
+    )
+    def test_prepare_lifecycle_phase_registers_workflow_and_runs_structured_reference_graph(
+        self,
+        phase: str,
+        input_data: dict[str, object],
+    ):
+        server, store = _server_with_routes()
+
+        prepared = server.handle_request(
+            "POST",
+            f"/api/v1/lifecycle/projects/orbit/phases/{phase}/prepare",
+            body={},
+        )
+
+        assert prepared.status_code == 201
+        workflow_id = prepared.body["workflow_id"]
+        assert workflow_id == f"lifecycle-{phase}-orbit"
+        assert store.get_workflow_project(workflow_id, tenant_id="default") is not None
+        assert any(skill_id in store.skills for skill_id in prepared.body["blueprint"]["team"][0]["skills"])
+
+        started = server.handle_request(
+            "POST",
+            f"/api/v1/workflows/{workflow_id}/runs",
+            body={"input": input_data},
+        )
+
+        assert started.status_code == 202
+        assert started.body["status"] == "completed"
+        state = started.body["state"]
+        if phase == "research":
+            assert state["research"]["competitors"]
+            assert state["research"]["tech_feasibility"]["score"] > 0
+        elif phase == "planning":
+            assert state["analysis"]["personas"]
+            assert state["features"]
+            assert state["planEstimates"]
+        elif phase == "design":
+            assert len(state["variants"]) == 3
+            assert state["design"]["variants"][0]["preview_html"].startswith("<!doctype html>")
+        else:
+            assert state["development"]["code"].startswith("<!doctype html>")
+            assert state["development"]["review_summary"]["milestonesTotal"] >= 1
+            assert state["_build_iteration"] in {1, 2}
+
+        synced = server.handle_request(
+            "POST",
+            f"/api/v1/lifecycle/projects/orbit/phases/{phase}/sync",
+            body={"run_id": started.body["id"]},
+        )
+        assert synced.status_code == 200
+        project = synced.body["project"]
+        assert project["phaseRuns"]
+        assert project["artifacts"]
+        assert project["decisionLog"]
+        assert project["skillInvocations"]
+        if phase in {"research", "design", "development"}:
+            assert project["delegations"]
+
+    @pytest.mark.parametrize(
+        ("backend", "filename"),
+        [
+            (ControlPlaneBackend.JSON_FILE, "lifecycle-control-plane.json"),
+            (ControlPlaneBackend.SQLITE, "lifecycle-control-plane.db"),
+        ],
+    )
+    def test_lifecycle_projects_persist_across_server_restarts(
+        self,
+        tmp_path: Path,
+        backend: ControlPlaneBackend,
+        filename: str,
+    ):
+        control_plane_path = str(tmp_path / filename)
+        headers = {"X-Tenant-ID": "tenant-a"}
+        server, _ = _server_with_routes(
+            control_plane_backend=backend,
+            control_plane_path=control_plane_path,
+        )
+
+        patched = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/orbit",
+            headers=headers,
+            body={
+                "spec": "Durable lifecycle workspace",
+                "features": [{"feature": "承認ゲート", "selected": True, "priority": "must", "category": "must-be"}],
+                "buildCode": (
+                    "<!doctype html><html lang='ja'><head><meta name='viewport' "
+                    "content='width=device-width, initial-scale=1' /></head>"
+                    "<body><main><button aria-label='Ship'>Ship</button></main></body></html>"
+                ),
+            },
+        )
+        assert patched.status_code == 200
+
+        checks = server.handle_request(
+            "POST",
+            "/api/v1/lifecycle/projects/orbit/deploy/checks",
+            headers=headers,
+            body={},
+        )
+        assert checks.status_code == 200
+
+        release = server.handle_request(
+            "POST",
+            "/api/v1/lifecycle/projects/orbit/releases",
+            headers=headers,
+            body={"note": "Persistent preview"},
+        )
+        assert release.status_code == 201
+
+        feedback = server.handle_request(
+            "POST",
+            "/api/v1/lifecycle/projects/orbit/feedback",
+            headers=headers,
+            body={"text": "Preserve history across restarts", "type": "feature", "impact": "high"},
+        )
+        assert feedback.status_code == 201
+
+        restarted_server, _ = _server_with_routes(
+            control_plane_backend=backend,
+            control_plane_path=control_plane_path,
+        )
+        persisted = restarted_server.handle_request(
+            "GET",
+            "/api/v1/lifecycle/projects/orbit",
+            headers=headers,
+        )
+
+        assert persisted.status_code == 200
+        assert persisted.body["tenant_id"] == "tenant-a"
+        assert persisted.body["spec"] == "Durable lifecycle workspace"
+        assert persisted.body["releases"][0]["note"] == "Persistent preview"
+        assert persisted.body["feedbackItems"][0]["text"] == "Preserve history across restarts"
+        assert persisted.body["decisionLog"]
+
+
+# ---------------------------------------------------------------------------
 # Workflow routes
 # ---------------------------------------------------------------------------
 

@@ -24,6 +24,13 @@ from pylon.api.public_contract import (
     register_public_route,
     v1,
 )
+from pylon.approval import ApprovalManager
+from pylon.approval.manager import (
+    ApprovalAlreadyDecidedError,
+    ApprovalBindingMismatchError,
+    ApprovalNotFoundError,
+)
+from pylon.approval.types import compute_approval_binding_hash
 from pylon.api.schemas import (
     APPROVAL_DECISION_SCHEMA,
     CREATE_AGENT_SCHEMA,
@@ -40,8 +47,38 @@ from pylon.control_plane import (
     WorkflowControlPlaneStore,
     build_workflow_control_plane_store,
 )
+from pylon.control_plane.adapters import (
+    StoreBackedApprovalStore,
+    StoreBackedAuditRepository,
+)
 from pylon.control_plane.workflow_service import WorkflowRunService
 from pylon.dsl.parser import PylonProject
+from pylon.lifecycle import (
+    PHASE_ORDER,
+    build_deploy_checks,
+    build_lifecycle_autonomy_projection,
+    build_lifecycle_approval_binding,
+    build_lifecycle_invalidation_patch,
+    build_lifecycle_phase_blueprints,
+    build_lifecycle_skill_catalog,
+    build_lifecycle_workflow_definition,
+    build_lifecycle_workflow_handlers,
+    build_release_record,
+    derive_lifecycle_next_action,
+    default_lifecycle_project_record,
+    lifecycle_action_execution_budget,
+    lifecycle_phase_input,
+    lifecycle_artifact,
+    lifecycle_decision,
+    merge_operator_records,
+    merge_lifecycle_project_record,
+    refresh_lifecycle_recommendations,
+    resolve_lifecycle_autonomy_level,
+    resolve_lifecycle_orchestration_mode,
+    sync_lifecycle_project_with_run,
+)
+from pylon.repository.audit import default_hmac_key
+from pylon.types import AutonomyLevel
 from pylon.providers.base import Message, TokenUsage
 
 logger = logging.getLogger(__name__)
@@ -920,6 +957,1213 @@ def register_routes(
             key=lambda record: str(record.get(sort_key, "")),
             reverse=reverse,
         )
+
+    def _lifecycle_project_key(tenant_id: str, project_id: str) -> str:
+        return f"{tenant_id}:{project_id}"
+
+    def _lifecycle_workflow_id(project_id: str, phase: str) -> str:
+        return f"lifecycle-{phase}-{project_id}"
+
+    def _phase_index(phase: str) -> int:
+        try:
+            return PHASE_ORDER.index(phase)
+        except ValueError:
+            return -1
+
+    def _set_phase_status(
+        project: dict[str, Any],
+        phase: str,
+        status: str,
+    ) -> None:
+        phase_statuses = project.get("phaseStatuses")
+        if not isinstance(phase_statuses, list):
+            return
+        phase_index = _phase_index(phase)
+        for entry in phase_statuses:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("phase") == phase:
+                entry["status"] = status
+                if status == "completed":
+                    entry["completedAt"] = _utc_now_iso()
+                break
+        if status not in {"in_progress", "completed"}:
+            return
+        if phase_index >= 0 and phase_index + 1 < len(PHASE_ORDER):
+            next_phase = PHASE_ORDER[phase_index + 1]
+            for entry in phase_statuses:
+                if isinstance(entry, dict) and entry.get("phase") == next_phase and entry.get("status") == "locked":
+                    entry["status"] = "available"
+                    break
+
+    def _lifecycle_project_payload(project: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(project)
+        payload.setdefault("orchestrationMode", "workflow")
+        payload.setdefault("autonomyLevel", "A3")
+        payload.setdefault("researchConfig", {"competitorUrls": [], "depth": "standard"})
+        payload["blueprints"] = build_lifecycle_phase_blueprints(str(project.get("id", "")))
+        payload["recommendations"] = refresh_lifecycle_recommendations(payload)
+        approval_request_id = str(payload.get("approvalRequestId") or "")
+        approval_record = s.get_approval_record(approval_request_id) if approval_request_id else None
+        if str(payload.get("approvalStatus", "pending") or "pending") == "approved":
+            if approval_record is None or approval_record.get("status") != "approved":
+                payload["approvalStatus"] = "pending"
+                payload["approvalRequestId"] = None
+                approval_record = None
+            else:
+                binding = build_lifecycle_approval_binding(payload)
+                manager = _lifecycle_approval_manager()
+                try:
+                    _run_coro(
+                        manager.validate_binding(
+                            approval_request_id,
+                            plan=binding["plan"],
+                            effect_envelope=binding["effect_envelope"],
+                        )
+                    )
+                except (ApprovalAlreadyDecidedError, ApprovalBindingMismatchError, ApprovalNotFoundError):
+                    payload["approvalStatus"] = "pending"
+                    payload["approvalRequestId"] = None
+                    approval_record = None
+        payload["approvalRequest"] = dict(approval_record) if approval_record is not None else None
+        payload["activeApproval"] = (
+            dict(approval_record)
+            if isinstance(approval_record, dict) and approval_record.get("status") == "pending"
+            else None
+        )
+        autonomy = build_lifecycle_autonomy_projection(payload)
+        payload["phaseContracts"] = autonomy["contracts"]
+        payload["phaseReadiness"] = autonomy["phaseReadiness"]
+        payload["nextAction"] = autonomy["nextAction"]
+        payload["autonomyState"] = {
+            "orchestrationMode": autonomy["orchestrationMode"],
+            "completedExecutablePhases": autonomy["completedExecutablePhases"],
+            "blockedPhases": autonomy["blockedPhases"],
+            "approvalRequired": autonomy["approvalRequired"],
+            "canAdvanceAutonomously": autonomy["canAdvanceAutonomously"],
+        }
+        return payload
+
+    def _seed_lifecycle_skills() -> None:
+        for skill_id, skill_payload in build_lifecycle_skill_catalog().items():
+            if skill_id not in s.skills:
+                s.skills[skill_id] = dict(skill_payload)
+
+    def _persist_lifecycle_project(
+        tenant_id: str,
+        project_id: str,
+        project: dict[str, Any],
+    ) -> dict[str, Any]:
+        project["recommendations"] = refresh_lifecycle_recommendations(project)
+        s.put_surface_record("lifecycle_projects", _lifecycle_project_key(tenant_id, project_id), project)
+        return project
+
+    def _lifecycle_mutation_response(
+        project: dict[str, Any],
+        *,
+        actions: list[dict[str, Any]] | None = None,
+        next_action: dict[str, Any] | None = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        payload = _lifecycle_project_payload(project)
+        response = dict(payload)
+        response["project"] = payload
+        response["actions"] = list(actions or [])
+        response["nextAction"] = dict(next_action or payload.get("nextAction") or {})
+        response.update(extra)
+        return response
+
+    def _run_coro(coro: Any) -> Any:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def _lifecycle_approval_manager() -> ApprovalManager:
+        return ApprovalManager(
+            StoreBackedApprovalStore(s.control_plane_store),
+            StoreBackedAuditRepository(s.control_plane_store, hmac_key=default_hmac_key()),
+        )
+
+    def _current_lifecycle_approval(project: dict[str, Any]) -> dict[str, Any] | None:
+        approval_request_id = str(project.get("approvalRequestId") or "")
+        if not approval_request_id:
+            return None
+        approval = s.get_approval_record(approval_request_id)
+        return dict(approval) if approval is not None else None
+
+    def _ensure_lifecycle_approval_request(
+        tenant_id: str,
+        project_id: str,
+        *,
+        project: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        binding = build_lifecycle_approval_binding(project)
+        plan_hash = compute_approval_binding_hash(binding["plan"])
+        effect_hash = compute_approval_binding_hash(binding["effect_envelope"])
+        current_approval = _current_lifecycle_approval(project)
+        if (
+            current_approval is not None
+            and current_approval.get("status") == "pending"
+            and current_approval.get("plan_hash") == plan_hash
+            and current_approval.get("effect_hash") == effect_hash
+        ):
+            return project, current_approval
+
+        manager = _lifecycle_approval_manager()
+        request = _run_coro(
+            manager.submit_request(
+                agent_id="lifecycle-coordinator",
+                action=binding["action"],
+                autonomy_level=AutonomyLevel.A3,
+                context={
+                    **binding["context"],
+                    "project_id": project_id,
+                    "tenant_id": tenant_id,
+                    "run_id": f"lifecycle:{project_id}",
+                },
+                plan=binding["plan"],
+                effect_envelope=binding["effect_envelope"],
+            )
+        )
+        approval = s.get_approval_record(request.id) or request.to_dict()
+        merged = merge_lifecycle_project_record(
+            project,
+            {
+                "approvalStatus": "pending",
+                "approvalRequestId": request.id,
+            },
+        )
+        persisted = _persist_lifecycle_project(tenant_id, project_id, merged)
+        return persisted, dict(approval)
+
+    def _parse_lifecycle_max_steps(
+        body: dict[str, Any] | None,
+        *,
+        default: int,
+    ) -> int:
+        raw_value = default if not isinstance(body, dict) else body.get("max_steps", default)
+        try:
+            steps = int(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Field 'max_steps' must be an integer") from exc
+        if steps < 1 or steps > 8:
+            raise ValueError("Field 'max_steps' must be between 1 and 8")
+        return steps
+
+    def _append_lifecycle_approval_comment(
+        project: dict[str, Any],
+        *,
+        text: str,
+        comment_type: str,
+    ) -> dict[str, Any]:
+        comments = list(project.get("approvalComments", []))
+        comment_record = {
+            "id": f"approval-{uuid.uuid4().hex[:8]}",
+            "text": text,
+            "type": comment_type,
+            "time": _utc_now_iso(),
+        }
+        comments.append(comment_record)
+        return merge_lifecycle_project_record(
+            project,
+            {
+                "approvalComments": comments,
+                **merge_operator_records(
+                    project,
+                    artifacts=[
+                        lifecycle_artifact(
+                            artifact_id=f"approval-thread:{comment_record['id']}",
+                            phase="approval",
+                            kind="approval_thread",
+                            title="Approval comment",
+                            summary=text,
+                            created_at=comment_record["time"],
+                            payload=comment_record,
+                        )
+                    ],
+                    decisions=[
+                        lifecycle_decision(
+                            decision_id=f"approval-decision:{comment_record['id']}",
+                            phase="approval",
+                            kind="approval_comment",
+                            title="Approval thread updated",
+                            rationale=text,
+                            created_at=comment_record["time"],
+                            status=(
+                                "approved"
+                                if comment_type == "approve"
+                                else "revision_requested"
+                                if comment_type == "reject"
+                                else "comment"
+                            ),
+                            details={"type": comment_type},
+                        )
+                    ],
+                ),
+            },
+        )
+
+    def _record_lifecycle_approval_state(
+        project: dict[str, Any],
+        *,
+        project_id: str,
+        decision: str,
+        note: str,
+    ) -> dict[str, Any]:
+        return merge_lifecycle_project_record(
+            project,
+            merge_operator_records(
+                project,
+                decisions=[
+                    lifecycle_decision(
+                        decision_id=f"approval-state:{project_id}:{decision}:{uuid.uuid4().hex[:8]}",
+                        phase="approval",
+                        kind="approval_state",
+                        title="Approval state changed",
+                        rationale=note or f"Approval state set to {decision}.",
+                        status=decision,
+                        details={"decision": decision},
+                    )
+                ],
+            ),
+        )
+
+    def _apply_lifecycle_lineage_reset(
+        project: dict[str, Any],
+        *,
+        project_id: str,
+        changed_fields: set[str],
+    ) -> dict[str, Any]:
+        invalidation = build_lifecycle_invalidation_patch(project, changed_fields=changed_fields)
+        patch = dict(invalidation["patch"])
+        reset_from = str(invalidation["reset_from"])
+        reason = str(invalidation["reason"])
+        if not patch:
+            return project
+
+        patch.update(
+            merge_operator_records(
+                merge_lifecycle_project_record(project, patch),
+                decisions=[
+                    lifecycle_decision(
+                        decision_id=f"lineage-reset:{project_id}:{uuid.uuid4().hex[:8]}",
+                        phase=reset_from,
+                        kind="lineage_reset",
+                        title="Downstream lifecycle outputs invalidated",
+                        rationale=reason,
+                        status="review",
+                        details={
+                            "changedFields": sorted(changed_fields),
+                            "resetFrom": reset_from,
+                        },
+                    )
+                ],
+            )
+        )
+        return merge_lifecycle_project_record(project, patch)
+
+    def _preserve_explicit_lifecycle_overrides(
+        project: dict[str, Any],
+        *,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        explicit_fields = {
+            field_name: body[field_name]
+            for field_name in {
+                "research",
+                "analysis",
+                "features",
+                "milestones",
+                "planEstimates",
+                "designVariants",
+                "selectedDesignId",
+                "buildCode",
+                "buildCost",
+                "buildIteration",
+                "milestoneResults",
+                "deployChecks",
+                "releases",
+                "feedbackItems",
+                "selectedPreset",
+                "orchestrationMode",
+                "autonomyLevel",
+                "researchConfig",
+            }
+            if field_name in body
+        }
+        if not explicit_fields:
+            return project
+        return merge_lifecycle_project_record(project, explicit_fields)
+
+    def _reconcile_lifecycle_approval_state(
+        tenant_id: str,
+        project_id: str,
+        *,
+        project: dict[str, Any],
+        persist: bool,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        approval_status = str(project.get("approvalStatus", "pending") or "pending")
+        approval = _current_lifecycle_approval(project)
+        if approval_status != "approved":
+            return project, approval
+
+        if approval is None:
+            normalized = merge_lifecycle_project_record(
+                project,
+                {
+                    "approvalStatus": "pending",
+                    "approvalRequestId": None,
+                },
+            )
+            _set_phase_status(normalized, "approval", "review")
+            if persist:
+                normalized = _persist_lifecycle_project(tenant_id, project_id, normalized)
+            return normalized, None
+
+        binding = build_lifecycle_approval_binding(project)
+        manager = _lifecycle_approval_manager()
+        try:
+            _run_coro(
+                manager.validate_binding(
+                    str(approval.get("id", "")),
+                    plan=binding["plan"],
+                    effect_envelope=binding["effect_envelope"],
+                )
+            )
+        except (ApprovalAlreadyDecidedError, ApprovalBindingMismatchError, ApprovalNotFoundError):
+            normalized = merge_lifecycle_project_record(
+                project,
+                {
+                    "approvalStatus": "pending",
+                    "approvalRequestId": None,
+                },
+            )
+            _set_phase_status(normalized, "approval", "review")
+            if persist:
+                normalized = _persist_lifecycle_project(tenant_id, project_id, normalized)
+            return normalized, None
+        return project, approval
+
+    def _apply_lifecycle_approval_decision(
+        tenant_id: str,
+        project_id: str,
+        *,
+        project: dict[str, Any],
+        decision: str,
+        note: str,
+        requested_steps: int,
+        mode_override: str | None = None,
+        record_comment: bool,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+        current, approval = _reconcile_lifecycle_approval_state(
+            tenant_id,
+            project_id,
+            project=project,
+            persist=False,
+        )
+        manager = _lifecycle_approval_manager()
+        comment_type = "comment"
+
+        if decision == "pending":
+            current, approval = _ensure_lifecycle_approval_request(
+                tenant_id,
+                project_id,
+                project=current,
+            )
+            current = merge_lifecycle_project_record(current, {"approvalStatus": "pending"})
+            _set_phase_status(current, "approval", "review")
+        elif decision == "approved":
+            if approval is None or approval.get("status") != "pending":
+                current, approval = _ensure_lifecycle_approval_request(
+                    tenant_id,
+                    project_id,
+                    project=current,
+                )
+            approval_id = str(current.get("approvalRequestId") or approval.get("id", ""))
+            binding = build_lifecycle_approval_binding(current)
+            _run_coro(manager.approve(approval_id, "lifecycle-api", comment=note))
+            _run_coro(
+                manager.validate_binding(
+                    approval_id,
+                    plan=binding["plan"],
+                    effect_envelope=binding["effect_envelope"],
+                )
+            )
+            current = merge_lifecycle_project_record(
+                current,
+                {
+                    "approvalStatus": "approved",
+                    "approvalRequestId": approval_id,
+                },
+            )
+            _set_phase_status(current, "approval", "completed")
+            comment_type = "approve"
+        else:
+            approval_id = str(current.get("approvalRequestId") or "")
+            if approval is not None and approval.get("status") == "pending" and approval_id:
+                _run_coro(manager.reject(approval_id, "lifecycle-api", note or decision))
+            current = merge_lifecycle_project_record(
+                current,
+                {
+                    "approvalStatus": decision,
+                    "approvalRequestId": approval_id if approval_id and approval is not None and approval.get("status") == "pending" else None,
+                },
+            )
+            _set_phase_status(current, "approval", "review")
+            comment_type = "reject"
+
+        current = _record_lifecycle_approval_state(
+            current,
+            project_id=project_id,
+            decision=decision,
+            note=note,
+        )
+        if record_comment and note:
+            current = _append_lifecycle_approval_comment(
+                current,
+                text=note,
+                comment_type=comment_type,
+            )
+        current = _persist_lifecycle_project(tenant_id, project_id, current)
+
+        resolved_mode = resolve_lifecycle_orchestration_mode(current, override=mode_override)
+        if decision == "approved" and resolved_mode == "autonomous":
+            return _execute_lifecycle_progression(
+                tenant_id,
+                project_id,
+                project=current,
+                requested_steps=requested_steps,
+                mode_override=resolved_mode,
+            )
+        return current, [], derive_lifecycle_next_action(current, mode_override=resolved_mode)
+
+    def _prepare_lifecycle_phase_internal(
+        tenant_id: str,
+        project_id: str,
+        phase: str,
+        *,
+        project_record: dict[str, Any] | None = None,
+    ) -> tuple[str, PylonProject, dict[str, Any]]:
+        _seed_lifecycle_skills()
+        definition = build_lifecycle_workflow_definition(project_id, phase)
+        workflow_id = _lifecycle_workflow_id(project_id, phase)
+        workflow_project = s.register_workflow_project(workflow_id, definition["project"], tenant_id=tenant_id)
+        raw_store = s.control_plane_store
+        if hasattr(raw_store, "set_handlers"):
+            raw_store.set_handlers(
+                workflow_id,
+                node_handlers=build_lifecycle_workflow_handlers(
+                    phase,
+                    provider_registry=provider_registry,
+                ),
+            )
+        lifecycle_project = project_record or _get_lifecycle_project(tenant_id, project_id, create=True)
+        if lifecycle_project is None:
+            raise KeyError(f"Lifecycle project not found: {project_id}")
+        _set_phase_status(lifecycle_project, phase, "in_progress")
+        persisted = merge_lifecycle_project_record(lifecycle_project, {"phaseStatuses": lifecycle_project.get("phaseStatuses", [])})
+        return workflow_id, workflow_project, _persist_lifecycle_project(tenant_id, project_id, persisted)
+
+    def _sync_lifecycle_phase_run_internal(
+        tenant_id: str,
+        project_id: str,
+        phase: str,
+        *,
+        project_record: dict[str, Any],
+        run_record: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        checkpoints = workflow_service.list_checkpoint_payloads(tenant_id=tenant_id, run_id=str(run_record["id"]))
+        patch = sync_lifecycle_project_with_run(project_record, phase=phase, run_record=run_record, checkpoints=checkpoints)
+        merged = merge_lifecycle_project_record(project_record, patch)
+        persisted = _persist_lifecycle_project(tenant_id, project_id, merged)
+        latest_phase_run = next((item for item in persisted.get("phaseRuns", []) if item.get("runId") == run_record.get("id")), None)
+        return persisted, latest_phase_run
+
+    def _run_lifecycle_deploy_checks_internal(
+        tenant_id: str,
+        project_id: str,
+        *,
+        project: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        checks_payload = build_deploy_checks(project)
+        merged = merge_lifecycle_project_record(
+            project,
+            {
+                "deployChecks": checks_payload["checks"],
+                **merge_operator_records(
+                    project,
+                    artifacts=[
+                        lifecycle_artifact(
+                            artifact_id=f"deploy-checks:{project_id}:{uuid.uuid4().hex[:8]}",
+                            phase="deploy",
+                            kind="deploy_checks",
+                            title="Release gate summary",
+                            summary=f"Score {checks_payload['summary']['overallScore']} with {checks_payload['summary']['failed']} failing checks.",
+                            payload=checks_payload,
+                        )
+                    ],
+                    decisions=[
+                        lifecycle_decision(
+                            decision_id=f"deploy-gate:{project_id}:{uuid.uuid4().hex[:8]}",
+                            phase="deploy",
+                            kind="release_gate",
+                            title="Release gate evaluated",
+                            rationale="Release is ready." if checks_payload["summary"]["releaseReady"] else "Release remains blocked until failing checks are cleared.",
+                            status="approved" if checks_payload["summary"]["releaseReady"] else "blocked",
+                            details=checks_payload["summary"],
+                        )
+                    ],
+                ),
+            },
+        )
+        _set_phase_status(merged, "deploy", "review")
+        return _persist_lifecycle_project(tenant_id, project_id, merged), checks_payload
+
+    def _create_lifecycle_release_internal(
+        tenant_id: str,
+        project_id: str,
+        *,
+        project: dict[str, Any],
+        note: str = "",
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        release_record = build_release_record(project, note=note)
+        releases = list(project.get("releases", []))
+        releases.insert(0, release_record)
+        merged = merge_lifecycle_project_record(
+            project,
+            {
+                "releases": releases,
+                **merge_operator_records(
+                    project,
+                    artifacts=[
+                        lifecycle_artifact(
+                            artifact_id=f"release-record:{release_record['id']}",
+                            phase="deploy",
+                            kind="release_record",
+                            title=f"Release {release_record['version']}",
+                            summary=note or "Release record created.",
+                            created_at=release_record["createdAt"],
+                            payload=release_record,
+                        )
+                    ],
+                    decisions=[
+                        lifecycle_decision(
+                            decision_id=f"release-decision:{release_record['id']}",
+                            phase="deploy",
+                            kind="release_creation",
+                            title="Release created",
+                            rationale=note or f"Created {release_record['version']} after passing release gates.",
+                            created_at=release_record["createdAt"],
+                            status="approved",
+                            details=release_record["qualitySummary"],
+                        )
+                    ],
+                ),
+            },
+        )
+        _set_phase_status(merged, "deploy", "completed")
+        return _persist_lifecycle_project(tenant_id, project_id, merged), release_record
+
+    def _execute_lifecycle_progression(
+        tenant_id: str,
+        project_id: str,
+        *,
+        project: dict[str, Any],
+        requested_steps: int,
+        mode_override: str | None = None,
+        release_note: str = "",
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+        orchestration_mode = resolve_lifecycle_orchestration_mode(project, override=mode_override)
+        resolve_lifecycle_autonomy_level(project)
+        if requested_steps <= 0:
+            return project, [], derive_lifecycle_next_action(project, mode_override=orchestration_mode)
+        step_budget = lifecycle_action_execution_budget(
+            project,
+            requested_steps=requested_steps,
+            mode_override=mode_override,
+        )
+        actions: list[dict[str, Any]] = []
+        current, _ = _reconcile_lifecycle_approval_state(
+            tenant_id,
+            project_id,
+            project=project,
+            persist=True,
+        )
+
+        if step_budget == 0:
+            next_action = derive_lifecycle_next_action(current, mode_override=orchestration_mode)
+            actions.append(
+                {
+                    "action": next_action,
+                    "executed": False,
+                    "reason": "Workflow mode does not auto-execute lifecycle steps. Use explicit phase workflow endpoints or switch orchestration mode.",
+                }
+            )
+            return current, actions, next_action
+
+        for _ in range(step_budget):
+            next_action = derive_lifecycle_next_action(current, mode_override=orchestration_mode)
+            action_record: dict[str, Any] = {"action": next_action}
+            actions.append(action_record)
+
+            if next_action["type"] == "run_phase":
+                phase = str(next_action.get("phase", ""))
+                workflow_id, _, current = _prepare_lifecycle_phase_internal(
+                    tenant_id,
+                    project_id,
+                    phase,
+                    project_record=current,
+                )
+                stored_run = workflow_service.start_run(
+                    workflow_id=workflow_id,
+                    tenant_id=tenant_id,
+                    input_data=next_action.get("payload", {}).get("input") or lifecycle_phase_input(current, phase),
+                    parameters={},
+                    execution_mode="inline",
+                )
+                action_record["workflow_id"] = workflow_id
+                action_record["run_id"] = stored_run["id"]
+                action_record["run_status"] = stored_run["status"]
+                if stored_run["status"] == "completed":
+                    current, latest_phase_run = _sync_lifecycle_phase_run_internal(
+                        tenant_id,
+                        project_id,
+                        phase,
+                        project_record=current,
+                        run_record=stored_run,
+                    )
+                    action_record["phase_run"] = latest_phase_run
+                    continue
+                break
+
+            if next_action["type"] == "request_approval":
+                current, approval = _ensure_lifecycle_approval_request(
+                    tenant_id,
+                    project_id,
+                    project=current,
+                )
+                action_record["approval"] = approval
+                break
+
+            if next_action["type"] == "auto_approve":
+                current, nested_actions, nested_next_action = _apply_lifecycle_approval_decision(
+                    tenant_id,
+                    project_id,
+                    project=current,
+                    decision="approved",
+                    note="Auto-approved by the lifecycle A4 full-autonomy policy.",
+                    requested_steps=0,
+                    mode_override=orchestration_mode,
+                    record_comment=True,
+                )
+                action_record["approval"] = _current_lifecycle_approval(current)
+                action_record["approval_status"] = current.get("approvalStatus")
+                action_record["nested_actions"] = nested_actions
+                action_record["resulting_next_action"] = nested_next_action
+                continue
+
+            if next_action["type"] == "run_deploy_checks":
+                current, checks_payload = _run_lifecycle_deploy_checks_internal(
+                    tenant_id,
+                    project_id,
+                    project=current,
+                )
+                action_record["checks_summary"] = checks_payload["summary"]
+                continue
+
+            if next_action["type"] == "create_release":
+                current, release_record = _create_lifecycle_release_internal(
+                    tenant_id,
+                    project_id,
+                    project=current,
+                    note=release_note,
+                )
+                action_record["release"] = release_record
+                continue
+
+            break
+
+        return current, actions, derive_lifecycle_next_action(current, mode_override=orchestration_mode)
+
+    def _get_lifecycle_project(
+        tenant_id: str,
+        project_id: str,
+        *,
+        create: bool,
+    ) -> dict[str, Any] | None:
+        key = _lifecycle_project_key(tenant_id, project_id)
+        existing = s.get_surface_record("lifecycle_projects", key)
+        if existing is not None:
+            return dict(existing)
+        if not create:
+            return None
+        created = default_lifecycle_project_record(project_id, tenant_id=tenant_id)
+        s.put_surface_record("lifecycle_projects", key, created)
+        return created
+
+    def list_lifecycle_projects(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        records = s.list_surface_records("lifecycle_projects", tenant_id=tenant_id)
+        records.sort(key=lambda record: str(record.get("updatedAt", record.get("createdAt", ""))), reverse=True)
+        return Response(body={"projects": [_lifecycle_project_payload(record) for record in records], "count": len(records)})
+
+    def get_lifecycle_project(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        project_id = request.path_params.get("project_id", "")
+        project = _get_lifecycle_project(tenant_id, project_id, create=True)
+        if project is None:
+            return Response(status_code=404, body={"error": f"Lifecycle project not found: {project_id}"})
+        return Response(body=_lifecycle_project_payload(project))
+
+    def update_lifecycle_project(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        project_id = request.path_params.get("project_id", "")
+        body = request.body or {}
+        if not isinstance(body, dict):
+            return Response(status_code=422, body={"errors": ["Request body must be a JSON object"]})
+        project = _get_lifecycle_project(tenant_id, project_id, create=True)
+        if project is None:
+            return Response(status_code=404, body={"error": f"Lifecycle project not found: {project_id}"})
+        operator_patch: dict[str, Any] = {}
+        selected_design = body.get("selectedDesignId")
+        if isinstance(selected_design, str) and selected_design and selected_design != project.get("selectedDesignId"):
+            operator_patch = merge_operator_records(
+                project,
+                decisions=[
+                    lifecycle_decision(
+                        decision_id=f"design-selection:{project_id}:{selected_design}",
+                        phase="design",
+                        kind="design_selection",
+                        title="Operator selected a design direction",
+                        rationale=f"Selected design variant {selected_design} as the build baseline.",
+                        details={"selectedDesignId": selected_design},
+                    )
+                ],
+            )
+        merged = merge_lifecycle_project_record(project, body)
+        if operator_patch:
+            merged = merge_lifecycle_project_record(merged, operator_patch)
+        changed_fields = {
+            field_name
+            for field_name in {
+                "spec",
+                "researchConfig",
+                "research",
+                "analysis",
+                "features",
+                "milestones",
+                "planEstimates",
+                "designVariants",
+                "selectedDesignId",
+                "selectedPreset",
+            }
+            if field_name in body and body.get(field_name) != project.get(field_name)
+        }
+        if changed_fields:
+            merged = _apply_lifecycle_lineage_reset(
+                merged,
+                project_id=project_id,
+                changed_fields=changed_fields,
+            )
+            merged = _preserve_explicit_lifecycle_overrides(merged, body=body)
+        merged = _persist_lifecycle_project(tenant_id, project_id, merged)
+
+        auto_run = bool(body.get("auto_run", True))
+        try:
+            mode = resolve_lifecycle_orchestration_mode(merged)
+            resolve_lifecycle_autonomy_level(merged)
+        except ValueError as exc:
+            return Response(status_code=422, body={"errors": [str(exc)]})
+
+        actions: list[dict[str, Any]] = []
+        next_action = derive_lifecycle_next_action(merged, mode_override=mode)
+        if auto_run and mode == "autonomous":
+            try:
+                merged, actions, next_action = _execute_lifecycle_progression(
+                    tenant_id,
+                    project_id,
+                    project=merged,
+                    requested_steps=_parse_lifecycle_max_steps(body, default=8),
+                    mode_override=mode,
+                )
+            except ValueError as exc:
+                return Response(status_code=422, body={"errors": [str(exc)]})
+            except KeyError as exc:
+                return Response(status_code=404, body={"error": str(exc)})
+        return Response(body=_lifecycle_mutation_response(merged, actions=actions, next_action=next_action))
+
+    def get_lifecycle_blueprints(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        project_id = request.path_params.get("project_id", "")
+        return Response(body={"project_id": project_id, "tenant_id": tenant_id, "blueprints": build_lifecycle_phase_blueprints(project_id)})
+
+    def prepare_lifecycle_phase(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        project_id = request.path_params.get("project_id", "")
+        phase = request.path_params.get("phase", "")
+        if phase not in {"research", "planning", "design", "development"}:
+            return Response(status_code=422, body={"errors": [f"Unsupported executable lifecycle phase: {phase}"]})
+        workflow_id, project, _ = _prepare_lifecycle_phase_internal(tenant_id, project_id, phase)
+        blueprints = build_lifecycle_phase_blueprints(project_id)
+        return Response(
+            status_code=201,
+            body={
+                "project_id": project_id,
+                "phase": phase,
+                "workflow_id": workflow_id,
+                "blueprint": blueprints[phase],
+                "workflow": _workflow_summary(workflow_id, project, tenant_id=tenant_id),
+            },
+        )
+
+    def sync_lifecycle_phase_run(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        project_id = request.path_params.get("project_id", "")
+        phase = request.path_params.get("phase", "")
+        if phase not in {"research", "planning", "design", "development"}:
+            return Response(status_code=422, body={"errors": [f"Unsupported executable lifecycle phase: {phase}"]})
+        body = request.body or {}
+        if not isinstance(body, dict):
+            return Response(status_code=422, body={"errors": ["Request body must be a JSON object"]})
+        run_id = str(body.get("run_id", "")).strip()
+        if not run_id:
+            return Response(status_code=422, body={"errors": ["Field 'run_id' is required"]})
+        run = s.get_run_record(run_id)
+        if run is None:
+            return Response(status_code=404, body={"error": f"Run not found: {run_id}"})
+        if run.get("tenant_id", tenant_id) != tenant_id:
+            return Response(status_code=403, body={"error": "Forbidden"})
+        expected_workflow_id = _lifecycle_workflow_id(project_id, phase)
+        if run.get("workflow_id") != expected_workflow_id:
+            return Response(
+                status_code=409,
+                body={"error": f"Run {run_id} does not belong to lifecycle phase {phase} for project {project_id}"},
+            )
+        project = _get_lifecycle_project(tenant_id, project_id, create=True)
+        if project is None:
+            return Response(status_code=404, body={"error": f"Lifecycle project not found: {project_id}"})
+        merged, latest_phase_run = _sync_lifecycle_phase_run_internal(
+            tenant_id,
+            project_id,
+            phase,
+            project_record=project,
+            run_record=run,
+        )
+        return Response(body={"project": _lifecycle_project_payload(merged), "phase_run": latest_phase_run})
+
+    def advance_lifecycle_project(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        project_id = request.path_params.get("project_id", "")
+        body = request.body or {}
+        if body not in ({}, None) and not isinstance(body, dict):
+            return Response(status_code=422, body={"errors": ["Request body must be a JSON object"]})
+        execution_mode = str(body.get("execution_mode", "inline") or "inline") if isinstance(body, dict) else "inline"
+        release_note = str(body.get("release_note", "") or "") if isinstance(body, dict) else ""
+        mode_override = str(body.get("orchestration_mode", "") or "").strip().lower() if isinstance(body, dict) and body.get("orchestration_mode") else None
+        try:
+            max_steps = _parse_lifecycle_max_steps(body if isinstance(body, dict) else None, default=1)
+        except ValueError as exc:
+            return Response(status_code=422, body={"errors": [str(exc)]})
+        if execution_mode != "inline":
+            return Response(status_code=422, body={"errors": ["Lifecycle auto-advance currently supports only inline execution"]})
+        project = _get_lifecycle_project(tenant_id, project_id, create=True)
+        if project is None:
+            return Response(status_code=404, body={"error": f"Lifecycle project not found: {project_id}"})
+        try:
+            current, actions, next_action = _execute_lifecycle_progression(
+                tenant_id,
+                project_id,
+                project=project,
+                requested_steps=max_steps,
+                mode_override=mode_override,
+                release_note=release_note,
+            )
+        except ValueError as exc:
+            return Response(status_code=422, body={"errors": [str(exc)]})
+        except KeyError as exc:
+            return Response(status_code=404, body={"error": str(exc)})
+
+        return Response(
+            body={
+                "project": _lifecycle_project_payload(current),
+                "actions": actions,
+                "nextAction": next_action,
+            }
+        )
+
+    def add_lifecycle_approval_comment(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        project_id = request.path_params.get("project_id", "")
+        body = request.body or {}
+        if not isinstance(body, dict):
+            return Response(status_code=422, body={"errors": ["Request body must be a JSON object"]})
+        text = str(body.get("text", "")).strip()
+        comment_type = str(body.get("type", "comment") or "comment")
+        if comment_type not in {"comment", "approve", "reject"}:
+            return Response(status_code=422, body={"errors": ["Field 'type' must be one of ['comment', 'approve', 'reject']"]})
+        if not text:
+            text = "承認しました" if comment_type == "approve" else "差し戻しました" if comment_type == "reject" else ""
+        if not text:
+            return Response(status_code=422, body={"errors": ["Field 'text' is required"]})
+        project = _get_lifecycle_project(tenant_id, project_id, create=True)
+        if project is None:
+            return Response(status_code=404, body={"error": f"Lifecycle project not found: {project_id}"})
+        try:
+            max_steps = _parse_lifecycle_max_steps(body, default=8)
+        except ValueError as exc:
+            return Response(status_code=422, body={"errors": [str(exc)]})
+
+        if comment_type == "comment":
+            merged = _append_lifecycle_approval_comment(project, text=text, comment_type=comment_type)
+            merged = _persist_lifecycle_project(tenant_id, project_id, merged)
+            return Response(
+                body=_lifecycle_mutation_response(
+                    merged,
+                    actions=[],
+                    next_action=derive_lifecycle_next_action(merged),
+                )
+            )
+
+        decision = "approved" if comment_type == "approve" else "revision_requested"
+        try:
+            merged, actions, next_action = _apply_lifecycle_approval_decision(
+                tenant_id,
+                project_id,
+                project=project,
+                decision=decision,
+                note=text,
+                requested_steps=max_steps,
+                record_comment=True,
+            )
+        except ApprovalNotFoundError as exc:
+            return Response(status_code=404, body={"error": str(exc)})
+        except (ApprovalAlreadyDecidedError, ApprovalBindingMismatchError, ValueError) as exc:
+            return Response(status_code=409, body={"error": str(exc)})
+        return Response(body=_lifecycle_mutation_response(merged, actions=actions, next_action=next_action))
+
+    def decide_lifecycle_approval(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        project_id = request.path_params.get("project_id", "")
+        body = request.body or {}
+        if not isinstance(body, dict):
+            return Response(status_code=422, body={"errors": ["Request body must be a JSON object"]})
+        decision = str(body.get("decision", ""))
+        if decision not in {"approved", "rejected", "revision_requested", "pending"}:
+            return Response(status_code=422, body={"errors": ["Field 'decision' must be a valid approval state"]})
+        project = _get_lifecycle_project(tenant_id, project_id, create=True)
+        if project is None:
+            return Response(status_code=404, body={"error": f"Lifecycle project not found: {project_id}"})
+        note = str(body.get("comment", "")).strip()
+        try:
+            max_steps = _parse_lifecycle_max_steps(body, default=8)
+        except ValueError as exc:
+            return Response(status_code=422, body={"errors": [str(exc)]})
+        try:
+            merged, actions, next_action = _apply_lifecycle_approval_decision(
+                tenant_id,
+                project_id,
+                project=project,
+                decision=decision,
+                note=note,
+                requested_steps=max_steps,
+                record_comment=bool(note),
+            )
+        except ApprovalNotFoundError as exc:
+            return Response(status_code=404, body={"error": str(exc)})
+        except (ApprovalAlreadyDecidedError, ApprovalBindingMismatchError, ValueError) as exc:
+            return Response(status_code=409, body={"error": str(exc)})
+        return Response(body=_lifecycle_mutation_response(merged, actions=actions, next_action=next_action))
+
+    def run_lifecycle_deploy_checks(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        project_id = request.path_params.get("project_id", "")
+        project = _get_lifecycle_project(tenant_id, project_id, create=True)
+        if project is None:
+            return Response(status_code=404, body={"error": f"Lifecycle project not found: {project_id}"})
+        body = request.body or {}
+        if isinstance(body, dict) and body.get("buildCode"):
+            project = merge_lifecycle_project_record(project, {"buildCode": body.get("buildCode")})
+        if not project.get("buildCode"):
+            return Response(status_code=422, body={"errors": ["Lifecycle project has no buildCode to validate"]})
+        merged, checks_payload = _run_lifecycle_deploy_checks_internal(tenant_id, project_id, project=project)
+        return Response(body={"project": _lifecycle_project_payload(merged), **checks_payload})
+
+    def create_lifecycle_release(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        project_id = request.path_params.get("project_id", "")
+        project = _get_lifecycle_project(tenant_id, project_id, create=True)
+        if project is None:
+            return Response(status_code=404, body={"error": f"Lifecycle project not found: {project_id}"})
+        body = request.body or {}
+        note = str(body.get("note", "")).strip() if isinstance(body, dict) else ""
+        try:
+            merged, release_record = _create_lifecycle_release_internal(tenant_id, project_id, project=project, note=note)
+        except ValueError as exc:
+            return Response(status_code=422, body={"errors": [str(exc)]})
+        return Response(status_code=201, body={"project": _lifecycle_project_payload(merged), "release": release_record})
+
+    def list_lifecycle_feedback(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        project_id = request.path_params.get("project_id", "")
+        project = _get_lifecycle_project(tenant_id, project_id, create=True)
+        if project is None:
+            return Response(status_code=404, body={"error": f"Lifecycle project not found: {project_id}"})
+        return Response(body={"feedbackItems": list(project.get("feedbackItems", [])), "recommendations": refresh_lifecycle_recommendations(project)})
+
+    def create_lifecycle_feedback(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        project_id = request.path_params.get("project_id", "")
+        body = request.body or {}
+        if not isinstance(body, dict):
+            return Response(status_code=422, body={"errors": ["Request body must be a JSON object"]})
+        text = str(body.get("text", "")).strip()
+        feedback_type = str(body.get("type", "improvement") or "improvement")
+        impact = str(body.get("impact", "medium") or "medium")
+        if not text:
+            return Response(status_code=422, body={"errors": ["Field 'text' is required"]})
+        if feedback_type not in {"bug", "feature", "improvement", "praise"}:
+            return Response(status_code=422, body={"errors": ["Field 'type' must be a valid feedback type"]})
+        if impact not in {"low", "medium", "high"}:
+            return Response(status_code=422, body={"errors": ["Field 'impact' must be one of ['low', 'medium', 'high']"]})
+        project = _get_lifecycle_project(tenant_id, project_id, create=True)
+        if project is None:
+            return Response(status_code=404, body={"error": f"Lifecycle project not found: {project_id}"})
+        feedbacks = list(project.get("feedbackItems", []))
+        feedbacks.insert(
+            0,
+            {
+                "id": f"fb-{uuid.uuid4().hex[:8]}",
+                "type": feedback_type,
+                "text": text,
+                "impact": impact,
+                "votes": 0,
+                "createdAt": _utc_now_iso(),
+            },
+        )
+        feedback_record = feedbacks[0]
+        merged = merge_lifecycle_project_record(
+            project,
+            {
+                "feedbackItems": feedbacks,
+                **merge_operator_records(
+                    project,
+                    artifacts=[
+                        lifecycle_artifact(
+                            artifact_id=f"feedback-item:{feedback_record['id']}",
+                            phase="iterate",
+                            kind="feedback_item",
+                            title="Feedback captured",
+                            summary=feedback_record["text"],
+                            created_at=feedback_record["createdAt"],
+                            payload=feedback_record,
+                        )
+                    ],
+                    decisions=[
+                        lifecycle_decision(
+                            decision_id=f"feedback-ingest:{feedback_record['id']}",
+                            phase="iterate",
+                            kind="feedback_ingest",
+                            title="Feedback entered the backlog",
+                            rationale=feedback_record["text"],
+                            created_at=feedback_record["createdAt"],
+                            details={"type": feedback_record["type"], "impact": feedback_record["impact"]},
+                        )
+                    ],
+                ),
+            },
+        )
+        _set_phase_status(merged, "iterate", "in_progress")
+        merged["recommendations"] = refresh_lifecycle_recommendations(merged)
+        s.put_surface_record("lifecycle_projects", _lifecycle_project_key(tenant_id, project_id), merged)
+        return Response(status_code=201, body={"project": _lifecycle_project_payload(merged), "feedbackItems": feedbacks})
+
+    def vote_lifecycle_feedback(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        project_id = request.path_params.get("project_id", "")
+        feedback_id = request.path_params.get("feedback_id", "")
+        body = request.body or {}
+        if not isinstance(body, dict):
+            return Response(status_code=422, body={"errors": ["Request body must be a JSON object"]})
+        delta = body.get("delta", 0)
+        if not isinstance(delta, int):
+            return Response(status_code=422, body={"errors": ["Field 'delta' must be an integer"]})
+        project = _get_lifecycle_project(tenant_id, project_id, create=True)
+        if project is None:
+            return Response(status_code=404, body={"error": f"Lifecycle project not found: {project_id}"})
+        feedbacks = list(project.get("feedbackItems", []))
+        updated = False
+        for item in feedbacks:
+            if isinstance(item, dict) and item.get("id") == feedback_id:
+                item["votes"] = max(0, int(item.get("votes", 0)) + delta)
+                updated = True
+                break
+        if not updated:
+            return Response(status_code=404, body={"error": f"Feedback not found: {feedback_id}"})
+        merged = merge_lifecycle_project_record(
+            project,
+            {
+                "feedbackItems": feedbacks,
+                **merge_operator_records(
+                    project,
+                    decisions=[
+                        lifecycle_decision(
+                            decision_id=f"feedback-priority:{feedback_id}:{max(0, delta)}:{len(feedbacks)}",
+                            phase="iterate",
+                            kind="feedback_reprioritized",
+                            title="Feedback priority changed",
+                            rationale=f"Feedback {feedback_id} vote delta {delta}.",
+                            details={"feedbackId": feedback_id, "delta": delta},
+                        )
+                    ],
+                ),
+            },
+        )
+        merged["recommendations"] = refresh_lifecycle_recommendations(merged)
+        s.put_surface_record("lifecycle_projects", _lifecycle_project_key(tenant_id, project_id), merged)
+        return Response(body={"project": _lifecycle_project_payload(merged), "feedbackItems": feedbacks})
+
+    def get_lifecycle_recommendations(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        project_id = request.path_params.get("project_id", "")
+        project = _get_lifecycle_project(tenant_id, project_id, create=True)
+        if project is None:
+            return Response(status_code=404, body={"error": f"Lifecycle project not found: {project_id}"})
+        recommendations = refresh_lifecycle_recommendations(project)
+        merged = merge_lifecycle_project_record(project, {"recommendations": recommendations})
+        s.put_surface_record("lifecycle_projects", _lifecycle_project_key(tenant_id, project_id), merged)
+        return Response(body={"recommendations": recommendations})
 
     def _ensure_default_teams(tenant_id: str) -> list[dict[str, Any]]:
         existing = [
@@ -2742,6 +3986,21 @@ def register_routes(
     _public("POST", v1("/models/refresh"), refresh_models, all_of=("agents:read",))
     _public("POST", v1("/models/policy"), update_model_policy, all_of=("agents:write",))
     _public("GET", v1("/models/health"), health_models, all_of=("agents:read",))
+    _public("GET", v1("/lifecycle/projects"), list_lifecycle_projects, all_of=("runs:read",))
+    _public("GET", v1("/lifecycle/projects/{project_id}"), get_lifecycle_project, all_of=("runs:read",))
+    _public("PATCH", v1("/lifecycle/projects/{project_id}"), update_lifecycle_project, all_of=("runs:write",))
+    _public("GET", v1("/lifecycle/projects/{project_id}/blueprint"), get_lifecycle_blueprints, all_of=("runs:read",))
+    _public("POST", v1("/lifecycle/projects/{project_id}/phases/{phase}/prepare"), prepare_lifecycle_phase, all_of=("runs:write",))
+    _public("POST", v1("/lifecycle/projects/{project_id}/phases/{phase}/sync"), sync_lifecycle_phase_run, all_of=("runs:write",))
+    _public("POST", v1("/lifecycle/projects/{project_id}/advance"), advance_lifecycle_project, all_of=("runs:write",))
+    _public("POST", v1("/lifecycle/projects/{project_id}/approval/comments"), add_lifecycle_approval_comment, all_of=("runs:write",))
+    _public("POST", v1("/lifecycle/projects/{project_id}/approval/decision"), decide_lifecycle_approval, all_of=("runs:write",))
+    _public("POST", v1("/lifecycle/projects/{project_id}/deploy/checks"), run_lifecycle_deploy_checks, all_of=("runs:write",))
+    _public("POST", v1("/lifecycle/projects/{project_id}/releases"), create_lifecycle_release, all_of=("runs:write",))
+    _public("GET", v1("/lifecycle/projects/{project_id}/feedback"), list_lifecycle_feedback, all_of=("runs:read",))
+    _public("POST", v1("/lifecycle/projects/{project_id}/feedback"), create_lifecycle_feedback, all_of=("runs:write",))
+    _public("POST", v1("/lifecycle/projects/{project_id}/feedback/{feedback_id}/vote"), vote_lifecycle_feedback, all_of=("runs:write",))
+    _public("GET", v1("/lifecycle/projects/{project_id}/recommendations"), get_lifecycle_recommendations, all_of=("runs:read",))
     _public("GET", v1("/tasks"), list_tasks, all_of=("runs:read",))
     _public("POST", v1("/tasks"), create_task, all_of=("runs:write",))
     _public("GET", v1("/tasks/{task_id}"), get_task, all_of=("runs:read",))

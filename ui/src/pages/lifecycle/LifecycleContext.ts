@@ -7,11 +7,16 @@ import type {
   FeatureSelection,
   FeedbackItem,
   LifecycleArtifact,
+  LifecycleAutonomyLevel,
+  LifecycleAutonomyState,
   LifecycleDecision,
   LifecycleDelegation,
+  LifecycleNextAction,
+  LifecycleOrchestrationMode,
   LifecyclePhase,
   LifecyclePhaseRun,
   LifecycleProject,
+  LifecycleResearchConfig,
   LifecycleRecommendation,
   LifecycleSkillInvocation,
   MarketResearch,
@@ -27,6 +32,12 @@ import type {
 export interface LifecycleState {
   spec: string;
   setSpec: (s: string) => void;
+  orchestrationMode: LifecycleOrchestrationMode;
+  setOrchestrationMode: (mode: LifecycleOrchestrationMode) => void;
+  autonomyLevel: LifecycleAutonomyLevel;
+  setAutonomyLevel: (level: LifecycleAutonomyLevel) => void;
+  researchConfig: LifecycleResearchConfig;
+  setResearchConfig: (config: LifecycleResearchConfig) => void;
   research: MarketResearch | null;
   setResearch: (r: MarketResearch | null) => void;
   analysis: AnalysisResult | null;
@@ -70,6 +81,8 @@ export interface LifecycleState {
   skillInvocations: LifecycleSkillInvocation[];
   delegations: LifecycleDelegation[];
   phaseRuns: LifecyclePhaseRun[];
+  nextAction: LifecycleNextAction | null;
+  autonomyState: LifecycleAutonomyState | null;
   blueprints: Record<LifecyclePhase, PhaseBlueprint>;
   isHydrating: boolean;
   applyProject: (project: LifecycleProject) => void;
