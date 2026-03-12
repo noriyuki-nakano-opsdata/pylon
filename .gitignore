@@ -43,3 +43,8 @@ logs/
 
 # Local durable control-plane state
 .pylon/
+
+# Local browser/debug artifacts
+.playwright-mcp/
+screenshot-*.png
+ui/tsconfig.tsbuildinfo
