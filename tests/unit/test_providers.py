@@ -60,6 +60,7 @@ class TestTokenUsage:
             cache_write_tokens=10,
         )
         assert usage.total_tokens == 150
+        assert usage.metered_tokens == 180
         assert usage.cache_read_tokens == 20
 
 

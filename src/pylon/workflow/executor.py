@@ -1015,6 +1015,8 @@ class GraphExecutor:
                 "cache_read_tokens": ctx.token_usage.cache_read_tokens,
                 "cache_write_tokens": ctx.token_usage.cache_write_tokens,
                 "total_tokens": ctx.token_usage.total_tokens,
+                "metered_tokens": ctx.token_usage.metered_tokens,
+                "reasoning_tokens": ctx.token_usage.reasoning_tokens,
             },
             "model_routes": list(ctx.model_route_history),
         }
@@ -1079,6 +1081,9 @@ class GraphExecutor:
                 "output_tokens": ctx.token_usage.output_tokens,
                 "cache_read_tokens": ctx.token_usage.cache_read_tokens,
                 "cache_write_tokens": ctx.token_usage.cache_write_tokens,
+                "total_tokens": ctx.token_usage.total_tokens,
+                "metered_tokens": ctx.token_usage.metered_tokens,
+                "reasoning_tokens": ctx.token_usage.reasoning_tokens,
             },
             "estimated_cost_usd": ctx.estimated_cost_usd,
             "model_routes": list(ctx.model_route_history),

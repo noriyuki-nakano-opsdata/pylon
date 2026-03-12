@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,10 +13,13 @@ from pylon.cost.fallback_engine import (
     ProviderCallError,
 )
 from pylon.dsl.parser import PylonProject
+from pylon.observability.tracing import Tracer
 from pylon.providers.base import Message, Response, TokenUsage
 from pylon.runtime import LLMRuntime, ModelPricing, ProviderRegistry, execute_project_sync
 from pylon.runtime.context import ContextManager, ContextWindowConfig
-from pylon.runtime.llm import estimate_message_tokens, messages_from_input
+from pylon.runtime.llm import estimate_cost_from_usage, estimate_message_tokens, messages_from_input
+from pylon.providers.openai import _extract_usage as extract_openai_usage
+from pylon.providers.vertex import _extract_usage as extract_vertex_usage
 
 
 @dataclass
@@ -135,6 +139,78 @@ async def test_llm_runtime_routes_and_estimates_cost() -> None:
 
 
 @pytest.mark.asyncio
+async def test_llm_runtime_uses_builtin_pricing_for_supported_models() -> None:
+    provider = FakeProvider("gpt-5-mini", provider_name="openai")
+    registry = ProviderRegistry({"openai": lambda _model_id: provider})
+    router = ModelRouter(
+        profiles=(
+            ModelProfile(provider_name="openai", model_id="gpt-5-mini", tier=ModelTier.STANDARD),
+        )
+    )
+    runtime = LLMRuntime(router=router)
+
+    result = await runtime.chat(
+        registry=registry,
+        request=ModelRouteRequest(
+            purpose="unit-test",
+            input_tokens_estimate=100,
+        ),
+        messages=[Message(role="user", content="hello")],
+    )
+
+    assert result.estimated_cost_usd > 0
+
+
+def test_openai_usage_extracts_cached_and_reasoning_tokens() -> None:
+    usage = SimpleNamespace(
+        prompt_tokens=1200,
+        completion_tokens=340,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=200),
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=40),
+    )
+
+    extracted = extract_openai_usage(usage)
+
+    assert extracted.input_tokens == 1000
+    assert extracted.output_tokens == 300
+    assert extracted.cache_read_tokens == 200
+    assert extracted.reasoning_tokens == 40
+    assert extracted.total_tokens == 1300
+    assert extracted.metered_tokens == 1540
+
+
+def test_vertex_usage_extracts_cache_tool_and_thought_tokens() -> None:
+    usage = SimpleNamespace(
+        prompt_token_count=27,
+        tool_use_prompt_token_count=10309,
+        cached_content_token_count=20,
+        candidates_token_count=45,
+        thoughts_token_count=31,
+    )
+
+    extracted = extract_vertex_usage(usage)
+
+    assert extracted.input_tokens == 10316
+    assert extracted.output_tokens == 45
+    assert extracted.cache_read_tokens == 20
+    assert extracted.reasoning_tokens == 31
+    assert extracted.total_tokens == 10361
+    assert extracted.metered_tokens == 10412
+
+
+def test_estimate_cost_from_usage_normalizes_google_provider_aliases() -> None:
+    usage = TokenUsage(input_tokens=1_000_000, output_tokens=500_000, cache_read_tokens=250_000)
+
+    google_cost = estimate_cost_from_usage("google", "gemini-3-pro-preview", usage)
+    gemini_cost = estimate_cost_from_usage("gemini", "gemini-3-pro-preview", usage)
+    vertex_cost = estimate_cost_from_usage("vertex", "gemini-3-pro-preview", usage)
+
+    assert google_cost > 0
+    assert gemini_cost == google_cost
+    assert vertex_cost == google_cost
+
+
+@pytest.mark.asyncio
 async def test_llm_runtime_route_falls_back_to_preferred_model_on_available_provider() -> None:
     provider = FakeProvider("fallback-model")
     registry = ProviderRegistry({"fake": lambda _model_id: provider})
@@ -251,6 +327,29 @@ async def test_llm_runtime_uses_selected_route_as_fallback_primary_and_records_e
     assert result.context["requested_route"]["provider_name"] == "fake"
     assert result.context["fallback"]["final_provider"] == "backup"
     assert result.estimated_cost_usd > 0
+
+
+@pytest.mark.asyncio
+async def test_llm_runtime_includes_trace_context_for_current_span() -> None:
+    provider = FakeProvider("fake-standard")
+    registry = ProviderRegistry({"fake": lambda _model_id: provider})
+    router = ModelRouter(
+        profiles=(
+            ModelProfile(provider_name="fake", model_id="fake-standard", tier=ModelTier.STANDARD),
+        )
+    )
+    tracer = Tracer()
+    runtime = LLMRuntime(router=router, tracer=tracer)
+
+    with tracer.start_as_current_span("workflow.node") as parent:
+        result = await runtime.chat(
+            registry=registry,
+            request=ModelRouteRequest(purpose="trace-test", input_tokens_estimate=10),
+            messages=[Message(role="user", content="hello")],
+        )
+
+    assert result.context["trace"]["trace_id"] == parent.trace_id
+    assert result.context["trace"]["parent_id"] == parent.span_id
 
 
 def test_execute_project_sync_records_model_route_and_usage() -> None:

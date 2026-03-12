@@ -130,6 +130,7 @@ class StreamingHandler:
                             "input_tokens": response.usage.input_tokens,
                             "output_tokens": response.usage.output_tokens,
                             "total_tokens": response.usage.total_tokens,
+                            "metered_tokens": response.usage.metered_tokens,
                         }
                     await ws.send(json.dumps({
                         "jsonrpc": "2.0",
@@ -205,6 +206,7 @@ class StreamingHandler:
                     "input_tokens": response.usage.input_tokens,
                     "output_tokens": response.usage.output_tokens,
                     "total_tokens": response.usage.total_tokens,
+                    "metered_tokens": response.usage.metered_tokens,
                 }
             await transport.send_event(
                 self._format_sse_event("done", {"usage": usage, "cost": 0.0})

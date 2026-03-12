@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 
+from pylon.lifecycle.contracts import build_phase_contract
 from pylon.lifecycle.orchestrator import PHASE_ORDER, build_lifecycle_phase_blueprints
 from pylon.protocols.a2a.card import AgentCardRegistry, generate_card
 from pylon.protocols.a2a.types import (
@@ -19,6 +20,8 @@ from pylon.protocols.a2a.types import (
 from pylon.protocols.a2a.types import (
     Artifact as A2AArtifact,
 )
+from pylon.providers.base import TokenUsage
+from pylon.runtime.llm import estimate_cost_from_usage
 
 
 def _utc_now_iso() -> str:
@@ -83,7 +86,7 @@ def _phase_statuses_with_status(
             if status == "completed":
                 item["completedAt"] = _utc_now_iso()
             break
-    if status in {"in_progress", "completed"} and phase_index + 1 < len(PHASE_ORDER):
+    if status == "completed" and phase_index + 1 < len(PHASE_ORDER):
         next_phase = PHASE_ORDER[phase_index + 1]
         for item in statuses:
             if item.get("phase") == next_phase and item.get("status") == "locked":
@@ -318,7 +321,9 @@ def _phase_output_patch(
 ) -> dict[str, Any]:
     patch: dict[str, Any] = {}
     if phase == "research":
-        patch["research"] = _as_dict(run_state.get("research"))
+        research = _as_dict(run_state.get("research"))
+        if research:
+            patch["research"] = research
     elif phase == "planning":
         patch["analysis"] = _as_dict(run_state.get("analysis"))
         patch["features"] = _as_list(run_state.get("features"))
@@ -351,12 +356,93 @@ def _phase_output_patch(
         patch["buildCost"] = float(run_state.get("estimated_cost_usd", 0.0) or 0.0)
         patch["buildIteration"] = int(run_state.get("_build_iteration", 0) or 0)
         patch["milestoneResults"] = _as_list(development.get("milestone_results"))
-    patch["phaseStatuses"] = _phase_statuses_with_status(
-        _as_list(project_record.get("phaseStatuses")),
-        phase=phase,
-        status="completed",
-    )
     return patch
+
+
+def _contract_blocking_issues(contract: dict[str, Any] | None) -> list[str]:
+    if not isinstance(contract, dict):
+        return ["Phase outputs did not produce a valid handoff contract."]
+    issues = []
+    for gate in _as_list(contract.get("qualityGates")):
+        if not isinstance(gate, dict) or gate.get("passed") is True:
+            continue
+        title = str(gate.get("title", "") or "Quality gate failed")
+        detail = str(gate.get("detail", "") or "").strip()
+        issues.append(f"{title}: {detail}" if detail else title)
+    return issues or ["Phase outputs did not pass readiness checks."]
+
+
+def _is_external_url(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return text.startswith("http://") or text.startswith("https://")
+
+
+def _research_stub_run_issues(
+    run_record: dict[str, Any],
+    *,
+    candidate: dict[str, Any],
+) -> list[str]:
+    runtime_metrics = _as_dict(run_record.get("runtime_metrics"))
+    if not runtime_metrics:
+        runtime_metrics = _as_dict(_as_dict(run_record.get("state")).get("runtime_metrics"))
+    if not runtime_metrics:
+        return []
+    token_usage = _as_dict(runtime_metrics.get("token_usage"))
+    total_tokens = int(token_usage.get("total_tokens", 0) or 0)
+    model_routes = _as_list(runtime_metrics.get("model_routes"))
+    if total_tokens > 0 or model_routes:
+        return []
+    research = _as_dict(candidate.get("research"))
+    source_links = [item for item in _as_list(research.get("source_links")) if _is_external_url(item)]
+    grounded_evidence = [
+        item for item in _as_list(research.get("evidence"))
+        if isinstance(item, dict)
+        and str(item.get("source_type", "")).strip() == "url"
+        and _is_external_url(item.get("source_ref"))
+    ]
+    if source_links or grounded_evidence:
+        return []
+    return ["Research run finished without model activity or external URL evidence."]
+
+
+def _resolve_phase_sync_status(
+    project_record: dict[str, Any],
+    *,
+    phase: str,
+    run_record: dict[str, Any],
+    patch: dict[str, Any],
+) -> tuple[str, list[str]]:
+    run_status = str(run_record.get("status", "completed") or "completed")
+    if run_status != "completed":
+        return "available", [f"Run finished with status '{run_status}'."]
+    if (
+        phase == "research"
+        and "research" not in patch
+        and _as_dict(project_record.get("research"))
+    ):
+        current_status = next(
+            (
+                str(entry.get("status", "available"))
+                for entry in _as_list(project_record.get("phaseStatuses"))
+                if isinstance(entry, dict) and entry.get("phase") == phase
+            ),
+            "completed",
+        )
+        return current_status, []
+    candidate = dict(project_record)
+    candidate.update(patch)
+    if phase == "research" and not _as_dict(candidate.get("research")):
+        return "available", ["Research run completed without a persisted research artifact."]
+    contract = build_phase_contract(candidate, phase)
+    if contract is None:
+        return "completed", []
+    if contract.get("ready") is True:
+        if phase == "research":
+            stub_issues = _research_stub_run_issues(run_record, candidate=candidate)
+            if stub_issues:
+                return "available", stub_issues
+        return "completed", []
+    return "available", _contract_blocking_issues(contract)
 
 
 def _phase_artifacts(
@@ -443,6 +529,8 @@ def _phase_decisions(
     *,
     phase: str,
     run_record: dict[str, Any],
+    phase_status: str,
+    blocking_issues: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     decisions: list[dict[str, Any]] = []
     run_id = str(run_record.get("id", ""))
@@ -462,15 +550,30 @@ def _phase_decisions(
             )
         )
     blueprint = build_lifecycle_phase_blueprints(project_id).get(phase, {})
+    outcome_completed = phase_status == "completed"
     decisions.append(
         lifecycle_decision(
             decision_id=f"{run_id}:{phase}:outcome",
             phase=phase,
             kind="phase_outcome",
-            title=f"{blueprint.get('title', phase.title())} completed",
-            rationale=str(blueprint.get("summary", "Phase completed and produced operator-ready outputs.")),
+            title=(
+                f"{blueprint.get('title', phase.title())} completed"
+                if outcome_completed
+                else f"{blueprint.get('title', phase.title())} requires rework"
+            ),
+            rationale=(
+                str(blueprint.get("summary", "Phase completed and produced operator-ready outputs."))
+                if outcome_completed
+                else "; ".join(blocking_issues or ["Phase outputs did not satisfy readiness checks."])
+            ),
             run_id=run_id,
-            details={"workflow_id": run_record.get("workflow_id"), "status": run_record.get("status")},
+            status="approved" if outcome_completed else "blocked",
+            details={
+                "workflow_id": run_record.get("workflow_id"),
+                "status": run_record.get("status"),
+                "phase_status": phase_status,
+                "blocking_issues": list(blocking_issues or []),
+            },
         )
     )
     return decisions
@@ -615,9 +718,79 @@ def _phase_run_summary(
     *,
     phase: str,
     run_record: dict[str, Any],
+    checkpoints: list[dict[str, Any]],
     artifact_count: int,
     decision_count: int,
 ) -> dict[str, Any]:
+    runtime_metrics = _as_dict(run_record.get("runtime_metrics"))
+    token_usage = _as_dict(runtime_metrics.get("token_usage"))
+    input_tokens = int(token_usage.get("input_tokens", 0) or 0)
+    output_tokens = int(token_usage.get("output_tokens", 0) or 0)
+    cache_read_tokens = int(token_usage.get("cache_read_tokens", 0) or 0)
+    cache_write_tokens = int(token_usage.get("cache_write_tokens", 0) or 0)
+    reasoning_tokens = int(token_usage.get("reasoning_tokens", 0) or 0)
+    total_tokens = int(token_usage.get("total_tokens", input_tokens + output_tokens) or 0)
+    metered_tokens = int(
+        token_usage.get(
+            "metered_tokens",
+            total_tokens + cache_read_tokens + cache_write_tokens + reasoning_tokens,
+        ) or 0
+    )
+    cost_usd = float(runtime_metrics.get("estimated_cost_usd", 0.0) or 0.0)
+    checkpoint_input_tokens = 0
+    checkpoint_output_tokens = 0
+    checkpoint_cache_read_tokens = 0
+    checkpoint_cache_write_tokens = 0
+    checkpoint_reasoning_tokens = 0
+    checkpoint_cost_usd = 0.0
+    for checkpoint in checkpoints:
+        for event in _as_list(checkpoint.get("event_log")):
+            if not isinstance(event, dict):
+                continue
+            for llm_event in _as_list(event.get("llm_events")):
+                if not isinstance(llm_event, dict):
+                    continue
+                event_usage = _as_dict(llm_event.get("usage"))
+                usage = TokenUsage(
+                    input_tokens=int(event_usage.get("input_tokens", 0) or 0),
+                    output_tokens=int(event_usage.get("output_tokens", 0) or 0),
+                    cache_read_tokens=int(event_usage.get("cache_read_tokens", 0) or 0),
+                    cache_write_tokens=int(event_usage.get("cache_write_tokens", 0) or 0),
+                    reasoning_tokens=int(event_usage.get("reasoning_tokens", 0) or 0),
+                )
+                checkpoint_input_tokens += usage.input_tokens
+                checkpoint_output_tokens += usage.output_tokens
+                checkpoint_cache_read_tokens += usage.cache_read_tokens
+                checkpoint_cache_write_tokens += usage.cache_write_tokens
+                checkpoint_reasoning_tokens += usage.reasoning_tokens
+                event_cost = float(llm_event.get("estimated_cost_usd", llm_event.get("cost_usd", 0.0)) or 0.0)
+                if event_cost <= 0.0:
+                    event_cost = estimate_cost_from_usage(
+                        str(llm_event.get("provider", "") or ""),
+                        str(llm_event.get("model", "") or ""),
+                        usage,
+                    )
+                checkpoint_cost_usd += event_cost
+    checkpoint_total_tokens = checkpoint_input_tokens + checkpoint_output_tokens
+    checkpoint_metered_tokens = (
+        checkpoint_total_tokens
+        + checkpoint_cache_read_tokens
+        + checkpoint_cache_write_tokens
+        + checkpoint_reasoning_tokens
+    )
+    if checkpoint_total_tokens > total_tokens:
+        input_tokens = checkpoint_input_tokens
+        output_tokens = checkpoint_output_tokens
+        cache_read_tokens = checkpoint_cache_read_tokens
+        cache_write_tokens = checkpoint_cache_write_tokens
+        reasoning_tokens = checkpoint_reasoning_tokens
+        total_tokens = checkpoint_total_tokens
+        metered_tokens = checkpoint_metered_tokens
+    elif checkpoint_metered_tokens > metered_tokens:
+        metered_tokens = checkpoint_metered_tokens
+    if checkpoint_cost_usd > cost_usd:
+        cost_usd = checkpoint_cost_usd
+    cost_measured = checkpoint_cost_usd > 0.0 or cost_usd > 0.0
     return {
         "id": str(run_record.get("id", "")),
         "runId": str(run_record.get("id", "")),
@@ -630,7 +803,15 @@ def _phase_run_summary(
         "createdAt": str(run_record.get("completed_at", run_record.get("started_at", _utc_now_iso()))),
         "artifactCount": artifact_count,
         "decisionCount": decision_count,
-        "costUsd": float(_as_dict(run_record.get("runtime_metrics")).get("estimated_cost_usd", 0.0) or 0.0),
+        "costUsd": round(cost_usd, 6),
+        "costMeasured": cost_measured,
+        "totalTokens": total_tokens,
+        "meteredTokens": metered_tokens,
+        "inputTokens": input_tokens,
+        "outputTokens": output_tokens,
+        "cacheReadTokens": cache_read_tokens,
+        "cacheWriteTokens": cache_write_tokens,
+        "reasoningTokens": reasoning_tokens,
         "executionSummary": _compact_value(_as_dict(run_record.get("execution_summary"))),
     }
 
@@ -645,8 +826,25 @@ def sync_lifecycle_project_with_run(
     project_id = str(project_record.get("projectId", project_record.get("id", "")))
     run_state = _as_dict(run_record.get("state"))
     patch = _phase_output_patch(project_record, phase=phase, run_state=run_state)
+    phase_status, blocking_issues = _resolve_phase_sync_status(
+        project_record,
+        phase=phase,
+        run_record=run_record,
+        patch=patch,
+    )
+    patch["phaseStatuses"] = _phase_statuses_with_status(
+        _as_list(project_record.get("phaseStatuses")),
+        phase=phase,
+        status=phase_status,
+    )
     artifacts = _phase_artifacts(project_id, phase=phase, run_record=run_record, checkpoints=checkpoints)
-    decisions = _phase_decisions(project_id, phase=phase, run_record=run_record)
+    decisions = _phase_decisions(
+        project_id,
+        phase=phase,
+        run_record=run_record,
+        phase_status=phase_status,
+        blocking_issues=blocking_issues,
+    )
     skill_invocations, delegations = _skill_and_delegation_records(
         project_id,
         phase=phase,
@@ -657,6 +855,7 @@ def sync_lifecycle_project_with_run(
         project_id,
         phase=phase,
         run_record=run_record,
+        checkpoints=checkpoints,
         artifact_count=len(artifacts),
         decision_count=len(decisions),
     )

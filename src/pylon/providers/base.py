@@ -89,7 +89,19 @@ class TokenUsage:
 
     @property
     def total_tokens(self) -> int:
+        """Logical prompt+completion total used by existing runtime budgets."""
         return self.input_tokens + self.output_tokens
+
+    @property
+    def metered_tokens(self) -> int:
+        """Extended token total used for billing/telemetry surfaces."""
+        return (
+            self.input_tokens
+            + self.output_tokens
+            + self.cache_read_tokens
+            + self.cache_write_tokens
+            + self.reasoning_tokens
+        )
 
 
 @runtime_checkable
@@ -103,7 +115,7 @@ class LLMProvider(Protocol):
 
     async def chat(self, messages: list[Message], **kwargs: Any) -> Response: ...
 
-    async def stream(self, messages: list[Message], **kwargs: Any) -> AsyncIterator[Chunk]: ...
+    def stream(self, messages: list[Message], **kwargs: Any) -> AsyncIterator[Chunk]: ...
 
     @property
     def model_id(self) -> str: ...

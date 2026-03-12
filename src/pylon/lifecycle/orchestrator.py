@@ -1,18 +1,26 @@
-"""Product Lifecycle orchestration and deterministic multi-agent reference logic."""
+"""Product Lifecycle orchestration and grounded multi-agent lifecycle logic."""
 
 from __future__ import annotations
 
+import ast
+import contextvars
+import inspect
 import json
 import math
+import os
+import re
 import uuid
 from datetime import UTC, datetime
-from html import escape
-from typing import Any
-from urllib.parse import urlparse
+from html import escape, unescape
+from typing import Any, Callable
+from urllib import request as urllib_request
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
+from pylon.agents.cognitive import ReActEngine
 from pylon.autonomy.routing import ModelRouteRequest
 from pylon.providers.base import Message
 from pylon.runtime.llm import LLMRuntime, ProviderRegistry
+from pylon.skills.runtime import SkillRuntime, get_default_skill_runtime
 from pylon.workflow.result import NodeResult
 
 PHASE_ORDER: tuple[str, ...] = (
@@ -23,6 +31,11 @@ PHASE_ORDER: tuple[str, ...] = (
     "development",
     "deploy",
     "iterate",
+)
+
+_LifecycleAgentSkillLookup = Callable[[str], list[str] | tuple[str, ...]]
+_LIFECYCLE_SKILL_CONTEXT: contextvars.ContextVar[dict[str, Any] | None] = (
+    contextvars.ContextVar("pylon_lifecycle_skill_context", default=None)
 )
 
 _MUTABLE_PROJECT_FIELDS = frozenset(
@@ -179,6 +192,90 @@ def _dedupe_strings(values: list[str]) -> list[str]:
     return ordered
 
 
+def _current_lifecycle_skill_context() -> dict[str, Any]:
+    return dict(_LIFECYCLE_SKILL_CONTEXT.get() or {})
+
+
+def _resolve_lifecycle_assigned_skills(
+    *,
+    phase: str,
+    node_id: str,
+    assigned_skill_ids: list[str] | tuple[str, ...] = (),
+    include_blueprint_defaults: bool = True,
+    agent_skill_lookup: _LifecycleAgentSkillLookup | None = None,
+) -> list[str]:
+    resolved = [
+        str(item)
+        for item in assigned_skill_ids
+        if str(item).strip()
+    ]
+    effective_lookup = (
+        agent_skill_lookup
+        or _current_lifecycle_skill_context().get("agent_skill_lookup")
+    )
+    if callable(effective_lookup) and node_id:
+        try:
+            resolved.extend(
+                str(item)
+                for item in effective_lookup(node_id)
+                if str(item).strip()
+            )
+        except Exception:
+            pass
+    if include_blueprint_defaults and phase and node_id:
+        try:
+            blueprint_agent = _phase_blueprint_for_node(phase, node_id)
+            resolved.extend(
+                str(item)
+                for item in _as_list(blueprint_agent.get("skills"))
+                if str(item).strip()
+            )
+        except Exception:
+            pass
+    return _dedupe_strings(resolved)
+
+
+def _infer_lifecycle_phase_and_node(purpose: str) -> tuple[str | None, str | None]:
+    skill_plan_match = re.match(
+        r"^lifecycle-skill-plan-(research|planning|design|development|deploy|iterate)-([a-z0-9-]+)$",
+        purpose,
+    )
+    if skill_plan_match:
+        return skill_plan_match.group(1), skill_plan_match.group(2)
+    phase_match = re.match(
+        r"^lifecycle-(research|planning|design|development|deploy|iterate)-",
+        purpose,
+    )
+    if not phase_match:
+        return None, None
+    phase = phase_match.group(1)
+    remainder = purpose[len(f"lifecycle-{phase}-"):]
+    try:
+        node_ids = sorted(
+            build_lifecycle_phase_blueprints(phase).keys(),
+            key=len,
+            reverse=True,
+        )
+    except Exception:
+        node_ids = []
+    for candidate in node_ids:
+        if remainder == candidate or remainder.startswith(f"{candidate}-"):
+            return phase, candidate
+    special_nodes = {
+        "design": {
+            "judge": "design-evaluator",
+        },
+        "development": {
+            "plan": "planner",
+            "frontend-plan": "frontend-builder",
+            "backend-plan": "backend-builder",
+            "integrate": "integrator",
+            "review": "reviewer",
+        },
+    }
+    return phase, _as_dict(special_nodes.get(phase)).get(remainder)
+
+
 def _as_list(value: Any) -> list[Any]:
     return list(value) if isinstance(value, list) else []
 
@@ -207,6 +304,1347 @@ def _compact_lifecycle_value(value: Any, *, depth: int = 0) -> Any:
     return value
 
 
+def _contains_japanese(text: str) -> bool:
+    return any(
+        ("\u3040" <= ch <= "\u30ff") or ("\u4e00" <= ch <= "\u9fff")
+        for ch in text
+    )
+
+
+def _looks_like_machine_token(text: str) -> bool:
+    normalized = text.strip()
+    return bool(
+        normalized
+        and (
+            normalized.startswith(("http://", "https://", "project://"))
+            or re.fullmatch(r"[a-z0-9_.:-]+", normalized)
+        )
+    )
+
+
+_RESEARCH_RESULT_LIMITS = {
+    "quick": 2,
+    "standard": 3,
+    "deep": 4,
+}
+
+_RESEARCH_NON_VENDOR_HOSTS = frozenset(
+    {
+        "bing.com",
+        "capterra.com",
+        "docs.google.com",
+        "duckduckgo.com",
+        "facebook.com",
+        "g2.com",
+        "getapp.com",
+        "github.com",
+        "linkedin.com",
+        "medium.com",
+        "reddit.com",
+        "softwareadvice.com",
+        "x.com",
+        "youtube.com",
+    }
+)
+
+_RESEARCH_POSITIVE_HINTS = (
+    "adoption",
+    "demand",
+    "expanding",
+    "growth",
+    "opportunity",
+    "roi",
+    "scale",
+    "需要",
+    "成長",
+    "拡大",
+    "導入",
+)
+
+_RESEARCH_NEGATIVE_HINTS = (
+    "barrier",
+    "challenge",
+    "compliance",
+    "cost",
+    "friction",
+    "integration",
+    "latency",
+    "risk",
+    "security",
+    "課題",
+    "懸念",
+    "規制",
+    "運用負荷",
+)
+
+_RESEARCH_LOCALIZATION_FIXED_JA = {
+    "external url evidence is present": "外部 URL に grounded された evidence があります。",
+    "external url evidence is missing": "外部 URL に grounded された evidence が不足しています。",
+    "dissent coverage present": "主要仮説に対する反証が生成されています。",
+    "dissent coverage missing": "主要仮説に対する反証が不足しています。",
+    "confidence floor satisfied": "confidence floor は planning の閾値を満たしています。",
+    "all critical nodes healthy": "critical node はすべて正常です。",
+    "Address degraded nodes, strengthen source grounding, and re-evaluate blocked claims.": "degraded node を補修し、source grounding を補強したうえで、blocked claim を再評価します。",
+    "Claims that survived dissent are passed to planning together with unresolved questions.": "反証を踏まえて残った仮説を、未解決の問いと一緒に planning に引き渡します。",
+}
+
+_RESEARCH_TEXT_KEYS = (
+    "question",
+    "statement",
+    "thesis",
+    "claim_statement",
+    "core_claim",
+    "primary",
+    "signal",
+    "pain_point",
+    "segment",
+    "summary",
+    "title",
+    "name",
+    "text",
+    "draft",
+    "argument",
+    "recommendation",
+    "rationale",
+    "target",
+    "notes",
+)
+
+_RESEARCH_NON_PRODUCT_PATH_HINTS = (
+    "article",
+    "articles",
+    "blog",
+    "blogs",
+    "comparison",
+    "comparisons",
+    "guide",
+    "guides",
+    "insights",
+    "learn",
+    "news",
+    "post",
+    "posts",
+    "report",
+    "reports",
+    "research",
+    "resources",
+    "trends",
+)
+
+_RESEARCH_PRODUCT_PATH_HINTS = (
+    "app",
+    "features",
+    "platform",
+    "pricing",
+    "product",
+    "products",
+    "software",
+    "solution",
+    "solutions",
+)
+
+_RESEARCH_PRODUCT_TEXT_HINTS = (
+    "approval",
+    "automation",
+    "control plane",
+    "feature",
+    "governance",
+    "operator workflow",
+    "platform",
+    "pricing",
+    "product",
+    "software",
+    "traceability",
+    "workflow",
+)
+
+_RESEARCH_ARTICLE_TEXT_HINTS = (
+    "alternatives",
+    "best ",
+    "comparison",
+    "industry outlook",
+    "market size",
+    "news",
+    "report",
+    "top ",
+    "trends",
+    "vs.",
+    "vs ",
+)
+
+
+def _normalize_space(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _truncate_research_text(value: Any, *, limit: int = 220) -> str:
+    text = _normalize_space(value)
+    if len(text) <= limit:
+        return text
+    clipped = text[:limit].rsplit(" ", 1)[0].strip()
+    clipped = clipped or text[:limit].strip()
+    return f"{clipped}..."
+
+
+def _parse_research_structured_value(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    raw = str(value or "").strip()
+    if not raw or raw[0] not in "{[":
+        return value
+    for loader in (json.loads, ast.literal_eval):
+        try:
+            parsed = loader(raw)
+        except Exception:
+            continue
+        if isinstance(parsed, (dict, list)):
+            return parsed
+    return value
+
+
+def _research_text_fragments(
+    value: Any,
+    *,
+    max_items: int = 6,
+    char_limit: int = 180,
+) -> list[str]:
+    items: list[str] = []
+
+    def _visit(current: Any) -> None:
+        if len(items) >= max_items:
+            return
+        parsed = _parse_research_structured_value(current)
+        if isinstance(parsed, list):
+            for child in parsed:
+                _visit(child)
+                if len(items) >= max_items:
+                    break
+            return
+        if isinstance(parsed, dict):
+            preferred: list[str] = []
+            for key in _RESEARCH_TEXT_KEYS:
+                if key not in parsed:
+                    continue
+                for fragment in _research_text_fragments(parsed.get(key), max_items=1, char_limit=char_limit):
+                    if fragment:
+                        preferred.append(fragment)
+            if preferred:
+                items.extend(preferred[: max_items - len(items)])
+                return
+            for child in parsed.values():
+                _visit(child)
+                if len(items) >= max_items:
+                    break
+            return
+        text = _truncate_research_text(parsed, limit=char_limit)
+        if text:
+            items.append(text)
+
+    _visit(value)
+    return _dedupe_strings(items)[:max_items]
+
+
+def _first_research_text(value: Any, *, default: str = "", char_limit: int = 180) -> str:
+    fragments = _research_text_fragments(value, max_items=1, char_limit=char_limit)
+    return fragments[0] if fragments else default
+
+
+def _claim_confidence_overrides(value: Any) -> dict[str, Any]:
+    parsed = _parse_research_structured_value(value)
+    overrides: dict[str, Any] = {}
+    if isinstance(parsed, dict):
+        for claim_id, confidence in parsed.items():
+            normalized_id = _first_research_text(claim_id, char_limit=64)
+            if normalized_id:
+                overrides[normalized_id] = confidence
+        return overrides
+    if not isinstance(parsed, list):
+        return overrides
+    for item in parsed:
+        payload = _as_dict(_parse_research_structured_value(item))
+        claim_id = _first_research_text(payload.get("claim_id") or payload.get("id"), char_limit=64)
+        confidence = payload.get("confidence", payload.get("score"))
+        if claim_id and confidence is not None:
+            overrides[claim_id] = confidence
+    return overrides
+
+
+def _research_required_source_classes(node_id: str) -> list[str]:
+    mapping = {
+        "competitor-analyst": ["vendor_page"],
+        "market-researcher": ["market_report"],
+        "user-researcher": ["user_signal"],
+        "tech-evaluator": ["technical_source"],
+    }
+    return list(mapping.get(node_id, []))
+
+
+def _research_source_classes_for_packets(
+    node_id: str,
+    packets: list[dict[str, Any]],
+) -> list[str]:
+    classes: set[str] = set()
+    url_packets = [
+        packet
+        for packet in packets
+        if str(packet.get("source_type", "")).strip() == "url"
+    ]
+    if node_id == "competitor-analyst":
+        if any(_looks_like_vendor_product_packet(packet) for packet in url_packets):
+            classes.add("vendor_page")
+        if any("/pricing" in str(packet.get("url", "")) for packet in url_packets):
+            classes.add("pricing_page")
+    elif node_id == "market-researcher":
+        if url_packets:
+            classes.add("market_report")
+    elif node_id == "user-researcher":
+        if len(url_packets) >= 2:
+            classes.add("secondary_user_source")
+        if url_packets:
+            classes.add("user_signal")
+    elif node_id == "tech-evaluator":
+        if url_packets:
+            classes.add("technical_source")
+    return sorted(classes)
+
+
+def _research_retry_count(state: dict[str, Any], node_id: str) -> int:
+    return int(
+        _as_dict(state.get(_node_state_key(node_id, "result"))).get("retryCount", 0)
+        or 0
+    )
+
+
+def _research_node_result(
+    node_id: str,
+    *,
+    status: str,
+    parse_status: str,
+    artifact: dict[str, Any] | None = None,
+    source_packets: list[dict[str, Any]] | None = None,
+    degradation_reasons: list[str] | None = None,
+    raw_preview: str = "",
+    llm_events: list[dict[str, Any]] | None = None,
+    retry_count: int = 0,
+) -> dict[str, Any]:
+    packets = list(source_packets or [])
+    satisfied = _research_source_classes_for_packets(node_id, packets)
+    required = _research_required_source_classes(node_id)
+    missing = [item for item in required if item not in satisfied]
+    reasons = _dedupe_strings(list(degradation_reasons or []))
+    if missing:
+        reasons.append(f"missing_source_classes:{','.join(missing)}")
+    normalized_status = status
+    if normalized_status == "success" and (missing or parse_status in {"fallback", "failed"}):
+        normalized_status = "degraded"
+    event = next(
+        (
+            item
+            for item in reversed(list(llm_events or []))
+            if isinstance(item, dict) and not str(item.get("error", "")).strip()
+        ),
+        {},
+    )
+    payload = {
+        "nodeId": node_id,
+        "status": normalized_status,
+        "parseStatus": parse_status,
+        "degradationReasons": reasons,
+        "sourceClassesSatisfied": satisfied,
+        "missingSourceClasses": missing,
+        "artifact": dict(artifact or {}),
+        "retryCount": retry_count,
+    }
+    if raw_preview:
+        payload["rawPreview"] = raw_preview[:400]
+    if event:
+        payload["llmModel"] = str(event.get("model", ""))
+        payload["llmProvider"] = str(event.get("provider", ""))
+    return payload
+
+
+def _collect_research_node_results(state: dict[str, Any]) -> list[dict[str, Any]]:
+    node_ids = list(_RESEARCH_PROPOSAL_NODES) + list(_RESEARCH_REVIEW_NODES)
+    results: list[dict[str, Any]] = []
+    for node_id in node_ids:
+        item = _as_dict(state.get(_node_state_key(node_id, "result")))
+        if item:
+            results.append(item)
+    return results
+
+
+def _research_has_external_evidence(research: dict[str, Any]) -> bool:
+    source_links = [
+        item for item in _as_list(research.get("source_links")) if _is_external_url(item)
+    ]
+    if source_links:
+        return True
+    return any(
+        isinstance(item, dict)
+        and str(item.get("source_type", "")).strip() == "url"
+        and _is_external_url(item.get("source_ref"))
+        for item in _as_list(research.get("evidence"))
+    )
+
+
+def _blocking_claim_node_ids(research: dict[str, Any]) -> list[str]:
+    node_ids: list[str] = []
+    for item in _as_list(research.get("claims")):
+        claim = _as_dict(item)
+        status = str(claim.get("status", "")).strip()
+        if status == "accepted":
+            continue
+        owner = str(claim.get("owner", "")).strip()
+        if owner:
+            node_ids.append(owner)
+    return _dedupe_strings(node_ids)
+
+
+def _research_quality_gate_payload(
+    gate_id: str,
+    title: str,
+    passed: bool,
+    reason: str,
+    blocking_node_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "id": gate_id,
+        "title": title,
+        "passed": passed,
+        "reason": reason,
+        "blockingNodeIds": _dedupe_strings(list(blocking_node_ids or [])),
+    }
+
+
+def _evaluate_research_quality(
+    research: dict[str, Any],
+    *,
+    node_results: list[dict[str, Any]],
+    remaining_iterations: int,
+) -> tuple[list[dict[str, Any]], str, dict[str, Any] | None]:
+    winning_theses = _normalized_research_strings(research.get("winning_theses"), limit=3, char_limit=220)
+    floor = float(_as_dict(research.get("confidence_summary")).get("floor", 0.0) or 0.0)
+    critical_dissent = int(research.get("critical_dissent_count", 0) or 0)
+    degraded_nodes = [
+        item for item in node_results if str(item.get("status", "")) != "success"
+    ]
+    degraded_ids = [str(item.get("nodeId", "")) for item in degraded_nodes if str(item.get("nodeId", "")).strip()]
+    source_gate_nodes = [
+        str(item.get("nodeId", ""))
+        for item in node_results
+        if _as_list(item.get("missingSourceClasses"))
+    ]
+    accepted_claim_nodes = _blocking_claim_node_ids(research)
+    has_external_evidence = _research_has_external_evidence(research)
+    gates = [
+        _research_quality_gate_payload(
+            "source-grounding",
+            "採択主張が source と evidence に接地している",
+            has_external_evidence,
+            (
+                "external url evidence is present"
+                if has_external_evidence
+                else "external url evidence is missing"
+            ),
+            source_gate_nodes or accepted_claim_nodes,
+        ),
+        _research_quality_gate_payload(
+            "counterclaim-coverage",
+            "主要仮説に対する反証が生成されている",
+            bool(_as_list(research.get("dissent"))),
+            "dissent coverage present" if bool(_as_list(research.get("dissent"))) else "dissent coverage missing",
+            ["devils-advocate-researcher"],
+        ),
+        _research_quality_gate_payload(
+            "critical-dissent-resolved",
+            "重大な dissent が未解決のまま残っていない",
+            critical_dissent == 0,
+            (
+                "no unresolved critical dissent"
+                if critical_dissent == 0
+                else f"{critical_dissent} unresolved critical dissent remain"
+            ),
+            ["cross-examiner", "research-judge", *accepted_claim_nodes],
+        ),
+        _research_quality_gate_payload(
+            "confidence-floor",
+            "採択 thesis が planning に渡せる信頼度を満たしている",
+            floor >= 0.6 and bool(winning_theses),
+            (
+                "confidence floor satisfied"
+                if floor >= 0.6 and bool(winning_theses)
+                else f"confidence floor={floor:.2f}, winning_theses={len(winning_theses)}"
+            ),
+            accepted_claim_nodes or ["research-judge"],
+        ),
+        _research_quality_gate_payload(
+            "critical-node-health",
+            "critical research nodes が degraded / failed ではない",
+            not degraded_ids,
+            (
+                "all critical nodes healthy"
+                if not degraded_ids
+                else f"degraded nodes: {', '.join(degraded_ids)}"
+            ),
+            degraded_ids,
+        ),
+    ]
+    ready = all(item.get("passed") is True for item in gates)
+    if ready:
+        return gates, "ready", None
+    retry_candidates = _dedupe_strings(
+        [
+            node_id
+            for gate in gates
+            if gate.get("passed") is not True
+            for node_id in _as_list(gate.get("blockingNodeIds"))
+            if str(node_id).strip()
+        ]
+    )
+    retry_node_ids = [
+        node_id
+        for node_id in _dedupe_strings(
+            retry_candidates + degraded_ids + source_gate_nodes + accepted_claim_nodes
+        )
+        if node_id in _RESEARCH_PROPOSAL_NODES
+        or node_id in {"devils-advocate-researcher", "cross-examiner"}
+    ]
+    remediation_plan = None
+    if remaining_iterations > 0 and retry_node_ids:
+        remediation_plan = {
+            "objective": "Address degraded nodes, strengthen source grounding, and re-evaluate blocked claims.",
+            "retryNodeIds": retry_node_ids[:4],
+            "maxIterations": remaining_iterations,
+        }
+    return gates, "rework", remediation_plan
+
+
+def _translate_fixed_research_text(value: Any, *, target_language: str) -> Any:
+    text = str(value or "").strip()
+    if not text or target_language != "ja":
+        return value
+    translated = _RESEARCH_LOCALIZATION_FIXED_JA.get(text)
+    if translated:
+        return translated
+    if text.startswith("confidence floor="):
+        return (
+            text.replace("confidence floor=", "confidence floor は ")
+            .replace(", winning_theses=", "、winning thesis 数は ")
+            + " です。"
+        )
+    if text.endswith(" unresolved critical dissent remain"):
+        count = text.split(" ", 1)[0]
+        return f"未解決の critical dissent が {count} 件残っています。"
+    if text.startswith("degraded nodes: "):
+        return f"degraded node: {text.removeprefix('degraded nodes: ')}"
+    return value
+
+
+def _translatable_research_text(value: Any, *, char_limit: int) -> str:
+    text = _first_research_text(value, char_limit=char_limit)
+    if not text or _contains_japanese(text) or _looks_like_machine_token(text):
+        return ""
+    return text
+
+
+def _research_localization_payload(research: dict[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+
+    def assign(key: str, value: Any) -> None:
+        if value:
+            payload[key] = value
+
+    def translated_list(values: Any, *, limit: int = 8) -> list[str]:
+        return [
+            text
+            for text in _normalized_research_strings(values, limit=limit, char_limit=280)
+            if text and not _contains_japanese(text) and not _looks_like_machine_token(text)
+        ]
+
+    assign("market_size", _translatable_research_text(research.get("market_size"), char_limit=220))
+    assign("trends", translated_list(research.get("trends"), limit=4))
+    assign("opportunities", translated_list(research.get("opportunities"), limit=4))
+    assign("threats", translated_list(research.get("threats"), limit=4))
+    tech = _as_dict(research.get("tech_feasibility"))
+    tech_notes = _translatable_research_text(tech.get("notes"), char_limit=280)
+    if tech_notes:
+        assign("tech_feasibility", {"notes": tech_notes})
+    user = _as_dict(research.get("user_research"))
+    user_payload = {
+        "signals": translated_list(user.get("signals"), limit=4),
+        "pain_points": translated_list(user.get("pain_points"), limit=4),
+    }
+    segment = _translatable_research_text(user.get("segment"), char_limit=80)
+    if segment:
+        user_payload["segment"] = segment
+    if any(user_payload.values()):
+        assign("user_research", user_payload)
+    claims = []
+    for item in _as_list(research.get("claims")):
+        claim = _as_dict(item)
+        statement = _first_research_text(claim.get("statement"), char_limit=220)
+        if not statement or _contains_japanese(statement) or _looks_like_machine_token(statement):
+            continue
+        claims.append({"id": str(claim.get("id", "")), "statement": statement})
+    assign("claims", claims)
+    dissent = []
+    for item in _as_list(research.get("dissent")):
+        record = _as_dict(item)
+        translated = {
+            "id": str(record.get("id", "")),
+            "argument": _first_research_text(record.get("argument"), char_limit=220),
+            "recommended_test": _first_research_text(record.get("recommended_test"), char_limit=220),
+            "resolution": _first_research_text(record.get("resolution"), char_limit=220),
+        }
+        if any(
+            text
+            and not _contains_japanese(text)
+            and not _looks_like_machine_token(text)
+            for text in translated.values()
+            if isinstance(text, str)
+        ):
+            dissent.append(translated)
+    assign("dissent", dissent)
+    assign("open_questions", translated_list(research.get("open_questions"), limit=8))
+    assign("winning_theses", translated_list(research.get("winning_theses"), limit=4))
+    assign("judge_summary", _translatable_research_text(research.get("judge_summary"), char_limit=280))
+    quality_gates = []
+    for item in _as_list(research.get("quality_gates")):
+        gate = _as_dict(item)
+        reason = _first_research_text(gate.get("reason"), char_limit=220)
+        if not reason or _contains_japanese(reason):
+            continue
+        quality_gates.append({"id": str(gate.get("id", "")), "reason": reason})
+    assign("quality_gates", quality_gates)
+    remediation_plan = _as_dict(research.get("remediation_plan"))
+    objective = _first_research_text(remediation_plan.get("objective"), char_limit=220)
+    if objective and not _contains_japanese(objective):
+        assign("remediation_plan", {"objective": objective})
+    execution_trace = []
+    for item in _as_list(research.get("execution_trace")):
+        trace = _as_dict(item)
+        objective = _first_research_text(trace.get("objective"), char_limit=220)
+        if objective and not _contains_japanese(objective):
+            execution_trace.append({"iteration": trace.get("iteration"), "objective": objective})
+    assign("execution_trace", execution_trace)
+    return payload
+
+
+def _research_runtime_output(research: dict[str, Any]) -> dict[str, Any]:
+    quality_gates = [
+        {
+            "id": _as_dict(item).get("id"),
+            "passed": _as_dict(item).get("passed"),
+            "reason": _first_research_text(_as_dict(item).get("reason"), char_limit=160),
+        }
+        for item in _as_list(research.get("quality_gates"))[:4]
+        if _as_dict(item)
+    ]
+    claims = [
+        {
+            "id": _as_dict(item).get("id"),
+            "statement": _first_research_text(_as_dict(item).get("statement"), char_limit=180),
+            "status": _as_dict(item).get("status"),
+            "confidence": _as_dict(item).get("confidence"),
+        }
+        for item in _as_list(research.get("claims"))[:4]
+        if _as_dict(item)
+    ]
+    remediation_plan = _as_dict(research.get("remediation_plan"))
+    autonomous_remediation = _as_dict(research.get("autonomous_remediation"))
+    return {
+        "kind": "research-runtime-output",
+        "readiness": research.get("readiness"),
+        "display_language": research.get("display_language", "ja"),
+        "localization_status": research.get("localization_status"),
+        "judge_summary": _first_research_text(research.get("judge_summary"), char_limit=220),
+        "winning_theses": _normalized_research_strings(
+            research.get("winning_theses"),
+            limit=3,
+            char_limit=180,
+        ),
+        "claims": claims,
+        "quality_gates": quality_gates,
+        "source_links": _as_list(research.get("source_links"))[:4],
+        "remediation_plan": (
+            {
+                "objective": _first_research_text(
+                    remediation_plan.get("objective"),
+                    char_limit=180,
+                ),
+                "retryNodeIds": _as_list(remediation_plan.get("retryNodeIds"))[:4],
+            }
+            if remediation_plan
+            else None
+        ),
+        "autonomous_remediation": (
+            {
+                "status": autonomous_remediation.get("status"),
+                "attemptCount": autonomous_remediation.get("attemptCount"),
+                "maxAttempts": autonomous_remediation.get("maxAttempts"),
+                "remainingAttempts": autonomous_remediation.get("remainingAttempts"),
+                "objective": _first_research_text(
+                    autonomous_remediation.get("objective"),
+                    char_limit=180,
+                ),
+                "retryNodeIds": _as_list(autonomous_remediation.get("retryNodeIds"))[:4],
+                "blockingGateIds": _as_list(autonomous_remediation.get("blockingGateIds"))[:4],
+                "stopReason": _first_research_text(
+                    autonomous_remediation.get("stopReason"),
+                    char_limit=180,
+                ),
+            }
+            if autonomous_remediation
+            else None
+        ),
+    }
+
+
+def _research_autonomous_remediation_state(
+    research: dict[str, Any],
+    *,
+    quality_gates: list[dict[str, Any]],
+    remediation_plan: dict[str, Any] | None,
+    remediation_context: dict[str, Any],
+    readiness: str,
+) -> dict[str, Any]:
+    failed_gates = [
+        _as_dict(item)
+        for item in quality_gates
+        if _as_dict(item) and _as_dict(item).get("passed") is not True
+    ]
+    blocking_node_ids = [
+        str(item)
+        for gate in failed_gates
+        for item in _as_list(gate.get("blockingNodeIds"))
+        if str(item).strip()
+    ]
+    retry_node_ids = [
+        str(item)
+        for item in _as_list(_as_dict(remediation_plan).get("retryNodeIds"))
+        if str(item).strip()
+    ]
+    if not retry_node_ids:
+        retry_node_ids = [
+            str(item)
+            for item in _as_list(remediation_context.get("retryNodeIds"))
+            if str(item).strip()
+        ]
+    missing_source_classes = [
+        str(item)
+        for node in _as_list(research.get("node_results"))
+        for item in _as_list(_as_dict(node).get("missingSourceClasses"))
+        if str(item).strip()
+    ]
+    attempt_count = int(remediation_context.get("attempt", 0) or 0)
+    max_attempts = int(remediation_context.get("maxAttempts", 2) or 2)
+    remaining_attempts = max(0, max_attempts - attempt_count)
+    auto_runnable = readiness != "ready" and bool(failed_gates) and remaining_attempts > 0
+    if readiness == "ready":
+        status = "resolved" if attempt_count > 0 else "not_needed"
+        stop_reason = ""
+    elif auto_runnable:
+        status = "retrying" if attempt_count > 0 else "queued"
+        stop_reason = ""
+    else:
+        status = "blocked"
+        stop_reason = (
+            "Autonomous remediation budget is exhausted."
+            if failed_gates and remaining_attempts == 0
+            else "The current research blockers need operator guidance."
+        )
+    return {
+        "status": status,
+        "attemptCount": attempt_count,
+        "maxAttempts": max_attempts,
+        "remainingAttempts": remaining_attempts,
+        "autoRunnable": auto_runnable,
+        "objective": str(
+            _as_dict(remediation_plan).get("objective")
+            or remediation_context.get("objective")
+            or ""
+        ),
+        "retryNodeIds": list(dict.fromkeys(retry_node_ids))[:6],
+        "blockingGateIds": list(
+            dict.fromkeys(
+                str(gate.get("id", ""))
+                for gate in failed_gates
+                if str(gate.get("id", "")).strip()
+            )
+        )[:6],
+        "blockingNodeIds": list(dict.fromkeys(blocking_node_ids))[:6],
+        "missingSourceClasses": list(dict.fromkeys(missing_source_classes))[:8],
+        "blockingSummary": [
+            _first_research_text(_as_dict(gate).get("reason"), char_limit=180)
+            for gate in failed_gates
+            if _first_research_text(_as_dict(gate).get("reason"), char_limit=180)
+        ][:4],
+        "lastBlockingSignature": "|".join(
+            sorted(
+                str(gate.get("id", ""))
+                for gate in failed_gates
+                if str(gate.get("id", "")).strip()
+            )
+        ),
+        "stopReason": stop_reason,
+    }
+
+
+def _research_judgement_artifact(research: dict[str, Any]) -> dict[str, Any]:
+    node_results = [
+        {
+            "nodeId": _as_dict(item).get("nodeId"),
+            "status": _as_dict(item).get("status"),
+            "parseStatus": _as_dict(item).get("parseStatus"),
+            "retryCount": _as_dict(item).get("retryCount"),
+            "degradationReasons": _as_list(_as_dict(item).get("degradationReasons"))[:4],
+            "missingSourceClasses": _as_list(_as_dict(item).get("missingSourceClasses"))[:4],
+        }
+        for item in _as_list(research.get("node_results"))[:8]
+        if _as_dict(item)
+    ]
+    return {
+        "name": "research-judgement",
+        "kind": "research",
+        **_research_runtime_output(research),
+        "node_results": node_results,
+    }
+
+
+def _merge_research_localization(
+    research: dict[str, Any],
+    translated: dict[str, Any],
+) -> dict[str, Any]:
+    localized = dict(research)
+    if translated.get("market_size"):
+        localized["market_size"] = translated["market_size"]
+    for key in ("trends", "opportunities", "threats", "open_questions", "winning_theses"):
+        values = _normalized_research_strings(translated.get(key), limit=8, char_limit=280)
+        if values:
+            localized[key] = values
+    tech = _as_dict(localized.get("tech_feasibility"))
+    translated_tech = _as_dict(translated.get("tech_feasibility"))
+    if translated_tech.get("notes"):
+        localized["tech_feasibility"] = {**tech, "notes": _first_research_text(translated_tech.get("notes"), char_limit=280)}
+    user = _as_dict(localized.get("user_research"))
+    translated_user = _as_dict(translated.get("user_research"))
+    if translated_user:
+        localized["user_research"] = {
+            **user,
+            "signals": _normalized_research_strings(translated_user.get("signals"), limit=4, char_limit=220) or _normalized_research_strings(user.get("signals"), limit=4, char_limit=220),
+            "pain_points": _normalized_research_strings(translated_user.get("pain_points"), limit=4, char_limit=220) or _normalized_research_strings(user.get("pain_points"), limit=4, char_limit=220),
+            "segment": _first_research_text(translated_user.get("segment"), default=str(user.get("segment", "")), char_limit=80),
+        }
+    translated_claims = {
+        str(_as_dict(item).get("id", "")): _first_research_text(_as_dict(item).get("statement"), char_limit=220)
+        for item in _as_list(translated.get("claims"))
+        if str(_as_dict(item).get("id", "")).strip()
+    }
+    if translated_claims:
+        localized["claims"] = [
+            {
+                **_as_dict(item),
+                "statement": translated_claims.get(str(_as_dict(item).get("id", "")), _as_dict(item).get("statement")),
+            }
+            for item in _as_list(localized.get("claims"))
+        ]
+    translated_dissent = {
+        str(_as_dict(item).get("id", "")): _as_dict(item)
+        for item in _as_list(translated.get("dissent"))
+        if str(_as_dict(item).get("id", "")).strip()
+    }
+    if translated_dissent:
+        localized["dissent"] = [
+            {
+                **_as_dict(item),
+                **{
+                    key: value
+                    for key, value in translated_dissent.get(str(_as_dict(item).get("id", "")), {}).items()
+                    if key in {"argument", "recommended_test", "resolution"} and value
+                },
+            }
+            for item in _as_list(localized.get("dissent"))
+        ]
+    if translated.get("judge_summary"):
+        localized["judge_summary"] = _first_research_text(translated.get("judge_summary"), char_limit=280)
+    translated_gate_reasons = {
+        str(_as_dict(item).get("id", "")): _first_research_text(_as_dict(item).get("reason"), char_limit=220)
+        for item in _as_list(translated.get("quality_gates"))
+        if str(_as_dict(item).get("id", "")).strip()
+    }
+    if translated_gate_reasons:
+        localized["quality_gates"] = [
+            {
+                **_as_dict(item),
+                "reason": translated_gate_reasons.get(str(_as_dict(item).get("id", "")), _as_dict(item).get("reason")),
+            }
+            for item in _as_list(localized.get("quality_gates"))
+        ]
+    remediation_plan = _as_dict(localized.get("remediation_plan"))
+    translated_plan = _as_dict(translated.get("remediation_plan"))
+    if remediation_plan and translated_plan.get("objective"):
+        localized["remediation_plan"] = {
+            **remediation_plan,
+            "objective": _first_research_text(translated_plan.get("objective"), char_limit=220),
+        }
+    translated_trace = {
+        str(_as_dict(item).get("iteration", "")): _first_research_text(_as_dict(item).get("objective"), char_limit=220)
+        for item in _as_list(translated.get("execution_trace"))
+        if str(_as_dict(item).get("iteration", "")).strip()
+    }
+    if translated_trace:
+        localized["execution_trace"] = [
+            {
+                **_as_dict(item),
+                "objective": translated_trace.get(str(_as_dict(item).get("iteration", "")), _as_dict(item).get("objective")),
+            }
+            for item in _as_list(localized.get("execution_trace"))
+        ]
+    return localized
+
+
+def _research_depth(state: dict[str, Any]) -> str:
+    return str(state.get("depth", "standard") or "standard")
+
+
+def _research_source_limit(state: dict[str, Any]) -> int:
+    return _RESEARCH_RESULT_LIMITS.get(_research_depth(state), 3)
+
+
+def _research_query_anchor(spec: str) -> str:
+    title = _normalize_space(_preview_title(spec))
+    if len(title) >= 18:
+        return title[:120]
+    keywords = _keywords(spec)
+    if keywords:
+        return " ".join(keywords[:8])[:120]
+    return title[:120] or "product software"
+
+
+def _research_remediation_context(state: dict[str, Any]) -> dict[str, Any]:
+    return _as_dict(state.get("remediation_context"))
+
+
+def _research_remediation_targets(state: dict[str, Any]) -> set[str]:
+    context = _research_remediation_context(state)
+    return {
+        str(item)
+        for item in [
+            *_as_list(context.get("retryNodeIds")),
+            *_as_list(context.get("blockingNodeIds")),
+        ]
+        if str(item).strip()
+    }
+
+
+def _research_node_is_targeted_for_remediation(state: dict[str, Any], node_id: str) -> bool:
+    targets = _research_remediation_targets(state)
+    return not targets or node_id in targets
+
+
+def _research_remediation_queries(
+    state: dict[str, Any],
+    *,
+    node_id: str,
+    queries: list[str],
+) -> list[str]:
+    context = _research_remediation_context(state)
+    if not context or not _research_node_is_targeted_for_remediation(state, node_id):
+        return list(dict.fromkeys(str(item) for item in queries if str(item).strip()))
+    anchor = _research_query_anchor(str(state.get("spec", "")))
+    objective = _normalize_space(context.get("objective"))
+    missing = {
+        str(item)
+        for item in _as_list(context.get("missingSourceClasses"))
+        if str(item).strip()
+    }
+    extra: list[str] = []
+    if node_id == "competitor-analyst":
+        extra.extend(
+            [
+                f"{anchor} official product",
+                f"{anchor} pricing",
+                f"{anchor} integrations",
+                f"{anchor} vendor platform",
+            ]
+        )
+        if {"vendor_page", "pricing_page", "integration_doc"} & missing:
+            extra.extend(
+                [
+                    f"{anchor} product overview",
+                    f"{anchor} pricing page",
+                    f"{anchor} integration documentation",
+                ]
+            )
+    elif node_id == "market-researcher":
+        extra.extend(
+            [
+                f"{anchor} market report",
+                f"{anchor} industry report",
+                f"{anchor} CAGR adoption",
+            ]
+        )
+    elif node_id == "user-researcher":
+        extra.extend(
+            [
+                f"{anchor} customer review",
+                f"{anchor} forum discussion",
+                f"{anchor} operator pain point",
+            ]
+        )
+    elif node_id == "tech-evaluator":
+        extra.extend(
+            [
+                f"{anchor} documentation api",
+                f"{anchor} security compliance",
+                f"{anchor} implementation guide",
+            ]
+        )
+    if objective:
+        extra.append(f"{anchor} {objective[:80]}")
+    return list(
+        dict.fromkeys(str(item).strip() for item in [*queries, *extra] if str(item).strip())
+    )
+
+
+def _source_host(value: str) -> str:
+    parsed = urlparse(str(value or "").strip())
+    return (parsed.hostname or "").lower().replace("www.", "")
+
+
+def _source_label_from_host(host: str) -> str:
+    primary = str(host or "").split(".", 1)[0].replace("-", " ").replace("_", " ").strip()
+    if not primary:
+        return "Source"
+    return " ".join(part.capitalize() for part in primary.split())
+
+
+def _normalize_external_url(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("//"):
+        raw = f"https:{raw}"
+    if "://" not in raw and "." in raw:
+        raw = f"https://{raw}"
+    parsed = urlparse(raw)
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return parsed._replace(fragment="").geturl()
+
+
+def _is_external_url(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return text.startswith("http://") or text.startswith("https://")
+
+
+def _research_network_enabled() -> bool:
+    return not bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+
+def _extract_html_title(html: str) -> str:
+    match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+    return _truncate_research_text(unescape(match.group(1)), limit=140) if match else ""
+
+
+def _extract_html_meta_description(html: str) -> str:
+    patterns = (
+        r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']',
+        r'<meta[^>]+content=["\'](.*?)["\'][^>]+name=["\']description["\']',
+        r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\'](.*?)["\']',
+        r'<meta[^>]+content=["\'](.*?)["\'][^>]+property=["\']og:description["\']',
+        r'<meta[^>]+name=["\']twitter:description["\'][^>]+content=["\'](.*?)["\']',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+        if match:
+            return _truncate_research_text(unescape(match.group(1)), limit=220)
+    return ""
+
+
+def _visible_text_from_html(html: str) -> str:
+    stripped = re.sub(r"(?is)<(script|style|noscript|svg).*?>.*?</\1>", " ", html)
+    stripped = re.sub(r"(?i)<br\s*/?>", "\n", stripped)
+    stripped = re.sub(r"(?i)</(p|div|section|article|li|h1|h2|h3|h4|h5|h6)>", "\n", stripped)
+    stripped = re.sub(r"(?s)<[^>]+>", " ", stripped)
+    return _normalize_space(unescape(stripped))
+
+
+def _fetch_research_packet(url: str) -> dict[str, Any]:
+    normalized = _normalize_external_url(url)
+    if not normalized or not _research_network_enabled():
+        return {}
+    request = urllib_request.Request(
+        normalized,
+        headers={
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
+            "User-Agent": "PylonLifecycleResearch/1.0 (+https://pylon.local)",
+        },
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=8.0) as response:  # noqa: S310
+            content_type = str(response.headers.get("Content-Type", ""))
+            lowered_content_type = content_type.lower()
+            if lowered_content_type and "text/html" not in lowered_content_type and "application/xhtml+xml" not in lowered_content_type:
+                return {}
+            raw = response.read(240_000)
+            charset = response.headers.get_content_charset() or "utf-8"
+    except Exception:
+        return {}
+    html = raw.decode(charset, errors="replace")
+    text_excerpt = _truncate_research_text(_visible_text_from_html(html), limit=1000)
+    description = _extract_html_meta_description(html)
+    title = _extract_html_title(html) or _source_label_from_host(_source_host(normalized))
+    excerpt = _truncate_research_text(description or text_excerpt or title, limit=260)
+    return {
+        "source_ref": normalized,
+        "source_type": "url",
+        "url": normalized,
+        "host": _source_host(normalized),
+        "title": title,
+        "description": description,
+        "excerpt": excerpt,
+        "text_excerpt": text_excerpt,
+    }
+
+
+def _html_attribute(attrs: str, name: str) -> str:
+    match = re.search(rf'{name}=["\'](.*?)["\']', attrs, re.IGNORECASE | re.DOTALL)
+    return unescape(match.group(1)).strip() if match else ""
+
+
+def _unwrap_search_result_url(href: str) -> str:
+    raw = unescape(str(href or "").strip())
+    if raw.startswith("//"):
+        raw = f"https:{raw}"
+    parsed = urlparse(raw)
+    if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+        redirected = parse_qs(parsed.query).get("uddg")
+        if redirected:
+            return _normalize_external_url(unquote(redirected[0]))
+    return _normalize_external_url(raw)
+
+
+def _extract_search_results(html: str, *, limit: int) -> list[dict[str, str]]:
+    results: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for match in re.finditer(r"<a(?P<attrs>[^>]*)>(?P<label>.*?)</a>", html, re.IGNORECASE | re.DOTALL):
+        attrs = str(match.group("attrs") or "")
+        href = _html_attribute(attrs, "href")
+        class_name = _html_attribute(attrs, "class")
+        if "uddg=" not in href and "result" not in class_name.lower():
+            continue
+        resolved = _unwrap_search_result_url(href)
+        if not resolved or resolved in seen_urls:
+            continue
+        title = _truncate_research_text(_visible_text_from_html(match.group("label")), limit=140)
+        if not title:
+            continue
+        seen_urls.add(resolved)
+        results.append({"title": title, "url": resolved})
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _search_web(query: str, *, limit: int) -> list[dict[str, str]]:
+    if not _research_network_enabled():
+        return []
+    endpoints = (
+        "https://duckduckgo.com/html/?" + urlencode({"q": query}),
+        "https://lite.duckduckgo.com/lite/?" + urlencode({"q": query}),
+    )
+    for endpoint in endpoints:
+        request = urllib_request.Request(
+            endpoint,
+            headers={
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
+                "User-Agent": "PylonLifecycleResearch/1.0 (+https://pylon.local)",
+            },
+        )
+        try:
+            with urllib_request.urlopen(request, timeout=6.0) as response:  # noqa: S310
+                html = response.read(180_000).decode(
+                    response.headers.get_content_charset() or "utf-8",
+                    errors="replace",
+                )
+        except Exception:
+            continue
+        results = _extract_search_results(html, limit=limit)
+        if results:
+            return results
+    return []
+
+
+def _brief_research_packet(spec: str) -> dict[str, Any]:
+    title = _preview_title(spec) or "Project brief"
+    excerpt = _truncate_research_text(spec, limit=260) or "No brief provided."
+    return {
+        "source_ref": "project://brief",
+        "source_type": "project-brief",
+        "url": "",
+        "host": "project-brief",
+        "title": title,
+        "description": excerpt,
+        "excerpt": excerpt,
+        "text_excerpt": _truncate_research_text(spec, limit=1000) or excerpt,
+    }
+
+
+def _looks_like_vendor_source(url: str) -> bool:
+    host = _source_host(url)
+    if not host:
+        return False
+    if host in _RESEARCH_NON_VENDOR_HOSTS:
+        return False
+    if any(host.endswith(f".{blocked}") for blocked in _RESEARCH_NON_VENDOR_HOSTS):
+        return False
+    return True
+
+
+def _looks_like_vendor_product_packet(packet: dict[str, Any]) -> bool:
+    url = str(packet.get("url") or packet.get("source_ref") or "")
+    if not _looks_like_vendor_source(url):
+        return False
+    parsed = urlparse(url)
+    path_segments = [
+        segment.strip().lower()
+        for segment in parsed.path.split("/")
+        if segment.strip()
+    ]
+    text = " ".join(
+        [
+            str(packet.get("title", "") or ""),
+            str(packet.get("description", "") or ""),
+            str(packet.get("excerpt", "") or ""),
+            str(packet.get("text_excerpt", "") or ""),
+        ]
+    ).lower()
+    if any(segment in _RESEARCH_PRODUCT_PATH_HINTS for segment in path_segments):
+        return True
+    if any(hint in text for hint in _RESEARCH_PRODUCT_TEXT_HINTS):
+        return True
+    if any(segment in _RESEARCH_NON_PRODUCT_PATH_HINTS for segment in path_segments):
+        return False
+    if any(hint in text for hint in _RESEARCH_ARTICLE_TEXT_HINTS):
+        return False
+    return len(path_segments) <= 1
+
+
+def _collect_research_source_packets(
+    state: dict[str, Any],
+    *,
+    focus: str,
+    queries: list[str],
+    seed_urls: list[str] | None = None,
+    include_brief_on_empty: bool = False,
+    prefer_vendor_hosts: bool = False,
+) -> list[dict[str, Any]]:
+    limit = _research_source_limit(state)
+    packets: list[dict[str, Any]] = []
+    seen_refs: set[str] = set()
+
+    def _append(packet: dict[str, Any]) -> None:
+        source_ref = str(packet.get("source_ref", "")).strip()
+        if not source_ref or source_ref in seen_refs:
+            return
+        seen_refs.add(source_ref)
+        packets.append(packet)
+
+    for raw_url in list(seed_urls or [])[:limit]:
+        normalized_url = _normalize_external_url(str(raw_url))
+        packet = _fetch_research_packet(str(raw_url))
+        if not packet and normalized_url:
+            host = _source_host(normalized_url)
+            packet = {
+                "source_ref": normalized_url,
+                "source_type": "url",
+                "url": normalized_url,
+                "host": host,
+                "title": _source_label_from_host(host),
+                "description": "",
+                "excerpt": "Public page fetch did not succeed for this supplied source URL.",
+                "text_excerpt": "",
+            }
+        if packet:
+            _append(packet)
+
+    if len(packets) < limit:
+        for query in queries:
+            for result in _search_web(query, limit=max(limit * 2, 4)):
+                candidate_url = str(result.get("url", "")).strip()
+                if prefer_vendor_hosts and not _looks_like_vendor_source(candidate_url):
+                    continue
+                packet = _fetch_research_packet(candidate_url)
+                if not packet:
+                    continue
+                if not packet.get("title"):
+                    packet["title"] = result.get("title", "")
+                if prefer_vendor_hosts and not _looks_like_vendor_product_packet(packet):
+                    continue
+                _append(packet)
+                if len(packets) >= limit:
+                    break
+            if len(packets) >= limit:
+                break
+
+    if prefer_vendor_hosts and not packets and not seed_urls:
+        return _collect_research_source_packets(
+            state,
+            focus=focus,
+            queries=queries,
+            seed_urls=seed_urls,
+            include_brief_on_empty=include_brief_on_empty,
+            prefer_vendor_hosts=False,
+        )
+
+    if not packets and include_brief_on_empty:
+        _append(_brief_research_packet(str(state.get("spec", ""))))
+
+    return packets
+
+
+def _source_observations(packets: list[dict[str, Any]], *, limit: int = 3) -> list[str]:
+    observations: list[str] = []
+    seen: set[str] = set()
+    for packet in packets:
+        title = _normalize_space(packet.get("title"))
+        excerpt = _truncate_research_text(packet.get("excerpt") or packet.get("description") or packet.get("text_excerpt"), limit=170)
+        if not title and not excerpt:
+            continue
+        summary = f"{title}: {excerpt}" if title and excerpt else (title or excerpt)
+        summary = _truncate_research_text(summary, limit=190)
+        if not summary or summary in seen:
+            continue
+        seen.add(summary)
+        observations.append(summary)
+        if len(observations) >= limit:
+            break
+    return observations
+
+
+def _pricing_hint_from_packet(packet: dict[str, Any]) -> str:
+    text = " ".join(
+        [
+            str(packet.get("description", "") or ""),
+            str(packet.get("excerpt", "") or ""),
+            str(packet.get("text_excerpt", "") or ""),
+        ]
+    )
+    price_match = re.search(
+        r"(\$\s?\d[\d,]*(?:\.\d+)?(?:\s*/\s*(?:month|mo|year|yr|user|seat))?)",
+        text,
+        re.IGNORECASE,
+    )
+    if price_match:
+        return _normalize_space(price_match.group(1))
+    if re.search(r"\bpricing\b|\bplans?\b|料金|価格", text, re.IGNORECASE):
+        return "Pricing page found"
+    return "Not publicly listed"
+
+
 def _infer_product_kind(spec: str) -> str:
     tokens = set(_keywords(spec))
     if "ec" in tokens:
@@ -229,11 +1667,15 @@ def _research_context(state: dict[str, Any]) -> dict[str, Any]:
     user_research = _as_dict(research.get("user_research")) or _as_dict(state.get("user_research"))
     return {
         "research": research,
-        "user_signals": [str(item) for item in _as_list(user_research.get("signals")) if str(item).strip()],
-        "pain_points": [str(item) for item in _as_list(user_research.get("pain_points")) if str(item).strip()],
-        "opportunities": [str(item) for item in _as_list(research.get("opportunities")) if str(item).strip()],
-        "threats": [str(item) for item in _as_list(research.get("threats")) if str(item).strip()],
-        "segment": str(user_research.get("segment") or _segment_from_spec(str(state.get("spec", "")))),
+        "user_signals": _normalized_research_strings(user_research.get("signals"), limit=4),
+        "pain_points": _normalized_research_strings(user_research.get("pain_points"), limit=4),
+        "opportunities": _normalized_research_strings(research.get("opportunities"), limit=4),
+        "threats": _normalized_research_strings(research.get("threats"), limit=4),
+        "segment": _first_research_text(
+            user_research.get("segment"),
+            default=_segment_from_spec(str(state.get("spec", ""))),
+            char_limit=80,
+        ),
     }
 
 
@@ -1233,6 +2675,8 @@ def _llm_event_payload(result: Any, *, purpose: str, raw_content: str) -> dict[s
             "cache_read_tokens": usage.cache_read_tokens,
             "cache_write_tokens": usage.cache_write_tokens,
             "reasoning_tokens": usage.reasoning_tokens,
+            "total_tokens": usage.total_tokens,
+            "metered_tokens": usage.metered_tokens,
         }
     return {
         "purpose": purpose,
@@ -1255,32 +2699,290 @@ async def _lifecycle_llm_json(
     static_instruction: str,
     user_prompt: str,
     quality_sensitive: bool = True,
+    tenant_id: str | None = None,
+    phase: str | None = None,
+    node_id: str | None = None,
+    assigned_skill_ids: list[str] | tuple[str, ...] = (),
+    explicit_skill_ids: list[str] | tuple[str, ...] = (),
+    skill_runtime: SkillRuntime | None = None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], str]:
     if not _provider_backed_lifecycle_available(provider_registry):
         return None, [], ""
     runtime = llm_runtime or LLMRuntime()
+    skill_context = _current_lifecycle_skill_context()
+    effective_skill_runtime = (
+        skill_runtime
+        or skill_context.get("skill_runtime")
+        or get_default_skill_runtime()
+    )
+    resolved_phase = phase
+    resolved_node_id = node_id
+    if not resolved_phase or not resolved_node_id:
+        inferred_phase, inferred_node_id = _infer_lifecycle_phase_and_node(purpose)
+        resolved_phase = resolved_phase or inferred_phase
+        resolved_node_id = resolved_node_id or inferred_node_id
+    resolved_tenant_id = str(
+        tenant_id
+        or skill_context.get("tenant_id")
+        or "default"
+    )
+    inferred_assigned_skill_ids = list(assigned_skill_ids)
+    if resolved_phase and resolved_node_id:
+        inferred_assigned_skill_ids = _resolve_lifecycle_assigned_skills(
+            phase=resolved_phase,
+            node_id=resolved_node_id,
+            assigned_skill_ids=assigned_skill_ids,
+        )
+    resolved_instruction, effective_skills = effective_skill_runtime.augment_instruction(
+        static_instruction,
+        tenant_id=resolved_tenant_id,
+        assigned_skill_ids=inferred_assigned_skill_ids,
+        explicit_skill_ids=explicit_skill_ids,
+        control_plane_skills=skill_context.get("control_plane_skills"),
+    )
     request = ModelRouteRequest(
         purpose=purpose,
-        input_tokens_estimate=max(len(static_instruction + user_prompt) // 4, 256),
-        requires_tools=False,
+        input_tokens_estimate=max(len(resolved_instruction + user_prompt) // 4, 256),
+        requires_tools=bool(effective_skills.available_tools),
         latency_sensitive=not quality_sensitive,
         quality_sensitive=quality_sensitive,
         cacheable_prefix=True,
         batch_eligible=False,
     )
+    llm_events: list[dict[str, Any]] = []
     try:
+        available_tools = [tool.provider_tool() for tool in effective_skills.available_tools]
+        tool_executors = {
+            tool.name: tool.executor
+            for tool in effective_skills.available_tools
+            if tool.executor is not None
+        }
+        if available_tools and tool_executors:
+            async def _chat_fn(messages: list[Message], **kwargs: Any):
+                result = await runtime.chat(
+                    registry=provider_registry,
+                    request=request,
+                    messages=messages,
+                    preferred_model=preferred_model,
+                    static_instruction=resolved_instruction,
+                    tools=kwargs.get("tools"),
+                )
+                usage = result.response.usage
+                llm_events.append(
+                    {
+                        "purpose": purpose,
+                        "provider": result.route.provider_name,
+                        "model": result.response.model,
+                        "usage": (
+                            {
+                                "input_tokens": usage.input_tokens,
+                                "output_tokens": usage.output_tokens,
+                                "cache_read_tokens": usage.cache_read_tokens,
+                                "cache_write_tokens": usage.cache_write_tokens,
+                                "reasoning_tokens": usage.reasoning_tokens,
+                                "total_tokens": usage.total_tokens,
+                                "metered_tokens": usage.metered_tokens,
+                            }
+                            if usage is not None
+                            else None
+                        ),
+                        "estimated_cost_usd": result.estimated_cost_usd,
+                        "context": dict(result.context),
+                        "tool_loop": True,
+                    }
+                )
+                return result.response
+
+            async def _tool_executor(tool_name: str, tool_input: dict[str, Any]) -> str:
+                executor = tool_executors.get(tool_name)
+                if executor is None:
+                    raise RuntimeError(f"Tool '{tool_name}' is not available")
+                return await executor(tool_input)
+
+            react_result = await ReActEngine().run(
+                messages=[Message(role="user", content=user_prompt)],
+                chat_fn=_chat_fn,
+                tool_executor=_tool_executor,
+                available_tools=available_tools,
+            )
+            raw_content = str(react_result.final_answer or "")
+            payload = _extract_json_object(raw_content)
+            return payload, llm_events, raw_content
         result = await runtime.chat(
             registry=provider_registry,
             request=request,
             messages=[Message(role="user", content=user_prompt)],
             preferred_model=preferred_model,
-            static_instruction=static_instruction,
+            static_instruction=resolved_instruction,
         )
     except Exception as exc:
         return None, [{"purpose": purpose, "error": str(exc)}], ""
     raw_content = str(result.response.content or "")
     payload = _extract_json_object(raw_content)
     return payload, [_llm_event_payload(result, purpose=purpose, raw_content=raw_content)], raw_content
+
+
+async def _research_llm_json(
+    *,
+    provider_registry: ProviderRegistry | None,
+    llm_runtime: LLMRuntime | None,
+    preferred_model: str,
+    purpose: str,
+    static_instruction: str,
+    user_prompt: str,
+    schema_name: str,
+    required_keys: list[str] | None = None,
+    phase: str | None = None,
+    node_id: str | None = None,
+    tenant_id: str | None = None,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]], dict[str, Any]]:
+    payload, llm_events, raw_content = await _lifecycle_llm_json(
+        provider_registry=provider_registry,
+        llm_runtime=llm_runtime,
+        preferred_model=preferred_model,
+        purpose=purpose,
+        static_instruction=static_instruction,
+        user_prompt=user_prompt,
+        phase=phase,
+        node_id=node_id,
+        tenant_id=tenant_id,
+    )
+    for item in llm_events:
+        if isinstance(item, dict):
+            item["stage"] = "strict"
+    if isinstance(payload, dict):
+        return payload, llm_events, {
+            "parse_status": "strict",
+            "raw_preview": raw_content[:400],
+        }
+    if not raw_content.strip():
+        return None, llm_events, {
+            "parse_status": "failed",
+            "raw_preview": "",
+            "degradation_reasons": ["empty_llm_response"],
+        }
+    repair_prompt = (
+        "Repair the following model output into a strict JSON object.\n"
+        f"Schema name: {schema_name}\n"
+        f"Required keys: {required_keys or []}\n"
+        "Return JSON only.\n"
+        f"Raw response:\n{raw_content}"
+    )
+    repaired, repair_events, repair_raw = await _lifecycle_llm_json(
+        provider_registry=provider_registry,
+        llm_runtime=llm_runtime,
+        preferred_model=preferred_model,
+        purpose=f"{purpose}-repair",
+        static_instruction=(
+            "You repair malformed model output into a strict JSON object. "
+            "Do not explain anything. Return JSON only."
+        ),
+        user_prompt=repair_prompt,
+        quality_sensitive=False,
+        phase=phase,
+        node_id=node_id,
+        tenant_id=tenant_id,
+    )
+    for item in repair_events:
+        if isinstance(item, dict):
+            item["stage"] = "repair"
+    llm_events.extend(repair_events)
+    if isinstance(repaired, dict):
+        return repaired, llm_events, {
+            "parse_status": "repaired",
+            "raw_preview": (repair_raw or raw_content)[:400],
+            "degradation_reasons": ["llm_response_repaired"],
+        }
+    return None, llm_events, {
+        "parse_status": "fallback",
+        "raw_preview": raw_content[:400],
+        "degradation_reasons": ["llm_json_parse_failed"],
+    }
+
+
+async def _localize_research_output(
+    research: dict[str, Any],
+    *,
+    target_language: str,
+    provider_registry: ProviderRegistry | None,
+    llm_runtime: LLMRuntime | None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    localized = dict(research)
+    if target_language != "ja":
+        localized["display_language"] = target_language
+        localized["localization_status"] = "skipped"
+        return localized, [], {"status": "skipped"}
+
+    localized["judge_summary"] = _translate_fixed_research_text(
+        localized.get("judge_summary"),
+        target_language=target_language,
+    )
+    localized["quality_gates"] = [
+        {
+            **_as_dict(item),
+            "reason": _translate_fixed_research_text(
+                _as_dict(item).get("reason"),
+                target_language=target_language,
+            ),
+        }
+        for item in _as_list(localized.get("quality_gates"))
+    ]
+    remediation_plan = _as_dict(localized.get("remediation_plan"))
+    if remediation_plan:
+        localized["remediation_plan"] = {
+            **remediation_plan,
+            "objective": _translate_fixed_research_text(
+                remediation_plan.get("objective"),
+                target_language=target_language,
+            ),
+        }
+    localized["execution_trace"] = [
+        {
+            **_as_dict(item),
+            "objective": _translate_fixed_research_text(
+                _as_dict(item).get("objective"),
+                target_language=target_language,
+            ),
+        }
+        for item in _as_list(localized.get("execution_trace"))
+    ]
+
+    payload = _research_localization_payload(localized)
+    if not payload:
+        localized["display_language"] = target_language
+        localized["localization_status"] = "noop"
+        return localized, [], {"status": "noop"}
+    if not _provider_backed_lifecycle_available(provider_registry):
+        localized["display_language"] = target_language
+        localized["localization_status"] = "skipped"
+        return localized, [], {"status": "skipped"}
+
+    translated, llm_events, llm_meta = await _research_llm_json(
+        provider_registry=provider_registry,
+        llm_runtime=llm_runtime,
+        preferred_model=_preferred_lifecycle_model("research-localizer", provider_registry),
+        purpose="lifecycle-research-localizer",
+        static_instruction=(
+            "Translate user-facing JSON string values into the target language. "
+            "Return JSON only. Preserve keys, arrays, ids, URLs, numeric values, booleans, and machine tokens."
+        ),
+        user_prompt=(
+            "Return JSON only.\n"
+            f"Target language: {target_language}\n"
+            "Translate natural-language values only. Keep product names and URLs unchanged when translation is unnatural.\n"
+            f"JSON payload: {json.dumps(payload, ensure_ascii=False)}"
+        ),
+        schema_name="research-localization",
+        required_keys=list(payload.keys()),
+        phase="research",
+    )
+    if isinstance(translated, dict):
+        localized = _merge_research_localization(localized, translated)
+        localized["localization_status"] = str(llm_meta.get("parse_status", "strict"))
+    else:
+        localized["localization_status"] = str(llm_meta.get("parse_status", "fallback"))
+    localized["display_language"] = target_language
+    return localized, llm_events, llm_meta
 
 
 _LIFECYCLE_MODEL_STRATEGIES: dict[str, dict[str, Any]] = {
@@ -1319,6 +3021,10 @@ _LIFECYCLE_MODEL_STRATEGIES: dict[str, dict[str, Any]] = {
     "research-judge": {
         "archetype": "decision calibrator",
         "candidates": ("anthropic/claude-sonnet-4-6", "openai/gpt-5-mini", "zhipu/glm-4-plus"),
+    },
+    "research-localizer": {
+        "archetype": "low-cost output localizer",
+        "candidates": ("openai/gpt-5-mini", "zhipu/glm-4-plus", "anthropic/claude-haiku-4-5-20251001"),
     },
     "persona-builder": {
         "archetype": "persona and motivation mapper",
@@ -1633,7 +3339,25 @@ def _peer_recommendation_payload(
     blockers: list[str] = []
     summary = f"{peer_name} reviewed {skill_name} for {phase}."
 
-    if peer_name == "design-critic":
+    if peer_name == "research-fabric":
+        sources = [_as_dict(item) for item in _as_list(artifact_payload.get("sources")) if _as_dict(item)]
+        summary = f"{peer_name} reviewed {len(sources)} grounded sources for {phase}."
+        strengths.extend(
+            [
+                "The research artifact keeps claim context attached to concrete source packets.",
+                "The review can distinguish grounded evidence from missing evidence.",
+            ]
+        )
+        recommendations.extend(
+            [
+                "Mix vendor pages with neutral analyst or practitioner sources before finalizing claims.",
+                "Call out where the result is based on public web evidence versus the project brief.",
+                "Prefer source diversity over adding more snippets from the same domain.",
+            ]
+        )
+        if len({str(item.get("host", "")) for item in sources if str(item.get("host", "")).strip()}) < 2:
+            blockers.append("Research should rely on at least two distinct grounded domains before planning.")
+    elif peer_name == "design-critic":
         pattern_name = str(artifact_payload.get("pattern_name", "Design concept") or "Design concept")
         summary = f"{peer_name} validated the {pattern_name} concept for clarity and accessibility."
         strengths.extend(
@@ -1824,7 +3548,11 @@ async def _plan_node_collaboration(
     agent = _phase_blueprint_for_node(phase, node_id)
     skill_catalog = build_lifecycle_skill_catalog()
     peer_registry = build_lifecycle_peer_registry()
-    own_skills = [str(item) for item in _as_list(agent.get("skills")) if str(item).strip()]
+    own_skills = _resolve_lifecycle_assigned_skills(
+        phase=phase,
+        node_id=node_id,
+        include_blueprint_defaults=True,
+    )
     candidate_skills = _dedupe_strings(own_skills + _phase_support_skills(phase))
     peer_candidates: list[dict[str, Any]] = []
     for skill_name in candidate_skills:
@@ -1884,6 +3612,8 @@ async def _plan_node_collaboration(
             f"Peer candidates: {peer_candidates}\n"
             f"Quality targets: {quality_targets}\n"
         ),
+        phase=phase,
+        node_id=node_id,
     )
     if not isinstance(payload, dict):
         return {**fallback_plan, "mode": "provider-backed-fallback"}, llm_events
@@ -1951,6 +3681,7 @@ def default_lifecycle_project_record(
         "researchConfig": {
             "competitorUrls": [],
             "depth": "standard",
+            "outputLanguage": "ja",
         },
         "research": None,
         "analysis": None,
@@ -2503,13 +4234,81 @@ def build_lifecycle_workflow_handlers(
     *,
     provider_registry: ProviderRegistry | None = None,
     llm_runtime: LLMRuntime | None = None,
+    skill_runtime: SkillRuntime | None = None,
+    tenant_id: str = "default",
+    agent_skill_lookup: _LifecycleAgentSkillLookup | None = None,
+    control_plane_skills: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    def _wrap_handlers(handlers: dict[str, Any]) -> dict[str, Any]:
+        wrapped: dict[str, Any] = {}
+
+        def _wrap(handler: Any):
+            async def invoke(node_id: str, state: dict[str, Any]):
+                token = _LIFECYCLE_SKILL_CONTEXT.set(
+                    {
+                        "phase": phase,
+                        "tenant_id": tenant_id,
+                        "skill_runtime": skill_runtime,
+                        "agent_skill_lookup": agent_skill_lookup,
+                        "control_plane_skills": dict(control_plane_skills or {}),
+                    }
+                )
+                try:
+                    result = handler(node_id, state)
+                    if inspect.isawaitable(result):
+                        return await result
+                    return result
+                finally:
+                    _LIFECYCLE_SKILL_CONTEXT.reset(token)
+
+            return invoke
+
+        for node_id, handler in handlers.items():
+            wrapped[node_id] = _wrap(handler)
+        return wrapped
+
     if phase == "research":
-        return {
-            "competitor-analyst": _research_competitor_handler,
-            "market-researcher": _research_market_handler,
-            "user-researcher": _research_user_handler,
-            "tech-evaluator": _research_tech_handler,
+        return _wrap_handlers({
+            "competitor-analyst": (
+                lambda node_id, state: _research_competitor_autonomous_handler(
+                    node_id,
+                    state,
+                    provider_registry=provider_registry,
+                    llm_runtime=llm_runtime,
+                )
+                if _provider_backed_lifecycle_available(provider_registry)
+                else _research_competitor_handler(node_id, state)
+            ),
+            "market-researcher": (
+                lambda node_id, state: _research_market_autonomous_handler(
+                    node_id,
+                    state,
+                    provider_registry=provider_registry,
+                    llm_runtime=llm_runtime,
+                )
+                if _provider_backed_lifecycle_available(provider_registry)
+                else _research_market_handler(node_id, state)
+            ),
+            "user-researcher": (
+                lambda node_id, state: _research_user_autonomous_handler(
+                    node_id,
+                    state,
+                    provider_registry=provider_registry,
+                    llm_runtime=llm_runtime,
+                )
+                if _provider_backed_lifecycle_available(provider_registry)
+                else _research_user_handler(node_id, state)
+            ),
+            "tech-evaluator": (
+                lambda node_id, state: _research_tech_autonomous_handler(
+                    node_id,
+                    state,
+                    provider_registry=provider_registry,
+                    llm_runtime=llm_runtime,
+                )
+                if _provider_backed_lifecycle_available(provider_registry)
+                else _research_tech_handler(node_id, state)
+            ),
             "research-synthesizer": _research_synthesizer_handler,
             "evidence-librarian": _research_evidence_librarian_handler,
             "devils-advocate-researcher": lambda node_id, state: _research_devils_advocate_handler(
@@ -2530,9 +4329,9 @@ def build_lifecycle_workflow_handlers(
                 provider_registry=provider_registry,
                 llm_runtime=llm_runtime,
             ),
-        }
+        })
     if phase == "planning":
-        return {
+        return _wrap_handlers({
             "persona-builder": _planning_persona_handler,
             "story-architect": _planning_story_handler,
             "feature-analyst": _planning_feature_handler,
@@ -2568,9 +4367,9 @@ def build_lifecycle_workflow_handlers(
                 provider_registry=provider_registry,
                 llm_runtime=llm_runtime,
             ),
-        }
+        })
     if phase == "design":
-        return {
+        return _wrap_handlers({
             "claude-designer": _design_variant_handler(
                 "Claude Sonnet 4.6",
                 "Modern Minimal",
@@ -2604,9 +4403,9 @@ def build_lifecycle_workflow_handlers(
                 provider_registry=provider_registry,
                 llm_runtime=llm_runtime,
             ),
-        }
+        })
     if phase == "development":
-        return {
+        return _wrap_handlers({
             "planner": lambda node_id, state: _development_planner_handler(
                 node_id,
                 state,
@@ -2644,7 +4443,7 @@ def build_lifecycle_workflow_handlers(
                 provider_registry=provider_registry,
                 llm_runtime=llm_runtime,
             ),
-        }
+        })
     raise ValueError(f"Unsupported lifecycle phase: {phase}")
 
 
@@ -3066,187 +4865,310 @@ def _build_traceability(state: dict[str, Any], features: list[dict[str, Any]], m
     return traces
 
 
+def _research_packets_to_evidence(
+    node_id: str,
+    packets: list[dict[str, Any]],
+    *,
+    prefix: str,
+    relevance: str,
+) -> list[dict[str, Any]]:
+    return [
+        _evidence_entry(
+            f"ev-{prefix}-{index + 1}",
+            source_ref=str(packet.get("source_ref", "")),
+            source_type=str(packet.get("source_type", "url") or "url"),
+            snippet=_truncate_research_text(
+                packet.get("excerpt") or packet.get("description") or packet.get("text_excerpt") or packet.get("title"),
+                limit=240,
+            ),
+            relevance=relevance,
+        )
+        for index, packet in enumerate(packets[: _research_source_limit({"depth": "deep"})])
+        if str(packet.get("source_ref", "")).strip()
+    ]
+
+
+def _market_size_signal_from_packets(packets: list[dict[str, Any]]) -> str:
+    for packet in packets:
+        text = " ".join(
+            [
+                str(packet.get("description", "") or ""),
+                str(packet.get("excerpt", "") or ""),
+                str(packet.get("text_excerpt", "") or ""),
+            ]
+        )
+        match = re.search(
+            r"([^.!?]{0,60}(?:market size|market growth|cagr|billion|million|市場規模|成長率|%)[^.!?]{0,120})",
+            text,
+            re.IGNORECASE,
+        )
+        if match:
+            return _truncate_research_text(match.group(1), limit=180)
+    return "公開ソースでは定量的な市場規模の記述を確認できませんでした。"
+
+
+def _competitor_weaknesses_from_packet(packet: dict[str, Any], spec: str) -> list[str]:
+    text = " ".join(
+        [
+            str(packet.get("description", "") or ""),
+            str(packet.get("excerpt", "") or ""),
+            str(packet.get("text_excerpt", "") or ""),
+        ]
+    ).lower()
+    weaknesses: list[str] = []
+    pricing = _pricing_hint_from_packet(packet)
+    if pricing == "Not publicly listed":
+        weaknesses.append("公開ページでは料金体系を確認できませんでした。")
+    if _infer_product_kind(spec) == "operations" and not any(
+        term in text
+        for term in ("governance", "audit", "approval", "traceability", "lineage", "compliance")
+    ):
+        weaknesses.append("公開情報ではガバナンスや監査性の説明が限定的でした。")
+    if len(_normalize_space(packet.get("text_excerpt"))) < 180:
+        weaknesses.append("公開情報だけでは詳細比較に十分な情報量を確保できませんでした。")
+    return weaknesses[:2]
+
+
 def _research_competitor_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
-    urls = state.get("competitor_urls", []) or []
     spec = str(state.get("spec", ""))
+    anchor = _research_query_anchor(spec)
+    queries = _research_remediation_queries(
+        state,
+        node_id=node_id,
+        queries=[
+            f"{anchor} software",
+            f"{anchor} platform",
+            f"{anchor} alternatives",
+        ],
+    )
+    packets = _collect_research_source_packets(
+        state,
+        focus="competition",
+        queries=queries,
+        seed_urls=[str(item) for item in _as_list(state.get("competitor_urls")) if str(item).strip()],
+        include_brief_on_empty=True,
+        prefer_vendor_hosts=True,
+    )
+    source_packets = [packet for packet in packets if str(packet.get("source_type")) == "url"]
+    evidence_packets = source_packets or packets[:1]
+    evidence = _research_packets_to_evidence(
+        node_id,
+        evidence_packets,
+        prefix="competitor",
+        relevance="Competitive positioning reference",
+    )
     competitors: list[dict[str, Any]] = []
-    evidence: list[dict[str, Any]] = []
-    for index, raw_url in enumerate(urls[:4]):
-        parsed = urlparse(str(raw_url))
-        host = (parsed.hostname or "competitor").replace("www.", "")
-        name = host.split(".")[0].replace("-", " ").title()
+    for packet in source_packets[: _research_source_limit(state)]:
+        host = str(packet.get("host", "") or "")
+        name = str(packet.get("title", "") or "").split("|", 1)[0].split(" - ", 1)[0].strip()
         competitors.append(
             {
-                "name": name or "Competitor",
-                "url": str(raw_url),
-                "strengths": ["認知が高い", "導入事例が多い", "オンボーディングが分かりやすい"],
-                "weaknesses": ["差別化が弱い", "運用体験が画一的", "深い自律化には弱い"],
-                "pricing": "問い合わせ",
+                "name": _truncate_research_text(name or _source_label_from_host(host), limit=64),
+                "url": str(packet.get("url", "")),
+                "strengths": _source_observations([packet], limit=2),
+                "weaknesses": _competitor_weaknesses_from_packet(packet, spec),
+                "pricing": _pricing_hint_from_packet(packet),
                 "target": _segment_from_spec(spec),
             }
         )
-        evidence.append(
-            _evidence_entry(
-                f"ev-competitor-{index + 1}",
-                source_ref=str(raw_url),
-                source_type="url",
-                snippet=f"{name or 'Competitor'} appears positioned for {_segment_from_spec(spec)} buyers with broad onboarding promises.",
-                relevance="Competitive positioning reference",
-            )
+    claim_statement = (
+        "公開ソースから直接参照できる競合候補がまだ不足しており、差別化仮説は追加調査前提です。"
+        if not competitors
+        else (
+            f"公開ソースでは {competitors[0]['name']} を含む隣接プロダクトが確認でき、"
+            "差別化は feature breadth ではなく運用品質・説明責任・導入後の制御性で評価されやすい可能性があります。"
         )
-    if not competitors:
-        base_names = ["Pulse", "Atlas", "Launchpad"]
-        for index, base_name in enumerate(base_names):
-            name = f"{base_name} {spec[:18].strip() or 'Suite'}".strip()
-            competitors.append(
-                {
-                    "name": name,
-                    "strengths": ["セットアップが速い", "一貫した UI", "導入説明が明快"],
-                    "weaknesses": ["深い制御が弱い", "運用品質の可視化が浅い"],
-                    "pricing": "SaaS tier",
-                    "target": _segment_from_spec(spec),
-                }
-            )
-            evidence.append(
-                _evidence_entry(
-                    f"ev-competitor-{index + 1}",
-                    source_ref=f"synthetic://competitor/{_slug(name, prefix='competitor')}",
-                    source_type="synthetic-reference",
-                    snippet=f"{name} represents the common fast-setup but low-governance baseline in this segment.",
-                    relevance="Competitive baseline for differentiation",
-                )
-            )
+    )
     claims = [
         _claim_entry(
             "claim-competitive-gap",
-            statement="Most adjacent products optimize onboarding and breadth before governed autonomous execution, leaving a differentiation gap around traceable decision-making.",
+            statement=claim_statement,
             owner=node_id,
             category="competition",
-            evidence_ids=[item["id"] for item in evidence[:2]],
-            confidence=0.71,
+            evidence_ids=[item["id"] for item in evidence],
+            confidence=0.7 if not competitors else min(0.82, 0.66 + len(evidence) * 0.04),
         ),
     ]
+    node_result = _research_node_result(
+        node_id,
+        status="success" if competitors and source_packets else "degraded",
+        parse_status="strict",
+        artifact={"competitors": competitors, "claim_statement": claim_statement},
+        source_packets=evidence_packets,
+        degradation_reasons=(
+            []
+            if competitors and source_packets
+            else ["competitor_grounding_insufficient"]
+        ),
+        retry_count=_research_retry_count(state, node_id),
+    )
     return NodeResult(
         state_patch={
             "competitor_report": competitors,
             _node_state_key(node_id, "claims"): claims,
             _node_state_key(node_id, "evidence"): evidence,
+            _node_state_key(node_id, "sources"): evidence_packets,
+            _node_state_key(node_id, "result"): node_result,
         },
         artifacts=_artifacts(
-            {"name": "competitor-map", "kind": "research", "items": competitors},
+            {"name": "competitor-map", "kind": "research", "items": competitors, "sources": evidence_packets},
             {"name": "competitor-claims", "kind": "research", "claims": claims, "evidence": evidence},
         ),
-        metrics={"competitor_count": len(competitors)},
+        metrics={"competitor_count": len(competitors), "grounded_sources": len(evidence_packets)},
     )
 
 
 def _research_market_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
     spec = str(state.get("spec", ""))
-    keywords = _keywords(spec)
-    trends = _market_trends(spec)
+    anchor = _research_query_anchor(spec)
+    queries = _research_remediation_queries(
+        state,
+        node_id=node_id,
+        queries=[
+            f"{anchor} market trends",
+            f"{anchor} adoption",
+            f"{anchor} market size",
+        ],
+    )
+    packets = _collect_research_source_packets(
+        state,
+        focus="market",
+        queries=queries,
+        include_brief_on_empty=True,
+    )
+    external_packets = [packet for packet in packets if str(packet.get("source_type")) == "url"]
+    evidence = _research_packets_to_evidence(
+        node_id,
+        external_packets or packets,
+        prefix="market",
+        relevance="Market research reference",
+    )
+    observations = _source_observations(external_packets or packets, limit=4)
     opportunities = [
-        "安全性と自律性の両立を前提にした運用体験を提供する",
-        "プロダクト判断の根拠を artifact として残し、監査可能にする",
-    ]
-    if _contains_any(spec, "agent", "エージェント", "workflow", "ワークフロー"):
-        opportunities.append("複数 agent の協調と handoff を見える化する")
+        item
+        for item in observations
+        if any(hint in item.lower() for hint in _RESEARCH_POSITIVE_HINTS)
+    ][:2] or observations[:2]
+    threats = [
+        item
+        for item in observations
+        if any(hint in item.lower() for hint in _RESEARCH_NEGATIVE_HINTS)
+    ][:2]
+    if not threats and observations:
+        threats = observations[-2:]
     payload = {
-        "market_size": _market_size_from_spec(spec, keywords),
-        "trends": trends,
+        "market_size": _market_size_signal_from_packets(external_packets),
+        "trends": observations[:3],
         "opportunities": opportunities,
-        "threats": [
-            "機能幅だけが増え、運用品質が伴わないプラットフォーム化",
-            "UI と backend の契約ドリフトによる信頼低下",
-        ],
+        "threats": threats,
     }
-    evidence = [
-        _evidence_entry(
-            "ev-market-size",
-            source_ref="derived://market-size",
-            source_type="derived-analysis",
-            snippet=payload["market_size"],
-            relevance="Market sizing thesis",
-        ),
-        *[
-            _evidence_entry(
-                f"ev-trend-{index + 1}",
-                source_ref=f"derived://trend/{index + 1}",
-                source_type="derived-analysis",
-                snippet=trend,
-                relevance="Observed market trend",
-            )
-            for index, trend in enumerate(trends[:2])
-        ],
-    ]
+    claim_statement = (
+        "公開市場ソースの量がまだ少なく、需要仮説は brief ベースの仮説に留まっています。"
+        if not external_packets
+        else "公開ソースでは導入拡大と運用上の制約が併存しており、需要自体はある一方で差別化には具体的な運用品質の説明が必要です。"
+    )
     claims = [
         _claim_entry(
             "claim-market-demand",
-            statement="The segment is shifting toward evidence-backed automation and governance, so products that keep decisions and execution context in one loop have a timing advantage.",
+            statement=claim_statement,
             owner=node_id,
             category="market",
             evidence_ids=[item["id"] for item in evidence],
-            confidence=0.74,
+            confidence=0.65 if not external_packets else min(0.83, 0.67 + len(evidence) * 0.04),
         ),
     ]
+    node_result = _research_node_result(
+        node_id,
+        status="success" if external_packets else "degraded",
+        parse_status="strict",
+        artifact={**payload, "claim_statement": claim_statement},
+        source_packets=external_packets or packets,
+        degradation_reasons=[] if external_packets else ["market_grounding_insufficient"],
+        retry_count=_research_retry_count(state, node_id),
+    )
     return NodeResult(
         state_patch={
             "market_report": payload,
             _node_state_key(node_id, "claims"): claims,
             _node_state_key(node_id, "evidence"): evidence,
+            _node_state_key(node_id, "sources"): external_packets or packets,
+            _node_state_key(node_id, "result"): node_result,
         },
         artifacts=_artifacts(
             {"name": "market-research", "kind": "research", **payload},
             {"name": "market-claims", "kind": "research", "claims": claims, "evidence": evidence},
         ),
-        metrics={"trend_count": len(trends)},
+        metrics={"trend_count": len(payload["trends"]), "grounded_sources": len(external_packets)},
     )
 
 
 def _research_user_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
     spec = str(state.get("spec", ""))
+    anchor = _research_query_anchor(spec)
+    queries = _research_remediation_queries(
+        state,
+        node_id=node_id,
+        queries=[
+            f"{anchor} user pain points",
+            f"{anchor} workflow challenges",
+            f"{anchor} customer frustrations",
+        ],
+    )
+    packets = _collect_research_source_packets(
+        state,
+        focus="user",
+        queries=queries,
+        include_brief_on_empty=True,
+    )
+    external_packets = [packet for packet in packets if str(packet.get("source_type")) == "url"]
+    evidence = _research_packets_to_evidence(
+        node_id,
+        external_packets or packets,
+        prefix="user",
+        relevance="User demand or friction reference",
+    )
+    observations = _source_observations(external_packets or packets, limit=4)
+    pain_points = [
+        item
+        for item in observations
+        if any(hint in item.lower() for hint in _RESEARCH_NEGATIVE_HINTS)
+    ][:2] or observations[1:3] or observations[:2]
     payload = {
-        "signals": [
-            "意思決定の根拠を共有したい",
-            "手戻りなく企画から実装へ繋ぎたい",
-            "agent に任せても制御を失いたくない",
-        ],
-        "pain_points": [
-            "ツールが分断されていて handoff のたびに文脈が失われる",
-            "自律化しても品質保証が弱くレビュー負債が残る",
-        ],
+        "signals": observations[:3] or [_truncate_research_text(spec, limit=180)],
+        "pain_points": pain_points or [_truncate_research_text(spec, limit=180)],
         "segment": _segment_from_spec(spec),
     }
-    evidence = [
-        _evidence_entry(
-            "ev-user-signal-1",
-            source_ref="derived://user-signal/continuity",
-            source_type="derived-analysis",
-            snippet=payload["signals"][0],
-            relevance="Primary user demand signal",
-        ),
-        _evidence_entry(
-            "ev-user-pain-1",
-            source_ref="derived://user-pain/handoff",
-            source_type="derived-analysis",
-            snippet=payload["pain_points"][0],
-            relevance="Primary friction to solve",
-        ),
-    ]
+    claim_statement = (
+        "外部ユーザー調査ソースがまだ薄く、現在の課題理解は brief と公開記事に依存しています。"
+        if not external_packets
+        else "公開ソースでは導入判断時の不安、運用負荷、既存手順との統合摩擦が繰り返し現れており、信頼形成が主要な UX 論点になります。"
+    )
     claims = [
         _claim_entry(
             "claim-user-trust",
-            statement="The product must preserve context continuity and controllability, otherwise users will not trust autonomous execution beyond simple happy paths.",
+            statement=claim_statement,
             owner=node_id,
             category="user",
             evidence_ids=[item["id"] for item in evidence],
-            confidence=0.76,
+            confidence=0.67 if not external_packets else min(0.84, 0.69 + len(evidence) * 0.04),
         ),
     ]
+    node_result = _research_node_result(
+        node_id,
+        status="success" if external_packets else "degraded",
+        parse_status="strict",
+        artifact={**payload, "claim_statement": claim_statement},
+        source_packets=external_packets or packets,
+        degradation_reasons=[] if external_packets else ["user_grounding_insufficient"],
+        retry_count=_research_retry_count(state, node_id),
+    )
     return NodeResult(
         state_patch={
             "user_research": payload,
             _node_state_key(node_id, "claims"): claims,
             _node_state_key(node_id, "evidence"): evidence,
+            _node_state_key(node_id, "sources"): external_packets or packets,
+            _node_state_key(node_id, "result"): node_result,
         },
         artifacts=_artifacts(
             {"name": "user-signals", "kind": "research", **payload},
@@ -3257,40 +5179,597 @@ def _research_user_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
 
 def _research_tech_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
     spec = str(state.get("spec", ""))
-    score = 0.84 if _contains_any(spec, "workflow", "agent", "ui", "dashboard", "app") else 0.72
+    anchor = _research_query_anchor(spec)
+    queries = _research_remediation_queries(
+        state,
+        node_id=node_id,
+        queries=[
+            f"{anchor} implementation challenges",
+            f"{anchor} architecture",
+            f"{anchor} security integration",
+        ],
+    )
+    packets = _collect_research_source_packets(
+        state,
+        focus="technical",
+        queries=queries,
+        include_brief_on_empty=True,
+    )
+    external_packets = [packet for packet in packets if str(packet.get("source_type")) == "url"]
+    evidence = _research_packets_to_evidence(
+        node_id,
+        external_packets or packets,
+        prefix="tech",
+        relevance="Technical feasibility reference",
+    )
+    source_text = " ".join(
+        str(packet.get("text_excerpt", "") or packet.get("excerpt", "") or "")
+        for packet in external_packets
+    ).lower()
+    penalty = 0.0
+    if any(term in source_text for term in ("security", "privacy", "compliance", "regulation", "規制")):
+        penalty += 0.05
+    if any(term in source_text for term in ("integration", "migration", "legacy", "latency", "cost", "運用負荷")):
+        penalty += 0.06
+    base_score = 0.78 if _contains_any(spec, "workflow", "agent", "dashboard", "app", "platform") else 0.7
+    score = _clamp_score(base_score + min(len(external_packets) * 0.03, 0.09) - penalty, default=base_score)
+    observations = _source_observations(external_packets or packets, limit=3)
+    notes = (
+        "公開技術ソースを十分に取得できず、技術評価は brief ベースの初期推定です。"
+        if not external_packets
+        else " / ".join(observations[:2]) or "公開ソースでは統合・運用品質・安全性が主要な実装論点として現れています。"
+    )
     payload = {
         "score": round(score, 2),
-        "notes": "Reference implementation can be delivered quickly; production hardening depends on durable state, quality gates, and approval integration.",
+        "notes": _truncate_research_text(notes, limit=280),
     }
-    evidence = [
-        _evidence_entry(
-            "ev-tech-score",
-            source_ref="derived://technical-feasibility",
-            source_type="derived-analysis",
-            snippet=f"Technical feasibility score {payload['score']:.2f}. {payload['notes']}",
-            relevance="Delivery feasibility assessment",
-        )
-    ]
+    claim_statement = (
+        "プロトタイプ実装は可能でも、本番品質は統合、運用監視、安全性の設計次第で大きく上下します。"
+        if external_packets
+        else "現時点では実装難易度を裏づける外部技術ソースが不足しており、技術リスクの多くは未検証です。"
+    )
     claims = [
         _claim_entry(
             "claim-technical-feasibility",
-            statement="The concept is technically feasible for a prototype, but autonomous quality depends on durable state, explicit quality gates, and operator-visible recovery paths.",
+            statement=claim_statement,
             owner=node_id,
             category="technical",
             evidence_ids=[item["id"] for item in evidence],
-            confidence=0.79 if score >= 0.8 else 0.68,
+            confidence=0.7 if not external_packets else min(0.84, 0.68 + len(evidence) * 0.04),
         ),
     ]
+    node_result = _research_node_result(
+        node_id,
+        status="success" if external_packets else "degraded",
+        parse_status="strict",
+        artifact={**payload, "claim_statement": claim_statement},
+        source_packets=external_packets or packets,
+        degradation_reasons=[] if external_packets else ["technical_grounding_insufficient"],
+        retry_count=_research_retry_count(state, node_id),
+    )
     return NodeResult(
         state_patch={
             "technical_report": payload,
             _node_state_key(node_id, "claims"): claims,
             _node_state_key(node_id, "evidence"): evidence,
+            _node_state_key(node_id, "sources"): external_packets or packets,
+            _node_state_key(node_id, "result"): node_result,
         },
         artifacts=_artifacts(
             {"name": "risk-register", "kind": "research", "tech_feasibility": payload},
             {"name": "tech-claims", "kind": "research", "claims": claims, "evidence": evidence},
         ),
+    )
+
+
+def _normalized_research_strings(values: Any, *, limit: int = 3, char_limit: int = 180) -> list[str]:
+    return _research_text_fragments(values, max_items=limit, char_limit=char_limit)
+
+
+async def _research_peer_delegations(
+    *,
+    node_id: str,
+    plan: dict[str, Any],
+    artifact_payload: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    peer_feedback: list[dict[str, Any]] = []
+    delegations: list[dict[str, Any]] = []
+    for delegation in _as_list(plan.get("delegations"))[:2]:
+        delegation_payload = _as_dict(delegation)
+        delegated = await _delegate_to_lifecycle_peer(
+            phase="research",
+            node_id=node_id,
+            peer_name=str(delegation_payload.get("peer", "")),
+            skill_name=str(delegation_payload.get("skill", "")),
+            artifact_payload=artifact_payload,
+            reason=str(delegation_payload.get("reason", "")),
+            quality_targets=[str(item) for item in _as_list(plan.get("quality_targets")) if str(item).strip()],
+        )
+        if delegated is None:
+            continue
+        delegations.append(delegated)
+        feedback = _as_dict(delegated.get("feedback"))
+        if feedback:
+            peer_feedback.append(feedback)
+    return delegations, peer_feedback
+
+
+def _research_autonomous_node_result(
+    *,
+    base: NodeResult,
+    node_id: str,
+    state_overrides: dict[str, Any],
+    plan: dict[str, Any],
+    delegations: list[dict[str, Any]],
+    peer_feedback: list[dict[str, Any]],
+    llm_events: list[dict[str, Any]],
+) -> NodeResult:
+    return NodeResult(
+        state_patch={
+            **base.state_patch,
+            **state_overrides,
+            _skill_plan_state_key(node_id): plan,
+            _delegation_state_key(node_id): delegations,
+            _peer_feedback_state_key(node_id): peer_feedback,
+        },
+        artifacts=_artifacts(
+            *[dict(item) for item in base.artifacts],
+            {"name": f"{node_id}-skill-plan", "kind": "skill-plan", **plan},
+            *[
+                {
+                    "name": f"{node_id}-{str(item.get('peer', 'peer'))}-review",
+                    "kind": "peer-review",
+                    **_as_dict(item.get("feedback")),
+                }
+                for item in delegations
+                if _as_dict(item.get("feedback"))
+            ],
+        ),
+        llm_events=llm_events,
+        metrics={**base.metrics, "research_mode": "provider-backed-autonomous"},
+    )
+
+
+async def _research_competitor_autonomous_handler(
+    node_id: str,
+    state: dict[str, Any],
+    *,
+    provider_registry: ProviderRegistry | None = None,
+    llm_runtime: LLMRuntime | None = None,
+) -> NodeResult:
+    base = _research_competitor_handler(node_id, state)
+    source_packets = [_as_dict(item) for item in _as_list(base.state_patch.get(_node_state_key(node_id, "sources"))) if _as_dict(item)]
+    if not _provider_backed_lifecycle_available(provider_registry) or not source_packets:
+        return base
+    plan, plan_events = await _plan_node_collaboration(
+        phase="research",
+        node_id=node_id,
+        state=state,
+        objective="Ground the competitive landscape in real web sources and avoid invented competitors or claims.",
+        provider_registry=provider_registry,
+        llm_runtime=llm_runtime,
+    )
+    payload, llm_events, llm_meta = await _research_llm_json(
+        provider_registry=provider_registry,
+        llm_runtime=llm_runtime,
+        preferred_model=_preferred_lifecycle_model(node_id, provider_registry),
+        purpose=f"lifecycle-research-{node_id}",
+        static_instruction=(
+            "You are a competitive intelligence analyst. Return JSON only. "
+            "Use only the provided source packets. Do not invent companies, URLs, pricing, strengths, or weaknesses."
+        ),
+        user_prompt=(
+            "Return JSON with keys competitors, claim_statement, confidence.\n"
+            "Each competitor must include name, url, strengths, weaknesses, pricing, target.\n"
+            "Use empty arrays when evidence is insufficient.\n"
+            f"Product spec: {state.get('spec')}\n"
+            f"Source packets: {_compact_lifecycle_value(source_packets)}\n"
+            f"Baseline competitors: {_compact_lifecycle_value(base.state_patch.get('competitor_report'))}\n"
+            f"Selected skills: {plan.get('selected_skills')}\n"
+            f"Delegation plan: {plan.get('delegations')}\n"
+        ),
+        schema_name="research-competitor",
+        required_keys=["competitors", "claim_statement", "confidence"],
+        phase="research",
+        node_id=node_id,
+    )
+    competitors = [_as_dict(item) for item in _as_list(base.state_patch.get("competitor_report")) if _as_dict(item)]
+    if isinstance(payload, dict):
+        packet_by_url = {
+            str(packet.get("source_ref", "")): packet
+            for packet in source_packets
+            if str(packet.get("source_ref", "")).strip()
+        }
+        refined: list[dict[str, Any]] = []
+        for raw in _as_list(payload.get("competitors"))[: _research_source_limit(state)]:
+            item = _as_dict(raw)
+            if not item:
+                continue
+            url = _normalize_external_url(str(item.get("url", "") or ""))
+            packet = packet_by_url.get(url)
+            if packet is None:
+                continue
+            refined.append(
+                {
+                    "name": _truncate_research_text(
+                        _first_research_text(
+                            item.get("name"),
+                            default=str(packet.get("title") or _source_label_from_host(str(packet.get("host", "")))),
+                            char_limit=64,
+                        ),
+                        limit=64,
+                    ),
+                    "url": url,
+                    "strengths": _normalized_research_strings(item.get("strengths"), limit=2, char_limit=150) or _source_observations([packet], limit=2),
+                    "weaknesses": _normalized_research_strings(item.get("weaknesses"), limit=2, char_limit=150) or _competitor_weaknesses_from_packet(packet, str(state.get("spec", ""))),
+                    "pricing": _truncate_research_text(
+                        _first_research_text(item.get("pricing"), default=_pricing_hint_from_packet(packet), char_limit=80),
+                        limit=80,
+                    ),
+                    "target": _truncate_research_text(
+                        _first_research_text(item.get("target"), default=_segment_from_spec(str(state.get("spec", ""))), char_limit=80),
+                        limit=80,
+                    ),
+                }
+            )
+        if refined:
+            competitors = refined
+    claim_statement = (
+        _first_research_text(_as_dict(payload).get("claim_statement"))
+        or str(_as_list(base.state_patch.get(_node_state_key(node_id, "claims")))[0].get("statement", ""))
+    )
+    confidence = _clamp_score(
+        _as_dict(payload).get("confidence"),
+        default=float(_as_list(base.state_patch.get(_node_state_key(node_id, "claims")))[0].get("confidence", 0.7) or 0.7),
+    )
+    claims = [
+        _claim_entry(
+            "claim-competitive-gap",
+            statement=claim_statement,
+            owner=node_id,
+            category="competition",
+            evidence_ids=[item["id"] for item in _as_list(base.state_patch.get(_node_state_key(node_id, "evidence")))],
+            confidence=confidence,
+        ),
+    ]
+    node_result = _research_node_result(
+        node_id,
+        status="success" if competitors and source_packets and llm_meta.get("parse_status") != "failed" else "degraded",
+        parse_status=str(llm_meta.get("parse_status", "strict")),
+        artifact={"competitors": competitors, "claim_statement": claim_statement},
+        source_packets=source_packets,
+        degradation_reasons=list(llm_meta.get("degradation_reasons", [])),
+        raw_preview=str(llm_meta.get("raw_preview", "")),
+        llm_events=llm_events,
+        retry_count=_research_retry_count(state, node_id),
+    )
+    delegations, peer_feedback = await _research_peer_delegations(
+        node_id=node_id,
+        plan=plan,
+        artifact_payload={
+            "focus": "competition",
+            "sources": source_packets,
+            "competitors": competitors,
+            "claim": claims[0],
+        },
+    )
+    return _research_autonomous_node_result(
+        base=base,
+        node_id=node_id,
+        state_overrides={
+            "competitor_report": competitors,
+            _node_state_key(node_id, "claims"): claims,
+            _node_state_key(node_id, "result"): node_result,
+        },
+        plan=plan,
+        delegations=delegations,
+        peer_feedback=peer_feedback,
+        llm_events=[*plan_events, *llm_events],
+    )
+
+
+async def _research_market_autonomous_handler(
+    node_id: str,
+    state: dict[str, Any],
+    *,
+    provider_registry: ProviderRegistry | None = None,
+    llm_runtime: LLMRuntime | None = None,
+) -> NodeResult:
+    base = _research_market_handler(node_id, state)
+    source_packets = [_as_dict(item) for item in _as_list(base.state_patch.get(_node_state_key(node_id, "sources"))) if _as_dict(item)]
+    if not _provider_backed_lifecycle_available(provider_registry) or not source_packets:
+        return base
+    plan, plan_events = await _plan_node_collaboration(
+        phase="research",
+        node_id=node_id,
+        state=state,
+        objective="Synthesize market signals from grounded public sources and separate opportunity from risk.",
+        provider_registry=provider_registry,
+        llm_runtime=llm_runtime,
+    )
+    payload, llm_events, llm_meta = await _research_llm_json(
+        provider_registry=provider_registry,
+        llm_runtime=llm_runtime,
+        preferred_model=_preferred_lifecycle_model(node_id, provider_registry),
+        purpose=f"lifecycle-research-{node_id}",
+        static_instruction=(
+            "You are a market researcher. Return JSON only. "
+            "Use only the provided source packets. If quantitative market sizing is missing, say so explicitly."
+        ),
+        user_prompt=(
+            "Return JSON with keys market_size, trends, opportunities, threats, claim_statement, confidence.\n"
+            f"Product spec: {state.get('spec')}\n"
+            f"Source packets: {_compact_lifecycle_value(source_packets)}\n"
+            f"Baseline market report: {_compact_lifecycle_value(base.state_patch.get('market_report'))}\n"
+            f"Selected skills: {plan.get('selected_skills')}\n"
+        ),
+        schema_name="research-market",
+        required_keys=["market_size", "trends", "opportunities", "threats", "claim_statement", "confidence"],
+        phase="research",
+        node_id=node_id,
+    )
+    market_report = _as_dict(base.state_patch.get("market_report"))
+    if isinstance(payload, dict):
+        market_report = {
+            "market_size": _truncate_research_text(
+                _first_research_text(
+                    payload.get("market_size"),
+                    default=str(market_report.get("market_size", "")),
+                    char_limit=180,
+                ),
+                limit=180,
+            ),
+            "trends": _normalized_research_strings(payload.get("trends"), limit=3) or _normalized_research_strings(market_report.get("trends"), limit=3),
+            "opportunities": _normalized_research_strings(payload.get("opportunities"), limit=3) or _normalized_research_strings(market_report.get("opportunities"), limit=3),
+            "threats": _normalized_research_strings(payload.get("threats"), limit=3) or _normalized_research_strings(market_report.get("threats"), limit=3),
+        }
+    claim_statement = (
+        _first_research_text(_as_dict(payload).get("claim_statement"))
+        or str(_as_list(base.state_patch.get(_node_state_key(node_id, "claims")))[0].get("statement", ""))
+    )
+    confidence = _clamp_score(
+        _as_dict(payload).get("confidence"),
+        default=float(_as_list(base.state_patch.get(_node_state_key(node_id, "claims")))[0].get("confidence", 0.7) or 0.7),
+    )
+    claims = [
+        _claim_entry(
+            "claim-market-demand",
+            statement=claim_statement,
+            owner=node_id,
+            category="market",
+            evidence_ids=[item["id"] for item in _as_list(base.state_patch.get(_node_state_key(node_id, "evidence")))],
+            confidence=confidence,
+        ),
+    ]
+    node_result = _research_node_result(
+        node_id,
+        status="success" if source_packets and llm_meta.get("parse_status") != "failed" else "degraded",
+        parse_status=str(llm_meta.get("parse_status", "strict")),
+        artifact={**market_report, "claim_statement": claim_statement},
+        source_packets=source_packets,
+        degradation_reasons=list(llm_meta.get("degradation_reasons", [])),
+        raw_preview=str(llm_meta.get("raw_preview", "")),
+        llm_events=llm_events,
+        retry_count=_research_retry_count(state, node_id),
+    )
+    delegations, peer_feedback = await _research_peer_delegations(
+        node_id=node_id,
+        plan=plan,
+        artifact_payload={"focus": "market", "sources": source_packets, "market_report": market_report, "claim": claims[0]},
+    )
+    return _research_autonomous_node_result(
+        base=base,
+        node_id=node_id,
+        state_overrides={
+            "market_report": market_report,
+            _node_state_key(node_id, "claims"): claims,
+            _node_state_key(node_id, "result"): node_result,
+        },
+        plan=plan,
+        delegations=delegations,
+        peer_feedback=peer_feedback,
+        llm_events=[*plan_events, *llm_events],
+    )
+
+
+async def _research_user_autonomous_handler(
+    node_id: str,
+    state: dict[str, Any],
+    *,
+    provider_registry: ProviderRegistry | None = None,
+    llm_runtime: LLMRuntime | None = None,
+) -> NodeResult:
+    base = _research_user_handler(node_id, state)
+    source_packets = [_as_dict(item) for item in _as_list(base.state_patch.get(_node_state_key(node_id, "sources"))) if _as_dict(item)]
+    if not _provider_backed_lifecycle_available(provider_registry) or not source_packets:
+        return base
+    plan, plan_events = await _plan_node_collaboration(
+        phase="research",
+        node_id=node_id,
+        state=state,
+        objective="Extract grounded user signals and pain points from public evidence without inventing interview data.",
+        provider_registry=provider_registry,
+        llm_runtime=llm_runtime,
+    )
+    payload, llm_events, llm_meta = await _research_llm_json(
+        provider_registry=provider_registry,
+        llm_runtime=llm_runtime,
+        preferred_model=_preferred_lifecycle_model(node_id, provider_registry),
+        purpose=f"lifecycle-research-{node_id}",
+        static_instruction=(
+            "You are a user researcher. Return JSON only. "
+            "Use only the provided public source packets and clearly grounded observations."
+        ),
+        user_prompt=(
+            "Return JSON with keys signals, pain_points, segment, claim_statement, confidence.\n"
+            f"Product spec: {state.get('spec')}\n"
+            f"Source packets: {_compact_lifecycle_value(source_packets)}\n"
+            f"Baseline user research: {_compact_lifecycle_value(base.state_patch.get('user_research'))}\n"
+            f"Selected skills: {plan.get('selected_skills')}\n"
+        ),
+        schema_name="research-user",
+        required_keys=["signals", "pain_points", "segment", "claim_statement", "confidence"],
+        phase="research",
+        node_id=node_id,
+    )
+    user_research = _as_dict(base.state_patch.get("user_research"))
+    if isinstance(payload, dict):
+        user_research = {
+            "signals": _normalized_research_strings(payload.get("signals"), limit=3) or _normalized_research_strings(user_research.get("signals"), limit=3),
+            "pain_points": _normalized_research_strings(payload.get("pain_points"), limit=3) or _normalized_research_strings(user_research.get("pain_points"), limit=3),
+            "segment": _truncate_research_text(
+                _first_research_text(
+                    payload.get("segment") or user_research.get("segment"),
+                    default=_segment_from_spec(str(state.get("spec", ""))),
+                    char_limit=80,
+                ),
+                limit=80,
+            ),
+        }
+    claim_statement = (
+        _first_research_text(_as_dict(payload).get("claim_statement"))
+        or str(_as_list(base.state_patch.get(_node_state_key(node_id, "claims")))[0].get("statement", ""))
+    )
+    confidence = _clamp_score(
+        _as_dict(payload).get("confidence"),
+        default=float(_as_list(base.state_patch.get(_node_state_key(node_id, "claims")))[0].get("confidence", 0.7) or 0.7),
+    )
+    claims = [
+        _claim_entry(
+            "claim-user-trust",
+            statement=claim_statement,
+            owner=node_id,
+            category="user",
+            evidence_ids=[item["id"] for item in _as_list(base.state_patch.get(_node_state_key(node_id, "evidence")))],
+            confidence=confidence,
+        ),
+    ]
+    node_result = _research_node_result(
+        node_id,
+        status="success" if source_packets and llm_meta.get("parse_status") != "failed" else "degraded",
+        parse_status=str(llm_meta.get("parse_status", "strict")),
+        artifact={**user_research, "claim_statement": claim_statement},
+        source_packets=source_packets,
+        degradation_reasons=list(llm_meta.get("degradation_reasons", [])),
+        raw_preview=str(llm_meta.get("raw_preview", "")),
+        llm_events=llm_events,
+        retry_count=_research_retry_count(state, node_id),
+    )
+    delegations, peer_feedback = await _research_peer_delegations(
+        node_id=node_id,
+        plan=plan,
+        artifact_payload={"focus": "user", "sources": source_packets, "user_research": user_research, "claim": claims[0]},
+    )
+    return _research_autonomous_node_result(
+        base=base,
+        node_id=node_id,
+        state_overrides={
+            "user_research": user_research,
+            _node_state_key(node_id, "claims"): claims,
+            _node_state_key(node_id, "result"): node_result,
+        },
+        plan=plan,
+        delegations=delegations,
+        peer_feedback=peer_feedback,
+        llm_events=[*plan_events, *llm_events],
+    )
+
+
+async def _research_tech_autonomous_handler(
+    node_id: str,
+    state: dict[str, Any],
+    *,
+    provider_registry: ProviderRegistry | None = None,
+    llm_runtime: LLMRuntime | None = None,
+) -> NodeResult:
+    base = _research_tech_handler(node_id, state)
+    source_packets = [_as_dict(item) for item in _as_list(base.state_patch.get(_node_state_key(node_id, "sources"))) if _as_dict(item)]
+    if not _provider_backed_lifecycle_available(provider_registry) or not source_packets:
+        return base
+    plan, plan_events = await _plan_node_collaboration(
+        phase="research",
+        node_id=node_id,
+        state=state,
+        objective="Calibrate technical feasibility against grounded implementation, integration, and security signals.",
+        provider_registry=provider_registry,
+        llm_runtime=llm_runtime,
+    )
+    payload, llm_events, llm_meta = await _research_llm_json(
+        provider_registry=provider_registry,
+        llm_runtime=llm_runtime,
+        preferred_model=_preferred_lifecycle_model(node_id, provider_registry),
+        purpose=f"lifecycle-research-{node_id}",
+        static_instruction=(
+            "You are a technical evaluator. Return JSON only. "
+            "Ground the score and notes in the provided source packets and do not invent benchmarks."
+        ),
+        user_prompt=(
+            "Return JSON with keys score, notes, claim_statement, confidence.\n"
+            f"Product spec: {state.get('spec')}\n"
+            f"Source packets: {_compact_lifecycle_value(source_packets)}\n"
+            f"Baseline technical report: {_compact_lifecycle_value(base.state_patch.get('technical_report'))}\n"
+            f"Selected skills: {plan.get('selected_skills')}\n"
+        ),
+        schema_name="research-technical",
+        required_keys=["score", "notes", "claim_statement", "confidence"],
+        phase="research",
+        node_id=node_id,
+    )
+    technical_report = _as_dict(base.state_patch.get("technical_report"))
+    if isinstance(payload, dict):
+        technical_report = {
+            "score": _clamp_score(payload.get("score"), default=float(technical_report.get("score", 0.7) or 0.7)),
+            "notes": _truncate_research_text(
+                _first_research_text(payload.get("notes"), default=str(technical_report.get("notes", "")), char_limit=280),
+                limit=280,
+            ),
+        }
+    claim_statement = (
+        _first_research_text(_as_dict(payload).get("claim_statement"))
+        or str(_as_list(base.state_patch.get(_node_state_key(node_id, "claims")))[0].get("statement", ""))
+    )
+    confidence = _clamp_score(
+        _as_dict(payload).get("confidence"),
+        default=float(_as_list(base.state_patch.get(_node_state_key(node_id, "claims")))[0].get("confidence", 0.7) or 0.7),
+    )
+    claims = [
+        _claim_entry(
+            "claim-technical-feasibility",
+            statement=claim_statement,
+            owner=node_id,
+            category="technical",
+            evidence_ids=[item["id"] for item in _as_list(base.state_patch.get(_node_state_key(node_id, "evidence")))],
+            confidence=confidence,
+        ),
+    ]
+    node_result = _research_node_result(
+        node_id,
+        status="success" if source_packets and llm_meta.get("parse_status") != "failed" else "degraded",
+        parse_status=str(llm_meta.get("parse_status", "strict")),
+        artifact={**technical_report, "claim_statement": claim_statement},
+        source_packets=source_packets,
+        degradation_reasons=list(llm_meta.get("degradation_reasons", [])),
+        raw_preview=str(llm_meta.get("raw_preview", "")),
+        llm_events=llm_events,
+        retry_count=_research_retry_count(state, node_id),
+    )
+    delegations, peer_feedback = await _research_peer_delegations(
+        node_id=node_id,
+        plan=plan,
+        artifact_payload={"focus": "technical", "sources": source_packets, "technical_report": technical_report, "claim": claims[0]},
+    )
+    return _research_autonomous_node_result(
+        base=base,
+        node_id=node_id,
+        state_overrides={
+            "technical_report": technical_report,
+            _node_state_key(node_id, "claims"): claims,
+            _node_state_key(node_id, "result"): node_result,
+        },
+        plan=plan,
+        delegations=delegations,
+        peer_feedback=peer_feedback,
+        llm_events=[*plan_events, *llm_events],
     )
 
 
@@ -3305,13 +5784,17 @@ def _research_synthesizer_handler(node_id: str, state: dict[str, Any]) -> NodeRe
     research = {
         "competitors": list(state.get("competitor_report", [])),
         "market_size": market.get("market_size", "Early but expanding operational market"),
-        "trends": list(market.get("trends", [])),
-        "opportunities": list(market.get("opportunities", [])),
-        "threats": list(market.get("threats", [])),
+        "trends": _normalized_research_strings(market.get("trends"), limit=3),
+        "opportunities": _normalized_research_strings(market.get("opportunities"), limit=3),
+        "threats": _normalized_research_strings(market.get("threats"), limit=3),
         "user_research": {
-            "signals": list(user_research.get("signals", [])),
-            "pain_points": list(user_research.get("pain_points", [])),
-            "segment": user_research.get("segment", _segment_from_spec(str(state.get("spec", "")))),
+            "signals": _normalized_research_strings(user_research.get("signals"), limit=3),
+            "pain_points": _normalized_research_strings(user_research.get("pain_points"), limit=3),
+            "segment": _first_research_text(
+                user_research.get("segment"),
+                default=_segment_from_spec(str(state.get("spec", ""))),
+                char_limit=80,
+            ),
         },
         "tech_feasibility": {
             "score": technical.get("score", 0.75),
@@ -3321,7 +5804,11 @@ def _research_synthesizer_handler(node_id: str, state: dict[str, Any]) -> NodeRe
         "evidence": evidence,
         "dissent": [],
         "open_questions": [],
-        "winning_theses": [str(item.get("statement", "")) for item in winning if str(item.get("statement", "")).strip()],
+        "winning_theses": _normalized_research_strings(
+            [item.get("statement") for item in winning],
+            limit=3,
+            char_limit=220,
+        ),
         "confidence_summary": {
             "average": round(sum(confidence_values) / len(confidence_values), 2) if confidence_values else 0.0,
             "floor": round(min(confidence_values), 2) if confidence_values else 0.0,
@@ -3355,7 +5842,7 @@ def _research_evidence_librarian_handler(node_id: str, state: dict[str, Any]) ->
         [
             str(item.get("source_ref", "")).strip()
             for item in normalized
-            if str(item.get("source_type", "")).strip() in {"url", "synthetic-reference", "derived-analysis"}
+            if str(item.get("source_type", "")).strip() == "url"
         ]
     )
     return NodeResult(
@@ -3366,6 +5853,58 @@ def _research_evidence_librarian_handler(node_id: str, state: dict[str, Any]) ->
         },
         artifacts=_artifacts({"name": "claim-ledger", "kind": "research", "evidence": normalized, "source_links": source_links}),
     )
+
+
+async def _execute_research_retry_node(
+    node_id: str,
+    state: dict[str, Any],
+    *,
+    provider_registry: ProviderRegistry | None,
+    llm_runtime: LLMRuntime | None,
+) -> NodeResult | None:
+    if node_id == "competitor-analyst":
+        return await _research_competitor_autonomous_handler(
+            node_id,
+            state,
+            provider_registry=provider_registry,
+            llm_runtime=llm_runtime,
+        )
+    if node_id == "market-researcher":
+        return await _research_market_autonomous_handler(
+            node_id,
+            state,
+            provider_registry=provider_registry,
+            llm_runtime=llm_runtime,
+        )
+    if node_id == "user-researcher":
+        return await _research_user_autonomous_handler(
+            node_id,
+            state,
+            provider_registry=provider_registry,
+            llm_runtime=llm_runtime,
+        )
+    if node_id == "tech-evaluator":
+        return await _research_tech_autonomous_handler(
+            node_id,
+            state,
+            provider_registry=provider_registry,
+            llm_runtime=llm_runtime,
+        )
+    if node_id == "devils-advocate-researcher":
+        return await _research_devils_advocate_handler(
+            node_id,
+            state,
+            provider_registry=provider_registry,
+            llm_runtime=llm_runtime,
+        )
+    if node_id == "cross-examiner":
+        return _research_cross_examiner_handler(
+            node_id,
+            state,
+            provider_registry=provider_registry,
+            llm_runtime=llm_runtime,
+        )
+    return None
 
 
 async def _research_devils_advocate_handler(
@@ -3403,7 +5942,7 @@ async def _research_devils_advocate_handler(
     )
     llm_events: list[dict[str, Any]] = []
     if _provider_backed_lifecycle_available(provider_registry) and claims:
-        payload, llm_events, _ = await _lifecycle_llm_json(
+        payload, llm_events, llm_meta = await _research_llm_json(
             provider_registry=provider_registry,
             llm_runtime=llm_runtime,
             preferred_model=_preferred_lifecycle_model(node_id, provider_registry),
@@ -3419,30 +5958,48 @@ async def _research_devils_advocate_handler(
                 f"User signals: {_as_dict(research.get('user_research')).get('signals')}\n"
                 "dissent items must include claim_id, argument, severity, recommended_test."
             ),
+            schema_name="research-devils-advocate",
+            required_keys=["dissent", "open_questions"],
+            phase="research",
+            node_id=node_id,
         )
         raw_dissent = [
             _dissent_entry(
                 f"dissent-llm-{index + 1}",
                 claim_id=str(_as_dict(item).get("claim_id", "")),
                 challenger=node_id,
-                argument=str(_as_dict(item).get("argument", "")).strip(),
-                severity=str(_as_dict(item).get("severity", "medium")).strip() or "medium",
-                recommended_test=str(_as_dict(item).get("recommended_test", "")).strip(),
+                argument=_first_research_text(_as_dict(item).get("argument")),
+                severity=_first_research_text(_as_dict(item).get("severity"), default="medium", char_limit=24) or "medium",
+                recommended_test=_first_research_text(_as_dict(item).get("recommended_test")),
             )
             for index, item in enumerate(_as_list(_as_dict(payload).get("dissent")))
-            if str(_as_dict(item).get("claim_id", "")).strip() and str(_as_dict(item).get("argument", "")).strip()
+            if str(_as_dict(item).get("claim_id", "")).strip() and _first_research_text(_as_dict(item).get("argument"))
         ]
         if raw_dissent:
             fallback_dissent = raw_dissent
-        llm_questions = _dedupe_strings(
-            [str(item).strip() for item in _as_list(_as_dict(payload).get("open_questions")) if str(item).strip()]
-        )
+        llm_questions = _normalized_research_strings(_as_dict(payload).get("open_questions"), limit=4, char_limit=220)
         if llm_questions:
             fallback_questions = llm_questions
+    else:
+        llm_meta = {"parse_status": "strict", "raw_preview": ""}
+    node_result = _research_node_result(
+        node_id,
+        status="success" if fallback_dissent else "degraded",
+        parse_status=str(llm_meta.get("parse_status", "strict")),
+        artifact={
+            "dissent_count": len(fallback_dissent),
+            "open_question_count": len(fallback_questions),
+        },
+        degradation_reasons=list(llm_meta.get("degradation_reasons", [])),
+        raw_preview=str(llm_meta.get("raw_preview", "")),
+        llm_events=llm_events,
+        retry_count=_research_retry_count(state, node_id),
+    )
     return NodeResult(
         state_patch={
             _node_state_key(node_id, "dissent"): fallback_dissent,
             _node_state_key(node_id, "open_questions"): fallback_questions,
+            _node_state_key(node_id, "result"): node_result,
         },
         artifacts=_artifacts({"name": "research-dissent", "kind": "research", "dissent": fallback_dissent, "open_questions": fallback_questions}),
         llm_events=llm_events,
@@ -3466,7 +6023,11 @@ def _research_cross_examiner_handler(
     updated_claims: list[dict[str, Any]] = []
     updated_dissent: list[dict[str, Any]] = []
     open_questions = _dedupe_strings(
-        [str(item) for item in _as_list(state.get(_node_state_key("devils-advocate-researcher", "open_questions"))) if str(item).strip()]
+        _normalized_research_strings(
+            state.get(_node_state_key("devils-advocate-researcher", "open_questions")),
+            limit=8,
+            char_limit=220,
+        )
     )
     for claim in claims:
         claim_id = str(claim.get("id", "")).strip()
@@ -3487,11 +6048,28 @@ def _research_cross_examiner_handler(
         updated_dissent.extend(resolved_claim_dissent)
         if evidence_count < 2:
             open_questions.append(f"{claim.get('statement')} を裏づける追加 evidence が必要")
+    node_result = _research_node_result(
+        node_id,
+        status="success" if not [item for item in updated_dissent if str(item.get("severity")) == "critical" and item.get("resolved") is not True] else "degraded",
+        parse_status="strict",
+        artifact={
+            "claim_count": len(updated_claims),
+            "unresolved_dissent_count": len([item for item in updated_dissent if item.get("resolved") is not True]),
+            "open_question_count": len(_dedupe_strings(open_questions)),
+        },
+        degradation_reasons=(
+            []
+            if not [item for item in updated_dissent if str(item.get("severity")) == "critical" and item.get("resolved") is not True]
+            else ["critical_dissent_unresolved"]
+        ),
+        retry_count=_research_retry_count(state, node_id),
+    )
     return NodeResult(
         state_patch={
             _node_state_key(node_id, "claims"): updated_claims,
             _node_state_key(node_id, "dissent"): updated_dissent,
             _node_state_key(node_id, "open_questions"): _dedupe_strings(open_questions),
+            _node_state_key(node_id, "result"): node_result,
         },
         artifacts=_artifacts({"name": "research-cross-examination", "kind": "research", "claims": updated_claims, "dissent": updated_dissent}),
     )
@@ -3504,74 +6082,295 @@ async def _research_judge_handler(
     provider_registry: ProviderRegistry | None = None,
     llm_runtime: LLMRuntime | None = None,
 ) -> NodeResult:
-    research = _as_dict(state.get("research"))
-    claims = _collect_state_lists(state, node_ids=("cross-examiner",), suffix="claims") or [_as_dict(item) for item in _as_list(research.get("claims")) if _as_dict(item)]
-    dissent = _collect_state_lists(state, node_ids=("cross-examiner",), suffix="dissent")
-    open_questions = _dedupe_strings(
-        [str(item) for item in _as_list(state.get(_node_state_key("cross-examiner", "open_questions"))) if str(item).strip()]
-    )
+    working_state = dict(state)
     llm_events: list[dict[str, Any]] = []
-    llm_summary = ""
-    if _provider_backed_lifecycle_available(provider_registry) and claims:
-        payload, llm_events, _ = await _lifecycle_llm_json(
-            provider_registry=provider_registry,
-            llm_runtime=llm_runtime,
-            preferred_model=_preferred_lifecycle_model(node_id, provider_registry),
-            purpose=f"lifecycle-research-{node_id}",
-            static_instruction=(
-                "You are a research judge. Return JSON only with keys winning_theses, claim_confidence_overrides, summary, open_questions. "
-                "Use conservative confidence updates."
+    remediation_trace: list[dict[str, Any]] = []
+    remediation_iteration = 0
+    max_remediation_iterations = 2
+    retained_summary = ""
+    retained_winning_theses: list[str] = []
+    retained_open_questions: list[str] = []
+    retained_overrides: dict[str, float] = {}
+    target_language = str(state.get("output_language", "ja") or "ja")
+
+    while True:
+        research = _as_dict(working_state.get("research"))
+        remediation_context = _research_remediation_context(working_state)
+        claims = _collect_state_lists(working_state, node_ids=("cross-examiner",), suffix="claims") or [
+            _as_dict(item) for item in _as_list(research.get("claims")) if _as_dict(item)
+        ]
+        dissent = _collect_state_lists(working_state, node_ids=("cross-examiner",), suffix="dissent")
+        open_questions = _dedupe_strings(
+            _normalized_research_strings(
+                working_state.get(_node_state_key("cross-examiner", "open_questions")),
+                limit=8,
+                char_limit=220,
+            )
+        )
+        if open_questions:
+            retained_open_questions = _dedupe_strings(retained_open_questions + open_questions)
+        llm_summary = ""
+        llm_winning_theses: list[str] = []
+        llm_meta = {"parse_status": "strict", "raw_preview": "", "degradation_reasons": []}
+        if _provider_backed_lifecycle_available(provider_registry) and claims:
+            payload, judge_events, llm_meta = await _research_llm_json(
+                provider_registry=provider_registry,
+                llm_runtime=llm_runtime,
+                preferred_model=_preferred_lifecycle_model(node_id, provider_registry),
+                purpose=f"lifecycle-research-{node_id}",
+                static_instruction=(
+                    "You are a research judge. Return JSON only with keys winning_theses, claim_confidence_overrides, summary, open_questions, blocking_reasons, retry_node_ids. "
+                    "Use conservative confidence updates."
+                ),
+                user_prompt=(
+                    "Return JSON only.\n"
+                    f"Claims: {claims}\n"
+                    f"Dissent: {dissent}\n"
+                    f"Open questions: {open_questions}\n"
+                ),
+                schema_name="research-judge",
+                required_keys=[
+                    "winning_theses",
+                    "claim_confidence_overrides",
+                    "summary",
+                    "open_questions",
+                    "blocking_reasons",
+                    "retry_node_ids",
+                ],
+                phase="research",
+                node_id=node_id,
+            )
+            llm_events.extend(judge_events)
+            llm_summary = _first_research_text(_as_dict(payload).get("summary"), char_limit=280)
+            if llm_summary:
+                retained_summary = llm_summary
+            overrides = _claim_confidence_overrides(_as_dict(payload).get("claim_confidence_overrides"))
+            if not overrides:
+                overrides = _claim_confidence_overrides(_as_dict(payload).get("winning_theses"))
+            if overrides:
+                retained_overrides.update(overrides)
+            overrides = dict(retained_overrides)
+            if overrides:
+                patched_claims = []
+                for claim in claims:
+                    claim_id = str(claim.get("id", ""))
+                    if claim_id in overrides:
+                        confidence = _clamp_score(
+                            overrides.get(claim_id),
+                            default=float(claim.get("confidence", 0.72) or 0.72),
+                        )
+                        unresolved = [
+                            item
+                            for item in dissent
+                            if str(item.get("claim_id", "")) == claim_id
+                            and item.get("resolved") is not True
+                        ]
+                        patched_claims.append(
+                            {
+                                **claim,
+                                "confidence": confidence,
+                                "status": _claim_status(confidence, unresolved),
+                            }
+                        )
+                    else:
+                        patched_claims.append(claim)
+                claims = patched_claims
+            llm_questions = _normalized_research_strings(
+                _as_dict(payload).get("open_questions"),
+                limit=8,
+                char_limit=220,
+            )
+            if llm_questions:
+                retained_open_questions = _dedupe_strings(retained_open_questions + llm_questions)
+            open_questions = _dedupe_strings(open_questions + retained_open_questions)
+            llm_winning_theses = _normalized_research_strings(
+                _as_dict(payload).get("winning_theses"),
+                limit=3,
+                char_limit=220,
+            )
+            if llm_winning_theses:
+                retained_winning_theses = llm_winning_theses
+        open_questions = _dedupe_strings(open_questions + retained_open_questions)
+
+        winners = _winning_claims(claims)
+        confidence_values = [float(item.get("confidence", 0.0) or 0.0) for item in claims]
+        node_results = _collect_research_node_results(working_state)
+        final_research = {
+            **research,
+            "claims": claims,
+            "evidence": _collect_state_lists(
+                working_state,
+                node_ids=("evidence-librarian",),
+                suffix="evidence",
+            ) or _as_list(research.get("evidence")),
+            "dissent": dissent,
+            "source_links": _as_list(
+                working_state.get(_node_state_key("evidence-librarian", "source_links"))
+            ) or _as_list(research.get("source_links")),
+            "open_questions": open_questions,
+            "winning_theses": retained_winning_theses
+            or llm_winning_theses
+            or _normalized_research_strings(
+                [item.get("statement") for item in winners],
+                limit=3,
+                char_limit=220,
             ),
-            user_prompt=(
-                "Return JSON only.\n"
-                f"Claims: {claims}\n"
-                f"Dissent: {dissent}\n"
-                f"Open questions: {open_questions}\n"
+            "confidence_summary": {
+                "average": round(sum(confidence_values) / len(confidence_values), 2)
+                if confidence_values
+                else 0.0,
+                "floor": round(min(confidence_values), 2) if confidence_values else 0.0,
+                "accepted": sum(
+                    1 for item in claims if str(item.get("status")) == "accepted"
+                ),
+            },
+            "judge_summary": llm_summary
+            or retained_summary
+            or "Claims that survived dissent are passed to planning together with unresolved questions.",
+            "critical_dissent_count": sum(
+                1
+                for item in dissent
+                if str(item.get("severity")) == "critical"
+                and item.get("resolved") is not True
+            ),
+            "resolved_dissent_count": sum(
+                1 for item in dissent if item.get("resolved") is True
+            ),
+            "model_assignments": _phase_model_assignments(
+                list(_RESEARCH_PROPOSAL_NODES) + list(_RESEARCH_REVIEW_NODES)
+            ),
+            "low_diversity_mode": _phase_low_diversity_mode(
+                list(_RESEARCH_PROPOSAL_NODES) + list(_RESEARCH_REVIEW_NODES)
+            ),
+            "execution_trace": remediation_trace,
+        }
+        quality_gates, readiness, remediation_plan = _evaluate_research_quality(
+            final_research,
+            node_results=node_results,
+            remaining_iterations=max(
+                0,
+                max_remediation_iterations - remediation_iteration,
             ),
         )
-        llm_summary = str(_as_dict(payload).get("summary", "")).strip()
-        overrides = _as_dict(_as_dict(payload).get("claim_confidence_overrides"))
-        if overrides:
-            patched_claims = []
-            for claim in claims:
-                claim_id = str(claim.get("id", ""))
-                if claim_id in overrides:
-                    confidence = _clamp_score(overrides.get(claim_id), default=float(claim.get("confidence", 0.72) or 0.72))
-                    unresolved = [item for item in dissent if str(item.get("claim_id", "")) == claim_id and item.get("resolved") is not True]
-                    patched_claims.append({**claim, "confidence": confidence, "status": _claim_status(confidence, unresolved)})
-                else:
-                    patched_claims.append(claim)
-            claims = patched_claims
-        llm_questions = _dedupe_strings([str(item).strip() for item in _as_list(_as_dict(payload).get("open_questions")) if str(item).strip()])
-        if llm_questions:
-            open_questions = _dedupe_strings(open_questions + llm_questions)
-    winners = _winning_claims(claims)
-    confidence_values = [float(item.get("confidence", 0.0) or 0.0) for item in claims]
-    final_research = {
-        **research,
-        "claims": claims,
-        "evidence": _collect_state_lists(state, node_ids=("evidence-librarian",), suffix="evidence") or _as_list(research.get("evidence")),
-        "dissent": dissent,
-        "source_links": _as_list(state.get(_node_state_key("evidence-librarian", "source_links"))) or _as_list(research.get("source_links")),
-        "open_questions": open_questions,
-        "winning_theses": [str(item.get("statement", "")) for item in winners if str(item.get("statement", "")).strip()],
-        "confidence_summary": {
-            "average": round(sum(confidence_values) / len(confidence_values), 2) if confidence_values else 0.0,
-            "floor": round(min(confidence_values), 2) if confidence_values else 0.0,
-            "accepted": sum(1 for item in claims if str(item.get("status")) == "accepted"),
-        },
-        "judge_summary": llm_summary or "Claims that survived dissent are passed to planning together with unresolved questions.",
-        "critical_dissent_count": sum(1 for item in dissent if str(item.get("severity")) == "critical" and item.get("resolved") is not True),
-        "resolved_dissent_count": sum(1 for item in dissent if item.get("resolved") is True),
-        "model_assignments": _phase_model_assignments(list(_RESEARCH_PROPOSAL_NODES) + list(_RESEARCH_REVIEW_NODES)),
-        "low_diversity_mode": _phase_low_diversity_mode(list(_RESEARCH_PROPOSAL_NODES) + list(_RESEARCH_REVIEW_NODES)),
-    }
-    return NodeResult(
-        state_patch={"research": final_research, "output": final_research},
-        artifacts=_artifacts({"name": "research-judgement", "kind": "research", **final_research}),
-        llm_events=llm_events,
-        metrics={"review_mode": "provider-backed" if llm_events else "deterministic-reference"},
-    )
+        judge_reasons = list(llm_meta.get("degradation_reasons", []))
+        if readiness != "ready":
+            judge_reasons.extend(
+                [
+                    f"quality_gate_failed:{gate['id']}"
+                    for gate in quality_gates
+                    if gate.get("passed") is not True
+                ]
+            )
+        judge_result = _research_node_result(
+            node_id,
+            status="success" if readiness == "ready" else "degraded",
+            parse_status=str(llm_meta.get("parse_status", "strict")),
+            artifact={
+                "readiness": readiness,
+                "winning_thesis_count": len(final_research["winning_theses"]),
+                "quality_gate_count": len(quality_gates),
+            },
+            degradation_reasons=judge_reasons,
+            raw_preview=str(llm_meta.get("raw_preview", "")),
+            llm_events=llm_events,
+            retry_count=_research_retry_count(working_state, node_id)
+            + remediation_iteration,
+        )
+        final_research["node_results"] = [*node_results, judge_result]
+        final_research["quality_gates"] = quality_gates
+        final_research["readiness"] = readiness
+        if remediation_plan:
+            final_research["remediation_plan"] = remediation_plan
+        else:
+            final_research.pop("remediation_plan", None)
+        final_research["autonomous_remediation"] = _research_autonomous_remediation_state(
+            final_research,
+            quality_gates=quality_gates,
+            remediation_plan=remediation_plan,
+            remediation_context=remediation_context,
+            readiness=readiness,
+        )
+        canonical_research = dict(final_research)
+        localized_research, localization_events, localization_meta = await _localize_research_output(
+            canonical_research,
+            target_language=target_language,
+            provider_registry=provider_registry,
+            llm_runtime=llm_runtime,
+        )
+        localized_research["autonomous_remediation"] = _research_autonomous_remediation_state(
+            localized_research,
+            quality_gates=quality_gates,
+            remediation_plan=localized_research.get("remediation_plan")
+            if isinstance(localized_research.get("remediation_plan"), dict)
+            else remediation_plan,
+            remediation_context=remediation_context,
+            readiness=readiness,
+        )
+        final_research = {
+            **localized_research,
+            "canonical": canonical_research,
+            "localized": dict(localized_research),
+        }
+        runtime_output = _research_runtime_output(final_research)
+        if localization_meta.get("status") not in {None, "noop", "skipped"}:
+            judge_result["artifact"]["localized"] = True
+        llm_events.extend(localization_events)
+
+        if readiness == "ready" or remediation_plan is None:
+            return NodeResult(
+                state_patch={
+                    "research": final_research,
+                    "output": runtime_output,
+                    _node_state_key(node_id, "result"): judge_result,
+                },
+                artifacts=_artifacts(_research_judgement_artifact(final_research)),
+                llm_events=llm_events,
+                metrics={
+                    "review_mode": "provider-backed" if llm_events else "deterministic-reference",
+                    "remediation_iterations": remediation_iteration,
+                },
+                event_output=runtime_output,
+            )
+
+        remediation_iteration += 1
+        working_state["research"] = final_research
+        remediation_trace.append(
+            {
+                "iteration": remediation_iteration,
+                "retry_node_ids": list(remediation_plan.get("retryNodeIds", [])),
+                "objective": str(remediation_plan.get("objective", "")),
+            }
+        )
+        for retry_node_id in remediation_plan.get("retryNodeIds", []):
+            retried = await _execute_research_retry_node(
+                str(retry_node_id),
+                working_state,
+                provider_registry=provider_registry,
+                llm_runtime=llm_runtime,
+            )
+            if retried is None:
+                continue
+            working_state.update(retried.state_patch)
+            llm_events.extend(list(retried.llm_events))
+        synth = _research_synthesizer_handler("research-synthesizer", working_state)
+        working_state.update(synth.state_patch)
+        librarian = _research_evidence_librarian_handler("evidence-librarian", working_state)
+        working_state.update(librarian.state_patch)
+        advocate = await _research_devils_advocate_handler(
+            "devils-advocate-researcher",
+            working_state,
+            provider_registry=provider_registry,
+            llm_runtime=llm_runtime,
+        )
+        working_state.update(advocate.state_patch)
+        llm_events.extend(list(advocate.llm_events))
+        examiner = _research_cross_examiner_handler(
+            "cross-examiner",
+            working_state,
+            provider_registry=provider_registry,
+            llm_runtime=llm_runtime,
+        )
+        working_state.update(examiner.state_patch)
 
 
 def _planning_persona_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
@@ -3742,6 +6541,8 @@ async def _planning_scope_skeptic_handler(
                 "Prefer cutting scope over vague risk language."
             ),
             user_prompt=f"Features: {features}\nResearch: {_as_dict(state.get('research'))}\n",
+            phase="planning",
+            node_id=node_id,
         )
         raw_rejected = [
             {
@@ -3948,6 +6749,8 @@ async def _planning_judge_handler(
                 f"Assumptions: {assumptions}\n"
                 f"Negative personas: {negative_personas}\n"
             ),
+            phase="planning",
+            node_id=node_id,
         )
         llm_recommendations = _dedupe_strings([str(item).strip() for item in _as_list(_as_dict(payload).get("recommendations")) if str(item).strip()])
         if llm_recommendations:
@@ -4111,6 +6914,8 @@ def _design_variant_handler(
                 "Return JSON only and optimize for operator trust, visual clarity, accessibility, and strong differentiation."
             ),
             user_prompt=proposal_prompt,
+            phase="design",
+            node_id=node_id,
         )
         critique_prompt = (
             "Critique and improve this design concept. Return JSON only with the same keys "
@@ -4131,6 +6936,8 @@ def _design_variant_handler(
                 "Strengthen weaknesses instead of restating the same concept."
             ),
             user_prompt=critique_prompt,
+            phase="design",
+            node_id=node_id,
         )
         payload = refined or proposal
         if not isinstance(payload, dict):
@@ -4269,6 +7076,8 @@ def _design_evaluator_handler(
                 "Prefer variants that are differentiated, accessible, responsive, and clearly aligned with the selected product scope."
             ),
             user_prompt=evaluation_prompt,
+            phase="design",
+            node_id=node_id,
         )
         if not isinstance(payload, dict):
             design_payload = {"variants": ordered}
@@ -4388,6 +7197,8 @@ def _development_planner_handler(
                     f"Selected design: {state.get('selected_design') or state.get('design')}\n"
                     f"Skill plan: {collaboration_plan}\n"
                 ),
+                phase="development",
+                node_id=node_id,
             )
             if not isinstance(payload, dict):
                 return NodeResult(
@@ -4516,6 +7327,8 @@ def _development_frontend_handler(
                     f"Skill plan: {collaboration_plan}\n"
                     "Bias toward application/workspace surfaces. Do not collapse the layout into a landing page."
                 ),
+                phase="development",
+                node_id=node_id,
             )
             if not isinstance(llm_payload, dict):
                 return NodeResult(
@@ -4609,6 +7422,8 @@ def _development_backend_handler(
                     f"Milestones: {state.get('milestones')}\n"
                     f"Skill plan: {collaboration_plan}\n"
                 ),
+                phase="development",
+                node_id=node_id,
             )
             if not isinstance(llm_payload, dict):
                 return NodeResult(
@@ -4733,6 +7548,8 @@ def _development_integrator_handler(
                     "a viewport meta tag, real application navigation, and multiple prototype screen surfaces. "
                     "Do not return a landing page or hero-only layout."
                 ),
+                phase="development",
+                node_id=node_id,
             )
             llm_code = str(_as_dict(llm_payload).get("code") or "")
             llm_sections = [str(item) for item in _as_list(_as_dict(llm_payload).get("build_sections")) if str(item).strip()] or frontend_sections
@@ -5110,6 +7927,8 @@ def _development_reviewer_handler(
                     "Revise the current HTML so the blockers are addressed while improving accessibility, responsive behavior, and clarity.\n"
                     f"Current HTML:\n{current_code}"
                 ),
+                phase="development",
+                node_id=node_id,
             )
             llm_events.extend(events)
             if not isinstance(payload, dict):

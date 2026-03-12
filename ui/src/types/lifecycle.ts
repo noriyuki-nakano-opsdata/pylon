@@ -52,6 +52,7 @@ export interface PhaseBlueprint {
 export interface LifecycleResearchConfig {
   competitorUrls: string[];
   depth: LifecycleResearchDepth;
+  outputLanguage?: string;
 }
 
 export interface ApprovalComment {
@@ -168,6 +169,14 @@ export interface LifecyclePhaseRun {
   artifactCount: number;
   decisionCount: number;
   costUsd: number;
+  costMeasured?: boolean;
+  totalTokens?: number;
+  meteredTokens?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  reasoningTokens?: number;
   executionSummary: Record<string, unknown>;
 }
 
@@ -238,6 +247,49 @@ export interface ConfidenceSummary {
   critical_findings?: number;
 }
 
+export interface ResearchNodeResult {
+  nodeId: string;
+  status: "success" | "degraded" | "failed";
+  parseStatus: "strict" | "repaired" | "fallback" | "failed";
+  degradationReasons: string[];
+  sourceClassesSatisfied: string[];
+  missingSourceClasses: string[];
+  artifact: Record<string, unknown>;
+  rawPreview?: string;
+  llmModel?: string;
+  llmProvider?: string;
+  retryCount: number;
+}
+
+export interface ResearchQualityGateResult {
+  id: string;
+  title: string;
+  passed: boolean;
+  reason: string;
+  blockingNodeIds: string[];
+}
+
+export interface ResearchRemediationPlan {
+  objective: string;
+  retryNodeIds: string[];
+  maxIterations: number;
+}
+
+export interface ResearchAutonomousRemediation {
+  status: "not_needed" | "queued" | "retrying" | "resolved" | "blocked";
+  attemptCount: number;
+  maxAttempts: number;
+  remainingAttempts: number;
+  autoRunnable?: boolean;
+  objective: string;
+  retryNodeIds: string[];
+  blockingGateIds: string[];
+  blockingNodeIds?: string[];
+  missingSourceClasses?: string[];
+  blockingSummary?: string[];
+  stopReason?: string;
+}
+
 export interface MarketResearch {
   competitors: Competitor[];
   market_size: string;
@@ -262,6 +314,16 @@ export interface MarketResearch {
   low_diversity_mode?: boolean;
   critical_dissent_count?: number;
   resolved_dissent_count?: number;
+  node_results?: ResearchNodeResult[];
+  quality_gates?: ResearchQualityGateResult[];
+  readiness?: "ready" | "rework" | "failed";
+  remediation_plan?: ResearchRemediationPlan;
+  autonomous_remediation?: ResearchAutonomousRemediation;
+  execution_trace?: Array<Record<string, unknown>>;
+  canonical?: Record<string, unknown>;
+  localized?: Record<string, unknown>;
+  display_language?: string;
+  localization_status?: string;
 }
 
 /* ── Planning (Analysis) ── */
@@ -633,6 +695,74 @@ export interface BuildProgress {
   qualityScore: number;
   costUsd: number;
   agentActivity: { agent: string; status: "idle" | "working" | "done" }[];
+}
+
+export interface WorkflowRunLiveSnapshot {
+  id: string;
+  status: string;
+  startedAt: string;
+  completedAt: string | null;
+  error?: string;
+}
+
+export interface WorkflowRunLiveEvent {
+  seq: number | null;
+  timestamp?: string;
+  nodeId: string;
+  agent?: string;
+  status: "running" | "completed" | "failed" | "pending";
+  summary: string;
+}
+
+export interface WorkflowRunLiveTelemetry {
+  run: WorkflowRunLiveSnapshot | null;
+  phase?: LifecyclePhase | null;
+  eventCount: number;
+  completedNodeCount: number;
+  runningNodeIds: string[];
+  failedNodeIds: string[];
+  lastEventSeq: number | null;
+  activeFocusNodeId?: string;
+  lastNodeId?: string;
+  lastAgent?: string;
+  recentNodeIds: string[];
+  recentEvents: WorkflowRunLiveEvent[];
+}
+
+export interface LifecyclePhaseRuntimeSummary {
+  phase: LifecyclePhase;
+  status: string;
+  objective?: string;
+  blockingSummary: string[];
+  readiness?: "ready" | "rework" | "failed";
+  failedGateCount?: number;
+  degradedNodeCount?: number;
+  attemptCount?: number;
+  maxAttempts?: number;
+  canAutorun?: boolean;
+  nextAutomaticAction?: string;
+  agents?: LifecyclePhaseRuntimeAgent[];
+  recentActions?: LifecyclePhaseRuntimeAction[];
+}
+
+export interface LifecyclePhaseRuntimeAgent {
+  agentId: string;
+  label: string;
+  role: string;
+  status: "idle" | "running" | "completed" | "failed";
+  currentTask: string;
+  delegatedTo?: string;
+  lastArtifactTitle?: string;
+}
+
+export interface LifecyclePhaseRuntimeAction {
+  nodeId: string;
+  label: string;
+  status: string;
+  summary: string;
+  agent?: string;
+  agentLabel?: string;
+  nodeLabel?: string;
 }
 
 /* ── Project Data (persisted per lifecycle) ── */
