@@ -33,7 +33,8 @@ from pylon.api.schemas import (
     WORKFLOW_RUN_SCHEMA,
     validate,
 )
-from pylon.api.server import APIServer, HandlerFunc, Request, Response
+from pylon.api.server import APIServer, HandlerFunc, Request, Response, StreamingBody
+from pylon.agents.cognitive import ReActEngine
 from pylon.approval import ApprovalManager
 from pylon.approval.manager import (
     ApprovalAlreadyDecidedError,
@@ -52,6 +53,7 @@ from pylon.control_plane.adapters import (
     StoreBackedAuditRepository,
 )
 from pylon.control_plane.workflow_service import WorkflowRunService
+from pylon.di import ServiceContainer
 from pylon.dsl.parser import PylonProject
 from pylon.lifecycle import (
     PHASE_ORDER,
@@ -80,9 +82,15 @@ from pylon.lifecycle import (
 from pylon.providers.base import Message, TokenUsage
 from pylon.repository.audit import default_hmac_key
 from pylon.runtime.llm import ProviderRegistry
+from pylon.skills.compat import (
+    SkillCompatibilityLayer,
+    get_default_skill_compatibility_layer,
+)
+from pylon.skills.runtime import SkillRuntime, get_default_skill_runtime
 from pylon.types import AutonomyLevel
 
 logger = logging.getLogger(__name__)
+LIFECYCLE_RUNTIME_EXECUTABLE_PHASES: tuple[str, ...] = ("research", "planning", "design", "development")
 
 
 MISSION_TASK_STATUSES = {"backlog", "in_progress", "review", "done"}
@@ -109,52 +117,202 @@ DEFAULT_AUDIT_AGENTS = (
 ADS_PLATFORMS = ("google", "meta", "linkedin", "tiktok", "microsoft")
 DEFAULT_TEAM_DEFINITIONS: tuple[dict[str, str], ...] = (
     {
-        "id": "development",
-        "name": "Engineering",
-        "nameJa": "エンジニアリング",
-        "icon": "Code2",
-        "color": "text-blue-400",
-        "bg": "bg-blue-600",
+        "id": "product",
+        "name": "Product Strategy",
+        "nameJa": "プロダクト戦略",
+        "icon": "Network",
+        "color": "text-orange-400",
+        "bg": "bg-orange-600",
+    },
+    {
+        "id": "research",
+        "name": "Research Intelligence",
+        "nameJa": "リサーチ",
+        "icon": "PenTool",
+        "color": "text-emerald-400",
+        "bg": "bg-emerald-600",
     },
     {
         "id": "design",
-        "name": "Design",
-        "nameJa": "デザイン",
+        "name": "UX & Design Systems",
+        "nameJa": "UX / デザインシステム",
         "icon": "Palette",
         "color": "text-purple-400",
         "bg": "bg-pink-600",
     },
     {
-        "id": "research",
-        "name": "Research & Writing",
-        "nameJa": "リサーチ & ライティング",
-        "icon": "PenTool",
-        "color": "text-emerald-400",
-        "bg": "bg-violet-600",
+        "id": "development",
+        "name": "Application Engineering",
+        "nameJa": "アプリケーション開発",
+        "icon": "Code2",
+        "color": "text-blue-400",
+        "bg": "bg-blue-600",
+    },
+    {
+        "id": "platform",
+        "name": "Platform & Infra",
+        "nameJa": "プラットフォーム / 基盤",
+        "icon": "Monitor",
+        "color": "text-sky-400",
+        "bg": "bg-sky-600",
     },
     {
         "id": "data",
-        "name": "Data & AI",
-        "nameJa": "データ & AI",
+        "name": "Data & Evaluation",
+        "nameJa": "データ / 評価",
         "icon": "Zap",
         "color": "text-cyan-400",
         "bg": "bg-cyan-600",
     },
     {
         "id": "security",
-        "name": "Security",
-        "nameJa": "セキュリティ",
+        "name": "Security & Governance",
+        "nameJa": "セキュリティ / ガバナンス",
         "icon": "Shield",
         "color": "text-red-400",
         "bg": "bg-red-600",
     },
     {
-        "id": "product",
-        "name": "Product & Ops",
-        "nameJa": "プロダクト & 運用",
-        "icon": "Network",
-        "color": "text-orange-400",
-        "bg": "bg-orange-600",
+        "id": "operations",
+        "name": "Operations & Release",
+        "nameJa": "運用 / リリース",
+        "icon": "Bot",
+        "color": "text-amber-400",
+        "bg": "bg-amber-600",
+    },
+)
+DEFAULT_AGENT_DEFINITIONS: tuple[dict[str, Any], ...] = (
+    {
+        "id": "product-orchestrator",
+        "name": "Product Orchestrator",
+        "model": "anthropic/claude-sonnet-4-6",
+        "role": "Initiative framing, prioritization, and cross-team orchestration.",
+        "team": "product",
+        "tools": ["planning", "triage", "coordination"],
+        "skills": ["product-strategy", "workflow-orchestration"],
+        "autonomy": "A2",
+        "sandbox": "gvisor",
+    },
+    {
+        "id": "delivery-manager",
+        "name": "Delivery Manager",
+        "model": "openai/gpt-5-mini",
+        "role": "Keeps milestones, handoffs, and release decisions on track.",
+        "team": "product",
+        "tools": ["checklists", "approvals", "tracking"],
+        "skills": ["delivery-management", "handoff-review"],
+        "autonomy": "A2",
+        "sandbox": "gvisor",
+    },
+    {
+        "id": "competitive-researcher",
+        "name": "Competitive Researcher",
+        "model": "moonshot/kimi-k2.5",
+        "role": "Competitive and market discovery grounded in public sources.",
+        "team": "research",
+        "tools": ["http", "browser", "notes"],
+        "skills": ["competitive-intelligence", "market-research"],
+        "autonomy": "A3",
+        "sandbox": "gvisor",
+    },
+    {
+        "id": "user-insight-analyst",
+        "name": "User Insight Analyst",
+        "model": "anthropic/claude-sonnet-4-6",
+        "role": "JTBD, persona, and friction synthesis from research signals.",
+        "team": "research",
+        "tools": ["interview-analysis", "synthesis", "journey-mapping"],
+        "skills": ["persona-research", "jtbd-analysis"],
+        "autonomy": "A3",
+        "sandbox": "gvisor",
+    },
+    {
+        "id": "ux-architect",
+        "name": "UX Architect",
+        "model": "gemini/gemini-3-pro-preview",
+        "role": "Primary UX flow, IA, and prototype direction.",
+        "team": "design",
+        "tools": ["wireframing", "prototype", "a11y-check"],
+        "skills": ["interaction-design", "information-architecture"],
+        "autonomy": "A3",
+        "sandbox": "gvisor",
+    },
+    {
+        "id": "design-critic",
+        "name": "Design Critic",
+        "model": "openai/gpt-5-mini",
+        "role": "Raises UI quality, accessibility, and visual differentiation.",
+        "team": "design",
+        "tools": ["critique", "a11y-check", "responsive-review"],
+        "skills": ["design-critique", "accessibility-review"],
+        "autonomy": "A2",
+        "sandbox": "gvisor",
+    },
+    {
+        "id": "frontend-builder",
+        "name": "Frontend Builder",
+        "model": "openai/gpt-5-mini",
+        "role": "Builds interactive product surfaces and responsive UI.",
+        "team": "development",
+        "tools": ["typescript", "react", "tailwind"],
+        "skills": ["frontend-implementation", "responsive-ui"],
+        "autonomy": "A3",
+        "sandbox": "gvisor",
+    },
+    {
+        "id": "backend-integrator",
+        "name": "Backend Integrator",
+        "model": "zhipu/glm-4-plus",
+        "role": "API contracts, orchestration, and persistence integration.",
+        "team": "development",
+        "tools": ["python", "api", "sqlite"],
+        "skills": ["backend-integration", "artifact-assembly"],
+        "autonomy": "A3",
+        "sandbox": "gvisor",
+    },
+    {
+        "id": "platform-engineer",
+        "name": "Platform Engineer",
+        "model": "zhipu/glm-4-plus",
+        "role": "Runtime stability, execution pipelines, and deployment plumbing.",
+        "team": "platform",
+        "tools": ["observability", "deploy", "runtime"],
+        "skills": ["platform-ops", "workflow-runtime"],
+        "autonomy": "A2",
+        "sandbox": "gvisor",
+    },
+    {
+        "id": "evaluation-analyst",
+        "name": "Evaluation Analyst",
+        "model": "moonshot/kimi-k2.5",
+        "role": "Measures quality, confidence, and experiment outcomes.",
+        "team": "data",
+        "tools": ["analysis", "metrics", "experiments"],
+        "skills": ["quality-evaluation", "experiment-design"],
+        "autonomy": "A2",
+        "sandbox": "gvisor",
+    },
+    {
+        "id": "safety-guardian",
+        "name": "Safety Guardian",
+        "model": "anthropic/claude-sonnet-4-6",
+        "role": "Security, safety posture, and approval gate review.",
+        "team": "security",
+        "tools": ["policy", "security-review", "audit"],
+        "skills": ["security-review", "safety-review"],
+        "autonomy": "A2",
+        "sandbox": "gvisor",
+    },
+    {
+        "id": "release-operator",
+        "name": "Release Operator",
+        "model": "openai/gpt-5-mini",
+        "role": "Release readiness, rollout checks, and incident coordination.",
+        "team": "operations",
+        "tools": ["release-checks", "runbooks", "monitoring"],
+        "skills": ["delivery-review", "release-management"],
+        "autonomy": "A2",
+        "sandbox": "gvisor",
     },
 )
 ADS_INDUSTRY_TEMPLATES: tuple[dict[str, Any], ...] = (
@@ -336,6 +494,19 @@ def _allocate_budget(raw_weights: dict[str, float], total_budget: int) -> dict[s
 
 def _team_store_key(tenant_id: str, team_id: str) -> str:
     return f"{tenant_id}:{team_id}"
+
+
+def _default_team_sort_key(team_id: str) -> tuple[int, str]:
+    default_order = {
+        definition["id"]: index
+        for index, definition in enumerate(DEFAULT_TEAM_DEFINITIONS)
+    }
+    return (default_order.get(team_id, len(default_order)), team_id)
+
+
+def _default_agent_id(tenant_id: str, agent_id: str) -> str:
+    tenant_slug = _slugify_identifier(tenant_id, prefix="tenant")
+    return f"{tenant_slug}-{agent_id}"
 
 
 def _model_policy_store_key(tenant_id: str, provider_name: str) -> str:
@@ -697,7 +868,10 @@ def register_routes(
     observability: APIObservabilityBundle | None = None,
     readiness_route_enabled: bool = True,
     metrics_route_enabled: bool = True,
+    container: ServiceContainer | None = None,
     provider_registry: ProviderRegistry | None = None,
+    skill_runtime: SkillRuntime | None = None,
+    compatibility_layer: SkillCompatibilityLayer | None = None,
 ) -> RouteStore:
     """Register all API routes on the server. Returns the store."""
     s = store or RouteStore(
@@ -708,7 +882,15 @@ def register_routes(
     public_contract = PublicContractRegistry()
     if observability is not None:
         setattr(s, "_observability", observability)
-    workflow_service = WorkflowRunService(s, provider_registry=provider_registry)
+    if container is not None:
+        if provider_registry is not None:
+            container.override(ProviderRegistry, provider_registry)
+        workflow_service = container.resolve(WorkflowRunService)
+        provider_registry = container.resolve_optional(ProviderRegistry, provider_registry)
+    else:
+        workflow_service = WorkflowRunService(s, provider_registry=provider_registry)
+    skill_runtime = skill_runtime or get_default_skill_runtime()
+    compatibility_layer = compatibility_layer or get_default_skill_compatibility_layer()
 
     def _workflow_summary(
         workflow_id: str,
@@ -866,17 +1048,143 @@ def register_routes(
 
         return errors
 
-    def _agent_skill_payload(skill_id: str) -> dict[str, Any]:
-        if skill_id in s.skills:
-            return dict(s.skills[skill_id])
+    def _effective_skill_catalog(tenant_id: str) -> dict[str, Any]:
+        control_plane_skills = {
+            str(skill_id): dict(payload)
+            for skill_id, payload in s.skills.items()
+        }
+        return {
+            skill_id: skill.to_payload(include_content=True)
+            for skill_id, skill in skill_runtime.effective_catalog(
+                tenant_id=tenant_id,
+                control_plane_skills=control_plane_skills,
+            ).items()
+        }
+
+    def _matching_skill_payloads(
+        catalog: dict[str, dict[str, Any]],
+        identifier: str,
+        *,
+        source_id: str = "",
+    ) -> list[dict[str, Any]]:
+        trimmed = str(identifier).strip()
+        if not trimmed:
+            return []
+        if trimmed in catalog:
+            candidate = dict(catalog[trimmed])
+            if source_id and str(candidate.get("source_id", "")) != source_id:
+                return []
+            return [candidate]
+        matches: list[dict[str, Any]] = []
+        for skill in catalog.values():
+            if source_id and str(skill.get("source_id", "")) != source_id:
+                continue
+            alias = str(skill.get("alias", skill.get("skill_key", skill.get("id", "")))).strip()
+            skill_key = str(skill.get("skill_key", alias)).strip()
+            if trimmed in {alias, skill_key}:
+                matches.append(dict(skill))
+        return matches
+
+    def _resolve_skill_payload(
+        catalog: dict[str, dict[str, Any]],
+        identifier: str,
+        *,
+        source_id: str = "",
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        matches = _matching_skill_payloads(catalog, identifier, source_id=source_id)
+        if not matches:
+            return None, "not_found"
+        if len(matches) > 1:
+            return None, "ambiguous"
+        return matches[0], None
+
+    def _canonicalize_skill_identifiers(
+        skill_ids: list[Any],
+        *,
+        tenant_id: str,
+    ) -> tuple[list[str], list[str], list[str]]:
+        catalog = _effective_skill_catalog(tenant_id)
+        canonical: list[str] = []
+        unknown: list[str] = []
+        ambiguous: list[str] = []
+        for raw in skill_ids:
+            identifier = str(raw).strip()
+            if not identifier:
+                continue
+            payload, error = _resolve_skill_payload(catalog, identifier)
+            if error == "ambiguous":
+                ambiguous.append(identifier)
+                continue
+            if error == "not_found":
+                unknown.append(identifier)
+                continue
+            canonical.append(str(payload.get("id", identifier)))
+        return canonical, unknown, ambiguous
+
+    def _canonicalize_skill_identifier_or_original(
+        identifier: str,
+        *,
+        tenant_id: str,
+    ) -> str:
+        payload, error = _resolve_skill_payload(
+            _effective_skill_catalog(tenant_id),
+            identifier,
+        )
+        if error is not None or payload is None:
+            return str(identifier)
+        return str(payload.get("id", identifier))
+
+    def _skill_source_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        source_id = str(payload.get("id", "")).strip()
+        manifest = compatibility_layer.manifest_for_source(source_id) if source_id else None
+        report_path = compatibility_layer.source_normalized_dir(source_id) / "import-report.json" if source_id else None
+        report = None
+        if report_path is not None and report_path.exists():
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        response = dict(payload)
+        if isinstance(manifest, dict):
+            response["adapter_profile"] = manifest.get("source", {}).get("adapter_profile", response.get("adapter_profile"))
+            response["source_format"] = manifest.get("source", {}).get("source_format", response.get("source_format"))
+            response["source_revision"] = manifest.get("source", {}).get("source_revision", response.get("source_revision"))
+            response["imported_skill_count"] = len(manifest.get("skills", []))
+        if isinstance(report, dict):
+            response["last_report"] = report
+        return response
+
+    def _get_skill_source_record(source_id: str, *, tenant_id: str) -> dict[str, Any] | None:
+        payload = s.get_surface_record("skill_sources", source_id)
+        if payload is None:
+            return None
+        if str(payload.get("tenant_id", "")) != tenant_id:
+            return None
+        return dict(payload)
+
+    def _agent_skill_payload(skill_id: str, *, tenant_id: str) -> dict[str, Any]:
+        catalog = _effective_skill_catalog(tenant_id)
+        payload, _ = _resolve_skill_payload(catalog, skill_id)
+        if payload is not None:
+            return payload
         return {
             "id": skill_id,
+            "alias": skill_id,
+            "skill_key": skill_id,
             "name": skill_id,
             "description": "",
             "category": "uncategorized",
             "risk": "unknown",
             "source": "local",
             "tags": [],
+            "handle": {
+                "source_id": "",
+                "skill_key": skill_id,
+                "canonical_id": skill_id,
+            },
+            "version_ref": {
+                "source_id": "",
+                "skill_key": skill_id,
+                "revision": "",
+                "canonical_ref": skill_id,
+            },
         }
 
     def _collect_model_catalog(tenant_id: str) -> dict[str, dict[str, Any]]:
@@ -946,6 +1254,28 @@ def register_routes(
             return str(value[-1] if value else default)
         return str(value)
 
+    def _query_bool(request: Request, name: str, default: bool = False) -> bool:
+        raw = _query_string(request, name, "1" if default else "").strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    def _json_signature(payload: Any) -> str:
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+
+    def _sse_event(
+        event: str,
+        data: Any,
+        *,
+        event_id: str | None = None,
+    ) -> str:
+        lines: list[str] = []
+        if event_id:
+            lines.append(f"id: {event_id}")
+        lines.append(f"event: {event}")
+        encoded = json.dumps(data, ensure_ascii=False, default=str)
+        for line in encoded.splitlines() or ["null"]:
+            lines.append(f"data: {line}")
+        return "\n".join(lines) + "\n\n"
+
     def _list_tenant_records(
         records: dict[object, dict[str, Any]],
         *,
@@ -988,7 +1318,7 @@ def register_routes(
                 if status == "completed":
                     entry["completedAt"] = _utc_now_iso()
                 break
-        if status not in {"in_progress", "completed"}:
+        if status != "completed":
             return
         if phase_index >= 0 and phase_index + 1 < len(PHASE_ORDER):
             next_phase = PHASE_ORDER[phase_index + 1]
@@ -1001,7 +1331,9 @@ def register_routes(
         payload = dict(project)
         payload.setdefault("orchestrationMode", "workflow")
         payload.setdefault("autonomyLevel", "A3")
-        payload.setdefault("researchConfig", {"competitorUrls": [], "depth": "standard"})
+        payload.setdefault("researchConfig", {"competitorUrls": [], "depth": "standard", "outputLanguage": "ja"})
+        if isinstance(payload.get("researchConfig"), dict):
+            payload["researchConfig"].setdefault("outputLanguage", "ja")
         payload["blueprints"] = build_lifecycle_phase_blueprints(str(project.get("id", "")))
         payload["recommendations"] = refresh_lifecycle_recommendations(payload)
         approval_request_id = str(payload.get("approvalRequestId") or "")
@@ -1074,6 +1406,713 @@ def register_routes(
         response.update(extra)
         return response
 
+    def _phase_blueprint(project: dict[str, Any], phase: str) -> dict[str, Any]:
+        blueprints = project.get("blueprints")
+        if isinstance(blueprints, dict):
+            blueprint = blueprints.get(phase)
+            if isinstance(blueprint, dict):
+                return dict(blueprint)
+        project_id = str(project.get("projectId", project.get("id", "catalog")) or "catalog")
+        return dict(build_lifecycle_phase_blueprints(project_id).get(phase, {}))
+
+    def _phase_team(project: dict[str, Any], phase: str) -> list[dict[str, Any]]:
+        team = _phase_blueprint(project, phase).get("team")
+        return [dict(item) for item in team if isinstance(item, dict)] if isinstance(team, list) else []
+
+    def _phase_team_index(project: dict[str, Any], phase: str) -> dict[str, dict[str, Any]]:
+        return {
+            str(item.get("id", "")).strip(): item
+            for item in _phase_team(project, phase)
+            if str(item.get("id", "")).strip()
+        }
+
+    def _run_node_status_map(run: dict[str, Any] | None) -> dict[str, str]:
+        if not isinstance(run, dict):
+            return {}
+        node_status = run.get("node_status")
+        if isinstance(node_status, dict):
+            return {str(key): str(value) for key, value in node_status.items()}
+        state = run.get("state")
+        if not isinstance(state, dict):
+            return {}
+        execution = state.get("execution")
+        if not isinstance(execution, dict):
+            return {}
+        node_status = execution.get("node_status")
+        if isinstance(node_status, dict):
+            return {str(key): str(value) for key, value in node_status.items()}
+        return {}
+
+    def _run_event_log(run: dict[str, Any] | None) -> list[dict[str, Any]]:
+        if not isinstance(run, dict):
+            return []
+        event_log = run.get("event_log")
+        return [dict(item) for item in event_log if isinstance(item, dict)] if isinstance(event_log, list) else []
+
+    def _phase_records_for_run(
+        records: Any,
+        *,
+        phase: str,
+        run_id: str,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(records, list):
+            return []
+        phase_records = [dict(item) for item in records if isinstance(item, dict) and item.get("phase") == phase]
+        if not run_id:
+            return phase_records
+        run_records = [item for item in phase_records if str(item.get("runId", "")) == run_id]
+        return run_records or phase_records
+
+    def _latest_record_by_agent(
+        records: list[dict[str, Any]],
+        *,
+        agent_key: str = "agentId",
+    ) -> dict[str, dict[str, Any]]:
+        latest: dict[str, dict[str, Any]] = {}
+        for item in reversed(records):
+            agent_id = str(item.get(agent_key, "")).strip()
+            if agent_id and agent_id not in latest:
+                latest[agent_id] = item
+        return latest
+
+    def _delegation_focus(delegation: dict[str, Any]) -> str:
+        skill = str(delegation.get("skill", "")).strip()
+        peer = str(delegation.get("peer", "")).strip()
+        task = delegation.get("task")
+        if isinstance(task, dict):
+            metadata = task.get("metadata")
+            if isinstance(metadata, dict):
+                skill = skill or str(metadata.get("skill", "")).strip()
+                peer = peer or str(metadata.get("receiver", "")).strip()
+        if skill and peer:
+            return f"{skill} を {peer} に委譲"
+        if skill:
+            return f"{skill} を委譲"
+        if peer:
+            return f"{peer} と連携"
+        return "委譲を実行"
+
+    def _resolve_runtime_agent_id(
+        project: dict[str, Any],
+        phase: str,
+        *,
+        node_id: str,
+        agent_hint: str = "",
+    ) -> str:
+        team_index = _phase_team_index(project, phase)
+        hint = agent_hint.strip()
+        node = node_id.strip()
+        if hint and hint in team_index:
+            return hint
+        if node and node in team_index:
+            return node
+        return hint or node
+
+    def _runtime_agent_status_from_nodes(statuses: list[str], *, observed: bool) -> str:
+        normalized = [status.strip() for status in statuses if status.strip()]
+        if any(status == "running" for status in normalized):
+            return "running"
+        if any(status == "failed" for status in normalized):
+            return "failed"
+        if any(status in {"completed", "succeeded"} for status in normalized) or observed:
+            return "completed"
+        return "idle"
+
+    def _runtime_node_focus(node_id: str, agent: dict[str, Any] | None) -> str:
+        label = str((agent or {}).get("label", "")).strip()
+        if label and node_id and node_id != str((agent or {}).get("id", "")).strip():
+            return f"{label} の {node_id}"
+        return node_id or label
+
+    def _runtime_human_task_summary(text: str, fallback: str = "") -> str:
+        value = " ".join(str(text or "").strip().split())
+        if not value:
+            return fallback
+        lowered = value.lower()
+        if lowered.startswith("research phase skill executed by "):
+            return "調査タスクを実行"
+        if value.startswith("{") or value.startswith("["):
+            return "構造化タスクを整理中"
+        if len(value) > 180:
+            return f"{value[:177].rstrip()}..."
+        return value
+
+    def _runtime_safe_next_action(next_action: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(next_action, dict):
+            return None
+        payload = next_action.get("payload")
+        payload_summary: dict[str, Any] = {}
+        if isinstance(payload, dict):
+            remediation = payload.get("remediation")
+            if isinstance(remediation, dict):
+                payload_summary["remediation"] = {
+                    "trigger": str(remediation.get("trigger", "")).strip() or None,
+                    "attempt": int(remediation.get("attempt", 0) or 0),
+                    "maxAttempts": int(remediation.get("maxAttempts", 0) or 0),
+                    "retryNodeIds": [
+                        str(item).strip()
+                        for item in remediation.get("retryNodeIds", [])
+                        if str(item).strip()
+                    ][:6],
+                    "blockingSummary": [
+                        str(item).strip()
+                        for item in remediation.get("blockingSummary", [])
+                        if str(item).strip()
+                    ][:4],
+                }
+            blocking_issues = [
+                str(item).strip()
+                for item in payload.get("blockingIssues", [])
+                if str(item).strip()
+            ] if isinstance(payload, dict) else []
+            if blocking_issues:
+                payload_summary["blockingIssues"] = blocking_issues[:4]
+        safe_action = {
+            "type": str(next_action.get("type", "")),
+            "phase": next_action.get("phase"),
+            "title": str(next_action.get("title", "")),
+            "reason": str(next_action.get("reason", "")),
+            "canAutorun": bool(next_action.get("canAutorun")),
+            "requiresTrigger": bool(next_action.get("requiresTrigger")),
+            "orchestrationMode": next_action.get("orchestrationMode"),
+            "payload": payload_summary,
+        }
+        return safe_action
+
+    def _runtime_active_phase(project: dict[str, Any], requested_phase: str) -> str:
+        for entry in project.get("phaseStatuses", []):
+            if (
+                isinstance(entry, dict)
+                and str(entry.get("phase", "")).strip() in LIFECYCLE_RUNTIME_EXECUTABLE_PHASES
+                and str(entry.get("status", "")).strip() == "in_progress"
+            ):
+                return str(entry.get("phase", "")).strip()
+        next_action = project.get("nextAction")
+        if (
+            isinstance(next_action, dict)
+            and bool(next_action.get("canAutorun"))
+            and str(next_action.get("phase", "")).strip() in LIFECYCLE_RUNTIME_EXECUTABLE_PHASES
+        ):
+            return str(next_action.get("phase", "")).strip()
+        if requested_phase in LIFECYCLE_RUNTIME_EXECUTABLE_PHASES:
+            return requested_phase
+        return requested_phase
+
+    def _phase_runtime_agents(
+        project: dict[str, Any],
+        phase: str,
+        latest_run: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        team_index = _phase_team_index(project, phase)
+        team = list(team_index.values())
+        if not team_index:
+            return []
+        run_id = str(latest_run.get("id", "")) if isinstance(latest_run, dict) else ""
+        phase_status = "available"
+        for entry in project.get("phaseStatuses", []):
+            if isinstance(entry, dict) and entry.get("phase") == phase:
+                phase_status = str(entry.get("status", phase_status))
+                break
+        node_status = _run_node_status_map(latest_run)
+        event_log = _run_event_log(latest_run)
+        latest_event_by_agent: dict[str, dict[str, Any]] = {}
+        latest_event_by_node: dict[str, dict[str, Any]] = {}
+        node_status_by_agent: dict[str, list[str]] = {}
+        for event in event_log:
+            node_id = str(event.get("node_id", "")).strip()
+            agent_id = _resolve_runtime_agent_id(
+                project,
+                phase,
+                node_id=node_id,
+                agent_hint=str(event.get("agent", "")),
+            )
+            if node_id:
+                latest_event_by_node[node_id] = event
+            if agent_id in team_index:
+                latest_event_by_agent[agent_id] = event
+        for node_id, status in node_status.items():
+            agent_id = _resolve_runtime_agent_id(
+                project,
+                phase,
+                node_id=str(node_id),
+                agent_hint=str(latest_event_by_node.get(str(node_id), {}).get("agent", "")),
+            )
+            if agent_id in team_index:
+                node_status_by_agent.setdefault(agent_id, []).append(str(status))
+        skill_records = _phase_records_for_run(project.get("skillInvocations"), phase=phase, run_id=run_id)
+        delegation_records = _phase_records_for_run(project.get("delegations"), phase=phase, run_id=run_id)
+        artifact_records = _phase_records_for_run(project.get("artifacts"), phase=phase, run_id=run_id)
+        latest_skill_by_agent = _latest_record_by_agent(skill_records)
+        latest_delegation_by_agent = _latest_record_by_agent(delegation_records)
+        latest_artifact_by_agent = _latest_record_by_agent(artifact_records, agent_key="producer")
+        status_priority = {"running": 0, "failed": 1, "completed": 2, "idle": 3}
+        agents: list[dict[str, Any]] = []
+        for agent in team:
+            agent_id = str(agent.get("id", "")).strip()
+            if not agent_id:
+                continue
+            status = _runtime_agent_status_from_nodes(
+                node_status_by_agent.get(agent_id, []),
+                observed=(
+                    agent_id in latest_event_by_agent
+                    or (
+                        phase_status == "completed"
+                        and (agent_id in latest_skill_by_agent or agent_id in latest_artifact_by_agent)
+                    )
+                ),
+            )
+            latest_delegation = latest_delegation_by_agent.get(agent_id)
+            latest_skill = latest_skill_by_agent.get(agent_id)
+            latest_artifact = latest_artifact_by_agent.get(agent_id)
+            current_task = str(agent.get("role", "")).strip() or f"{str(agent.get('label', agent_id))} task"
+            if isinstance(latest_skill, dict):
+                summary = str(latest_skill.get("summary", "")).strip()
+                if summary:
+                    current_task = _runtime_human_task_summary(summary, current_task)
+            if isinstance(latest_delegation, dict):
+                current_task = _delegation_focus(latest_delegation)
+            if status == "running" and not isinstance(latest_delegation, dict) and not isinstance(latest_skill, dict):
+                event = latest_event_by_agent.get(agent_id) or {}
+                node_id = str(event.get("node_id", "")).strip()
+                current_focus = _runtime_node_focus(node_id, agent)
+                if current_focus:
+                    current_task = f"{current_focus} を実行中"
+            current_task = _runtime_human_task_summary(current_task, str(agent.get("role", "")).strip())
+            agents.append(
+                {
+                    "agentId": agent_id,
+                    "label": str(agent.get("label", agent_id)),
+                    "role": str(agent.get("role", "")).strip(),
+                    "status": status,
+                    "currentTask": current_task,
+                    "delegatedTo": (
+                        str(latest_delegation.get("peer", "")).strip()
+                        if isinstance(latest_delegation, dict) and str(latest_delegation.get("peer", "")).strip()
+                        else None
+                    ),
+                    "lastArtifactTitle": (
+                        str(latest_artifact.get("title", "")).strip()
+                        if isinstance(latest_artifact, dict) and str(latest_artifact.get("title", "")).strip()
+                        else None
+                    ),
+                }
+            )
+        agents.sort(key=lambda item: (status_priority.get(str(item.get("status", "idle")), 9), str(item.get("label", ""))))
+        return agents
+
+    def _phase_runtime_recent_actions(
+        project: dict[str, Any],
+        phase: str,
+        latest_run: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        event_log = _run_event_log(latest_run)
+        team_index = _phase_team_index(project, phase)
+        agents = {str(item.get("agentId", "")): item for item in _phase_runtime_agents(project, phase, latest_run)}
+        if not event_log:
+            planned_actions: list[dict[str, Any]] = []
+            status_priority = {"running": 0, "failed": 1, "completed": 2, "idle": 3}
+            for agent in agents.values():
+                agent_id = str(agent.get("agentId", "")).strip()
+                if not agent_id:
+                    continue
+                summary = str(agent.get("currentTask", "")).strip()
+                if not summary:
+                    continue
+                planned_actions.append(
+                    {
+                        "nodeId": agent_id,
+                        "label": str(agent.get("label", "")).strip() or agent_id,
+                        "status": str(agent.get("status", "idle") or "idle"),
+                        "summary": summary,
+                        "agent": agent_id,
+                        "agentLabel": str(agent.get("label", "")).strip() or None,
+                        "nodeLabel": _runtime_node_focus(agent_id, team_index.get(agent_id)),
+                    }
+                )
+            planned_actions.sort(
+                key=lambda item: (
+                    status_priority.get(str(item.get("status", "idle")), 9),
+                    str(item.get("label", "")),
+                )
+            )
+            return planned_actions[:5]
+        node_status = _run_node_status_map(latest_run)
+        recent_actions: list[dict[str, Any]] = []
+        seen_node_ids: set[str] = set()
+        for event in reversed(event_log):
+            node_id = str(event.get("node_id", "")).strip()
+            if not node_id or node_id in seen_node_ids:
+                continue
+            seen_node_ids.add(node_id)
+            agent_id = _resolve_runtime_agent_id(
+                project,
+                phase,
+                node_id=node_id,
+                agent_hint=str(event.get("agent", "")),
+            )
+            agent = agents.get(agent_id, {})
+            label = str(agent.get("label", "")).strip() or str(team_index.get(agent_id, {}).get("label", "")).strip() or node_id
+            summary = _runtime_human_task_summary(
+                str(agent.get("currentTask", "")).strip() or str(event.get("agent", "")).strip() or node_id,
+                node_id,
+            )
+            recent_actions.append(
+                {
+                    "nodeId": node_id,
+                    "label": label,
+                    "status": str(node_status.get(node_id, "completed") or "completed"),
+                    "summary": summary,
+                    "agent": str(agent_id).strip() or None,
+                    "agentLabel": str(agent.get("label", "")).strip() or None,
+                    "nodeLabel": _runtime_node_focus(node_id, team_index.get(agent_id)),
+                }
+            )
+            if len(recent_actions) == 5:
+                break
+        return recent_actions
+
+    def _lifecycle_phase_runtime_summary(
+        project: dict[str, Any],
+        phase: str,
+        *,
+        latest_run: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        phase_status = "available"
+        for entry in project.get("phaseStatuses", []):
+            if isinstance(entry, dict) and entry.get("phase") == phase:
+                phase_status = str(entry.get("status", phase_status))
+                break
+        summary: dict[str, Any] = {
+            "phase": phase,
+            "status": phase_status,
+            "blockingSummary": [],
+            "canAutorun": bool((project.get("nextAction") or {}).get("canAutorun")),
+        }
+        next_action = project.get("nextAction")
+        if isinstance(next_action, dict) and next_action.get("phase") == phase:
+            objective = next_action.get("title") or next_action.get("reason")
+            if isinstance(objective, str) and objective.strip():
+                summary["objective"] = objective.strip()
+            reason = str(next_action.get("reason", "")).strip()
+            if reason:
+                summary["nextAutomaticAction"] = reason
+        summary["agents"] = _phase_runtime_agents(project, phase, latest_run)
+        summary["recentActions"] = _phase_runtime_recent_actions(project, phase, latest_run)
+        if phase != "research":
+            return summary
+        research = project.get("research")
+        if not isinstance(research, dict):
+            return summary
+        readiness = research.get("readiness")
+        if isinstance(readiness, str) and readiness:
+            summary["readiness"] = readiness
+        quality_gates = research.get("quality_gates")
+        if isinstance(quality_gates, list):
+            failed_gates = [
+                gate for gate in quality_gates
+                if isinstance(gate, dict) and gate.get("passed") is not True
+            ]
+            summary["failedGateCount"] = len(failed_gates)
+            if not summary["blockingSummary"]:
+                summary["blockingSummary"] = [
+                    str(gate.get("reason", "")).strip()
+                    for gate in failed_gates
+                    if str(gate.get("reason", "")).strip()
+                ][:3]
+        node_results = research.get("node_results")
+        if isinstance(node_results, list):
+            summary["degradedNodeCount"] = len([
+                item
+                for item in node_results
+                if isinstance(item, dict) and str(item.get("status", "success")) != "success"
+            ])
+        autonomous_remediation = research.get("autonomous_remediation")
+        if isinstance(autonomous_remediation, dict):
+            if isinstance(autonomous_remediation.get("objective"), str) and autonomous_remediation.get("objective", "").strip():
+                summary["objective"] = str(autonomous_remediation["objective"]).strip()
+            if isinstance(autonomous_remediation.get("attemptCount"), int):
+                summary["attemptCount"] = int(autonomous_remediation["attemptCount"])
+            if isinstance(autonomous_remediation.get("maxAttempts"), int):
+                summary["maxAttempts"] = int(autonomous_remediation["maxAttempts"])
+            if not summary["blockingSummary"]:
+                summary["blockingSummary"] = [
+                    str(item).strip()
+                    for item in autonomous_remediation.get("blockingSummary", [])
+                    if str(item).strip()
+                ][:3]
+        remediation_plan = research.get("remediation_plan")
+        if isinstance(remediation_plan, dict) and not summary.get("objective"):
+            objective = str(remediation_plan.get("objective", "")).strip()
+            if objective:
+                summary["objective"] = objective
+        return summary
+
+    def _lifecycle_active_phase_runtime_summary(
+        project: dict[str, Any],
+        *,
+        requested_phase: str,
+        active_phase: str,
+        active_run: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        return _lifecycle_phase_runtime_summary(
+            project,
+            active_phase or requested_phase,
+            latest_run=active_run,
+        )
+
+    def _lifecycle_runtime_payload(
+        project: dict[str, Any],
+        *,
+        phase: str,
+        active_phase: str,
+        latest_run: dict[str, Any] | None = None,
+        observed_run: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "updatedAt": project.get("updatedAt", project.get("createdAt", "")),
+            "savedAt": project.get("savedAt", project.get("updatedAt", project.get("createdAt", ""))),
+            "phaseStatuses": list(project.get("phaseStatuses", [])),
+            "nextAction": _runtime_safe_next_action(project.get("nextAction") if isinstance(project.get("nextAction"), dict) else None),
+            "autonomyState": (
+                dict(project.get("autonomyState") or {})
+                if project.get("autonomyState") is not None
+                else None
+            ),
+            "observedPhase": phase,
+            "activePhase": active_phase,
+            "phaseSummary": _lifecycle_phase_runtime_summary(project, phase, latest_run=observed_run),
+            "activePhaseSummary": _lifecycle_active_phase_runtime_summary(
+                project,
+                requested_phase=phase,
+                active_phase=active_phase,
+                active_run=latest_run,
+            ),
+        }
+
+    def _workflow_run_live_payload(run: dict[str, Any] | None, *, phase: str | None = None) -> dict[str, Any] | None:
+        if run is None:
+            return None
+        event_log = run.get("event_log")
+        node_status = run.get("node_status")
+        if not isinstance(event_log, list):
+            event_log = []
+        if not isinstance(node_status, dict):
+            node_status = {}
+        completed_node_ids = {
+            str(event.get("node_id", ""))
+            for event in event_log
+            if isinstance(event, dict) and event.get("node_id")
+        }
+        recent_node_ids: list[str] = []
+        for event in reversed(event_log):
+            if not isinstance(event, dict):
+                continue
+            node_id = str(event.get("node_id", "")).strip()
+            if not node_id or node_id in recent_node_ids:
+                continue
+            recent_node_ids.append(node_id)
+            if len(recent_node_ids) == 3:
+                break
+        completed_nodes = [
+            node_id
+            for node_id, status in node_status.items()
+            if str(status) in {"completed", "succeeded"}
+        ]
+        running_nodes = [
+            node_id
+            for node_id, status in node_status.items()
+            if str(status) == "running"
+        ]
+        failed_nodes = [
+            node_id
+            for node_id, status in node_status.items()
+            if str(status) == "failed"
+        ]
+        last_event = event_log[-1] if event_log else {}
+        active_focus = running_nodes[0] if running_nodes else (
+            str(last_event.get("node_id", "")) if isinstance(last_event, dict) else ""
+        )
+        last_node_id = ""
+        last_agent = ""
+        if isinstance(last_event, dict):
+            last_node_id = str(last_event.get("node_id", "")).strip()
+            last_agent = str(last_event.get("agent", "")).strip()
+        recent_events: list[dict[str, Any]] = []
+        for event in reversed(event_log[-5:]):
+            if not isinstance(event, dict):
+                continue
+            node_id = str(event.get("node_id", "")).strip()
+            if not node_id:
+                continue
+            status = str(node_status.get(node_id, "completed") or "completed")
+            summary = ""
+            artifacts = event.get("artifacts")
+            if isinstance(artifacts, list) and artifacts:
+                first_artifact = artifacts[0]
+                if isinstance(first_artifact, dict):
+                    summary = str(first_artifact.get("title", "")).strip()
+            tool_events = event.get("tool_events")
+            if not summary and isinstance(tool_events, list) and tool_events:
+                first_tool = tool_events[0]
+                if isinstance(first_tool, dict):
+                    tool_name = str(first_tool.get("tool", "")).strip()
+                    if tool_name:
+                        summary = f"{tool_name} を実行"
+            output = event.get("output")
+            if not summary and isinstance(output, dict) and output:
+                keys = [str(key).strip() for key in output.keys() if str(key).strip()]
+                if keys:
+                    summary = f"{', '.join(keys[:2])} を更新"
+            if not summary:
+                summary = f"{node_id} を処理"
+            recent_events.append(
+                {
+                    "seq": event.get("seq") if isinstance(event.get("seq"), int) else None,
+                    "timestamp": str(event.get("timestamp", "")).strip() or None,
+                    "nodeId": node_id,
+                    "agent": str(event.get("agent", "")).strip() or None,
+                    "status": (
+                        "running"
+                        if status == "running"
+                        else "failed"
+                        if status == "failed"
+                        else "completed"
+                    ),
+                    "summary": summary,
+                }
+            )
+        return {
+            "run": {
+                "id": str(run.get("id", "")),
+                "status": str(run.get("status", "pending")),
+                "startedAt": str(run.get("started_at", "")),
+                "completedAt": run.get("completed_at"),
+                "error": run.get("error"),
+            },
+            "phase": phase,
+            "eventCount": len(event_log),
+            "completedNodeCount": len(set(completed_nodes) | completed_node_ids),
+            "runningNodeIds": running_nodes,
+            "failedNodeIds": failed_nodes,
+            "lastEventSeq": last_event.get("seq") if isinstance(last_event, dict) else None,
+            "activeFocusNodeId": active_focus or None,
+            "lastNodeId": last_node_id or None,
+            "lastAgent": last_agent or None,
+            "recentNodeIds": recent_node_ids,
+            "recentEvents": recent_events,
+        }
+
+    def _latest_workflow_run_payload(
+        tenant_id: str,
+        workflow_id: str,
+    ) -> dict[str, Any] | None:
+        runs = workflow_service.list_run_payloads(
+            tenant_id=tenant_id,
+            workflow_id=workflow_id,
+        )
+        if not runs:
+            return None
+        return dict(runs[0])
+
+    def _iter_run_events(
+        tenant_id: str,
+        run_id: str,
+        *,
+        workflow_id: str | None = None,
+        once: bool = False,
+    ) -> Any:
+        emitted_signature: str | None = None
+        event_seq = 0
+        deadline = time.monotonic() + 45.0
+        while True:
+            run_payload = workflow_service.get_run_payload(run_id)
+            if workflow_id is not None and str(run_payload.get("workflow_id", "")) != workflow_id:
+                break
+            signature = _json_signature(run_payload)
+            if signature != emitted_signature:
+                event_name = "snapshot" if emitted_signature is None else "run"
+                yield _sse_event(event_name, run_payload, event_id=str(event_seq))
+                event_seq += 1
+                emitted_signature = signature
+            if str(run_payload.get("status", "")) in {"completed", "failed"}:
+                yield _sse_event(
+                    "terminal",
+                    {
+                        "runId": str(run_payload.get("id", "")),
+                        "workflowId": str(run_payload.get("workflow_id", "")),
+                        "status": str(run_payload.get("status", "")),
+                    },
+                    event_id=str(event_seq),
+                )
+                break
+            if once or time.monotonic() >= deadline:
+                break
+            yield ": keep-alive\n\n"
+            time.sleep(0.75)
+
+    def _iter_lifecycle_project_events(
+        tenant_id: str,
+        project_id: str,
+        *,
+        phase: str,
+        once: bool = False,
+    ) -> Any:
+        project_signature: str | None = None
+        run_signature: str | None = None
+        event_seq = 0
+        deadline = time.monotonic() + 45.0
+        terminal_emitted = False
+        workflow_id = _lifecycle_workflow_id(project_id, phase)
+        while True:
+            project_record = _get_lifecycle_project(tenant_id, project_id, create=True)
+            if project_record is None:
+                break
+            project_payload = _lifecycle_project_payload(project_record)
+            active_phase = _runtime_active_phase(project_payload, phase)
+            active_workflow_id = _lifecycle_workflow_id(project_id, active_phase)
+            observed_run = _latest_workflow_run_payload(tenant_id, workflow_id)
+            active_run = observed_run if active_phase == phase else _latest_workflow_run_payload(tenant_id, active_workflow_id)
+            runtime_payload = _lifecycle_runtime_payload(
+                project_payload,
+                phase=phase,
+                active_phase=active_phase,
+                latest_run=active_run,
+                observed_run=observed_run,
+            )
+            next_project_signature = _json_signature(runtime_payload)
+            if next_project_signature != project_signature:
+                yield _sse_event("project-runtime", runtime_payload, event_id=str(event_seq))
+                event_seq += 1
+                project_signature = next_project_signature
+
+            live_payload = _workflow_run_live_payload(active_run, phase=active_phase)
+            next_run_signature = _json_signature(live_payload)
+            if next_run_signature != run_signature:
+                yield _sse_event("run-live", live_payload, event_id=str(event_seq))
+                event_seq += 1
+                run_signature = next_run_signature
+
+            if active_run is not None and str(active_run.get("status", "")) in {"completed", "failed"}:
+                yield _sse_event(
+                    "phase-terminal",
+                    {
+                        "projectId": project_id,
+                        "phase": active_phase,
+                        "runId": str(active_run.get("id", "")),
+                        "status": str(active_run.get("status", "")),
+                    },
+                    event_id=str(event_seq),
+                )
+                terminal_emitted = True
+                break
+
+            if once or time.monotonic() >= deadline:
+                break
+            yield ": keep-alive\n\n"
+            time.sleep(0.75)
+        if not terminal_emitted and once:
+            return
+
     def _run_coro(coro: Any) -> Any:
         loop = asyncio.new_event_loop()
         try:
@@ -1082,6 +2121,10 @@ def register_routes(
             loop.close()
 
     def _lifecycle_approval_manager() -> ApprovalManager:
+        if container is not None:
+            manager = container.resolve_optional(ApprovalManager)
+            if manager is not None:
+                return manager
         return ApprovalManager(
             StoreBackedApprovalStore(s.control_plane_store),
             StoreBackedAuditRepository(s.control_plane_store, hmac_key=default_hmac_key()),
@@ -1449,15 +2492,74 @@ def register_routes(
     ) -> tuple[str, PylonProject, dict[str, Any]]:
         _seed_lifecycle_skills()
         definition = build_lifecycle_workflow_definition(project_id, phase)
+        phase_blueprint = build_lifecycle_phase_blueprints(project_id).get(phase, {})
+        team_index = {
+            str(item.get("id", "")).strip(): dict(item)
+            for item in phase_blueprint.get("team", [])
+            if isinstance(item, dict) and str(item.get("id", "")).strip()
+        } if isinstance(phase_blueprint, dict) else {}
+        def _lifecycle_agent_skill_lookup(agent_id: str) -> list[str]:
+            team_entry = team_index.get(agent_id, {})
+            aliases = {
+                str(agent_id).strip().lower(),
+                str(team_entry.get("label", "")).strip().lower(),
+            }
+            aliases.discard("")
+            matched_skills: list[str] = []
+            for agent in s.agents.values():
+                if not isinstance(agent, dict):
+                    continue
+                if str(agent.get("tenant_id", "")) != tenant_id:
+                    continue
+                candidate_keys = {
+                    str(agent.get("id", "")).strip().lower(),
+                    str(agent.get("name", "")).strip().lower(),
+                    str(agent.get("role", "")).strip().lower(),
+                }
+                candidate_keys.discard("")
+                if not aliases.intersection(candidate_keys):
+                    continue
+                matched_skills.extend(
+                    str(skill_id)
+                    for skill_id in agent.get("skills", [])
+                    if str(skill_id).strip()
+                )
+            return list(dict.fromkeys(matched_skills))
+        for agent_id, payload in definition["project"].get("agents", {}).items():
+            if not isinstance(payload, dict):
+                continue
+            assigned_skills = _lifecycle_agent_skill_lookup(str(agent_id))
+            if not assigned_skills:
+                continue
+            payload["skills"] = list(
+                dict.fromkeys(
+                    [
+                        *[
+                            str(skill_id)
+                            for skill_id in payload.get("skills", [])
+                            if str(skill_id).strip()
+                        ],
+                        *assigned_skills,
+                    ]
+                )
+            )
         workflow_id = _lifecycle_workflow_id(project_id, phase)
         workflow_project = s.register_workflow_project(workflow_id, definition["project"], tenant_id=tenant_id)
         raw_store = s.control_plane_store
+        control_plane_skills = {
+            str(skill_id): dict(payload)
+            for skill_id, payload in s.skills.items()
+        }
         if hasattr(raw_store, "set_handlers"):
             raw_store.set_handlers(
                 workflow_id,
                 node_handlers=build_lifecycle_workflow_handlers(
                     phase,
                     provider_registry=provider_registry,
+                    skill_runtime=get_default_skill_runtime(),
+                    tenant_id=tenant_id,
+                    agent_skill_lookup=_lifecycle_agent_skill_lookup,
+                    control_plane_skills=control_plane_skills,
                 ),
             )
         lifecycle_project = project_record or _get_lifecycle_project(tenant_id, project_id, create=True)
@@ -1721,6 +2823,31 @@ def register_routes(
         if project is None:
             return Response(status_code=404, body={"error": f"Lifecycle project not found: {project_id}"})
         return Response(body=_lifecycle_project_payload(project))
+
+    def stream_lifecycle_project_events(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        project_id = request.path_params.get("project_id", "")
+        phase = _query_string(request, "phase", "research").strip().lower() or "research"
+        if phase not in PHASE_ORDER:
+            return Response(status_code=422, body={"errors": [f"Unsupported lifecycle phase: {phase}"]})
+        once = _query_bool(request, "once", default=False)
+        return Response(
+            headers={
+                "content-type": "text/event-stream; charset=utf-8",
+                "cache-control": "no-cache",
+                "connection": "keep-alive",
+            },
+            body=StreamingBody(
+                _iter_lifecycle_project_events(
+                    tenant_id,
+                    project_id,
+                    phase=phase,
+                    once=once,
+                )
+            ),
+        )
 
     def update_lifecycle_project(request: Request) -> Response:
         tenant_id = _require_tenant_id(request)
@@ -2167,19 +3294,58 @@ def register_routes(
         return Response(body={"recommendations": recommendations})
 
     def _ensure_default_teams(tenant_id: str) -> list[dict[str, Any]]:
-        existing = [
-            dict(team)
+        existing = {
+            str(team.get("id", "")): dict(team)
             for team in s.teams.values()
             if team.get("tenant_id") == tenant_id
-        ]
-        if existing:
-            return sorted(existing, key=lambda team: str(team.get("name", "")))
+        }
+        created_any = False
         for definition in DEFAULT_TEAM_DEFINITIONS:
+            team_id = str(definition["id"])
+            if team_id in existing:
+                continue
             payload = dict(definition)
             payload["tenant_id"] = tenant_id
             payload["created_at"] = _utc_now_iso()
             s.teams[_team_store_key(tenant_id, payload["id"])] = payload
-        return _ensure_default_teams(tenant_id)
+            existing[team_id] = payload
+            created_any = True
+        if created_any:
+            existing = {
+                str(team.get("id", "")): dict(team)
+                for team in s.teams.values()
+                if team.get("tenant_id") == tenant_id
+            }
+        return sorted(
+            existing.values(),
+            key=lambda team: _default_team_sort_key(str(team.get("id", ""))),
+        )
+
+    def _ensure_default_agents(tenant_id: str) -> list[dict[str, Any]]:
+        existing = [
+            dict(agent)
+            for agent in s.agents.values()
+            if agent.get("tenant_id") == tenant_id
+        ]
+        if existing:
+            return sorted(
+                existing,
+                key=lambda agent: (
+                    str(agent.get("team", "")),
+                    str(agent.get("name", "")),
+                ),
+            )
+        _ensure_default_teams(tenant_id)
+        now = _utc_now_iso()
+        for definition in DEFAULT_AGENT_DEFINITIONS:
+            payload = dict(definition)
+            payload["id"] = _default_agent_id(tenant_id, str(definition["id"]))
+            payload["tenant_id"] = tenant_id
+            payload["status"] = str(definition.get("status", "ready") or "ready")
+            payload["created_at"] = now
+            payload["updated_at"] = now
+            s.agents[payload["id"]] = payload
+        return _ensure_default_agents(tenant_id)
 
     def _team_record(tenant_id: str, team_id: str) -> dict[str, Any] | None:
         _ensure_default_teams(tenant_id)
@@ -2657,8 +3823,7 @@ def register_routes(
             return _tenant_required_response()
         agents = [
             _agent_activity_payload(tenant_id, agent)
-            for agent in s.agents.values()
-            if agent.get("tenant_id") == tenant_id
+            for agent in _ensure_default_agents(tenant_id)
         ]
         agents.sort(key=lambda agent: (agent["team"], agent["name"]))
         return Response(body=agents)
@@ -3084,7 +4249,10 @@ def register_routes(
             "role": body.get("role", ""),
             "autonomy": _normalize_autonomy(body.get("autonomy", "A2")),
             "tools": body.get("tools", []),
-            "skills": body.get("skills", []),
+            "skills": [
+                _canonicalize_skill_identifier_or_original(str(item), tenant_id=tenant_id)
+                for item in body.get("skills", [])
+            ],
             "sandbox": body.get("sandbox", "gvisor"),
             "status": "ready",
             "tenant_id": tenant_id,
@@ -3138,7 +4306,10 @@ def register_routes(
         if "tools" in body:
             updated["tools"] = list(body["tools"])
         if "skills" in body:
-            updated["skills"] = list(body["skills"])
+            updated["skills"] = [
+                _canonicalize_skill_identifier_or_original(str(item), tenant_id=tenant_id)
+                for item in body["skills"]
+            ]
         updated["updated_at"] = _utc_now_iso()
         s.agents[agent_id] = updated
         return Response(body=updated)
@@ -3158,7 +4329,7 @@ def register_routes(
         return Response(body={
             "agent_id": agent_id,
             "agent_name": agent.get("name", ""),
-            "skills": [_agent_skill_payload(skill_id) for skill_id in skill_ids],
+            "skills": [_agent_skill_payload(skill_id, tenant_id=tenant_id) for skill_id in skill_ids],
         })
 
     def update_agent_skills(request: Request) -> Response:
@@ -3177,9 +4348,27 @@ def register_routes(
             return Response(status_code=422, body={"errors": errors})
         if "skills" not in body:
             return Response(status_code=422, body={"errors": ["Field 'skills' is required"]})
+        canonical, unknown, ambiguous = _canonicalize_skill_identifiers(
+            [str(item) for item in body.get("skills", [])],
+            tenant_id=tenant_id,
+        )
+        if unknown or ambiguous:
+            return Response(
+                status_code=400,
+                body={
+                    "error": (
+                        f"Unknown skill IDs: {unknown}"
+                        if unknown
+                        else f"Ambiguous skill aliases: {ambiguous}"
+                    ),
+                    "unknown": unknown,
+                    "ambiguous": ambiguous,
+                    "available": sorted(_effective_skill_catalog(tenant_id).keys()),
+                },
+            )
 
         updated = dict(agent)
-        updated["skills"] = list(body["skills"])
+        updated["skills"] = canonical
         s.agents[agent_id] = updated
         return Response(body=updated)
 
@@ -3204,7 +4393,7 @@ def register_routes(
         source = request.query_params.get("source")
         search = request.query_params.get("search")
 
-        skills = list(s.skills.values())
+        skills = list(_effective_skill_catalog(_tenant_id).values())
         if category:
             skills = [item for item in skills if item.get("category") == category]
         if source:
@@ -3215,6 +4404,8 @@ def register_routes(
                 item for item in skills
                 if lowered in str(item.get("name", "")).lower()
                 or lowered in str(item.get("description", "")).lower()
+                or lowered in str(item.get("alias", "")).lower()
+                or lowered in str(item.get("id", "")).lower()
             ]
 
         categories: dict[str, int] = {}
@@ -3243,17 +4434,254 @@ def register_routes(
         tenant_id = _require_tenant_id(request)
         if tenant_id is None:
             return _tenant_required_response()
-        return Response(body={"total": len(s.skills), "new": 0, "removed": 0})
+        result = skill_runtime.rescan(tenant_id=tenant_id)
+        return Response(body={
+            "total": result["total"],
+            "new": result["new"],
+            "removed": result["removed"],
+        })
 
     def get_skill(request: Request) -> Response:
         tenant_id = _require_tenant_id(request)
         if tenant_id is None:
             return _tenant_required_response()
         skill_id = request.path_params.get("id", "")
-        skill = s.skills.get(skill_id)
+        source_id = str(request.query_params.get("source_id", "")).strip()
+        skill, error = _resolve_skill_payload(
+            _effective_skill_catalog(tenant_id),
+            skill_id,
+            source_id=source_id,
+        )
+        if skill is None and error == "ambiguous":
+            return Response(status_code=409, body={"error": f"Ambiguous skill identifier: {skill_id}"})
         if skill is None:
             return Response(status_code=404, body={"error": f"Skill not found: {skill_id}"})
         return Response(body=skill)
+
+    def list_skill_sources(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        records = [
+            _skill_source_payload(record)
+            for record in s.list_surface_records("skill_sources", tenant_id=tenant_id)
+        ]
+        records.sort(key=lambda item: str(item.get("id", "")))
+        return Response(body={"sources": records, "count": len(records)})
+
+    def create_skill_source(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        body = request.body or {}
+        try:
+            payload = compatibility_layer.normalize_source_payload(body, tenant_id=tenant_id)
+        except ValueError as exc:
+            return Response(status_code=422, body={"error": str(exc)})
+        now = _utc_now_iso()
+        payload["created_at"] = now
+        payload["updated_at"] = now
+        try:
+            report = compatibility_layer.sync_source(payload)
+        except Exception as exc:
+            payload["status"] = "error"
+            payload["error"] = str(exc)
+            s.put_surface_record("skill_sources", str(payload["id"]), payload)
+            return Response(status_code=400, body={"error": str(exc)})
+        payload["status"] = "ready"
+        payload["source_revision"] = report["source_revision"]
+        payload["adapter_profile"] = report["adapter_profile"]
+        payload["source_format"] = report["source_format"]
+        payload["updated_at"] = _utc_now_iso()
+        s.put_surface_record("skill_sources", str(payload["id"]), payload)
+        skill_runtime.rescan(tenant_id=tenant_id)
+        return Response(status_code=201, body=_skill_source_payload(payload))
+
+    def get_skill_source(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        source_id = request.path_params.get("source_id", "")
+        payload = _get_skill_source_record(source_id, tenant_id=tenant_id)
+        if payload is None:
+            return Response(status_code=404, body={"error": f"Skill source not found: {source_id}"})
+        return Response(body=_skill_source_payload(payload))
+
+    def scan_skill_source(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        source_id = request.path_params.get("source_id", "")
+        payload = _get_skill_source_record(source_id, tenant_id=tenant_id)
+        if payload is None:
+            return Response(status_code=404, body={"error": f"Skill source not found: {source_id}"})
+        try:
+            report = compatibility_layer.sync_source(payload)
+        except Exception as exc:
+            payload["status"] = "error"
+            payload["error"] = str(exc)
+            payload["updated_at"] = _utc_now_iso()
+            s.put_surface_record("skill_sources", source_id, payload)
+            return Response(status_code=400, body={"error": str(exc)})
+        payload["status"] = "ready"
+        payload.pop("error", None)
+        payload["source_revision"] = report["source_revision"]
+        payload["adapter_profile"] = report["adapter_profile"]
+        payload["source_format"] = report["source_format"]
+        payload["updated_at"] = _utc_now_iso()
+        s.put_surface_record("skill_sources", source_id, payload)
+        skill_runtime.rescan(tenant_id=tenant_id)
+        return Response(body={"source": _skill_source_payload(payload), "report": report})
+
+    def list_skill_source_skills(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        source_id = request.path_params.get("source_id", "")
+        payload = _get_skill_source_record(source_id, tenant_id=tenant_id)
+        if payload is None:
+            return Response(status_code=404, body={"error": f"Skill source not found: {source_id}"})
+        manifest = compatibility_layer.manifest_for_source(source_id) or {}
+        return Response(body={
+            "source_id": source_id,
+            "skills": list(manifest.get("skills", [])),
+            "count": len(manifest.get("skills", [])),
+        })
+
+    def list_skill_source_tool_candidates(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        source_id = request.path_params.get("source_id", "")
+        payload = _get_skill_source_record(source_id, tenant_id=tenant_id)
+        if payload is None:
+            return Response(status_code=404, body={"error": f"Skill source not found: {source_id}"})
+        candidates = compatibility_layer.list_tool_candidates(source_id)
+        states: dict[str, int] = {}
+        for candidate in candidates:
+            state = str(candidate.get("review", {}).get("state", "pending"))
+            states[state] = states.get(state, 0) + 1
+        return Response(body={
+            "source_id": source_id,
+            "candidates": candidates,
+            "count": len(candidates),
+            "states": states,
+        })
+
+    def update_skill_source_tool_candidate(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        source_id = request.path_params.get("source_id", "")
+        payload = _get_skill_source_record(source_id, tenant_id=tenant_id)
+        if payload is None:
+            return Response(status_code=404, body={"error": f"Skill source not found: {source_id}"})
+        body = request.body or {}
+        if not isinstance(body, dict):
+            return Response(status_code=422, body={"error": "Request body must be a JSON object"})
+        state = str(body.get("state", "")).strip().lower()
+        note = str(body.get("note", "")).strip()
+        if state not in {"pending", "approved", "rejected"}:
+            return Response(
+                status_code=422,
+                body={"error": "Field 'state' must be one of ['pending', 'approved', 'rejected']"},
+            )
+        candidate_id = request.path_params.get("candidate_id", "")
+        try:
+            compatibility_layer.set_tool_candidate_state(
+                source_id=source_id,
+                candidate_id=candidate_id,
+                state=state,
+                note=note,
+            )
+        except KeyError:
+            return Response(
+                status_code=404,
+                body={"error": f"Tool candidate not found: {candidate_id}"},
+            )
+        except ValueError as exc:
+            return Response(status_code=422, body={"error": str(exc)})
+        try:
+            report = compatibility_layer.sync_source(payload)
+        except Exception as exc:
+            payload["status"] = "error"
+            payload["error"] = str(exc)
+            payload["updated_at"] = _utc_now_iso()
+            s.put_surface_record("skill_sources", source_id, payload)
+            return Response(status_code=400, body={"error": str(exc)})
+        payload["status"] = "ready"
+        payload.pop("error", None)
+        payload["source_revision"] = report["source_revision"]
+        payload["adapter_profile"] = report["adapter_profile"]
+        payload["source_format"] = report["source_format"]
+        payload["updated_at"] = _utc_now_iso()
+        s.put_surface_record("skill_sources", source_id, payload)
+        skill_runtime.rescan(tenant_id=tenant_id)
+        updated_candidate = next(
+            (
+                item
+                for item in compatibility_layer.list_tool_candidates(source_id)
+                if str(item.get("candidate_id", "")) == candidate_id
+            ),
+            None,
+        )
+        return Response(body={
+            "source": _skill_source_payload(payload),
+            "candidate": updated_candidate,
+            "report": report,
+        })
+
+    def get_skill_references(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        skill_id = request.path_params.get("id", "")
+        source_id = str(request.query_params.get("source_id", "")).strip()
+        skill, error = _resolve_skill_payload(
+            _effective_skill_catalog(tenant_id),
+            skill_id,
+            source_id=source_id,
+        )
+        if skill is None and error == "ambiguous":
+            return Response(status_code=409, body={"error": f"Ambiguous skill identifier: {skill_id}"})
+        if skill is None:
+            return Response(status_code=404, body={"error": f"Skill not found: {skill_id}"})
+        metadata = compatibility_layer.skill_metadata(
+            str(skill.get("id", skill_id)),
+            source_id=str(skill.get("source_id", source_id)),
+            skill_key=str(skill.get("skill_key", "")),
+        ) or {}
+        return Response(body={
+            "skill_id": str(skill.get("id", skill_id)),
+            "references": list(metadata.get("references", skill.get("references", []))),
+        })
+
+    def get_skill_context_contracts(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        skill_id = request.path_params.get("id", "")
+        source_id = str(request.query_params.get("source_id", "")).strip()
+        skill, error = _resolve_skill_payload(
+            _effective_skill_catalog(tenant_id),
+            skill_id,
+            source_id=source_id,
+        )
+        if skill is None and error == "ambiguous":
+            return Response(status_code=409, body={"error": f"Ambiguous skill identifier: {skill_id}"})
+        if skill is None:
+            return Response(status_code=404, body={"error": f"Skill not found: {skill_id}"})
+        metadata = compatibility_layer.skill_metadata(
+            str(skill.get("id", skill_id)),
+            source_id=str(skill.get("source_id", source_id)),
+            skill_key=str(skill.get("skill_key", "")),
+        ) or {}
+        return Response(body={
+            "skill_id": str(skill.get("id", skill_id)),
+            "context_contracts": list(
+                metadata.get("context_contracts", skill.get("context_contracts", []))
+            ),
+        })
 
     def _skill_execution_preview_payload(
         skill: dict[str, Any],
@@ -3296,7 +4724,7 @@ def register_routes(
         if tenant_id is None:
             return _tenant_required_response()
         skill_id = request.path_params.get("id", "")
-        skill = s.skills.get(skill_id)
+        skill = _effective_skill_catalog(tenant_id).get(skill_id)
         if skill is None:
             return Response(status_code=404, body={"error": f"Skill not found: {skill_id}"})
 
@@ -3387,6 +4815,56 @@ def register_routes(
 
         try:
             provider = provider_registry.resolve(provider_name, model_name)
+            effective_skill_set = skill_runtime.resolve_effective_skill_set(
+                tenant_id=tenant_id,
+                assigned_skill_ids=[skill_id],
+                control_plane_skills={
+                    str(candidate_id): dict(candidate_payload)
+                    for candidate_id, candidate_payload in s.skills.items()
+                },
+            )
+            available_tools = [
+                tool.provider_tool()
+                for tool in effective_skill_set.available_tools
+            ]
+            tool_executors = {
+                tool.name: tool.executor
+                for tool in effective_skill_set.available_tools
+                if tool.executor is not None
+            }
+            if available_tools and tool_executors:
+                engine = ReActEngine()
+
+                async def _chat_fn(run_messages: list[Message], **kwargs: Any):
+                    return await provider.chat(
+                        run_messages,
+                        model=model_name,
+                        tools=kwargs.get("tools"),
+                    )
+
+                async def _tool_executor(tool_name: str, tool_input: dict[str, Any]) -> str:
+                    executor = tool_executors.get(tool_name)
+                    if executor is None:
+                        raise RuntimeError(f"Tool '{tool_name}' is not available")
+                    return await executor(tool_input)
+
+                tool_result = asyncio.run(
+                    engine.run(
+                        messages=messages,
+                        chat_fn=_chat_fn,
+                        tool_executor=_tool_executor,
+                        available_tools=available_tools,
+                    )
+                )
+                total_tokens = tool_result.total_tokens
+                return Response(body={
+                    "skill_id": skill_id,
+                    "result": tool_result.final_answer,
+                    "tokens_in": int(total_tokens.input_tokens),
+                    "tokens_out": int(total_tokens.output_tokens),
+                    "model": model_name,
+                    "provider": provider_name,
+                })
             provider_response = asyncio.run(provider.chat(messages, model=model_name))
         except Exception:  # pragma: no cover - exercised via route-level behavior
             logger.exception(
@@ -3618,6 +5096,8 @@ def register_routes(
                 parameters=body.get("parameters", {}),
                 idempotency_key=body.get("idempotency_key"),
                 execution_mode=body.get("execution_mode", "inline"),
+                correlation_id=str(request.context.get("correlation_id", "")) or None,
+                trace_id=str(request.context.get("trace_id", "")) or None,
             )
         except KeyError as exc:
             return Response(status_code=404, body={"error": str(exc)})
@@ -3661,6 +5141,34 @@ def register_routes(
         if run.get("tenant_id") != tenant_id:
             return Response(status_code=403, body={"error": "Forbidden"})
         return Response(body=workflow_service.get_run_payload(run_id))
+
+    def stream_workflow_run_by_id(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        run_id = request.path_params.get("run_id", "")
+        run = s.get_run_record(run_id)
+        if run is None:
+            return Response(status_code=404, body={"error": f"Run not found: {run_id}"})
+        if run.get("tenant_id") != tenant_id:
+            return Response(status_code=403, body={"error": "Forbidden"})
+        once = _query_bool(request, "once", default=False)
+        workflow_id = str(run.get("workflow_id", run.get("workflow", "")))
+        return Response(
+            headers={
+                "content-type": "text/event-stream; charset=utf-8",
+                "cache-control": "no-cache",
+                "connection": "keep-alive",
+            },
+            body=StreamingBody(
+                _iter_run_events(
+                    tenant_id,
+                    run_id,
+                    workflow_id=workflow_id,
+                    once=once,
+                )
+            ),
+        )
 
     def list_runs(request: Request) -> Response:
         tenant_id = _require_tenant_id(request)
@@ -3736,6 +5244,8 @@ def register_routes(
                 run_id,
                 tenant_id=tenant_id,
                 input_data=raw_input,
+                correlation_id=str(request.context.get("correlation_id", "")) or None,
+                trace_id=str(request.context.get("trace_id", "")) or None,
             )
         except KeyError as exc:
             return Response(status_code=404, body={"error": str(exc)})
@@ -3970,6 +5480,7 @@ def register_routes(
     _public("GET", v1("/workflows/{id}/runs/{run_id}"), get_workflow_run, aliases=("/workflows/{id}/runs/{run_id}",), all_of=("runs:read",))
     _public("GET", v1("/runs"), list_runs, aliases=("/api/v1/workflow-runs",), all_of=("runs:read",))
     _public("GET", v1("/runs/{run_id}"), get_workflow_run_by_id, aliases=("/api/v1/workflow-runs/{run_id}",), all_of=("runs:read",))
+    _public("GET", v1("/runs/{run_id}/events"), stream_workflow_run_by_id, all_of=("runs:read",))
     _public("GET", v1("/runs/{run_id}/approvals"), list_run_approvals, aliases=("/api/v1/workflow-runs/{run_id}/approvals",), all_of=("approvals:read",))
     _public("GET", v1("/runs/{run_id}/checkpoints"), list_run_checkpoints, aliases=("/api/v1/workflow-runs/{run_id}/checkpoints",), all_of=("checkpoints:read",))
     _public("POST", v1("/runs/{run_id}/resume"), resume_workflow_run, aliases=("/api/v1/workflow-runs/{run_id}/resume",), all_of=("runs:write",))
@@ -3981,6 +5492,15 @@ def register_routes(
     _public("GET", v1("/skills"), list_skills, all_of=("agents:read",))
     _public("GET", v1("/skills/categories"), list_skill_categories, all_of=("agents:read",))
     _public("POST", v1("/skills/scan"), scan_skills, all_of=("agents:read",))
+    _public("GET", v1("/skill-sources"), list_skill_sources, all_of=("agents:read",))
+    _public("POST", v1("/skill-sources"), create_skill_source, all_of=("agents:write",))
+    _public("GET", v1("/skill-sources/{source_id}"), get_skill_source, all_of=("agents:read",))
+    _public("POST", v1("/skill-sources/{source_id}/scan"), scan_skill_source, all_of=("agents:write",))
+    _public("GET", v1("/skill-sources/{source_id}/skills"), list_skill_source_skills, all_of=("agents:read",))
+    _public("GET", v1("/skill-sources/{source_id}/tool-candidates"), list_skill_source_tool_candidates, all_of=("agents:read",))
+    _public("PATCH", v1("/skill-sources/{source_id}/tool-candidates/{candidate_id}"), update_skill_source_tool_candidate, all_of=("agents:write",))
+    _public("GET", v1("/skills/{id}/references"), get_skill_references, all_of=("agents:read",))
+    _public("GET", v1("/skills/{id}/context-contracts"), get_skill_context_contracts, all_of=("agents:read",))
     _public("GET", v1("/skills/{id}"), get_skill, all_of=("agents:read",))
     _public("POST", v1("/skills/{id}/execute"), execute_skill, all_of=("agents:write",))
     _public("GET", v1("/models"), list_models, all_of=("agents:read",))
@@ -3989,6 +5509,7 @@ def register_routes(
     _public("GET", v1("/models/health"), health_models, all_of=("agents:read",))
     _public("GET", v1("/lifecycle/projects"), list_lifecycle_projects, all_of=("runs:read",))
     _public("GET", v1("/lifecycle/projects/{project_id}"), get_lifecycle_project, all_of=("runs:read",))
+    _public("GET", v1("/lifecycle/projects/{project_id}/events"), stream_lifecycle_project_events, all_of=("runs:read",))
     _public("PATCH", v1("/lifecycle/projects/{project_id}"), update_lifecycle_project, all_of=("runs:write",))
     _public("GET", v1("/lifecycle/projects/{project_id}/blueprint"), get_lifecycle_blueprints, all_of=("runs:read",))
     _public("POST", v1("/lifecycle/projects/{project_id}/phases/{phase}/prepare"), prepare_lifecycle_phase, all_of=("runs:write",))

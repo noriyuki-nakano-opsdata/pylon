@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 from urllib.parse import parse_qs, urlsplit
@@ -37,6 +38,13 @@ class Response:
         if self.body is None:
             return ""
         return json.dumps(self.body)
+
+
+@dataclass
+class StreamingBody:
+    """Streaming response body."""
+
+    chunks: Iterable[str | bytes]
 
 
 class HandlerFunc(Protocol):
@@ -121,6 +129,9 @@ class APIServer:
             body=body,
         )
         request.context["query_params"] = query_params
+        container = getattr(self, "container", None)
+        if container is not None:
+            request.context["services"] = container.create_scope()
 
         # Match route
         route = self._match_route(request.method, request.path)

@@ -7,10 +7,12 @@ import inspect
 import logging
 import time
 from collections.abc import Mapping
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
 
 from pylon.approval import ApprovalManager
+from pylon.autonomy.explainability import DecisionExplainer
 from pylon.control_plane.adapters import (
     StoreBackedApprovalStore,
     StoreBackedAuditRepository,
@@ -22,6 +24,7 @@ from pylon.observability.query_service import (
     build_run_query_payload,
 )
 from pylon.observability.run_record import build_run_record, rebuild_run_record
+from pylon.observability.tracing import Tracer
 from pylon.repository.audit import default_hmac_key
 from pylon.repository.checkpoint import Checkpoint
 from pylon.repository.workflow import WorkflowRun
@@ -32,8 +35,9 @@ from pylon.runtime import (
     resume_project_sync,
 )
 from pylon.runtime.execution import execute_project_sync, serialize_run
-from pylon.runtime.llm import ProviderRegistry
+from pylon.runtime.llm import LLMRuntime, ProviderRegistry
 from pylon.runtime.queued_runner import QueuedWorkflowDispatchRunner
+from pylon.skills.runtime import SkillRuntime, get_default_skill_runtime
 from pylon.taskqueue import ExponentialBackoff, FixedRetry, TaskStatus
 from pylon.types import (
     AutonomyLevel,
@@ -214,9 +218,17 @@ class WorkflowRunService:
         store: WorkflowControlPlaneStore,
         *,
         provider_registry: ProviderRegistry | None = None,
+        llm_runtime: LLMRuntime | None = None,
+        skill_runtime: SkillRuntime | None = None,
+        tracer: Tracer | None = None,
+        decision_explainer: DecisionExplainer | None = None,
     ) -> None:
         self._store = store
         self._provider_registry = provider_registry
+        self._llm_runtime = llm_runtime
+        self._skill_runtime = skill_runtime or get_default_skill_runtime()
+        self._tracer = tracer
+        self._decision_explainer = decision_explainer or DecisionExplainer()
 
     def _approval_manager(self) -> ApprovalManager:
         return (
@@ -225,6 +237,24 @@ class WorkflowRunService:
                 StoreBackedAuditRepository(self._store, hmac_key=default_hmac_key()),
             )
         )
+
+    def _current_trace_id(self) -> str | None:
+        if self._tracer is None:
+            return None
+        context = self._tracer.current_context()
+        if context is None:
+            return None
+        return context.trace_id
+
+    def _trace_scope(
+        self,
+        name: str,
+        *,
+        attributes: dict[str, Any] | None = None,
+    ) -> Any:
+        if self._tracer is None:
+            return nullcontext(None)
+        return self._tracer.start_as_current_span(name, attributes=attributes)
 
     def _resolve_require_approval_above(self, level: str) -> AutonomyLevel:
         try:
@@ -335,7 +365,47 @@ class WorkflowRunService:
             custom_handler = agent_handlers[node.agent]
 
         if custom_handler is None:
-            return NodeResult(state_patch={f"{node_id}_done": True})
+            if self._provider_registry is None:
+                return NodeResult(state_patch={f"{node_id}_done": True})
+            single_node_project = PylonProject.model_validate(
+                {
+                    "version": project.version,
+                    "name": f"{project.name}:{node_id}",
+                    "description": project.description,
+                    "agents": {
+                        node.agent: project.agents[node.agent].model_dump(mode="json"),
+                    },
+                    "workflow": {
+                        "type": "graph",
+                        "nodes": {
+                            node_id: {
+                                "agent": node.agent,
+                                "node_type": node.node_type,
+                                "join_policy": node.join_policy,
+                                "loop_max_iterations": node.loop_max_iterations,
+                                "loop_criterion": node.loop_criterion,
+                                "loop_threshold": node.loop_threshold,
+                                "loop_metadata": dict(node.loop_metadata),
+                                "next": "END",
+                            }
+                        },
+                    },
+                    "policy": project.policy.model_dump(mode="json"),
+                }
+            )
+            artifacts = execute_project_sync(
+                single_node_project,
+                input_data=dict(state),
+                workflow_id=f"{workflow_id}:{node_id}",
+                provider_registry=self._provider_registry,
+                llm_runtime=self._llm_runtime,
+                skill_runtime=self._skill_runtime,
+                tracer=self._tracer,
+                decision_explainer=self._decision_explainer,
+            )
+            patch = dict(artifacts.run.state)
+            patch.setdefault(f"{node_id}_done", True)
+            return NodeResult(state_patch=patch)
 
         result = NodeResult.from_raw(
             _invoke_registered_handler_sync(
@@ -928,33 +998,97 @@ class WorkflowRunService:
         correlation_id: str | None = None,
         trace_id: str | None = None,
     ) -> dict[str, Any]:
-        logger.info(
-            "start_run workflow_id=%s tenant_id=%s mode=%s",
-            workflow_id, tenant_id, execution_mode,
-        )
-        normalized_idempotency_key = (idempotency_key or "").strip()
-        if execution_mode not in {"inline", "queued"}:
-            raise ValueError(f"Unsupported execution_mode: {execution_mode}")
-        if normalized_idempotency_key:
-            existing = self._store.get_run_record_by_idempotency_key(
-                workflow_id,
-                tenant_id=tenant_id,
-                idempotency_key=normalized_idempotency_key,
+        with self._trace_scope(
+            "workflow.start_run",
+            attributes={
+                "workflow.id": workflow_id,
+                "tenant.id": tenant_id,
+                "workflow.execution_mode": execution_mode,
+            },
+        ):
+            resolved_trace_id = trace_id or self._current_trace_id()
+            logger.info(
+                "start_run workflow_id=%s tenant_id=%s mode=%s",
+                workflow_id, tenant_id, execution_mode,
             )
-            if existing is not None:
-                return existing
-        project = self._store.get_workflow_project(workflow_id, tenant_id=tenant_id)
-        if project is None:
-            raise KeyError(f"Workflow not found: {workflow_id}")
-        if execution_mode == "queued":
-            stored_run = self._start_queued_run(
+            normalized_idempotency_key = (idempotency_key or "").strip()
+            if execution_mode not in {"inline", "queued"}:
+                raise ValueError(f"Unsupported execution_mode: {execution_mode}")
+            if normalized_idempotency_key:
+                existing = self._store.get_run_record_by_idempotency_key(
+                    workflow_id,
+                    tenant_id=tenant_id,
+                    idempotency_key=normalized_idempotency_key,
+                )
+                if existing is not None:
+                    return existing
+            project = self._store.get_workflow_project(workflow_id, tenant_id=tenant_id)
+            if project is None:
+                raise KeyError(f"Workflow not found: {workflow_id}")
+            if execution_mode == "queued":
+                stored_run = self._start_queued_run(
+                    workflow_id=workflow_id,
+                    tenant_id=tenant_id,
+                    project=project,
+                    input_data=input_data,
+                    parameters=parameters,
+                    correlation_id=correlation_id,
+                    trace_id=resolved_trace_id,
+                )
+                if normalized_idempotency_key:
+                    try:
+                        self._store.put_run_idempotency_key(
+                            workflow_id,
+                            tenant_id=tenant_id,
+                            idempotency_key=normalized_idempotency_key,
+                            run_id=str(stored_run["id"]),
+                        )
+                    except ConcurrencyError:
+                        existing = self._store.get_run_record_by_idempotency_key(
+                            workflow_id,
+                            tenant_id=tenant_id,
+                            idempotency_key=normalized_idempotency_key,
+                        )
+                        if existing is not None:
+                            return existing
+                        raise
+                    stored_run["idempotency_key"] = normalized_idempotency_key
+                    stored_run = self._store.put_run_record(
+                        stored_run,
+                        workflow_id=workflow_id,
+                        tenant_id=tenant_id,
+                        parameters=parameters,
+                        expected_record_version=int(stored_run.get("record_version", 1)),
+                    )
+                return stored_run
+            artifacts = execute_project_sync(
+                project,
+                input_data=normalize_runtime_input(input_data),
+                workflow_id=workflow_id,
+                approval_store=StoreBackedApprovalStore(self._store),
+                approval_manager=self._approval_manager(),
+                node_handlers=self._store.get_node_handlers(workflow_id),
+                agent_handlers=self._store.get_agent_handlers(workflow_id),
+                provider_registry=self._provider_registry,
+                llm_runtime=self._llm_runtime,
+                skill_runtime=self._skill_runtime,
+                tracer=self._tracer,
+                decision_explainer=self._decision_explainer,
+            )
+            run_record = serialize_run(
+                artifacts,
+                project_name=project.name,
+                workflow_name=workflow_id,
+                input_data=input_data,
+                correlation_id=correlation_id,
+                trace_id=resolved_trace_id,
+            )
+            stored_run = self._persist_execution(
                 workflow_id=workflow_id,
                 tenant_id=tenant_id,
-                project=project,
-                input_data=input_data,
+                run_record=run_record,
+                artifacts=artifacts,
                 parameters=parameters,
-                correlation_id=correlation_id,
-                trace_id=trace_id,
             )
             if normalized_idempotency_key:
                 try:
@@ -982,57 +1116,6 @@ class WorkflowRunService:
                     expected_record_version=int(stored_run.get("record_version", 1)),
                 )
             return stored_run
-        artifacts = execute_project_sync(
-            project,
-            input_data=normalize_runtime_input(input_data),
-            workflow_id=workflow_id,
-            approval_store=StoreBackedApprovalStore(self._store),
-            approval_manager=self._approval_manager(),
-            node_handlers=self._store.get_node_handlers(workflow_id),
-            agent_handlers=self._store.get_agent_handlers(workflow_id),
-            provider_registry=self._provider_registry,
-        )
-        run_record = serialize_run(
-            artifacts,
-            project_name=project.name,
-            workflow_name=workflow_id,
-            input_data=input_data,
-            correlation_id=correlation_id,
-            trace_id=trace_id,
-        )
-        stored_run = self._persist_execution(
-            workflow_id=workflow_id,
-            tenant_id=tenant_id,
-            run_record=run_record,
-            artifacts=artifacts,
-            parameters=parameters,
-        )
-        if normalized_idempotency_key:
-            try:
-                self._store.put_run_idempotency_key(
-                    workflow_id,
-                    tenant_id=tenant_id,
-                    idempotency_key=normalized_idempotency_key,
-                    run_id=str(stored_run["id"]),
-                )
-            except ConcurrencyError:
-                existing = self._store.get_run_record_by_idempotency_key(
-                    workflow_id,
-                    tenant_id=tenant_id,
-                    idempotency_key=normalized_idempotency_key,
-                )
-                if existing is not None:
-                    return existing
-                raise
-            stored_run["idempotency_key"] = normalized_idempotency_key
-            stored_run = self._store.put_run_record(
-                stored_run,
-                workflow_id=workflow_id,
-                tenant_id=tenant_id,
-                parameters=parameters,
-                expected_record_version=int(stored_run.get("record_version", 1)),
-            )
-        return stored_run
 
     def resume_run(
         self,
@@ -1043,44 +1126,53 @@ class WorkflowRunService:
         correlation_id: str | None = None,
         trace_id: str | None = None,
     ) -> dict[str, Any]:
-        run = self._store.get_run_record(run_id)
-        if run is None:
-            raise KeyError(f"Run not found: {run_id}")
-        resolved_correlation_id = correlation_id or run.get("correlation_id")
-        resolved_trace_id = trace_id or run.get("trace_id")
-        expected_record_version = int(run.get("record_version", 1))
-        workflow_id = str(run.get("workflow_id", run.get("workflow", "")))
-        project = self._store.get_workflow_project(workflow_id, tenant_id=tenant_id)
-        if project is None:
-            raise KeyError(f"Workflow not found: {workflow_id}")
-        raw_input = run.get("input") if input_data is None else input_data
-        artifacts = resume_project_sync(
-            project,
-            run,
-            input_data=normalize_runtime_input(raw_input),
-            checkpoints=self._store.list_run_checkpoints(run_id),
-            approvals=self._store.list_run_approvals(run_id),
-            approval_store=StoreBackedApprovalStore(self._store),
-            approval_manager=self._approval_manager(),
-            node_handlers=self._store.get_node_handlers(workflow_id),
-            agent_handlers=self._store.get_agent_handlers(workflow_id),
-        )
-        run_record = serialize_run(
-            artifacts,
-            project_name=project.name,
-            workflow_name=workflow_id,
-            input_data=raw_input,
-            correlation_id=resolved_correlation_id,
-            trace_id=resolved_trace_id,
-        )
-        return self._persist_execution(
-            workflow_id=workflow_id,
-            tenant_id=tenant_id,
-            run_record=run_record,
-            artifacts=artifacts,
-            parameters=run.get("parameters", {}),
-            expected_record_version=expected_record_version,
-        )
+        with self._trace_scope(
+            "workflow.resume_run",
+            attributes={"run.id": run_id, "tenant.id": tenant_id},
+        ):
+            run = self._store.get_run_record(run_id)
+            if run is None:
+                raise KeyError(f"Run not found: {run_id}")
+            resolved_correlation_id = correlation_id or run.get("correlation_id")
+            resolved_trace_id = trace_id or run.get("trace_id") or self._current_trace_id()
+            expected_record_version = int(run.get("record_version", 1))
+            workflow_id = str(run.get("workflow_id", run.get("workflow", "")))
+            project = self._store.get_workflow_project(workflow_id, tenant_id=tenant_id)
+            if project is None:
+                raise KeyError(f"Workflow not found: {workflow_id}")
+            raw_input = run.get("input") if input_data is None else input_data
+            artifacts = resume_project_sync(
+                project,
+                run,
+                input_data=normalize_runtime_input(raw_input),
+                checkpoints=self._store.list_run_checkpoints(run_id),
+                approvals=self._store.list_run_approvals(run_id),
+                approval_store=StoreBackedApprovalStore(self._store),
+                approval_manager=self._approval_manager(),
+                provider_registry=self._provider_registry,
+                llm_runtime=self._llm_runtime,
+                skill_runtime=self._skill_runtime,
+                tracer=self._tracer,
+                decision_explainer=self._decision_explainer,
+                node_handlers=self._store.get_node_handlers(workflow_id),
+                agent_handlers=self._store.get_agent_handlers(workflow_id),
+            )
+            run_record = serialize_run(
+                artifacts,
+                project_name=project.name,
+                workflow_name=workflow_id,
+                input_data=raw_input,
+                correlation_id=resolved_correlation_id,
+                trace_id=resolved_trace_id,
+            )
+            return self._persist_execution(
+                workflow_id=workflow_id,
+                tenant_id=tenant_id,
+                run_record=run_record,
+                artifacts=artifacts,
+                parameters=run.get("parameters", {}),
+                expected_record_version=expected_record_version,
+            )
 
     def approve_request(
         self,
@@ -1090,33 +1182,37 @@ class WorkflowRunService:
         actor: str,
         reason: str | None = None,
     ) -> dict[str, Any]:
-        logger.info("approve_request approval_id=%s actor=%s", approval_id, actor)
-        approval = self._store.get_approval_record(approval_id)
-        if approval is None:
-            raise KeyError(f"Approval request not found: {approval_id}")
-        if approval.get("status") != "pending":
-            raise ValueError(f"Approval request already decided: {approval_id}")
-        run_id = str(approval.get("run_id", ""))
-        run = self._store.get_run_record(run_id)
-        if run is None:
-            raise KeyError(f"Run not found: {run_id}")
+        with self._trace_scope(
+            "workflow.approve_request",
+            attributes={"approval.id": approval_id, "tenant.id": tenant_id},
+        ):
+            logger.info("approve_request approval_id=%s actor=%s", approval_id, actor)
+            approval = self._store.get_approval_record(approval_id)
+            if approval is None:
+                raise KeyError(f"Approval request not found: {approval_id}")
+            if approval.get("status") != "pending":
+                raise ValueError(f"Approval request already decided: {approval_id}")
+            run_id = str(approval.get("run_id", ""))
+            run = self._store.get_run_record(run_id)
+            if run is None:
+                raise KeyError(f"Run not found: {run_id}")
 
-        manager = self._approval_manager()
-        _run_sync(manager.approve(approval_id, actor, comment=reason or ""))
-        _run_sync(
-            manager.validate_binding(
-                approval_id,
-                plan=approval.get("context", {}).get("binding_plan"),
-                effect_envelope=approval.get("context", {}).get("binding_effect_envelope"),
+            manager = self._approval_manager()
+            _run_sync(manager.approve(approval_id, actor, comment=reason or ""))
+            _run_sync(
+                manager.validate_binding(
+                    approval_id,
+                    plan=approval.get("context", {}).get("binding_plan"),
+                    effect_envelope=approval.get("context", {}).get("binding_effect_envelope"),
+                )
             )
-        )
-        decided = self._store.get_approval_record(approval_id)
-        if decided is not None:
-            decided["decided_at"] = decided.get("decided_at") or time.time()
-            if reason:
-                decided["reason"] = reason
-            self._store.put_approval_record(decided)
-        return self.resume_run(run_id, tenant_id=tenant_id)
+            decided = self._store.get_approval_record(approval_id)
+            if decided is not None:
+                decided["decided_at"] = decided.get("decided_at") or time.time()
+                if reason:
+                    decided["reason"] = reason
+                self._store.put_approval_record(decided)
+            return self.resume_run(run_id, tenant_id=tenant_id)
 
     def reject_request(
         self,

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from pylon.autonomy.explainability import DecisionExplainer
 from pylon.api.http_server import PylonHTTPServer, create_http_server
 from pylon.api.middleware import (
     AuthMiddleware,
@@ -30,9 +31,21 @@ from pylon.api.middleware import (
 from pylon.api.observability import APIObservabilityBundle, build_api_observability_bundle
 from pylon.api.routes import RouteStore, register_routes
 from pylon.api.server import APIServer
+from pylon.approval import ApprovalManager
 from pylon.control_plane import ControlPlaneStoreConfig, WorkflowControlPlaneStore
+from pylon.control_plane.adapters import (
+    StoreBackedApprovalStore,
+    StoreBackedAuditRepository,
+)
+from pylon.control_plane.workflow_service import WorkflowRunService
+from pylon.di import ServiceContainer
 from pylon.errors import ConfigError
-from pylon.runtime.llm import ProviderRegistry
+from pylon.observability.logging import StructuredLogger
+from pylon.observability.metrics import MetricsCollector
+from pylon.observability.otel import OpenTelemetryConfig
+from pylon.observability.tracing import Tracer
+from pylon.repository.audit import default_hmac_key
+from pylon.runtime.llm import LLMRuntime, ProviderRegistry
 
 
 class AuthBackend(enum.StrEnum):
@@ -68,6 +81,7 @@ class RequestContextMiddlewareConfig:
     request_id_header: str = "x-request-id"
     correlation_id_header: str = "x-correlation-id"
     trace_id_header: str = "x-trace-id"
+    span_id_header: str = "x-span-id"
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any] | None) -> RequestContextMiddlewareConfig:
@@ -85,6 +99,7 @@ class RequestContextMiddlewareConfig:
                 raw.get("correlation_id_header", "x-correlation-id")
             ),
             trace_id_header=str(raw.get("trace_id_header", "x-trace-id")),
+            span_id_header=str(raw.get("span_id_header", "x-span-id")),
         )
 
 
@@ -374,6 +389,7 @@ class APIObservabilityConfig:
     telemetry_sink_backend: TelemetrySinkBackend = TelemetrySinkBackend.NONE
     telemetry_export_path: str | None = None
     metrics_namespace: str = "pylon"
+    open_telemetry: OpenTelemetryConfig = field(default_factory=OpenTelemetryConfig)
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any] | None) -> APIObservabilityConfig:
@@ -430,6 +446,13 @@ class APIObservabilityConfig:
                 "observability.metrics_namespace must be a non-empty string",
                 details={"metrics_namespace": metrics_namespace},
             )
+        try:
+            open_telemetry = OpenTelemetryConfig.from_mapping(raw.get("open_telemetry"))
+        except ValueError as exc:
+            raise ConfigError(
+                str(exc),
+                details={"open_telemetry": raw.get("open_telemetry")},
+            ) from exc
         return cls(
             enabled=enabled,
             request_metrics_enabled=request_metrics_enabled,
@@ -439,6 +462,7 @@ class APIObservabilityConfig:
             telemetry_sink_backend=telemetry_sink_backend,
             telemetry_export_path=telemetry_export_path,
             metrics_namespace=metrics_namespace,
+            open_telemetry=open_telemetry,
         )
 
 
@@ -618,6 +642,7 @@ def build_middleware_chain(
             request_id_header=config.request_context.request_id_header,
             correlation_id_header=config.request_context.correlation_id_header,
             trace_id_header=config.request_context.trace_id_header,
+            span_id_header=config.request_context.span_id_header,
         ))
     if observability is not None and request_metrics_enabled:
         chain.add(RequestTelemetryMiddleware(
@@ -638,21 +663,91 @@ def build_middleware_chain(
     return chain
 
 
+def build_api_container(
+    config: APIServerConfig,
+    *,
+    store: RouteStore | None = None,
+    control_plane_store: WorkflowControlPlaneStore | None = None,
+    provider_registry: ProviderRegistry | None = None,
+    observability: APIObservabilityBundle | None = None,
+    container: ServiceContainer | None = None,
+) -> ServiceContainer:
+    """Build the default DI container used by the API surface."""
+    services = container or ServiceContainer()
+
+    route_store = store or services.resolve_optional(RouteStore)
+    if route_store is None:
+        route_store = RouteStore(
+            control_plane_store=control_plane_store,
+            control_plane_backend=config.control_plane.backend,
+            control_plane_path=config.control_plane.path,
+        )
+    services.override(RouteStore, route_store)
+
+    if provider_registry is not None:
+        services.override(ProviderRegistry, provider_registry)
+
+    if observability is not None:
+        services.override(APIObservabilityBundle, observability)
+        services.override(MetricsCollector, observability.metrics)
+        services.override(Tracer, observability.tracer)
+        services.override(StructuredLogger, observability.logger)
+
+    if not services.has(DecisionExplainer):
+        services.register_singleton(
+            DecisionExplainer,
+            lambda _resolver: DecisionExplainer(),
+        )
+
+    if not services.has(ApprovalManager):
+        services.register_factory(
+            ApprovalManager,
+            lambda resolver: ApprovalManager(
+                StoreBackedApprovalStore(resolver.resolve(RouteStore)),
+                StoreBackedAuditRepository(
+                    resolver.resolve(RouteStore),
+                    hmac_key=default_hmac_key(),
+                ),
+            ),
+        )
+
+    if not services.has(WorkflowRunService):
+        services.register_singleton(
+            WorkflowRunService,
+            lambda resolver: WorkflowRunService(
+                resolver.resolve(RouteStore),
+                provider_registry=resolver.resolve_optional(ProviderRegistry),
+                llm_runtime=resolver.resolve_optional(LLMRuntime),
+                tracer=resolver.resolve_optional(Tracer),
+                decision_explainer=resolver.resolve_optional(DecisionExplainer),
+            ),
+        )
+
+    return services
+
+
 def build_api_server(
     config: APIServerConfig,
     *,
     store: RouteStore | None = None,
     control_plane_store: WorkflowControlPlaneStore | None = None,
     provider_registry: ProviderRegistry | None = None,
+    container: ServiceContainer | None = None,
 ) -> tuple[APIServer, RouteStore]:
     """Build an APIServer with the standard middleware stack and routes."""
 
     server = APIServer()
-    route_store = store or RouteStore(
-        control_plane_store=control_plane_store,
-        control_plane_backend=config.control_plane.backend,
-        control_plane_path=config.control_plane.path,
+    route_store = store or (
+        container.resolve_optional(RouteStore)
+        if container is not None
+        else None
     )
+    if route_store is None:
+        route_store = RouteStore(
+            control_plane_store=control_plane_store,
+            control_plane_backend=config.control_plane.backend,
+            control_plane_path=config.control_plane.path,
+        )
     observability = (
         build_api_observability_bundle(
             control_plane_store=route_store.control_plane_store,
@@ -673,16 +768,28 @@ def build_api_server(
                 is TelemetrySinkBackend.JSONL
                 else None
             ),
+            open_telemetry=config.observability.open_telemetry,
         )
         if config.observability.enabled
         else None
     )
+    services = build_api_container(
+        config,
+        store=route_store,
+        control_plane_store=control_plane_store,
+        provider_registry=provider_registry,
+        observability=observability,
+        container=container,
+    )
+    route_store = services.resolve(RouteStore)
+    setattr(server, "container", services)
     route_store = register_routes(
         server,
         store=route_store,
         control_plane_backend=config.control_plane.backend,
         control_plane_path=config.control_plane.path,
         observability=observability,
+        container=services,
         readiness_route_enabled=(
             config.observability.enabled
             and config.observability.readiness_route_enabled
@@ -693,7 +800,6 @@ def build_api_server(
             and observability is not None
             and observability.prometheus_exporter is not None
         ),
-        provider_registry=provider_registry,
     )
     for middleware in build_middleware_chain(
         config.middleware,
@@ -712,6 +818,7 @@ def build_http_api_server(
     store: RouteStore | None = None,
     control_plane_store: WorkflowControlPlaneStore | None = None,
     provider_registry: ProviderRegistry | None = None,
+    container: ServiceContainer | None = None,
 ) -> tuple[PylonHTTPServer, RouteStore]:
     """Build an HTTP server around the standard APIServer wiring."""
 
@@ -720,5 +827,6 @@ def build_http_api_server(
         store=store,
         control_plane_store=control_plane_store,
         provider_registry=provider_registry,
+        container=container,
     )
     return create_http_server(api_server, host=host, port=port), route_store

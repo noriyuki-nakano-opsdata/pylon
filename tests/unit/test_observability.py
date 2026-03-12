@@ -26,7 +26,7 @@ from pylon.observability.query_service import (
     rebuild_run_query_payload,
 )
 from pylon.observability.run_record import build_run_record, rebuild_run_record
-from pylon.observability.tracing import Span, SpanStatus, Tracer
+from pylon.observability.tracing import Span, SpanStatus, TraceContext, Tracer
 from pylon.types import RunStatus, RunStopReason
 from pylon.workflow.replay import ReplayResult
 
@@ -229,6 +229,35 @@ class TestNestedSpans:
         span = tracer.start_span("failing")
         tracer.end_span(span.span_id, status=SpanStatus.ERROR)
         assert span.status == SpanStatus.ERROR
+
+    def test_start_as_current_span_infers_parent(self) -> None:
+        tracer = Tracer()
+        with tracer.start_as_current_span("root") as root:
+            with tracer.start_as_current_span("child") as child:
+                assert child.trace_id == root.trace_id
+                assert child.parent_id == root.span_id
+
+    def test_extract_context_from_traceparent(self) -> None:
+        tracer = Tracer()
+        context = tracer.extract_context(
+            {
+                "traceparent": "00-1234567890abcdef1234567890abcdef-1234567890abcdef-01"
+            }
+        )
+
+        assert context == TraceContext(
+            trace_id="1234567890abcdef1234567890abcdef",
+            span_id="1234567890abcdef",
+            trace_flags="01",
+            is_remote=True,
+        )
+
+    def test_format_traceparent_from_current_span(self) -> None:
+        tracer = Tracer()
+        with tracer.start_as_current_span("root") as root:
+            assert tracer.format_traceparent() == (
+                f"00-{root.trace_id}-{root.span_id}-{root.trace_flags}"
+            )
 
 
 # ---------------------------------------------------------------------------

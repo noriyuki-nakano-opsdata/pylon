@@ -41,6 +41,11 @@ anthropic = [
 tokenizer = [
     "tiktoken>=0.7.0",
 ]
+opentelemetry = [
+    "opentelemetry-api>=1.30",
+    "opentelemetry-sdk>=1.30",
+    "opentelemetry-exporter-otlp-proto-http>=1.30",
+]
 
 [project.scripts]
 pylon = "pylon.cli.main:cli"

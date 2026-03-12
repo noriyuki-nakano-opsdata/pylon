@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -1038,10 +1039,15 @@ class RequestTelemetryMiddleware:
         base_labels = {"method": method, "route": route}
         started_at = time.time()
         self._adjust_in_flight(delta=1)
-        span = None
-        if self._tracer is not None:
-            span = self._tracer.start_span(
+        parent_context = (
+            self._tracer.extract_context(request.headers)
+            if self._tracer is not None
+            else None
+        )
+        scope = (
+            self._tracer.start_as_current_span(
                 "api.request",
+                parent_context=parent_context,
                 attributes={
                     "http.method": method,
                     "http.route": route,
@@ -1049,26 +1055,75 @@ class RequestTelemetryMiddleware:
                     "correlation.id": correlation_id,
                 },
             )
-            request.context["trace_id"] = span.trace_id
-        try:
-            response = next_handler(request)
-        except Exception as exc:
+            if self._tracer is not None
+            else nullcontext(None)
+        )
+        with scope as span:
+            if span is not None:
+                request.context["trace_id"] = span.trace_id
+                request.context["span_id"] = span.span_id
+                traceparent = self._tracer.format_traceparent() if self._tracer is not None else None
+                if traceparent:
+                    request.context["traceparent"] = traceparent
+            try:
+                response = next_handler(request)
+            except Exception as exc:
+                elapsed = time.time() - started_at
+                error_labels = {**base_labels, "status_class": "5xx"}
+                self._metrics.counter("api_request_count", 1, labels=error_labels)
+                self._metrics.counter("api_request_error_count", 1, labels=error_labels)
+                self._metrics.histogram(
+                    "api_request_duration_seconds",
+                    elapsed,
+                    labels=error_labels,
+                )
+                self._adjust_in_flight(delta=-1)
+                if span is not None:
+                    span.set_attribute("http.status_code", 500)
+                    span.set_attribute("error.type", exc.__class__.__name__)
+                    try:
+                        self._tracer.end_span(span.span_id, status=SpanStatus.ERROR)
+                        self._export_current_snapshot(span)
+                    except Exception:
+                        logger.warning(
+                            "instrumentation failure in end_span/export",
+                            exc_info=True,
+                        )
+                if self._logger is not None:
+                    self._logger.error(
+                        "api request failed",
+                        method=method,
+                        route=route,
+                        request_id=request_id,
+                        correlation_id=correlation_id,
+                        trace_id=str(request.context.get("trace_id", "")),
+                        span_id=str(request.context.get("span_id", "")),
+                        error_type=exc.__class__.__name__,
+                    )
+                raise
+
             elapsed = time.time() - started_at
-            error_labels = {**base_labels, "status_class": "5xx"}
-            self._metrics.counter("api_request_count", 1, labels=error_labels)
-            self._metrics.counter("api_request_error_count", 1, labels=error_labels)
+            status_code = int(response.status_code)
+            result_labels = {**base_labels, "status_class": f"{status_code // 100}xx"}
+            self._metrics.counter("api_request_count", 1, labels=result_labels)
             self._metrics.histogram(
                 "api_request_duration_seconds",
                 elapsed,
-                labels=error_labels,
+                labels=result_labels,
             )
+            if status_code >= 500:
+                self._metrics.counter("api_request_error_count", 1, labels=result_labels)
             self._adjust_in_flight(delta=-1)
             if span is not None:
-                span.set_attribute("http.status_code", 500)
-                span.set_attribute("error.type", exc.__class__.__name__)
-                span.add_event("exception", {"message": str(exc)})
+                span.set_attribute("http.status_code", status_code)
+                tenant_id = request.context.get("tenant_id")
+                if tenant_id:
+                    span.set_attribute("tenant.id", str(tenant_id))
                 try:
-                    self._tracer.end_span(span.span_id, status=SpanStatus.ERROR)
+                    self._tracer.end_span(
+                        span.span_id,
+                        status=SpanStatus.ERROR if status_code >= 500 else SpanStatus.OK,
+                    )
                     self._export_current_snapshot(span)
                 except Exception:
                     logger.warning(
@@ -1076,56 +1131,17 @@ class RequestTelemetryMiddleware:
                         exc_info=True,
                     )
             if self._logger is not None:
-                self._logger.error(
-                    "api request failed",
+                self._logger.info(
+                    "api request completed",
                     method=method,
                     route=route,
+                    status_code=status_code,
                     request_id=request_id,
                     correlation_id=correlation_id,
                     trace_id=str(request.context.get("trace_id", "")),
-                    error_type=exc.__class__.__name__,
+                    span_id=str(request.context.get("span_id", "")),
                 )
-            raise
-
-        elapsed = time.time() - started_at
-        status_code = int(response.status_code)
-        result_labels = {**base_labels, "status_class": f"{status_code // 100}xx"}
-        self._metrics.counter("api_request_count", 1, labels=result_labels)
-        self._metrics.histogram(
-            "api_request_duration_seconds",
-            elapsed,
-            labels=result_labels,
-        )
-        if status_code >= 500:
-            self._metrics.counter("api_request_error_count", 1, labels=result_labels)
-        self._adjust_in_flight(delta=-1)
-        if span is not None:
-            span.set_attribute("http.status_code", status_code)
-            tenant_id = request.context.get("tenant_id")
-            if tenant_id:
-                span.set_attribute("tenant.id", str(tenant_id))
-            try:
-                self._tracer.end_span(
-                    span.span_id,
-                    status=SpanStatus.ERROR if status_code >= 500 else SpanStatus.OK,
-                )
-                self._export_current_snapshot(span)
-            except Exception:
-                logger.warning(
-                    "instrumentation failure in end_span/export",
-                    exc_info=True,
-                )
-        if self._logger is not None:
-            self._logger.info(
-                "api request completed",
-                method=method,
-                route=route,
-                status_code=status_code,
-                request_id=request_id,
-                correlation_id=correlation_id,
-                trace_id=str(request.context.get("trace_id", "")),
-            )
-        return response
+            return response
 
     def _export_current_snapshot(self, span: Any) -> None:
         snapshot = self._metrics.get_metrics()
@@ -1149,10 +1165,12 @@ class RequestContextMiddleware:
         request_id_header: str = "x-request-id",
         correlation_id_header: str = "x-correlation-id",
         trace_id_header: str = "x-trace-id",
+        span_id_header: str = "x-span-id",
     ) -> None:
         self._request_id_header = request_id_header.lower()
         self._correlation_id_header = correlation_id_header.lower()
         self._trace_id_header = trace_id_header.lower()
+        self._span_id_header = span_id_header.lower()
 
     def __call__(self, request: Request, next_handler: HandlerFunc) -> Response:
         request_id = request.headers.get(self._request_id_header) or uuid.uuid4().hex
@@ -1167,6 +1185,12 @@ class RequestContextMiddleware:
         trace_id = request.context.get("trace_id")
         if trace_id:
             response.headers.setdefault(self._trace_id_header, str(trace_id))
+        span_id = request.context.get("span_id")
+        if span_id:
+            response.headers.setdefault(self._span_id_header, str(span_id))
+        traceparent = request.context.get("traceparent")
+        if traceparent:
+            response.headers.setdefault("traceparent", str(traceparent))
         return response
 
 

@@ -17,8 +17,12 @@ from pylon.api.factory import (
     RateLimitBackend,
     RateLimitMiddlewareConfig,
     TenantMiddlewareConfig,
+    build_api_container,
     build_api_server,
 )
+from pylon.api.routes import RouteStore
+from pylon.control_plane.workflow_service import WorkflowRunService
+from pylon.di import ServiceContainer
 from pylon.dsl.parser import PylonProject
 from pylon.errors import ConfigError
 
@@ -114,6 +118,9 @@ def test_build_api_server_with_default_stack() -> None:
     agent = server.handle_request("POST", "/agents", body={"name": "coder"})
     assert agent.status_code == 201
     assert agent.headers["x-frame-options"] == "DENY"
+    assert agent.headers["x-trace-id"]
+    assert agent.headers["x-span-id"]
+    assert agent.headers["traceparent"].startswith("00-")
 
 
 def test_build_api_server_registers_canonical_public_contract() -> None:
@@ -258,6 +265,7 @@ def test_api_server_config_from_mapping_round_trips() -> None:
                     "request_id_header": "x-request-id",
                     "correlation_id_header": "x-correlation-id",
                     "trace_id_header": "x-trace-id",
+                    "span_id_header": "x-span-id",
                 },
                 "auth": {
                     "backend": "memory",
@@ -291,6 +299,10 @@ def test_api_server_config_from_mapping_round_trips() -> None:
                 "telemetry_sink_backend": "jsonl",
                 "telemetry_export_path": ".pylon/api-telemetry.jsonl",
                 "metrics_namespace": "pylon_api",
+                "open_telemetry": {
+                    "enabled": False,
+                    "service_name": "pylon-api",
+                },
             },
         }
     )
@@ -298,6 +310,7 @@ def test_api_server_config_from_mapping_round_trips() -> None:
     assert config.control_plane.backend.value == "sqlite"
     assert config.middleware.request_context.enabled is True
     assert config.middleware.request_context.trace_id_header == "x-trace-id"
+    assert config.middleware.request_context.span_id_header == "x-span-id"
     assert config.middleware.auth.backend.value == "memory"
     assert config.middleware.auth.tokens[0].tenant_id == "tenant-a"
     assert config.middleware.rate_limit.backend.value == "sqlite"
@@ -309,6 +322,21 @@ def test_api_server_config_from_mapping_round_trips() -> None:
     assert config.observability.telemetry_sink_backend.value == "jsonl"
     assert config.observability.telemetry_export_path == ".pylon/api-telemetry.jsonl"
     assert config.observability.metrics_namespace == "pylon_api"
+    assert config.observability.open_telemetry.service_name == "pylon-api"
+
+
+def test_build_api_container_respects_workflow_service_override() -> None:
+    container = ServiceContainer()
+    fake_service = object()
+    container.override(WorkflowRunService, fake_service)
+
+    services = build_api_container(
+        APIServerConfig(),
+        store=RouteStore(),
+        container=container,
+    )
+
+    assert services.resolve(WorkflowRunService) is fake_service
 
 
 def test_build_api_server_with_jwt_auth_backend() -> None:

@@ -7,6 +7,7 @@ import pytest
 from pylon.control_plane import JsonFileWorkflowControlPlaneStore, WorkflowRunService
 from pylon.dsl.parser import PylonProject
 from pylon.errors import ConcurrencyError
+from pylon.observability.tracing import Tracer
 from pylon.types import RunStatus
 
 
@@ -216,6 +217,23 @@ def test_start_run_supports_queued_execution_mode(tmp_path: Path) -> None:
     queue_state = stored["state"]["queue"]
     assert queue_state["completed_task_ids"] == list(stored["queue_task_ids"])
     assert queue_state["failed_task_ids"] == []
+
+
+def test_start_run_uses_active_trace_context_when_not_explicit(tmp_path: Path) -> None:
+    state_path = tmp_path / "control-plane.json"
+    store = _store(state_path)
+    store.register_workflow_project("echo", _workflow_project(), tenant_id="tenant-a")
+    tracer = Tracer()
+    service = WorkflowRunService(store, tracer=tracer)
+
+    with tracer.start_as_current_span("api.request") as request_span:
+        stored = service.start_run(
+            workflow_id="echo",
+            tenant_id="tenant-a",
+            input_data={"msg": "hi"},
+        )
+
+    assert stored["trace_id"] == request_span.trace_id
 
 
 def test_start_run_rejects_queued_execution_for_approval_workflow(tmp_path: Path) -> None:

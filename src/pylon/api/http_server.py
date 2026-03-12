@@ -8,7 +8,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from pylon.api.server import APIServer, Response
+from pylon.api.server import APIServer, Response, StreamingBody
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +25,7 @@ class _BoundHTTPRequestHandler(BaseHTTPRequestHandler):
     """Base handler bound to an APIServer instance through subclassing."""
 
     api_server: APIServer
+    protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:  # noqa: N802
         self._handle()
@@ -93,6 +94,9 @@ class _BoundHTTPRequestHandler(BaseHTTPRequestHandler):
         return raw.decode("utf-8")
 
     def _write_response(self, response: Response) -> None:
+        if isinstance(response.body, StreamingBody):
+            self._write_streaming_response(response)
+            return
         body_bytes: bytes
         if response.body is None:
             body_bytes = b""
@@ -113,6 +117,30 @@ class _BoundHTTPRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if body_bytes:
             self.wfile.write(body_bytes)
+
+    def _write_streaming_response(self, response: Response) -> None:
+        headers = dict(response.headers)
+        headers.setdefault("content-type", "text/event-stream; charset=utf-8")
+        headers.setdefault("cache-control", "no-cache")
+        headers.setdefault("connection", "close")
+
+        self.send_response(response.status_code)
+        for key, value in headers.items():
+            if key.lower() == "content-length":
+                continue
+            self.send_header(key, value)
+        self.end_headers()
+        try:
+            for chunk in response.body.chunks:
+                body_bytes = chunk.encode("utf-8") if isinstance(chunk, str) else bytes(chunk)
+                if not body_bytes:
+                    continue
+                self.wfile.write(body_bytes)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            logger.debug("Client disconnected during streaming response")
+        finally:
+            self.close_connection = True
 
 
 def build_http_handler(api_server: APIServer) -> type[BaseHTTPRequestHandler]:

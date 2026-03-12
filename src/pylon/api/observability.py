@@ -19,6 +19,7 @@ from pylon.observability.exporters import (
 )
 from pylon.observability.logging import StructuredLogger
 from pylon.observability.metrics import MetricsCollector
+from pylon.observability.otel import OpenTelemetryConfig, build_open_telemetry_bridge
 from pylon.observability.tracing import Tracer
 
 
@@ -43,9 +44,10 @@ def build_api_observability_bundle(
     metrics_namespace: str,
     enable_prometheus_exporter: bool,
     telemetry_export_path: str | None = None,
+    open_telemetry: OpenTelemetryConfig = OpenTelemetryConfig(),
 ) -> APIObservabilityBundle:
     metrics = MetricsCollector()
-    tracer = Tracer()
+    tracer = Tracer(bridge=build_open_telemetry_bridge(open_telemetry))
     logger = StructuredLogger()
     health_checker = build_default_checker()
     readiness_checker = build_default_readiness_checker()
