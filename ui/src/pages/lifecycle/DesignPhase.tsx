@@ -19,7 +19,7 @@ const DESIGN_AGENTS = [
   { id: "claude-designer", label: "Claude Sonnet 4.6" },
   { id: "openai-designer", label: "GPT-5 Mini" },
   { id: "gemini-designer", label: "Gemini 3 Flash" },
-  { id: "design-evaluator", label: "Design Judge" },
+  { id: "design-evaluator", label: "デザイン審査" },
 ];
 
 export function DesignPhase() {
@@ -32,10 +32,11 @@ export function DesignPhase() {
     : DESIGN_AGENTS;
   const [previewDevice, setPreviewDevice] = useState<"desktop" | "tablet" | "mobile">("desktop");
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [selectError, setSelectError] = useState<string | null>(null);
   const syncedRunRef = useRef<string | null>(null);
 
   useEffect(() => {
-    if (workflow.status !== "completed" || !workflow.runId || !projectSlug) return;
+    if ((workflow.status !== "completed" && workflow.status !== "failed") || !workflow.runId || !projectSlug) return;
     if (syncedRunRef.current === workflow.runId) return;
     syncedRunRef.current = workflow.runId;
     void lifecycleApi.syncPhaseRun(projectSlug, "design", workflow.runId).then(({ project }) => {
@@ -65,13 +66,20 @@ export function DesignPhase() {
   };
 
   const selectDesign = (designId: string) => {
+    setSelectError(null);
     if (!projectSlug) {
       lc.setSelectedDesignId(designId);
       return;
     }
-    void lifecycleApi.saveProject(projectSlug, { selectedDesignId: designId }).then((response) => {
-      lc.applyProject(response.project);
-    });
+    // Optimistically update local state
+    lc.setSelectedDesignId(designId);
+    void lifecycleApi.saveProject(projectSlug, { selectedDesignId: designId })
+      .then((response) => {
+        lc.applyProject(response.project);
+      })
+      .catch((err) => {
+        setSelectError(err instanceof Error ? err.message : "デザインの保存に失敗しました");
+      });
   };
 
   if (lc.designVariants.length === 0 && !isGenerating) {
@@ -89,12 +97,12 @@ export function DesignPhase() {
           </div>
           <div className="grid gap-4 md:grid-cols-[1.4fr_1fr]">
             <div className="rounded-xl border border-border bg-card p-5 text-left">
-              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground/70">handoff summary</p>
-              <h3 className="mt-2 text-base font-semibold text-foreground">企画から design に渡る材料</h3>
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground/70">引き継ぎサマリー</p>
+              <h3 className="mt-2 text-base font-semibold text-foreground">企画からデザインに渡る材料</h3>
               <div className="mt-4 grid gap-3 sm:grid-cols-3">
                 <div className="rounded-lg border border-border bg-background p-3">
                   <p className="text-xs text-muted-foreground">分析結果</p>
-                  <p className="mt-1 text-lg font-semibold text-foreground">{planningReady ? "Ready" : "Pending"}</p>
+                  <p className="mt-1 text-lg font-semibold text-foreground">{planningReady ? "準備完了" : "未完了"}</p>
                 </div>
                 <div className="rounded-lg border border-border bg-background p-3">
                   <p className="text-xs text-muted-foreground">選択機能</p>
@@ -113,18 +121,18 @@ export function DesignPhase() {
                   ))}
                 </div>
                 <p className="mt-3 text-sm text-muted-foreground">
-                  planning で選んだ機能と分析結果をもとに、比較可能な 3 案を一度に生成します。
+                  企画で選んだ機能と分析結果をもとに、比較可能な 3 案を一度に生成します。
                 </p>
               </div>
             </div>
             <div className="rounded-xl border border-border bg-card p-5 text-left">
-              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground/70">readiness</p>
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground/70">開始前チェック</p>
               <h3 className="mt-2 text-base font-semibold text-foreground">開始前チェック</h3>
               <div className="mt-4 space-y-2">
                 {[
-                  { label: "planning analysis が存在する", done: planningReady },
+                  { label: "企画分析が完了している", done: planningReady },
                   { label: "少なくとも 1 つ機能が選択されている", done: selectedFeatureCount > 0 },
-                  { label: "比較対象となる spec が入力されている", done: lc.spec.trim().length > 0 },
+                  { label: "比較対象となる仕様が入力されている", done: lc.spec.trim().length > 0 },
                 ].map((item) => (
                   <div key={item.label} className="flex items-center gap-2 rounded-lg border border-border bg-background px-3 py-2 text-sm">
                     <span className={cn("h-2.5 w-2.5 rounded-full", item.done ? "bg-success" : "bg-warning")} />
@@ -136,7 +144,11 @@ export function DesignPhase() {
                 <Button variant="outline" onClick={goBack} className="flex-1">
                   企画に戻る
                 </Button>
-                <Button onClick={generate} className="flex-1 gap-2">
+                <Button
+                  onClick={generate}
+                  disabled={!planningReady || selectedFeatureCount === 0 || lc.spec.trim().length === 0}
+                  className="flex-1 gap-2"
+                >
                   <Zap className="h-4 w-4" /> 3パターン生成
                 </Button>
               </div>
@@ -167,7 +179,7 @@ export function DesignPhase() {
         progress={workflow.agentProgress}
         elapsedMs={workflow.elapsedMs}
         title="3つのAIモデルが並行生成中..."
-        subtitle="Design jury が複数案を生成し、judge が品質比較を行っています"
+        subtitle="デザイン陪審が複数案を生成し、審査員が品質比較を行っています"
       />
     );
   }
@@ -210,6 +222,13 @@ export function DesignPhase() {
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-6">
+        {selectError && (
+          <div className="mx-auto max-w-7xl mb-4">
+            <p className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+              {selectError}
+            </p>
+          </div>
+        )}
         <div className="mx-auto max-w-7xl space-y-4">
           {variants.map((v) => (
             <DesignCard
@@ -325,8 +344,8 @@ function DesignCard({ variant, deviceWidth, isSelected, isExpanded, onSelect, on
             <p className="text-[11px] text-muted-foreground">{variant.model}</p>
             {variant.prototype && (
               <div className="mt-1.5 flex flex-wrap gap-1.5">
-                <Badge variant="secondary" className="text-[10px]">{variant.prototype.screens.length} screens</Badge>
-                <Badge variant="secondary" className="text-[10px]">{variant.prototype.flows.length} flows</Badge>
+                <Badge variant="secondary" className="text-[10px]">{variant.prototype.screens.length} 画面</Badge>
+                <Badge variant="secondary" className="text-[10px]">{variant.prototype.flows.length} フロー</Badge>
                 <Badge variant="secondary" className="text-[10px]">{variant.prototype.app_shell.layout}</Badge>
               </div>
             )}
@@ -334,7 +353,7 @@ function DesignCard({ variant, deviceWidth, isSelected, isExpanded, onSelect, on
           {!isExpanded && (
             <div className="flex gap-2 ml-4">
               {Object.entries(variant.scores).slice(0, 3).map(([key, val]) => {
-                const labels: Record<string, string> = { ux_quality: "UX", code_quality: "Code", performance: "Perf" };
+                const labels: Record<string, string> = { ux_quality: "UX", code_quality: "コード", performance: "性能" };
                 return (
                   <div key={key} className="flex items-center gap-1 text-[10px] text-muted-foreground">
                     <div className="h-1 w-8 rounded-full bg-muted overflow-hidden">

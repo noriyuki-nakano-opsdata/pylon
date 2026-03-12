@@ -15,6 +15,7 @@ export interface WorkflowRun {
   status: string;
   started_at: string;
   completed_at: string | null;
+  error?: string;
   runtime_metrics?: {
     estimated_cost_usd: number;
   };
@@ -25,6 +26,7 @@ export interface WorkflowRun {
     seq: number;
     node_id: string;
     agent: string;
+    timestamp?: string;
     output?: unknown;
   }>;
   /** Per-node execution status map */

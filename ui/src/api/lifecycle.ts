@@ -1,8 +1,9 @@
-import { apiFetch, ApiError } from "./client";
+import { apiFetch, apiStream, ApiError } from "./client";
 import type { WorkflowRun } from "./workflows";
 import type {
   LifecyclePhase,
   LifecycleNextAction,
+  LifecycleAutonomyState,
   MarketResearch,
   Competitor,
   AnalysisResult,
@@ -34,6 +35,8 @@ import type {
   ReleaseRecord,
   FeedbackItem,
   LifecycleRecommendation,
+  LifecyclePhaseRuntimeSummary,
+  PhaseStatus,
 } from "@/types/lifecycle";
 
 /* ── API Functions ── */
@@ -78,6 +81,25 @@ interface LifecycleMutationResponse extends LifecycleProject {
   project: LifecycleProject;
   actions: Record<string, unknown>[];
   nextAction: LifecycleNextAction;
+}
+
+export interface LifecycleRuntimeStreamPayload {
+  updatedAt: string;
+  savedAt: string;
+  phaseStatuses: PhaseStatus[];
+  nextAction: LifecycleNextAction | null;
+  autonomyState: LifecycleAutonomyState | null;
+  observedPhase?: LifecyclePhase | null;
+  activePhase?: LifecyclePhase | null;
+  phaseSummary?: LifecyclePhaseRuntimeSummary | null;
+  activePhaseSummary?: LifecyclePhaseRuntimeSummary | null;
+}
+
+export interface LifecyclePhaseTerminalEvent {
+  projectId: string;
+  phase: LifecyclePhase;
+  runId: string;
+  status: string;
 }
 
 export function lifecycleWorkflowId(
@@ -177,6 +199,30 @@ export const lifecycleApi = {
     return apiFetch<WorkflowRun>(`/v1/runs/${runId}`);
   },
 
+  streamRun(
+    runId: string,
+    options: {
+      signal?: AbortSignal;
+      onEvent: (event: { event: string; data: string; id?: string }) => void;
+    },
+  ): Promise<void> {
+    return apiStream(`/v1/runs/${runId}/events`, options);
+  },
+
+  streamProjectEvents(
+    projectSlug: string,
+    phase: LifecyclePhase,
+    options: {
+      signal?: AbortSignal;
+      onEvent: (event: { event: string; data: string; id?: string }) => void;
+    },
+  ): Promise<void> {
+    return apiStream(
+      `/v1/lifecycle/projects/${projectSlug}/events?phase=${encodeURIComponent(phase)}`,
+      options,
+    );
+  },
+
   async getLatestRun(
     workflowId: string,
   ): Promise<WorkflowRun | null> {
@@ -185,7 +231,10 @@ export const lifecycleApi = {
       if (!res.runs || res.runs.length === 0) return null;
       // Return the most recent run (first in list)
       return res.runs[0];
-    } catch {
+    } catch (err) {
+      // 404 is expected when no workflow has been created yet
+      if (err instanceof ApiError && err.status === 404) return null;
+      // Suppress other transient errors during restore
       return null;
     }
   },

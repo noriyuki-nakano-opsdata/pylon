@@ -51,14 +51,17 @@ export function PlanningPhase() {
     if (lc.analysis && subStep === "analyze") setSubStep("review");
   }, [lc.analysis, subStep]);
 
-  // Handle workflow completion
+  // Sync terminal workflow runs back into the lifecycle project.
   useEffect(() => {
-    if (workflow.status === "completed" && workflow.runId && projectSlug) {
-      if (syncedRunRef.current === workflow.runId) return;
-      syncedRunRef.current = workflow.runId;
-      void lifecycleApi.syncPhaseRun(projectSlug, "planning", workflow.runId).then(({ project }) => {
-        lc.applyProject(project);
-      });
+    if ((workflow.status !== "completed" && workflow.status !== "failed") || !workflow.runId || !projectSlug) {
+      return;
+    }
+    if (syncedRunRef.current === workflow.runId) return;
+    syncedRunRef.current = workflow.runId;
+    void lifecycleApi.syncPhaseRun(projectSlug, "planning", workflow.runId).then(({ project }) => {
+      lc.applyProject(project);
+    });
+    if (workflow.status === "completed") {
       setSubStep("review");
     }
   }, [workflow.runId, workflow.status, projectSlug, lc]);
@@ -137,7 +140,7 @@ export function PlanningPhase() {
         progress={workflow.agentProgress}
         elapsedMs={workflow.elapsedMs}
         title="AIが徹底分析中..."
-        subtitle="Planning council がペルソナ、ユースケース、優先度、delivery plan を統合しています"
+        subtitle="企画評議会がペルソナ、ユースケース、優先度、デリバリープランを統合しています"
       />
     );
   }
@@ -197,11 +200,11 @@ export function PlanningPhase() {
 
 /* ── KANO Bubble Chart ── */
 const KANO_CAT_STYLE: Record<string, { fill: string; stroke: string; text: string; label: string }> = {
-  "must-be": { fill: "rgba(239,68,68,0.25)", stroke: "rgba(239,68,68,0.7)", text: "#f87171", label: "Must-Be" },
-  "one-dimensional": { fill: "rgba(59,130,246,0.25)", stroke: "rgba(59,130,246,0.7)", text: "#60a5fa", label: "One-Dimensional" },
-  "attractive": { fill: "rgba(34,197,94,0.25)", stroke: "rgba(34,197,94,0.7)", text: "#4ade80", label: "Attractive" },
-  "indifferent": { fill: "rgba(148,163,184,0.2)", stroke: "rgba(148,163,184,0.5)", text: "#94a3b8", label: "Indifferent" },
-  "reverse": { fill: "rgba(168,85,247,0.25)", stroke: "rgba(168,85,247,0.7)", text: "#a855f7", label: "Reverse" },
+  "must-be": { fill: "rgba(239,68,68,0.25)", stroke: "rgba(239,68,68,0.7)", text: "#f87171", label: "当たり前" },
+  "one-dimensional": { fill: "rgba(59,130,246,0.25)", stroke: "rgba(59,130,246,0.7)", text: "#60a5fa", label: "一元的" },
+  "attractive": { fill: "rgba(34,197,94,0.25)", stroke: "rgba(34,197,94,0.7)", text: "#4ade80", label: "魅力" },
+  "indifferent": { fill: "rgba(148,163,184,0.2)", stroke: "rgba(148,163,184,0.5)", text: "#94a3b8", label: "無関心" },
+  "reverse": { fill: "rgba(168,85,247,0.25)", stroke: "rgba(168,85,247,0.7)", text: "#a855f7", label: "逆転" },
 };
 const KANO_CHART_WIDTH = 720;
 const KANO_CHART_HEIGHT = 400;
@@ -247,8 +250,8 @@ function KanoBubbleChart({ features, hoveredIdx, onHover }: { features: KanoFeat
 
   // Quadrant labels
   const quadrants = [
-    { x: pad.left + plotW * 0.08, y: pad.top + plotH * 0.08, text: "High Delight / Low Cost", sub: "Quick Wins" },
-    { x: pad.left + plotW * 0.75, y: pad.top + plotH * 0.08, text: "High Delight / High Cost", sub: "Strategic" },
+    { x: pad.left + plotW * 0.08, y: pad.top + plotH * 0.08, text: "高満足 / 低コスト", sub: "即効性あり" },
+    { x: pad.left + plotW * 0.75, y: pad.top + plotH * 0.08, text: "高満足 / 高コスト", sub: "戦略的" },
   ];
 
   return (
@@ -281,19 +284,19 @@ function KanoBubbleChart({ features, hoveredIdx, onHover }: { features: KanoFeat
 
           {/* X axis labels */}
           {[
-            { x: 0.15, label: "Low" },
-            { x: 0.5, label: "Medium" },
-            { x: 0.85, label: "High" },
+            { x: 0.15, label: "低" },
+            { x: 0.5, label: "中" },
+            { x: 0.85, label: "高" },
           ].map((a) => (
             <text key={a.label} x={pad.left + a.x * plotW} y={H - 12} textAnchor="middle" fill="rgba(255,255,255,0.4)" fontSize={11}>{a.label}</text>
           ))}
-          <text x={W / 2} y={H - 0} textAnchor="middle" fill="rgba(255,255,255,0.5)" fontSize={12} fontWeight={500}>Implementation Cost</text>
+          <text x={W / 2} y={H - 0} textAnchor="middle" fill="rgba(255,255,255,0.5)" fontSize={12} fontWeight={500}>実装コスト</text>
 
           {/* Y axis labels */}
           {[0, 0.25, 0.5, 0.75, 1.0].map((v) => (
             <text key={v} x={pad.left - 8} y={pad.top + (1 - v) * plotH + 4} textAnchor="end" fill="rgba(255,255,255,0.4)" fontSize={10}>{v.toFixed(1)}</text>
           ))}
-          <text x={14} y={pad.top + plotH / 2} textAnchor="middle" fill="rgba(255,255,255,0.5)" fontSize={12} fontWeight={500} transform={`rotate(-90, 14, ${pad.top + plotH / 2})`}>User Delight</text>
+          <text x={14} y={pad.top + plotH / 2} textAnchor="middle" fill="rgba(255,255,255,0.5)" fontSize={12} fontWeight={500} transform={`rotate(-90, 14, ${pad.top + plotH / 2})`}>ユーザー満足度</text>
 
           {/* Bubbles */}
           {features.map((f, i) => {
@@ -330,7 +333,7 @@ function KanoBubbleChart({ features, hoveredIdx, onHover }: { features: KanoFeat
                 <rect x={tx} y={finalY} width={tooltipW} height={tooltipH} rx={8} fill="rgba(15,23,42,0.95)" stroke={style.stroke} strokeWidth={1.5} filter="url(#tooltip-shadow)" />
                 <text x={tx + 12} y={finalY + 18} fill="#e2e8f0" fontSize={12} fontWeight={600}>{f.feature}</text>
                 <text x={tx + 12} y={finalY + 36} fill="rgba(148,163,184,0.8)" fontSize={10}>
-                  {style.label} · Delight {f.user_delight.toFixed(1)} · Cost {f.implementation_cost}
+                  {style.label} · 満足度 {f.user_delight.toFixed(1)} · コスト {f.implementation_cost}
                 </text>
                 {hasRationale && (
                   <text x={tx + 12} y={finalY + 54} fill="rgba(148,163,184,0.6)" fontSize={9}>
@@ -405,12 +408,12 @@ function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
           <div className="space-y-2">
             <div className="inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/5 px-3 py-1 text-[11px] font-medium text-primary">
               <Sparkles className="h-3.5 w-3.5" />
-              Planning synthesis
+              企画統合
             </div>
             <div>
               <h2 className="text-lg font-semibold text-foreground">調査結果を実装可能な企画に圧縮</h2>
               <p className="mt-1 text-sm text-muted-foreground">
-                ペルソナ、ユースケース、KANO、IA を横断して、次の design phase に渡すスコープと判断材料を揃えます。
+                ペルソナ、ユースケース、KANO、IA を横断して、次のデザインフェーズに渡すスコープと判断材料を揃えます。
               </p>
             </div>
           </div>
@@ -419,7 +422,7 @@ function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
               { label: "ペルソナ", value: analysis.personas.length },
               { label: "ストーリー", value: analysis.user_stories.length },
               { label: "機能候補", value: analysis.kano_features.length },
-              { label: "Red-team", value: analysis.red_team_findings?.length ?? 0 },
+              { label: "レッドチーム", value: analysis.red_team_findings?.length ?? 0 },
             ].map((item) => (
               <div key={item.label} className="rounded-xl border border-border bg-background px-3 py-3 text-center">
                 <p className="text-lg font-semibold text-foreground">{item.value}</p>
@@ -430,7 +433,7 @@ function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
         </div>
         {(analysis.judge_summary || analysis.recommendations[0]) && (
           <div className="mt-4 rounded-xl border border-primary/20 bg-primary/5 px-4 py-3">
-            <p className="text-[11px] font-medium uppercase tracking-[0.16em] text-primary/80">Recommended focus</p>
+            <p className="text-[11px] font-medium uppercase tracking-[0.16em] text-primary/80">推奨フォーカス</p>
             <p className="mt-1 text-sm text-foreground">{analysis.judge_summary ?? analysis.recommendations[0]}</p>
           </div>
         )}
@@ -451,12 +454,12 @@ function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
         <div className="space-y-4">
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-6">
             {[
-              { label: "Personas", value: analysis.personas.length },
-              { label: "Stories", value: analysis.user_stories.length },
-              { label: "Features", value: analysis.kano_features.length },
-              { label: "Recommendations", value: analysis.recommendations.length },
-              { label: "Rejected", value: analysis.rejected_features?.length ?? 0 },
-              { label: "Findings", value: analysis.red_team_findings?.length ?? 0 },
+              { label: "ペルソナ", value: analysis.personas.length },
+              { label: "ストーリー", value: analysis.user_stories.length },
+              { label: "機能候補", value: analysis.kano_features.length },
+              { label: "推奨事項", value: analysis.recommendations.length },
+              { label: "却下済み", value: analysis.rejected_features?.length ?? 0 },
+              { label: "調査結果", value: analysis.red_team_findings?.length ?? 0 },
             ].map((s) => (
               <div key={s.label} className="rounded-xl border border-border bg-card p-4 text-center">
                 <p className="text-2xl font-bold text-foreground">{s.value}</p>
@@ -469,9 +472,9 @@ function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
             <h3 className="text-sm font-medium text-foreground mb-3">KANO分布</h3>
             <div className="grid gap-3 sm:grid-cols-3">
               {[
-                { label: "Must-Be", count: analysis.kano_features.filter((f) => f.category === "must-be").length, color: "bg-destructive/10 text-destructive" },
-                { label: "One-Dim", count: analysis.kano_features.filter((f) => f.category === "one-dimensional").length, color: "bg-primary/10 text-primary" },
-                { label: "Attractive", count: analysis.kano_features.filter((f) => f.category === "attractive").length, color: "bg-success/10 text-success" },
+                { label: "当たり前品質", count: analysis.kano_features.filter((f) => f.category === "must-be").length, color: "bg-destructive/10 text-destructive" },
+                { label: "一元的品質", count: analysis.kano_features.filter((f) => f.category === "one-dimensional").length, color: "bg-primary/10 text-primary" },
+                { label: "魅力品質", count: analysis.kano_features.filter((f) => f.category === "attractive").length, color: "bg-success/10 text-success" },
               ].map((k) => (
                 <div key={k.label} className={cn("flex-1 rounded-lg p-3 text-center", k.color)}>
                   <p className="text-lg font-bold">{k.count}</p>
@@ -495,18 +498,18 @@ function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
 
           <div className="grid gap-4 lg:grid-cols-2">
             <div className="rounded-xl border border-border bg-card p-4">
-              <h3 className="mb-3 text-sm font-medium text-foreground">Decision table</h3>
+              <h3 className="mb-3 text-sm font-medium text-foreground">判定テーブル</h3>
               <div className="space-y-2">
                 {(analysis.feature_decisions ?? []).map((decision) => (
                   <div key={decision.feature} className="rounded-lg border border-border/80 bg-background px-3 py-2">
                     <div className="flex items-center justify-between gap-2">
                       <p className="text-xs font-medium text-foreground">{decision.feature}</p>
                       <Badge variant={decision.selected ? "default" : "secondary"} className="text-[10px]">
-                        {decision.selected ? "selected" : "deferred"}
+                        {decision.selected ? "採用" : "保留"}
                       </Badge>
                     </div>
                     <p className="mt-1 text-[11px] text-muted-foreground">
-                      uncertainty {(decision.uncertainty * 100).toFixed(0)}% · claims {decision.supporting_claim_ids.length}
+                      不確実性 {(decision.uncertainty * 100).toFixed(0)}% · 裏付け {decision.supporting_claim_ids.length}
                     </p>
                     {!!decision.counterarguments.length && (
                       <p className="mt-1 text-[11px] text-muted-foreground">{decision.counterarguments[0]}</p>
@@ -519,7 +522,7 @@ function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
               </div>
             </div>
             <div className="rounded-xl border border-border bg-card p-4">
-              <h3 className="mb-3 text-sm font-medium text-foreground">Assumptions and red-team findings</h3>
+              <h3 className="mb-3 text-sm font-medium text-foreground">仮説とレッドチームの発見</h3>
               <div className="space-y-2">
                 {(analysis.assumptions ?? []).map((assumption) => (
                   <div key={assumption.id} className="rounded-lg border border-border/80 bg-background px-3 py-2">
@@ -539,20 +542,20 @@ function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
 
           <div className="grid gap-4 lg:grid-cols-2">
             <div className="rounded-xl border border-border bg-card p-4">
-              <h3 className="mb-3 text-sm font-medium text-foreground">Traceability</h3>
+              <h3 className="mb-3 text-sm font-medium text-foreground">トレーサビリティ</h3>
               <div className="space-y-2">
                 {(analysis.traceability ?? []).map((item, index) => (
                   <div key={`${item.feature}-${index}`} className="rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground">
                     <p>{item.feature}</p>
                     <p className="mt-1 text-[11px] text-muted-foreground">
-                      claim {item.claim_id || "n/a"} → use case {item.use_case_id || "n/a"} → milestone {item.milestone_id || "n/a"}
+                      主張 {item.claim_id || "n/a"} → ユースケース {item.use_case_id || "n/a"} → マイルストーン {item.milestone_id || "n/a"}
                     </p>
                   </div>
                 ))}
               </div>
             </div>
             <div className="rounded-xl border border-border bg-card p-4">
-              <h3 className="mb-3 text-sm font-medium text-foreground">Negative personas and kill criteria</h3>
+              <h3 className="mb-3 text-sm font-medium text-foreground">ネガティブペルソナと中止基準</h3>
               <div className="space-y-2">
                 {(analysis.negative_personas ?? []).map((persona) => (
                   <div key={persona.id} className="rounded-lg border border-border/80 bg-background px-3 py-2">
@@ -601,10 +604,10 @@ function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
                 <tr className="border-b border-border bg-muted/30">
                   {([
                     { key: "index" as KanoSortKey, label: "#", w: "w-10" },
-                    { key: "feature" as KanoSortKey, label: "Feature", w: "" },
-                    { key: "category" as KanoSortKey, label: "Category", w: "w-36" },
-                    { key: "delight" as KanoSortKey, label: "Delight", w: "w-32" },
-                    { key: "cost" as KanoSortKey, label: "Cost", w: "w-24" },
+                    { key: "feature" as KanoSortKey, label: "機能", w: "" },
+                    { key: "category" as KanoSortKey, label: "カテゴリ", w: "w-36" },
+                    { key: "delight" as KanoSortKey, label: "満足度", w: "w-32" },
+                    { key: "cost" as KanoSortKey, label: "コスト", w: "w-24" },
                   ]).map((col) => (
                     <th key={col.key} className={cn("px-3 py-2.5 text-xs font-medium text-muted-foreground text-left select-none", col.w)}>
                       <button onClick={() => toggleKanoSort(col.key)} className="flex items-center gap-1 hover:text-foreground transition-colors cursor-pointer">
@@ -653,8 +656,8 @@ function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
               <div key={i} className="flex items-start gap-2 rounded-lg border border-border bg-card p-3">
                 <Badge className={cn("text-[10px] border-0 uppercase shrink-0 mt-0.5", color[s.priority])}>{s.priority}</Badge>
                 <div>
-                  <p className="text-sm text-foreground">As a {s.role}, I want to {s.action}</p>
-                  <p className="text-xs text-muted-foreground mt-0.5">So that {s.benefit}</p>
+                  <p className="text-sm text-foreground">{s.role} として、{s.action} したい</p>
+                  <p className="text-xs text-muted-foreground mt-0.5">それにより {s.benefit}</p>
                 </div>
               </div>
             );
@@ -677,8 +680,8 @@ function DesignTokenContent({ tokens }: { tokens: DesignTokenAnalysis }) {
   const { style, colors, typography, effects, anti_patterns, rationale } = tokens;
   const colorEntries = Object.entries(colors).filter(([k]) => k !== "notes") as [string, string][];
   const colorLabels: Record<string, string> = {
-    primary: "Primary", secondary: "Secondary", cta: "CTA",
-    background: "Background", text: "Text",
+    primary: "プライマリ", secondary: "セカンダリ", cta: "CTA",
+    background: "背景", text: "テキスト",
   };
 
   return (

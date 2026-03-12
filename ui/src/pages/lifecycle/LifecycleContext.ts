@@ -14,6 +14,7 @@ import type {
   LifecycleNextAction,
   LifecycleOrchestrationMode,
   LifecyclePhase,
+  LifecyclePhaseRuntimeSummary,
   LifecyclePhaseRun,
   LifecycleProject,
   LifecycleResearchConfig,
@@ -27,6 +28,7 @@ import type {
   PlanEstimate,
   PlanPreset,
   ReleaseRecord,
+  WorkflowRunLiveTelemetry,
 } from "@/types/lifecycle";
 
 export interface LifecycleState {
@@ -83,6 +85,12 @@ export interface LifecycleState {
   phaseRuns: LifecyclePhaseRun[];
   nextAction: LifecycleNextAction | null;
   autonomyState: LifecycleAutonomyState | null;
+  runtimeObservedPhase: LifecyclePhase | null;
+  runtimeActivePhase: LifecyclePhase | null;
+  runtimePhaseSummary: LifecyclePhaseRuntimeSummary | null;
+  runtimeActivePhaseSummary: LifecyclePhaseRuntimeSummary | null;
+  runtimeLiveTelemetry: WorkflowRunLiveTelemetry | null;
+  runtimeConnectionState: "inactive" | "connecting" | "live" | "reconnecting";
   blueprints: Record<LifecyclePhase, PhaseBlueprint>;
   isHydrating: boolean;
   applyProject: (project: LifecycleProject) => void;

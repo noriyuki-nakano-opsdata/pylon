@@ -16,6 +16,7 @@ export function ApprovalPhase() {
   const lc = useLifecycle();
   const [comment, setComment] = useState("");
   const [submitting, setSubmitting] = useState<"comment" | "approve" | "reject" | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
   const selectedFeatureCount = lc.features.filter((f) => f.selected).length;
   const selectedDesign = lc.designVariants.find((v) => v.id === lc.selectedDesignId);
@@ -29,7 +30,9 @@ export function ApprovalPhase() {
   const submitComment = async (type: "comment" | "approve" | "reject") => {
     if (!projectSlug) return;
     if (type === "comment" && !comment.trim()) return;
+    if (submitting !== null) return;
     setSubmitting(type);
+    setSubmitError(null);
     try {
       const payload = {
         text: comment || (type === "approve" ? "承認しました" : "差し戻しました"),
@@ -37,7 +40,12 @@ export function ApprovalPhase() {
       } as const;
       const project = await lifecycleApi.addApprovalComment(projectSlug, payload);
       lc.applyProject(project);
+      if (type === "approve") {
+        lc.completePhase("approval");
+      }
       setComment("");
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : "コメントの送信に失敗しました");
     } finally {
       setSubmitting(null);
     }
@@ -169,6 +177,12 @@ export function ApprovalPhase() {
                 ))}
               </div>
 
+              {submitError && (
+                <p className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                  {submitError}
+                </p>
+              )}
+
               {lc.approvalStatus !== "approved" && (
                 <div className="space-y-2">
                   <textarea
@@ -235,7 +249,7 @@ export function ApprovalPhase() {
               <h3 className="text-sm font-bold text-foreground mb-2">コスト見積</h3>
               <div className="space-y-1.5">
                 <div className="flex justify-between text-xs"><span className="text-muted-foreground">UX分析</span><span className="font-mono text-foreground">~$0.05</span></div>
-                <div className="flex justify-between text-xs"><span className="text-muted-foreground">デザイン生成</span><span className="font-mono text-foreground">~${(lc.designVariants.reduce((a, v) => a + v.cost_usd, 0)).toFixed(3)}</span></div>
+                <div className="flex justify-between text-xs"><span className="text-muted-foreground">デザイン生成</span><span className="font-mono text-foreground">~${(lc.designVariants.reduce((a, v) => a + v.cost_usd, 0)).toFixed(2)}</span></div>
                 <div className="flex justify-between text-xs"><span className="text-muted-foreground">自律開発 (見積)</span><span className="font-mono text-foreground">~$0.50</span></div>
                 <div className="border-t border-border pt-1.5 mt-1.5 flex justify-between text-xs font-medium"><span className="text-foreground">合計見積</span><span className="font-mono text-foreground">~$0.60</span></div>
               </div>

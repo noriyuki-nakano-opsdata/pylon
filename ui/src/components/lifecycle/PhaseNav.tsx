@@ -18,10 +18,10 @@ const PHASES: { key: LifecyclePhase; label: string; icon: React.ElementType; des
 
 function statusIcon(status: PhaseStatus["status"]) {
   switch (status) {
-    case "completed": return <Check className="h-3.5 w-3.5 text-success" />;
-    case "in_progress": return <Loader2 className="h-3.5 w-3.5 text-primary animate-spin" />;
-    case "review": return <ShieldCheck className="h-3.5 w-3.5 text-warning" />;
-    case "locked": return <Lock className="h-3.5 w-3.5 text-muted-foreground/40" />;
+    case "completed": return <Check className="h-3.5 w-3.5 text-success" aria-label="完了" />;
+    case "in_progress": return <Loader2 className="h-3.5 w-3.5 text-primary animate-spin" aria-label="進行中" />;
+    case "review": return <ShieldCheck className="h-3.5 w-3.5 text-warning" aria-label="レビュー中" />;
+    case "locked": return <Lock className="h-3.5 w-3.5 text-muted-foreground/40" aria-label="ロック中" />;
     default: return null;
   }
 }
@@ -51,7 +51,7 @@ export function PhaseNav({
     )}>
       {!collapsed && (
         <p className="px-3 pb-2 pt-1 text-[10px] font-semibold uppercase tracking-widest text-muted-foreground/60">
-          Product Lifecycle
+          プロダクトライフサイクル
         </p>
       )}
       {PHASES.map((phase, i) => {
@@ -182,7 +182,7 @@ function PhaseNavItem({
 
   if (isLocked) {
     return (
-      <div className={cn(baseClassName, "opacity-40 cursor-not-allowed")} aria-disabled="true">
+      <div className={cn(baseClassName, "opacity-40 cursor-not-allowed")} aria-disabled="true" tabIndex={-1}>
         {inner}
       </div>
     );

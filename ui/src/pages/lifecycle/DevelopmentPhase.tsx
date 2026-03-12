@@ -42,13 +42,13 @@ function estimateQuality(sections: HtmlSections): { label: string; score: number
   const details: string[] = [];
   let score = 50;
 
-  if (sections.css.length > 0) { score += 15; details.push("CSS separated"); }
-  if (sections.js.length > 0) { score += 10; details.push("JS present"); }
-  if (sections.body.includes("aria-")) { score += 10; details.push("ARIA attrs detected"); }
-  if (sections.full.includes("<meta name=\"viewport\"")) { score += 10; details.push("Responsive meta"); }
-  if (sections.full.includes("lang=")) { score += 5; details.push("Lang attribute"); }
+  if (sections.css.length > 0) { score += 15; details.push("CSS 分離済み"); }
+  if (sections.js.length > 0) { score += 10; details.push("JS あり"); }
+  if (sections.body.includes("aria-")) { score += 10; details.push("ARIA 属性あり"); }
+  if (sections.full.includes("<meta name=\"viewport\"")) { score += 10; details.push("レスポンシブ対応"); }
+  if (sections.full.includes("lang=")) { score += 5; details.push("言語属性あり"); }
 
-  const label = score >= 80 ? "Good" : score >= 60 ? "Fair" : "Basic";
+  const label = score >= 80 ? "良好" : score >= 60 ? "普通" : "基本";
   return { label, score: Math.min(score, 100), details };
 }
 
@@ -62,17 +62,17 @@ export function DevelopmentPhase() {
   const buildTeam = lc.blueprints.development.team.length > 0
     ? lc.blueprints.development.team
     : [
-        { id: "planner", label: "Build Planner", role: "作業分解", autonomy: "A2", tools: [], skills: [] },
-        { id: "frontend-builder", label: "Frontend Builder", role: "UI 実装", autonomy: "A2", tools: [], skills: [] },
-        { id: "backend-builder", label: "Backend Builder", role: "Domain 設計", autonomy: "A2", tools: [], skills: [] },
-        { id: "integrator", label: "Integrator", role: "統合", autonomy: "A2", tools: [], skills: [] },
-        { id: "reviewer", label: "Release Reviewer", role: "品質判定", autonomy: "A2", tools: [], skills: [] },
+        { id: "planner", label: "ビルド設計", role: "作業分解", autonomy: "A2", tools: [], skills: [] },
+        { id: "frontend-builder", label: "フロントエンド", role: "UI 実装", autonomy: "A2", tools: [], skills: [] },
+        { id: "backend-builder", label: "バックエンド", role: "Domain 設計", autonomy: "A2", tools: [], skills: [] },
+        { id: "integrator", label: "インテグレーター", role: "統合", autonomy: "A2", tools: [], skills: [] },
+        { id: "reviewer", label: "リリースレビュー", role: "品質判定", autonomy: "A2", tools: [], skills: [] },
       ];
   const syncedRunRef = useRef<string | null>(null);
 
-  // Handle workflow completion
+  // Sync terminal workflow runs back into the lifecycle project.
   useEffect(() => {
-    if (workflow.status !== "completed" || !workflow.runId || !projectSlug) return;
+    if ((workflow.status !== "completed" && workflow.status !== "failed") || !workflow.runId || !projectSlug) return;
     if (syncedRunRef.current === workflow.runId) return;
     syncedRunRef.current = workflow.runId;
     void lifecycleApi.syncPhaseRun(projectSlug, "development", workflow.runId).then(({ project }) => {
@@ -83,7 +83,8 @@ export function DevelopmentPhase() {
   // Track build iteration from workflow state
   useEffect(() => {
     if (workflow.state._build_iteration != null) {
-      lc.setBuildIteration(Number(workflow.state._build_iteration));
+      const iteration = Number(workflow.state._build_iteration) || 1;
+      lc.setBuildIteration(iteration);
     }
     if (workflow.state.review) {
       const review = workflow.state.review as Record<string, unknown>;
@@ -115,7 +116,10 @@ export function DevelopmentPhase() {
     });
   };
 
-  const goNext = () => navigate(`/p/${projectSlug}/lifecycle/deploy`);
+  const goNext = () => {
+    lc.completePhase("development");
+    navigate(`/p/${projectSlug}/lifecycle/deploy`);
+  };
 
   // Error view
   if (workflow.status === "failed") {
@@ -166,7 +170,7 @@ export function DevelopmentPhase() {
               </div>
 
               <div className="rounded-lg border border-border bg-background p-4">
-                <p className="text-xs font-medium text-muted-foreground mb-2">handoff summary</p>
+                <p className="text-xs font-medium text-muted-foreground mb-2">引き継ぎサマリー</p>
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div>
                     <p className="text-xs text-muted-foreground">承認状態</p>
@@ -182,7 +186,7 @@ export function DevelopmentPhase() {
                   </div>
                 </div>
                 <p className="mt-3 text-sm text-muted-foreground">
-                  設計意図、選択機能、マイルストーンをまとめて build team に渡し、reviewer が品質判定まで閉じます。
+                  設計意図、選択機能、マイルストーンをまとめてビルドチームに渡し、レビュアーが品質判定まで閉じます。
                 </p>
               </div>
 
@@ -207,13 +211,13 @@ export function DevelopmentPhase() {
             </div>
 
             <div className="rounded-xl border border-border bg-card p-5 text-left">
-              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground/70">readiness</p>
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground/70">開始前チェック</p>
               <h3 className="mt-2 text-base font-semibold text-foreground">開始前チェック</h3>
               <div className="mt-4 space-y-2">
                 {[
                   { label: "選択機能が存在する", done: selectedFeatureCount > 0 },
-                  { label: "比較済みの design が選択されている", done: selectedDesign != null },
-                  { label: "approval gate を通過している", done: lc.approvalStatus === "approved" },
+                  { label: "比較済みのデザインが選択されている", done: selectedDesign != null },
+                  { label: "承認ゲートを通過している", done: lc.approvalStatus === "approved" },
                 ].map((item) => (
                   <div key={item.label} className="flex items-center gap-2 rounded-lg border border-border bg-background px-3 py-2 text-sm">
                     <span className={cn("h-2.5 w-2.5 rounded-full", item.done ? "bg-success" : "bg-warning")} />
@@ -223,14 +227,23 @@ export function DevelopmentPhase() {
               </div>
               {lc.approvalStatus !== "approved" && (
                 <p className="mt-3 rounded-lg border border-warning/20 bg-warning/5 px-3 py-2 text-xs text-warning">
-                  本来は approval 後に進むフェーズです。設計確認が未完了なら先に承認へ戻してください。
+                  本来は承認後に進むフェーズです。設計確認が未完了なら先に承認へ戻してください。
                 </p>
               )}
               <div className="mt-4 flex gap-2">
                 <button onClick={() => navigate(`/p/${projectSlug}/lifecycle/approval`)} className="flex-1 rounded-lg border border-border px-4 py-3 text-sm font-medium text-foreground hover:bg-accent transition-colors">
                   承認に戻る
                 </button>
-                <button onClick={startBuild} className="flex-1 flex items-center justify-center gap-2 rounded-lg bg-primary py-3 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors">
+                <button
+                  onClick={startBuild}
+                  disabled={lc.approvalStatus !== "approved" || selectedFeatureCount === 0 || selectedDesign == null}
+                  className={cn(
+                    "flex-1 flex items-center justify-center gap-2 rounded-lg py-3 text-sm font-medium transition-colors",
+                    lc.approvalStatus === "approved" && selectedFeatureCount > 0 && selectedDesign != null
+                      ? "bg-primary text-primary-foreground hover:bg-primary/90"
+                      : "bg-muted text-muted-foreground cursor-not-allowed",
+                  )}
+                >
                   <Zap className="h-4 w-4" /> 開発を開始
                 </button>
               </div>
@@ -359,10 +372,10 @@ function BuildCompleteView({ onNext }: { onNext: () => void }) {
   if (!lc.buildCode || !sections || !quality) return null;
 
   const codeTabItems: { key: CodeTab; label: string; charCount: number }[] = [
-    { key: "full", label: "Full HTML", charCount: sections.full.length },
+    { key: "full", label: "HTML 全体", charCount: sections.full.length },
     { key: "css", label: "CSS", charCount: sections.css.length },
     { key: "js", label: "JavaScript", charCount: sections.js.length },
-    { key: "body", label: "Structure", charCount: sections.body.length },
+    { key: "body", label: "構造", charCount: sections.body.length },
   ];
 
   const activeCode = sections[codeTab];
@@ -383,7 +396,7 @@ function BuildCompleteView({ onNext }: { onNext: () => void }) {
             <Minimize2 className="h-3.5 w-3.5" /> 閉じる
           </button>
         </div>
-        <iframe srcDoc={lc.buildCode} className="flex-1 border-0 bg-white" sandbox="allow-scripts allow-same-origin" title="Fullscreen Preview" />
+        <iframe srcDoc={lc.buildCode} className="flex-1 border-0 bg-white" sandbox="allow-scripts allow-same-origin" title="フルスクリーンプレビュー" />
       </div>
     );
   }
@@ -398,10 +411,10 @@ function BuildCompleteView({ onNext }: { onNext: () => void }) {
         </div>
         <Badge variant="secondary" className="text-[10px]">{formatBytes(new Blob([lc.buildCode]).size)}</Badge>
         {lc.buildCost > 0 && <Badge variant="secondary" className="text-[10px]">${lc.buildCost.toFixed(4)}</Badge>}
-        {lc.buildIteration > 0 && <Badge variant="outline" className="text-[10px]">{lc.buildIteration} iterations</Badge>}
+        {lc.buildIteration > 0 && <Badge variant="outline" className="text-[10px]">{lc.buildIteration} 回反復</Badge>}
         {lc.milestoneResults.length > 0 && (
           <Badge variant="outline" className="text-[10px]">
-            {lc.milestoneResults.filter((r) => r.status === "satisfied").length}/{lc.milestoneResults.length} milestones
+            {lc.milestoneResults.filter((r) => r.status === "satisfied").length}/{lc.milestoneResults.length} マイルストーン
           </Badge>
         )}
         {/* Quality badge */}
@@ -445,7 +458,7 @@ function BuildCompleteView({ onNext }: { onNext: () => void }) {
       {/* ── Content area ── */}
       <div className="flex-1 overflow-hidden">
         {viewMode === "preview" ? (
-          <iframe srcDoc={lc.buildCode} className="h-full w-full border-0 bg-white" sandbox="allow-scripts allow-same-origin" title="Preview" />
+          <iframe srcDoc={lc.buildCode} className="h-full w-full border-0 bg-white" sandbox="allow-scripts allow-same-origin" title="プレビュー" />
         ) : (
           <div className="flex h-full flex-col">
             {/* Code section tabs */}

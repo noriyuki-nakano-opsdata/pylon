@@ -108,7 +108,7 @@ export function IteratePhase() {
             srcDoc={lc.buildCode}
             sandbox="allow-scripts allow-same-origin"
             className="flex-1 w-full bg-white"
-            title="Build preview"
+            title="ビルドプレビュー"
           />
         </div>
       )}
@@ -327,7 +327,7 @@ export function IteratePhase() {
                 <div className={cn("mt-3 rounded-md px-3 py-2 text-xs",
                   nps <= 6 ? "bg-destructive/10 text-destructive" : nps <= 8 ? "bg-warning/10 text-warning" : "bg-success/10 text-success",
                 )}>
-                  {nps <= 6 ? "Detractor — 改善が必要です" : nps <= 8 ? "Passive — まだ改善の余地があります" : "Promoter — 素晴らしい！"}
+                  {nps <= 6 ? "批判者 — 改善が必要です" : nps <= 8 ? "中立者 — まだ改善の余地があります" : "推薦者 — 素晴らしい！"}
                 </div>
               )}
             </div>
@@ -364,7 +364,7 @@ export function IteratePhase() {
               <h3 className="text-sm font-bold text-foreground">フィードバック一覧（投票順）</h3>
               {sorted.length === 0 && (
                 <div className="rounded-xl border border-dashed border-border bg-card p-5 text-sm text-muted-foreground">
-                  まだフィードバックはありません。deploy 後の signal をここに集約します。
+                  まだフィードバックはありません。デプロイ後のシグナルをここに集約します。
                 </div>
               )}
               {sorted.map((feedback) => (
@@ -426,7 +426,7 @@ export function IteratePhase() {
               </h3>
               <div className="space-y-2">
                 {lc.releases.length === 0 && (
-                  <div className="text-xs text-muted-foreground">まだ release record はありません。</div>
+                  <div className="text-xs text-muted-foreground">まだリリース記録はありません。</div>
                 )}
                 {lc.releases.map((release) => (
                   <div key={release.id} className="flex items-center gap-2 text-xs">

@@ -29,6 +29,7 @@ interface AgentMember {
 interface Team {
   id: string; name: string; nameJa: string; icon: React.ElementType;
   color: string; members: AgentMember[];
+  description: string; emptyState: string; recommendedRoles: string[];
 }
 
 const ICON_MAP: Record<string, React.ElementType> = {
@@ -39,13 +40,58 @@ function resolveIcon(name: string): React.ElementType {
 }
 
 const FALLBACK_TEAMS: ApiTeamDef[] = [
-  { id: "development", name: "Engineering", nameJa: "エンジニアリング", icon: "Code2", color: "text-blue-400", bg: "bg-blue-600" },
-  { id: "design", name: "Design", nameJa: "デザイン", icon: "Palette", color: "text-purple-400", bg: "bg-pink-600" },
-  { id: "research", name: "Research & Writing", nameJa: "リサーチ & ライティング", icon: "PenTool", color: "text-emerald-400", bg: "bg-violet-600" },
-  { id: "data", name: "Data & AI", nameJa: "データ & AI", icon: "Zap", color: "text-cyan-400", bg: "bg-cyan-600" },
-  { id: "security", name: "Security", nameJa: "セキュリティ", icon: "Shield", color: "text-red-400", bg: "bg-red-600" },
-  { id: "product", name: "Product & Ops", nameJa: "プロダクト & 運用", icon: "Network", color: "text-orange-400", bg: "bg-orange-600" },
+  { id: "product", name: "Product Strategy", nameJa: "プロダクト戦略", icon: "Network", color: "text-orange-400", bg: "bg-orange-600" },
+  { id: "research", name: "Research Intelligence", nameJa: "リサーチ", icon: "PenTool", color: "text-emerald-400", bg: "bg-emerald-600" },
+  { id: "design", name: "UX & Design Systems", nameJa: "UX / デザインシステム", icon: "Palette", color: "text-purple-400", bg: "bg-pink-600" },
+  { id: "development", name: "Application Engineering", nameJa: "アプリケーション開発", icon: "Code2", color: "text-blue-400", bg: "bg-blue-600" },
+  { id: "platform", name: "Platform & Infra", nameJa: "プラットフォーム / 基盤", icon: "Monitor", color: "text-sky-400", bg: "bg-sky-600" },
+  { id: "data", name: "Data & Evaluation", nameJa: "データ / 評価", icon: "Zap", color: "text-cyan-400", bg: "bg-cyan-600" },
+  { id: "security", name: "Security & Governance", nameJa: "セキュリティ / ガバナンス", icon: "Shield", color: "text-red-400", bg: "bg-red-600" },
+  { id: "operations", name: "Operations & Release", nameJa: "運用 / リリース", icon: "Bot", color: "text-amber-400", bg: "bg-amber-600" },
 ];
+
+const TEAM_META: Record<string, { description: string; emptyState: string; recommendedRoles: string[] }> = {
+  product: {
+    description: "企画、優先順位、承認判断、全体ハンドオフを束ねる中核チーム。",
+    emptyState: "まだ product specialist が配備されていません。",
+    recommendedRoles: ["Product Orchestrator", "Delivery Manager"],
+  },
+  research: {
+    description: "市場、競合、ユーザー仮説を検証し、planning の根拠を作るチーム。",
+    emptyState: "調査担当が不在です。research の質が落ちます。",
+    recommendedRoles: ["Competitive Researcher", "User Insight Analyst"],
+  },
+  design: {
+    description: "IA、UX、プロトタイプ品質、アクセシビリティを引き上げるチーム。",
+    emptyState: "design specialist が未配備です。",
+    recommendedRoles: ["UX Architect", "Design Critic"],
+  },
+  development: {
+    description: "UI/API の実装と統合を進め、成果物に落とし込むチーム。",
+    emptyState: "実装担当が不足しています。",
+    recommendedRoles: ["Frontend Builder", "Backend Integrator"],
+  },
+  platform: {
+    description: "実行基盤、観測性、デプロイ導線を支えるチーム。",
+    emptyState: "platform 担当がいません。実行基盤が弱くなります。",
+    recommendedRoles: ["Platform Engineer"],
+  },
+  data: {
+    description: "評価、実験、品質計測を担当し、意思決定を定量で支えるチーム。",
+    emptyState: "評価担当がいません。改善サイクルが鈍ります。",
+    recommendedRoles: ["Evaluation Analyst"],
+  },
+  security: {
+    description: "安全性、ガバナンス、承認ゲートを監督するチーム。",
+    emptyState: "security / governance の監視役が未配備です。",
+    recommendedRoles: ["Safety Guardian"],
+  },
+  operations: {
+    description: "リリース運用、監視、インシデント初動を担うチーム。",
+    emptyState: "運用 / リリース担当が未配備です。",
+    recommendedRoles: ["Release Operator"],
+  },
+};
 
 const AVAILABLE_MODELS = [
   "anthropic/claude-sonnet-4-6",
@@ -55,17 +101,58 @@ const AVAILABLE_MODELS = [
   "gemini/gemini-3-pro-preview",
 ];
 
+function stableUnit(seed: string): number {
+  let hash = 2166136261;
+  for (let index = 0; index < seed.length; index += 1) {
+    hash ^= seed.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return ((hash >>> 0) % 1000) / 1000;
+}
+
+function stableMetric(seed: string, min: number, max: number): number {
+  return min + stableUnit(seed) * (max - min);
+}
+
+function mergeTeamDefs(teamDefs?: ApiTeamDef[]): ApiTeamDef[] {
+  const merged = new Map(FALLBACK_TEAMS.map((team) => [team.id, team]));
+  for (const team of teamDefs ?? []) {
+    merged.set(team.id, {
+      ...(merged.get(team.id) ?? {}),
+      ...team,
+    });
+  }
+  return [...merged.values()];
+}
+
+function dedupeAgents(agents: AgentActivity[]): AgentActivity[] {
+  const deduped = new Map<string, AgentActivity>();
+  for (const agent of agents) {
+    const key = agent.id || `${agent.name}:${agent.role}:${agent.team ?? "product"}`;
+    if (!deduped.has(key)) {
+      deduped.set(key, agent);
+      continue;
+    }
+    const current = deduped.get(key);
+    if ((agent.current_task?.updated_at ?? "") > (current?.current_task?.updated_at ?? "")) {
+      deduped.set(key, agent);
+    }
+  }
+  return [...deduped.values()];
+}
+
 function buildMember(agent: AgentActivity, teamDefs: ApiTeamDef[]): AgentMember {
   const teamId = agent.team ?? "product";
   const def = teamDefs.find((d) => d.id === teamId) ?? teamDefs[0] ?? FALLBACK_TEAMS[0];
   const hasTask = agent.current_task !== null;
   const status: AgentStatus = hasTask ? "busy" : agent.status === "ready" ? "online" : "offline";
+  const taskSeed = agent.current_task?.id ?? "idle";
   return {
     id: agent.id, name: agent.name, role: agent.role, status,
-    specialties: agent.tools.slice(0, 3), model: agent.model, tools: agent.tools,
+    specialties: agent.tools.slice(0, 4), model: agent.model, tools: agent.tools,
     currentTask: agent.current_task?.title ?? null,
-    cpuUsage: hasTask ? 40 + Math.random() * 50 : 5 + Math.random() * 15,
-    memoryUsage: 30 + Math.random() * 40, uptimeSeconds: agent.uptime_seconds,
+    cpuUsage: hasTask ? stableMetric(`${agent.id}:cpu:${taskSeed}`, 42, 88) : stableMetric(`${agent.id}:cpu:idle`, 6, 18),
+    memoryUsage: stableMetric(`${agent.id}:mem:${taskSeed}`, 26, 72), uptimeSeconds: agent.uptime_seconds,
     team: def.name, teamId: def.id, teamColor: def.color, avatarBg: def.bg,
     initials: agent.name.slice(0, 2).toUpperCase(),
   };
@@ -96,7 +183,7 @@ export function TeamStructure() {
   const queryError = agentsError || tasksError || teamsError;
   const error = queryError ? (queryError instanceof Error ? queryError.message : "データの取得に失敗しました") : null;
 
-  const teamDefs = teamsData ?? FALLBACK_TEAMS;
+  const teamDefs = useMemo(() => mergeTeamDefs(teamsData), [teamsData]);
 
   const [tab, setTab] = useState<ViewTab>("team");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -113,15 +200,21 @@ export function TeamStructure() {
   const { allMembers, teams, tasksCount } = useMemo(() => {
     if (!agentsData || !tasksData) return { allMembers: [] as AgentMember[], teams: [] as Team[], tasksCount: 0 };
     const doneCount = tasksData.filter((t: Task) => t.status === "done").length;
-    const members = agentsData.map((a) => buildMember(a, teamDefs));
+    const members = dedupeAgents(agentsData).map((a) => buildMember(a, teamDefs));
     const teamMap: Record<string, AgentMember[]> = {};
     for (const def of teamDefs) teamMap[def.id] = [];
     for (const m of members) {
       (teamMap[m.teamId] ?? (teamMap[teamDefs[0]?.id ?? "product"] ??= [])).push(m);
     }
     const builtTeams: Team[] = teamDefs
-      .map((def) => ({ ...def, icon: resolveIcon(def.icon), members: teamMap[def.id] ?? [] }))
-      .filter((t) => t.members.length > 0);
+      .map((def) => ({
+        ...def,
+        icon: resolveIcon(def.icon),
+        members: (teamMap[def.id] ?? []).slice().sort((left, right) => left.name.localeCompare(right.name)),
+        description: TEAM_META[def.id]?.description ?? "チームの役割説明は未設定です。",
+        emptyState: TEAM_META[def.id]?.emptyState ?? "まだメンバーが配備されていません。",
+        recommendedRoles: TEAM_META[def.id]?.recommendedRoles ?? [],
+      }));
     return { allMembers: members, teams: builtTeams, tasksCount: doneCount };
   }, [agentsData, tasksData, teamDefs]);
 
@@ -134,6 +227,7 @@ export function TeamStructure() {
 
   const totalAgents = allMembers.length;
   const activeAgents = allMembers.filter((m) => m.status !== "offline").length;
+  const staffedTeams = teams.filter((team) => team.members.length > 0).length;
 
   return (
     <div
@@ -160,8 +254,9 @@ export function TeamStructure() {
           </div>
         </div>
         {error && <div className="rounded-md border border-red-500/30 bg-red-500/10 px-4 py-2 text-sm text-red-400">{error}</div>}
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
           <StatCard icon={Users} iconClass="bg-primary/10 text-primary" value={totalAgents} label="総エージェント数" />
+          <StatCard icon={Network} iconClass="bg-orange-500/10 text-orange-500" value={staffedTeams} label="配備済みチーム" />
           <StatCard icon={Zap} iconClass="bg-green-500/10 text-green-500" value={activeAgents} label="稼働中" />
           <StatCard icon={Monitor} iconClass="bg-blue-500/10 text-blue-500" value={tasksCount} label="完了タスク" />
         </div>
@@ -259,24 +354,36 @@ function TeamView({ teams, selectedId, onSelect }: { teams: Team[]; selectedId: 
                   <CardTitle className="text-base">{team.nameJa}</CardTitle>
                   <Badge variant="secondary" className="ml-auto">{onlineCount}/{team.members.length} 稼働</Badge>
                 </div>
+                <p className="text-sm text-muted-foreground">{team.description}</p>
               </CardHeader>
               <CardContent>
-                <div className="ml-6 border-l-2 border-dashed border-border pl-4 space-y-2">
-                  {team.members.map((member) => (
-                    <button key={member.id} onClick={() => onSelect(member.id)} className={cn("relative flex w-full items-center gap-3 rounded-lg border border-border p-3 text-left transition-colors hover:bg-accent", selectedId === member.id && "border-primary bg-accent")}>
-                      <div className="absolute -left-[1.125rem] top-1/2 h-px w-3 border-t-2 border-dashed border-border" />
-                      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-muted"><Bot className="h-4 w-4 text-muted-foreground" /></div>
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2">
-                          <span className="text-sm font-medium">{member.name}</span>
-                          <span className={cn("h-2 w-2 rounded-full", STATUS_CFG[member.status].dot)} />
+                {team.members.length > 0 ? (
+                  <div className="ml-6 space-y-2 border-l-2 border-dashed border-border pl-4">
+                    {team.members.map((member) => (
+                      <button key={member.id} onClick={() => onSelect(member.id)} className={cn("relative flex w-full items-center gap-3 rounded-lg border border-border p-3 text-left transition-colors hover:bg-accent", selectedId === member.id && "border-primary bg-accent")}>
+                        <div className="absolute -left-[1.125rem] top-1/2 h-px w-3 border-t-2 border-dashed border-border" />
+                        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-muted"><Bot className="h-4 w-4 text-muted-foreground" /></div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium">{member.name}</span>
+                            <span className={cn("h-2 w-2 rounded-full", STATUS_CFG[member.status].dot)} />
+                          </div>
+                          <p className="text-xs text-muted-foreground">{member.role}</p>
                         </div>
-                        <p className="text-xs text-muted-foreground">{member.role}</p>
-                      </div>
-                      <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
-                    </button>
-                  ))}
-                </div>
+                        <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="rounded-lg border border-dashed border-border bg-muted/30 p-4">
+                    <p className="text-sm text-foreground">{team.emptyState}</p>
+                    {team.recommendedRoles.length > 0 && (
+                      <p className="mt-2 text-xs text-muted-foreground">
+                        推奨ロール: {team.recommendedRoles.join(" / ")}
+                      </p>
+                    )}
+                  </div>
+                )}
               </CardContent>
             </Card>
           );
@@ -438,8 +545,11 @@ function DetailPanel({ agent, team, teamDefs, onClose }: {
               {team && (
                 <section className="space-y-2">
                   <h3 className="text-sm font-medium">所属チーム</h3>
-                  <div className="flex items-center gap-2 rounded-lg border border-border p-3">
-                    <TeamIcon className={cn("h-4 w-4", team.color)} /><span className="text-sm">{team.nameJa}</span>
+                  <div className="rounded-lg border border-border p-3">
+                    <div className="flex items-center gap-2">
+                      <TeamIcon className={cn("h-4 w-4", team.color)} /><span className="text-sm">{team.nameJa}</span>
+                    </div>
+                    <p className="mt-2 text-xs text-muted-foreground">{team.description}</p>
                   </div>
                 </section>
               )}

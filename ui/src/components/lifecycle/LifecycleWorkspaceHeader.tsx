@@ -4,12 +4,12 @@ import type { LifecyclePhase, PhaseStatus } from "@/types/lifecycle";
 
 const PHASE_META: Record<LifecyclePhase, { label: string; description: string }> = {
   research: { label: "調査", description: "市場調査・競合分析を整理し、企画の前提を固めます。" },
-  planning: { label: "企画", description: "ペルソナ、ストーリー、優先度、IA を統合してスコープを定義します。" },
+  planning: { label: "企画", description: "ペルソナ、ストーリー、優先度、情報設計を統合してスコープを定義します。" },
   design: { label: "デザイン", description: "複数案を比較し、実装に渡す UX 方針を選びます。" },
-  approval: { label: "承認", description: "企画と設計の説明責任を担保し、次工程への gate を閉じます。" },
+  approval: { label: "承認", description: "企画と設計の内容をレビューし、次工程への進行を判断します。" },
   development: { label: "開発", description: "自律開発の進行と品質到達を確認します。" },
-  deploy: { label: "デプロイ", description: "release gate を通して成果物を検証し、公開準備を整えます。" },
-  iterate: { label: "改善", description: "フィードバックを次の iteration backlog に変換します。" },
+  deploy: { label: "デプロイ", description: "リリース前チェックを通して成果物を検証し、公開準備を整えます。" },
+  iterate: { label: "改善", description: "フィードバックを次のイテレーションのバックログに変換します。" },
 };
 
 interface LifecycleWorkspaceHeaderProps {
@@ -20,6 +20,7 @@ interface LifecycleWorkspaceHeaderProps {
   isMobile: boolean;
   consoleOpen: boolean;
   saveState: "idle" | "saving" | "saved" | "error";
+  runtimeConnectionState?: "inactive" | "connecting" | "live" | "reconnecting";
   lastSavedAt: string | null;
   onTogglePhaseNav: () => void;
   onToggleConsole: () => void;
@@ -41,6 +42,7 @@ export function LifecycleWorkspaceHeader({
   isMobile,
   consoleOpen,
   saveState,
+  runtimeConnectionState = "inactive",
   lastSavedAt,
   onTogglePhaseNav,
   onToggleConsole,
@@ -49,7 +51,7 @@ export function LifecycleWorkspaceHeader({
   const currentIndex = phaseStatuses.findIndex((item) => item.phase === currentPhase);
   const total = phaseStatuses.length;
   const meta = PHASE_META[currentPhase];
-  const progress = total === 0 ? 0 : ((Math.max(completed, currentIndex + 1)) / total) * 100;
+  const progress = total === 0 ? 0 : (completed / total) * 100;
 
   return (
     <header className="border-b border-border bg-background/90 px-4 py-3 backdrop-blur">
@@ -65,7 +67,7 @@ export function LifecycleWorkspaceHeader({
           <div>
             <div className="flex items-center gap-2">
               <span className="text-[11px] font-semibold uppercase tracking-[0.22em] text-muted-foreground/70">
-                lifecycle workspace
+                ライフサイクル
               </span>
               <span className="rounded-full border border-border px-2 py-0.5 text-[10px] text-muted-foreground">
                 {projectLabel}
@@ -74,7 +76,7 @@ export function LifecycleWorkspaceHeader({
             <div className="mt-1 flex items-center gap-2">
               <h1 className="text-base font-semibold text-foreground">{meta.label}</h1>
               <span className="text-xs text-muted-foreground">
-                {Math.min(completed + 1, total)}/{total}
+                ステップ {currentIndex >= 0 ? currentIndex + 1 : 1}/{total}
               </span>
             </div>
           </div>
@@ -112,6 +114,23 @@ export function LifecycleWorkspaceHeader({
               {saveState === "saved" && `保存済み ${formatSavedTime(lastSavedAt)}`}
               {saveState === "error" && "保存に失敗"}
               {saveState === "idle" && "自動保存待機"}
+            </span>
+          </div>
+          <div className={cn(
+            "inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-xs",
+            runtimeConnectionState === "live"
+              ? "border-primary/30 bg-primary/10 text-primary"
+              : "border-border bg-card text-muted-foreground",
+          )}>
+            <span className={cn(
+              "h-2 w-2 rounded-full",
+              runtimeConnectionState === "live" ? "bg-primary" : "bg-muted-foreground/50",
+            )} />
+            <span>
+              {runtimeConnectionState === "live" && "ライブ接続"}
+              {runtimeConnectionState === "connecting" && "接続中"}
+              {runtimeConnectionState === "reconnecting" && "再接続中"}
+              {runtimeConnectionState === "inactive" && "ライブ停止"}
             </span>
           </div>
           <button

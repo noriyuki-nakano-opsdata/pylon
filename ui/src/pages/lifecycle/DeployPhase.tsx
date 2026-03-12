@@ -48,6 +48,7 @@ export function DeployPhase() {
     try {
       const response = await lifecycleApi.createRelease(projectSlug, releaseNote);
       lc.applyProject(response.project);
+      lc.completePhase("deploy");
       setReleaseNote("");
     } finally {
       setIsDeploying(false);
@@ -107,27 +108,27 @@ export function DeployPhase() {
               className="h-full border border-border rounded-lg bg-white transition-all"
               style={{ width: deviceWidth, maxWidth: "100%" }}
               sandbox="allow-scripts allow-same-origin"
-              title="Deploy Preview"
+              title="デプロイプレビュー"
             />
           ) : (
             <div className="flex w-full max-w-2xl items-center justify-center">
               <div className="w-full rounded-2xl border border-dashed border-border bg-card p-8 text-center">
                 <Rocket className="mx-auto h-10 w-10 text-primary" />
-                <h2 className="mt-4 text-lg font-semibold text-foreground">まだ deploy できるビルドがありません</h2>
+                <h2 className="mt-4 text-lg font-semibold text-foreground">まだデプロイできるビルドがありません</h2>
                 <p className="mt-2 text-sm text-muted-foreground">
-                  development phase で build を完了すると、ここにプレビュー、quality checks、release gate が表示されます。
+                  開発フェーズでビルドを完了すると、ここにプレビュー、品質チェック、リリースゲートが表示されます。
                 </p>
                 <div className="mt-5 grid gap-3 text-left sm:grid-cols-3">
                   <div className="rounded-lg border border-border bg-background p-3">
-                    <p className="text-xs text-muted-foreground">build code</p>
-                    <p className="mt-1 text-sm font-medium text-foreground">{lc.buildCode ? "Ready" : "Pending"}</p>
+                    <p className="text-xs text-muted-foreground">ビルドコード</p>
+                    <p className="mt-1 text-sm font-medium text-foreground">{lc.buildCode ? "準備完了" : "未完了"}</p>
                   </div>
                   <div className="rounded-lg border border-border bg-background p-3">
-                    <p className="text-xs text-muted-foreground">deploy checks</p>
+                    <p className="text-xs text-muted-foreground">デプロイチェック</p>
                     <p className="mt-1 text-sm font-medium text-foreground">{checks.length > 0 ? `${checks.length}件` : "未実行"}</p>
                   </div>
                   <div className="rounded-lg border border-border bg-background p-3">
-                    <p className="text-xs text-muted-foreground">release</p>
+                    <p className="text-xs text-muted-foreground">リリース</p>
                     <p className="mt-1 text-sm font-medium text-foreground">{deployed ? latestRelease?.version : "未作成"}</p>
                   </div>
                 </div>
@@ -145,11 +146,11 @@ export function DeployPhase() {
         <div className="w-full border-t border-border bg-card/50 p-4 overflow-y-auto space-y-4 xl:w-80 xl:border-l xl:border-t-0">
           <div className="rounded-xl border border-border bg-card p-4">
             <h3 className="flex items-center gap-2 text-sm font-bold text-foreground mb-3">
-              <ShieldCheck className="h-4 w-4 text-primary" /> Release Gate
+              <ShieldCheck className="h-4 w-4 text-primary" /> リリースゲート
             </h3>
             {checks.length === 0 ? (
               <div className="rounded-lg border border-dashed border-border px-3 py-4 text-xs text-muted-foreground">
-                デプロイ前に backend quality checks を実行してください。
+                デプロイ前に品質チェックを実行してください。
               </div>
             ) : (
               <div className="space-y-2">
@@ -175,9 +176,9 @@ export function DeployPhase() {
               </div>
             )}
             <div className="mt-3 grid grid-cols-3 gap-2 text-[10px]">
-              <StatChip label="Pass" value={passedCount} tone="success" />
-              <StatChip label="Warning" value={warningCount} tone="warning" />
-              <StatChip label="Fail" value={failedCount} tone="danger" />
+              <StatChip label="合格" value={passedCount} tone="success" />
+              <StatChip label="警告" value={warningCount} tone="warning" />
+              <StatChip label="不合格" value={failedCount} tone="danger" />
             </div>
             <button
               onClick={() => void runChecks()}
@@ -196,9 +197,9 @@ export function DeployPhase() {
                   <CheckCircle2 className="h-4 w-4" /> {latestRelease.version} を作成済み
                 </div>
                 <div className="rounded-lg border border-success/20 bg-success/5 p-3 text-xs">
-                  <p className="font-medium text-foreground">Latest release</p>
+                  <p className="font-medium text-foreground">最新リリース</p>
                   <p className="mt-1 text-muted-foreground">{new Date(latestRelease.createdAt).toLocaleString("ja-JP")}</p>
-                  <p className="mt-1 text-muted-foreground">Quality score: {latestRelease.qualitySummary.overallScore}</p>
+                  <p className="mt-1 text-muted-foreground">品質スコア: {latestRelease.qualitySummary.overallScore}</p>
                   {latestRelease.note && <p className="mt-1 text-foreground">{latestRelease.note}</p>}
                 </div>
                 {blobUrl && (

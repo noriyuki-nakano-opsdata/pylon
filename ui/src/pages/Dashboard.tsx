@@ -89,7 +89,7 @@ export function Dashboard() {
         <CardContent>
           <div className="space-y-3 text-sm">
             <p className="text-muted-foreground">
-              まずは新しいプロジェクトを作成して、ライフサイクルのリサーチから開始してください。
+              まずはプロジェクト名だけで作成し、research kickoff で brief を固めてください。
             </p>
             <Link
               to="/projects/new"

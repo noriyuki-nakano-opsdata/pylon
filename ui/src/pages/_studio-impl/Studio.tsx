@@ -284,7 +284,7 @@ export function Studio() {
         <span>
           プロダクトを段階的に構築する場合は{" "}
           <Link to={`/p/${projectSlug}/lifecycle/research`} className="text-primary hover:underline font-medium">
-            Product Lifecycle
+            プロダクトライフサイクル
           </Link>{" "}
           をご利用ください
         </span>

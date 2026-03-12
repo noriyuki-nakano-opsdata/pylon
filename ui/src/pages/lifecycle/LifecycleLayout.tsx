@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Outlet, useLocation, useNavigate, useParams } from "react-router-dom";
 import { Loader2 } from "lucide-react";
+import { useTenantProject } from "@/contexts/TenantProjectContext";
 import { cn } from "@/lib/utils";
 import { lifecycleApi } from "@/api/lifecycle";
 import { LifecycleOperatorConsole } from "@/components/lifecycle/LifecycleOperatorConsole";
 import { PhaseNav } from "@/components/lifecycle/PhaseNav";
 import { LifecycleWorkspaceHeader } from "@/components/lifecycle/LifecycleWorkspaceHeader";
+import { useLifecycleRuntimeStream } from "@/hooks/useLifecycleRuntimeStream";
 import { LifecycleContext } from "./LifecycleContext";
 import type {
   ApprovalComment,
@@ -48,6 +50,9 @@ const PHASE_ORDER: LifecyclePhase[] = [
   "iterate",
 ];
 
+const lifecycleProjectCache = new Map<string, LifecycleProject>();
+const LIFECYCLE_CACHE_PREFIX = "pylon:lifecycle-project:";
+
 const defaultStatuses = (): PhaseStatus[] => PHASE_ORDER.map((phase, index) => ({
   phase,
   status: index === 0 ? "available" : "locked",
@@ -57,6 +62,7 @@ const defaultStatuses = (): PhaseStatus[] => PHASE_ORDER.map((phase, index) => (
 const defaultResearchConfig = (): LifecycleResearchConfig => ({
   competitorUrls: [],
   depth: "standard",
+  outputLanguage: "ja",
 });
 
 function emptyBlueprint(phase: LifecyclePhase): PhaseBlueprint {
@@ -91,74 +97,192 @@ function normalizeBlueprints(
   };
 }
 
-function toProjectPatch(state: {
+type EditableProjectPatch = {
   spec: string;
   orchestrationMode: LifecycleOrchestrationMode;
   autonomyLevel: LifecycleAutonomyLevel;
   researchConfig: LifecycleResearchConfig;
-  research: MarketResearch | null;
-  analysis: AnalysisResult | null;
   features: FeatureSelection[];
   milestones: Milestone[];
-  designVariants: DesignVariant[];
   selectedDesignId: string | null;
-  approvalStatus: LifecycleProject["approvalStatus"];
-  approvalComments: ApprovalComment[];
-  buildCode: string | null;
-  buildCost: number;
-  buildIteration: number;
-  milestoneResults: MilestoneResult[];
-  planEstimates: PlanEstimate[];
   selectedPreset: PlanPreset;
-  phaseStatuses: PhaseStatus[];
-  deployChecks: DeployCheck[];
-  releases: ReleaseRecord[];
-  feedbackItems: FeedbackItem[];
-  recommendations: LifecycleRecommendation[];
-  artifacts: LifecycleArtifact[];
-  decisionLog: LifecycleDecision[];
-  skillInvocations: LifecycleSkillInvocation[];
-  delegations: LifecycleDelegation[];
-  phaseRuns: LifecyclePhaseRun[];
-}): Partial<LifecycleProject> {
+};
+
+function defaultEditableProjectPatch(): EditableProjectPatch {
+  return {
+    spec: "",
+    orchestrationMode: "workflow",
+    autonomyLevel: "A3",
+    researchConfig: defaultResearchConfig(),
+    features: [],
+    milestones: [],
+    selectedDesignId: null,
+    selectedPreset: "standard",
+  };
+}
+
+function toEditableProjectPatch(state: EditableProjectPatch): EditableProjectPatch {
   return {
     spec: state.spec,
     orchestrationMode: state.orchestrationMode,
     autonomyLevel: state.autonomyLevel,
     researchConfig: state.researchConfig,
-    research: state.research ?? undefined,
-    analysis: state.analysis ?? undefined,
     features: state.features,
     milestones: state.milestones,
-    designVariants: state.designVariants,
-    selectedDesignId: state.selectedDesignId ?? undefined,
-    approvalStatus: state.approvalStatus,
-    approvalComments: state.approvalComments,
-    buildCode: state.buildCode ?? undefined,
-    buildCost: state.buildCost,
-    buildIteration: state.buildIteration,
-    milestoneResults: state.milestoneResults,
-    planEstimates: state.planEstimates,
+    selectedDesignId: state.selectedDesignId ?? null,
     selectedPreset: state.selectedPreset,
-    phaseStatuses: state.phaseStatuses,
-    deployChecks: state.deployChecks,
-    releases: state.releases,
-    feedbackItems: state.feedbackItems,
-    recommendations: state.recommendations,
-    artifacts: state.artifacts,
-    decisionLog: state.decisionLog,
-    skillInvocations: state.skillInvocations,
-    delegations: state.delegations,
-    phaseRuns: state.phaseRuns,
+  };
+}
+
+function editableProjectPayload(state: EditableProjectPatch): Partial<LifecycleProject> {
+  return {
+    ...state,
+    selectedDesignId: state.selectedDesignId ?? undefined,
+  };
+}
+
+function editableProjectFromProject(project: LifecycleProject): EditableProjectPatch {
+  return {
+    spec: project.spec || project.description || "",
+    orchestrationMode: project.orchestrationMode ?? "workflow",
+    autonomyLevel: project.autonomyLevel ?? "A3",
+    researchConfig: project.researchConfig ?? defaultResearchConfig(),
+    features: project.features ?? [],
+    milestones: project.milestones ?? [],
+    selectedDesignId: project.selectedDesignId ?? null,
+    selectedPreset: project.selectedPreset ?? "standard",
+  };
+}
+
+function stableProjectSnapshot(payload: EditableProjectPatch): string {
+  return JSON.stringify(payload);
+}
+
+function readLifecycleProjectCache(projectSlug: string): LifecycleProject | null {
+  const inMemory = lifecycleProjectCache.get(projectSlug);
+  if (inMemory) {
+    return inMemory;
+  }
+  if (typeof window === "undefined") {
+    return null;
+  }
+  try {
+    const raw = window.sessionStorage.getItem(`${LIFECYCLE_CACHE_PREFIX}${projectSlug}`);
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+    return parsed as LifecycleProject;
+  } catch {
+    return null;
+  }
+}
+
+function writeLifecycleProjectCache(projectSlug: string, project: LifecycleProject): void {
+  lifecycleProjectCache.set(projectSlug, project);
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.sessionStorage.setItem(
+      `${LIFECYCLE_CACHE_PREFIX}${projectSlug}`,
+      JSON.stringify(project),
+    );
+  } catch {
+    // Ignore cache persistence failures.
+  }
+}
+
+function LifecycleContentSkeleton() {
+  return (
+    <div className="space-y-6 px-6 py-8">
+      <div className="space-y-3">
+        <div className="h-3 w-28 rounded-full bg-muted/70" />
+        <div className="h-9 w-80 max-w-full rounded-2xl bg-muted/60" />
+        <div className="h-4 w-[32rem] max-w-full rounded-full bg-muted/40" />
+      </div>
+      <div className="grid gap-4 xl:grid-cols-[1.35fr_0.95fr]">
+        <div className="space-y-4 rounded-3xl border border-border/60 bg-card/60 p-6">
+          <div className="h-5 w-40 rounded-full bg-muted/60" />
+          <div className="space-y-3">
+            <div className="h-12 rounded-2xl bg-muted/40" />
+            <div className="h-28 rounded-3xl bg-muted/30" />
+            <div className="h-10 w-40 rounded-2xl bg-muted/50" />
+          </div>
+        </div>
+        <div className="space-y-4 rounded-3xl border border-border/60 bg-card/50 p-6">
+          <div className="h-5 w-36 rounded-full bg-muted/60" />
+          <div className="space-y-3">
+            <div className="h-20 rounded-2xl bg-muted/35" />
+            <div className="h-20 rounded-2xl bg-muted/35" />
+            <div className="h-20 rounded-2xl bg-muted/35" />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function editableFieldChanged<T extends keyof EditableProjectPatch>(
+  key: T,
+  local: EditableProjectPatch,
+  saved: EditableProjectPatch,
+): boolean {
+  return JSON.stringify(local[key]) !== JSON.stringify(saved[key]);
+}
+
+function mergeEditableProjectPatch(
+  local: EditableProjectPatch,
+  saved: EditableProjectPatch,
+  server: EditableProjectPatch,
+): {
+  applied: EditableProjectPatch;
+  baseline: EditableProjectPatch;
+} {
+  const specChanged = editableFieldChanged("spec", local, saved);
+  const modeChanged = editableFieldChanged("orchestrationMode", local, saved);
+  const autonomyChanged = editableFieldChanged("autonomyLevel", local, saved);
+  const researchConfigChanged = editableFieldChanged("researchConfig", local, saved);
+  const featuresChanged = editableFieldChanged("features", local, saved);
+  const milestonesChanged = editableFieldChanged("milestones", local, saved);
+  const designChanged = editableFieldChanged("selectedDesignId", local, saved);
+  const presetChanged = editableFieldChanged("selectedPreset", local, saved);
+
+  return {
+    applied: {
+      spec: specChanged ? local.spec : server.spec,
+      orchestrationMode: modeChanged ? local.orchestrationMode : server.orchestrationMode,
+      autonomyLevel: autonomyChanged ? local.autonomyLevel : server.autonomyLevel,
+      researchConfig: researchConfigChanged ? local.researchConfig : server.researchConfig,
+      features: featuresChanged ? local.features : server.features,
+      milestones: milestonesChanged ? local.milestones : server.milestones,
+      selectedDesignId: designChanged ? local.selectedDesignId : server.selectedDesignId,
+      selectedPreset: presetChanged ? local.selectedPreset : server.selectedPreset,
+    },
+    baseline: {
+      spec: specChanged ? saved.spec : server.spec,
+      orchestrationMode: modeChanged ? saved.orchestrationMode : server.orchestrationMode,
+      autonomyLevel: autonomyChanged ? saved.autonomyLevel : server.autonomyLevel,
+      researchConfig: researchConfigChanged ? saved.researchConfig : server.researchConfig,
+      features: featuresChanged ? saved.features : server.features,
+      milestones: milestonesChanged ? saved.milestones : server.milestones,
+      selectedDesignId: designChanged ? saved.selectedDesignId : server.selectedDesignId,
+      selectedPreset: presetChanged ? saved.selectedPreset : server.selectedPreset,
+    },
   };
 }
 
 export function LifecycleLayout() {
   const { projectSlug } = useParams();
-  return <LifecycleLayoutInner key={projectSlug} projectSlug={projectSlug ?? ""} />;
+  const { currentProject } = useTenantProject();
+  const projectLabel = currentProject?.name || projectSlug || "";
+  return <LifecycleLayoutInner key={projectSlug} projectSlug={projectSlug ?? ""} projectLabel={projectLabel} />;
 }
 
-function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
+function LifecycleLayoutInner({ projectSlug, projectLabel }: { projectSlug: string; projectLabel: string }) {
   const basePath = `/p/${projectSlug}`;
   const location = useLocation();
   const navigate = useNavigate();
@@ -195,6 +319,8 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
   const [autonomyState, setAutonomyState] = useState<LifecycleAutonomyState | null>(null);
   const [blueprints, setBlueprints] = useState<Record<LifecyclePhase, PhaseBlueprint>>(defaultBlueprints);
   const [isHydrating, setIsHydrating] = useState(true);
+  const [hydrateError, setHydrateError] = useState<string | null>(null);
+  const [isRefreshingProject, setIsRefreshingProject] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
   const [phaseNavCollapsed, setPhaseNavCollapsed] = useState(false);
   const [mobilePhaseNavOpen, setMobilePhaseNavOpen] = useState(false);
@@ -206,6 +332,9 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
   const hydratedRef = useRef(false);
   const applyingRemoteRef = useRef(false);
   const autoAdvanceInFlightRef = useRef(false);
+  const editableDraftRef = useRef<EditableProjectPatch>(defaultEditableProjectPatch());
+  const lastSavedEditableProjectRef = useRef<EditableProjectPatch>(defaultEditableProjectPatch());
+  const lastSavedEditableRef = useRef(stableProjectSnapshot(defaultEditableProjectPatch()));
 
   useEffect(() => {
     const mq = window.matchMedia("(max-width: 1024px)");
@@ -219,7 +348,7 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
     onChange(mq);
     mq.addEventListener("change", onChange);
     return () => mq.removeEventListener("change", onChange);
-  }, []);
+  }, [projectSlug]);
 
   useEffect(() => {
     if (!isMobile) return;
@@ -227,18 +356,35 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
     setConsoleOpen(false);
   }, [isMobile, location.pathname]);
 
-  const applyProject = useCallback((project: LifecycleProject) => {
+  const applyProject = useCallback((
+    project: LifecycleProject,
+    options: { preserveDirtyEditable?: boolean } = {},
+  ) => {
     applyingRemoteRef.current = true;
-    setSpec(project.spec ?? "");
-    setOrchestrationMode(project.orchestrationMode ?? "workflow");
-    setAutonomyLevel(project.autonomyLevel ?? "A3");
-    setResearchConfig(project.researchConfig ?? defaultResearchConfig());
+    writeLifecycleProjectCache(projectSlug, project);
+    const serverEditable = editableProjectFromProject(project);
+    const { applied: editablePatch, baseline: editableBaseline } = options.preserveDirtyEditable
+      ? mergeEditableProjectPatch(
+          editableDraftRef.current,
+          lastSavedEditableProjectRef.current,
+          serverEditable,
+        )
+      : { applied: serverEditable, baseline: serverEditable };
+
+    editableDraftRef.current = editablePatch;
+    lastSavedEditableProjectRef.current = editableBaseline;
+    lastSavedEditableRef.current = stableProjectSnapshot(editableBaseline);
+
+    setSpec(editablePatch.spec);
+    setOrchestrationMode(editablePatch.orchestrationMode);
+    setAutonomyLevel(editablePatch.autonomyLevel);
+    setResearchConfig(editablePatch.researchConfig);
     setResearch(project.research ?? null);
     setAnalysis(project.analysis ?? null);
-    setFeatures(project.features ?? []);
-    setMilestones(project.milestones ?? []);
+    setFeatures(editablePatch.features);
+    setMilestones(editablePatch.milestones);
     setDesignVariants(project.designVariants ?? []);
-    setSelectedDesignId(project.selectedDesignId ?? null);
+    setSelectedDesignId(editablePatch.selectedDesignId);
     setApprovalStatus(project.approvalStatus ?? "pending");
     setApprovalComments(project.approvalComments ?? []);
     setBuildCode(project.buildCode ?? null);
@@ -246,7 +392,7 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
     setBuildIteration(project.buildIteration ?? 0);
     setMilestoneResults(project.milestoneResults ?? []);
     setPlanEstimates(project.planEstimates ?? []);
-    setSelectedPreset(project.selectedPreset ?? "standard");
+    setSelectedPreset(editablePatch.selectedPreset);
     setPhaseStatuses(project.phaseStatuses ?? defaultStatuses());
     setDeployChecks(project.deployChecks ?? []);
     setReleases(project.releases ?? []);
@@ -260,13 +406,62 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
     setNextAction(project.nextAction ?? null);
     setAutonomyState(project.autonomyState ?? null);
     setBlueprints(normalizeBlueprints(project.blueprints));
-    setSaveState("idle");
+    if (!options.preserveDirtyEditable || stableProjectSnapshot(editablePatch) === lastSavedEditableRef.current) {
+      setSaveState("idle");
+    }
     setLastSavedAt(project.savedAt ?? null);
     hydratedRef.current = true;
     queueMicrotask(() => {
       applyingRemoteRef.current = false;
     });
+  }, [projectSlug]);
+
+  const applyRuntimeProject = useCallback((payload: {
+    phaseStatuses?: PhaseStatus[];
+    nextAction?: LifecycleNextAction | null;
+    autonomyState?: LifecycleAutonomyState | null;
+    updatedAt?: string;
+    savedAt?: string;
+  }) => {
+    applyingRemoteRef.current = true;
+    if (payload.phaseStatuses) {
+      setPhaseStatuses(payload.phaseStatuses);
+    }
+    if (payload.nextAction !== undefined) {
+      setNextAction(payload.nextAction);
+    }
+    if (payload.autonomyState !== undefined) {
+      setAutonomyState(payload.autonomyState);
+    }
+    if (payload.savedAt) {
+      setLastSavedAt(payload.savedAt);
+    }
+    queueMicrotask(() => {
+      applyingRemoteRef.current = false;
+    });
   }, []);
+
+  useEffect(() => {
+    editableDraftRef.current = toEditableProjectPatch({
+      spec,
+      orchestrationMode,
+      autonomyLevel,
+      researchConfig,
+      features,
+      milestones,
+      selectedDesignId,
+      selectedPreset,
+    });
+  }, [
+    spec,
+    orchestrationMode,
+    autonomyLevel,
+    researchConfig,
+    features,
+    milestones,
+    selectedDesignId,
+    selectedPreset,
+  ]);
 
   useEffect(() => {
     let cancelled = false;
@@ -274,21 +469,35 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
       setIsHydrating(false);
       return;
     }
+    setHydrateError(null);
     setIsHydrating(true);
+    setIsRefreshingProject(false);
     hydratedRef.current = false;
     applyingRemoteRef.current = true;
+
+    const cachedProject = readLifecycleProjectCache(projectSlug);
+    if (cachedProject) {
+      applyProject(cachedProject);
+      setIsHydrating(false);
+      setIsRefreshingProject(true);
+    }
 
     lifecycleApi.getProject(projectSlug)
       .then((project) => {
         if (cancelled) return;
-        applyProject(project);
+        applyProject(project, { preserveDirtyEditable: Boolean(cachedProject) });
         setIsHydrating(false);
+        setIsRefreshingProject(false);
       })
       .catch(() => {
         if (cancelled) return;
-        hydratedRef.current = true;
+        hydratedRef.current = Boolean(cachedProject);
         applyingRemoteRef.current = false;
         setIsHydrating(false);
+        setIsRefreshingProject(false);
+        if (!cachedProject) {
+          setHydrateError("Lifecycle state を読み込めませんでした。もう一度読み込むと復旧できる場合があります。");
+        }
       });
 
     return () => {
@@ -299,46 +508,26 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
 
   useEffect(() => {
     if (!projectSlug || !hydratedRef.current || applyingRemoteRef.current) return;
+    const editablePatch = editableDraftRef.current;
+    const snapshot = stableProjectSnapshot(editablePatch);
+    if (snapshot === lastSavedEditableRef.current) {
+      return;
+    }
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
       setSaveState("saving");
       void lifecycleApi.saveProject(
         projectSlug,
-        toProjectPatch({
-          spec,
-          orchestrationMode,
-          autonomyLevel,
-          researchConfig,
-          research,
-          analysis,
-          features,
-          milestones,
-          designVariants,
-          selectedDesignId,
-          approvalStatus,
-          approvalComments,
-          buildCode,
-          buildCost,
-          buildIteration,
-          milestoneResults,
-          planEstimates,
-          selectedPreset,
-          phaseStatuses,
-          deployChecks,
-          releases,
-          feedbackItems,
-          recommendations,
-          artifacts,
-          decisionLog,
-          skillInvocations,
-          delegations,
-          phaseRuns,
-        }),
+        editableProjectPayload(editablePatch),
         { autoRun: false },
       )
-        .then(() => {
+        .then((response) => {
+          const savedEditable = editableProjectFromProject(response.project);
+          lastSavedEditableProjectRef.current = savedEditable;
+          lastSavedEditableRef.current = stableProjectSnapshot(savedEditable);
+          applyRuntimeProject(response.project);
           setSaveState("saved");
-          setLastSavedAt(new Date().toISOString());
+          setLastSavedAt(response.project.savedAt ?? new Date().toISOString());
         })
         .catch(() => {
           setSaveState("error");
@@ -346,35 +535,16 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
     }, 500);
     return () => clearTimeout(saveTimer.current);
   }, [
+    applyRuntimeProject,
     projectSlug,
     spec,
     orchestrationMode,
     autonomyLevel,
     researchConfig,
-    research,
-    analysis,
     features,
     milestones,
-    designVariants,
     selectedDesignId,
-    approvalStatus,
-    approvalComments,
-    buildCode,
-    buildCost,
-    buildIteration,
-    milestoneResults,
-    planEstimates,
     selectedPreset,
-    phaseStatuses,
-    deployChecks,
-    releases,
-    feedbackItems,
-    recommendations,
-    artifacts,
-    decisionLog,
-    skillInvocations,
-    delegations,
-    phaseRuns,
   ]);
 
   useEffect(() => {
@@ -417,14 +587,62 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
   const currentPhase = PHASE_ORDER.find((phase) =>
     location.pathname.endsWith(`/lifecycle/${phase}`),
   ) ?? null;
+  const shouldStreamRuntime = Boolean(projectSlug && currentPhase);
+  const runtimeStream = useLifecycleRuntimeStream(
+    projectSlug,
+    currentPhase,
+    shouldStreamRuntime,
+  );
+
+  // Phase guard: redirect locked phases to the latest accessible phase
+  useEffect(() => {
+    if (isHydrating || !currentPhase) return;
+    const currentStatus = phaseStatuses.find((s) => s.phase === currentPhase);
+    if (!currentStatus || currentStatus.status === "locked") {
+      let fallbackPhase: LifecyclePhase | null = null;
+      for (let i = PHASE_ORDER.length - 1; i >= 0; i--) {
+        const status = phaseStatuses.find((s) => s.phase === PHASE_ORDER[i]);
+        if (status && (status.status === "in_progress" || status.status === "completed" || status.status === "available")) {
+          fallbackPhase = PHASE_ORDER[i];
+          break;
+        }
+      }
+      if (fallbackPhase) {
+        navigate(`${basePath}/lifecycle/${fallbackPhase}`, { replace: true });
+      }
+    }
+  }, [basePath, currentPhase, isHydrating, navigate, phaseStatuses]);
+
+  useEffect(() => {
+    if (!runtimeStream.runtime) return;
+    applyRuntimeProject(runtimeStream.runtime);
+  }, [applyRuntimeProject, runtimeStream.runtime]);
+
+  useEffect(() => {
+    if (!runtimeStream.terminalEvent || !projectSlug) return;
+    void lifecycleApi.getProject(projectSlug)
+      .then((project) => {
+        applyProject(project, { preserveDirtyEditable: true });
+      })
+      .catch(() => {
+        // Ignore transient terminal refresh failures; the next manual refresh recovers.
+      });
+  }, [applyProject, projectSlug, runtimeStream.terminalEvent]);
 
   const prevNextActionRef = useRef(nextAction);
   useEffect(() => {
     if (isHydrating || !projectSlug || orchestrationMode !== "autonomous" || !nextAction?.phase) return;
     if (nextAction.type === "collect_input") return;
 
+    // Keep explicit phase URLs stable. Autonomous progression should refresh
+    // the shared lifecycle state, but it should not override manual inspection
+    // of a completed or in-progress phase screen.
+    if (currentPhase !== null) {
+      prevNextActionRef.current = nextAction;
+      return;
+    }
+
     // Only auto-redirect when nextAction actually changes, not on every route change.
-    // This allows users to freely navigate to completed phases.
     const changed = prevNextActionRef.current?.phase !== nextAction.phase
       || prevNextActionRef.current?.type !== nextAction.type;
     prevNextActionRef.current = nextAction;
@@ -440,11 +658,20 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
   }, [basePath, currentPhase, isHydrating, navigate, nextAction, orchestrationMode, projectSlug]);
 
   useEffect(() => {
+    const remediationPayload = nextAction?.payload?.remediation;
+    const selfHealingResearchRecovery = Boolean(
+      nextAction?.canAutorun
+      && nextAction?.type === "run_phase"
+      && nextAction?.phase === "research"
+      && remediationPayload
+      && typeof remediationPayload === "object"
+      && (remediationPayload as Record<string, unknown>).trigger === "quality_gate_recovery",
+    );
     if (
       isHydrating
       || !projectSlug
-      || orchestrationMode !== "autonomous"
       || !nextAction?.canAutorun
+      || (orchestrationMode !== "autonomous" && !selfHealingResearchRecovery)
       || autoAdvanceInFlightRef.current
     ) {
       return;
@@ -519,23 +746,18 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
     phaseRuns,
     nextAction,
     autonomyState,
+    runtimeObservedPhase: runtimeStream.runtime?.observedPhase ?? currentPhase,
+    runtimeActivePhase: runtimeStream.runtime?.activePhase ?? null,
+    runtimePhaseSummary: runtimeStream.runtime?.phaseSummary ?? null,
+    runtimeActivePhaseSummary: runtimeStream.runtime?.activePhaseSummary ?? null,
+    runtimeLiveTelemetry: runtimeStream.liveTelemetry,
+    runtimeConnectionState: runtimeStream.connectionState,
     blueprints,
     isHydrating,
     applyProject,
     advancePhase,
     completePhase,
   };
-
-  if (isHydrating) {
-    return (
-      <div className="flex h-full items-center justify-center">
-        <div className="flex items-center gap-3 text-sm text-muted-foreground">
-          <Loader2 className="h-4 w-4 animate-spin" />
-          Lifecycle state を読み込み中...
-        </div>
-      </div>
-    );
-  }
 
   return (
     <LifecycleContext.Provider value={ctx}>
@@ -551,12 +773,13 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
         <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
           <LifecycleWorkspaceHeader
             currentPhase={currentPhase ?? "research"}
-            projectLabel={projectSlug}
+            projectLabel={projectLabel}
             phaseStatuses={phaseStatuses}
             phaseNavCollapsed={phaseNavCollapsed}
             isMobile={isMobile}
             consoleOpen={consoleOpen}
             saveState={saveState}
+            runtimeConnectionState={runtimeStream.connectionState}
             lastSavedAt={lastSavedAt}
             onTogglePhaseNav={() => {
               if (isMobile) setMobilePhaseNavOpen(true);
@@ -567,7 +790,27 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
           <div className="flex min-h-0 flex-1 overflow-hidden">
             <div className="min-w-0 flex-1 overflow-hidden">
               <div className="h-full overflow-y-auto">
-                <Outlet />
+                {isHydrating && !hydratedRef.current ? (
+                  <LifecycleContentSkeleton />
+                ) : hydrateError && !hydratedRef.current ? (
+                  <div className="px-6 py-10">
+                    <div className="rounded-3xl border border-amber-500/30 bg-amber-500/10 p-6 text-sm text-amber-100">
+                      {hydrateError}
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    {isRefreshingProject && (
+                      <div className="sticky top-0 z-10 border-b border-border/60 bg-background/85 px-6 py-3 backdrop-blur">
+                        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          最新の lifecycle state を同期中...
+                        </div>
+                      </div>
+                    )}
+                    <Outlet />
+                  </>
+                )}
               </div>
             </div>
             {!isMobile && consoleOpen && (
@@ -578,6 +821,10 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
                 skillInvocations={skillInvocations}
                 delegations={delegations}
                 phaseRuns={phaseRuns}
+                research={research}
+                liveTelemetry={runtimeStream.liveTelemetry}
+                phaseSummary={runtimeStream.runtime?.phaseSummary ?? null}
+                activePhaseSummary={runtimeStream.runtime?.activePhaseSummary ?? null}
                 className="hidden w-[22rem] shrink-0 xl:flex"
               />
             )}
@@ -616,6 +863,10 @@ function LifecycleLayoutInner({ projectSlug }: { projectSlug: string }) {
               skillInvocations={skillInvocations}
               delegations={delegations}
               phaseRuns={phaseRuns}
+              research={research}
+              liveTelemetry={runtimeStream.liveTelemetry}
+              phaseSummary={runtimeStream.runtime?.phaseSummary ?? null}
+              activePhaseSummary={runtimeStream.runtime?.activePhaseSummary ?? null}
               className={cn("h-full w-full shadow-2xl")}
             />
           </div>

@@ -72,7 +72,7 @@ export function WelcomeScreen({ onExampleClick }: { onExampleClick: (text: strin
           >
             <Layers className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
             <div>
-              <p className="text-sm font-medium">Product Lifecycle</p>
+              <p className="text-sm font-medium">プロダクトライフサイクル</p>
               <p className="mt-0.5 text-xs text-muted-foreground">
                 調査→設計→開発→デプロイの段階的プロセス
               </p>

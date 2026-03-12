@@ -1,8 +1,8 @@
 import { useState, useRef, useCallback, useEffect } from "react";
-import { useQuery, useMutation } from "@tanstack/react-query";
+import { useMutation } from "@tanstack/react-query";
 import { lifecycleApi, lifecycleWorkflowId } from "@/api/lifecycle";
 import type { WorkflowRun } from "@/api/workflows";
-import type { LifecyclePhase } from "@/types/lifecycle";
+import type { LifecyclePhase, WorkflowRunLiveEvent, WorkflowRunLiveTelemetry } from "@/types/lifecycle";
 
 export interface AgentProgress {
   nodeId: string;
@@ -20,10 +20,17 @@ export interface WorkflowRunState {
   elapsedMs: number;
 }
 
+interface UseWorkflowRunOptions {
+  enabled?: boolean;
+  observeOnly?: boolean;
+}
+
+const RUN_RECONCILE_INTERVAL_MS = 5000;
+const START_GRACE_PERIOD_MS = 10000;
+
 function extractAgentProgress(data: WorkflowRun): AgentProgress[] {
   const nodeMap = new Map<string, AgentProgress>();
 
-  // Extract from event_log
   if (data.event_log) {
     for (const evt of data.event_log) {
       nodeMap.set(evt.node_id, {
@@ -35,7 +42,6 @@ function extractAgentProgress(data: WorkflowRun): AgentProgress[] {
     }
   }
 
-  // Extract from node_status (top-level) or state.execution.node_status
   const nodeStatus =
     data.node_status ??
     (
@@ -68,44 +74,161 @@ function isTerminal(status: string): boolean {
   return status === "completed" || status === "failed";
 }
 
-export function useWorkflowRun(phase: LifecyclePhase, projectSlug: string) {
+function extractRunError(run: WorkflowRun): string | null {
+  if (typeof run.error === "string" && run.error.trim()) {
+    return run.error;
+  }
+  const stateError = (run.state as Record<string, unknown> | undefined)?.error;
+  return typeof stateError === "string" && stateError.trim()
+    ? stateError
+    : null;
+}
+
+function runTimestampMs(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const timestamp = new Date(value).getTime();
+  return Number.isNaN(timestamp) ? null : timestamp;
+}
+
+function computeElapsedMs(run: WorkflowRun): number {
+  const startedAt = runTimestampMs(run.started_at);
+  if (startedAt === null) return 0;
+  const endedAt = isTerminal(run.status)
+    ? runTimestampMs(run.completed_at) ?? startedAt
+    : Date.now();
+  return Math.max(0, endedAt - startedAt);
+}
+
+function isNewerRun(candidate: WorkflowRun, current: WorkflowRun | null): boolean {
+  if (!current) return true;
+  const candidateStartedAt = runTimestampMs(candidate.started_at) ?? 0;
+  const currentStartedAt = runTimestampMs(current.started_at) ?? 0;
+  if (candidateStartedAt !== currentStartedAt) {
+    return candidateStartedAt > currentStartedAt;
+  }
+  return candidate.id !== current.id;
+}
+
+function toLiveTelemetry(run: WorkflowRun | null, agentProgress: AgentProgress[]): WorkflowRunLiveTelemetry {
+  const lastEventSeq = run?.event_log && run.event_log.length > 0
+    ? run.event_log[run.event_log.length - 1]?.seq ?? null
+    : null;
+  const recentNodeIds = Array.from(new Set(
+    [...(run?.event_log ?? [])]
+      .reverse()
+      .map((event) => event.node_id)
+      .filter(Boolean),
+  )).slice(0, 3);
+  const lastEvent = run?.event_log && run.event_log.length > 0
+    ? run.event_log[run.event_log.length - 1]
+    : null;
+  const activeFocusNodeId = agentProgress.find((item) => item.status === "running")?.nodeId
+    ?? lastEvent?.node_id;
+  const recentEvents: WorkflowRunLiveEvent[] = [...(run?.event_log ?? [])]
+    .slice(-5)
+    .reverse()
+    .map((event) => ({
+      seq: typeof event.seq === "number" ? event.seq : null,
+      timestamp: typeof event.timestamp === "string" ? event.timestamp : undefined,
+      nodeId: event.node_id,
+      agent: typeof event.agent === "string" ? event.agent : undefined,
+      status:
+        agentProgress.find((item) => item.nodeId === event.node_id)?.status
+        ?? "completed",
+      summary: typeof event.agent === "string" && event.agent.trim()
+        ? `${event.agent} finished ${event.node_id}`
+        : `${event.node_id} finished`,
+    }));
+  return {
+    run: run
+      ? {
+          id: run.id,
+          status: run.status,
+          startedAt: run.started_at,
+          completedAt: run.completed_at,
+          error: run.error,
+        }
+      : null,
+    eventCount: run?.event_log?.length ?? 0,
+    completedNodeCount: agentProgress.filter((item) => item.status === "completed").length,
+    runningNodeIds: agentProgress.filter((item) => item.status === "running").map((item) => item.nodeId),
+    failedNodeIds: agentProgress.filter((item) => item.status === "failed").map((item) => item.nodeId),
+    lastEventSeq,
+    activeFocusNodeId,
+    lastNodeId: lastEvent?.node_id,
+    lastAgent: lastEvent?.agent,
+    recentNodeIds,
+    recentEvents,
+  };
+}
+
+export function useWorkflowRun(
+  phase: LifecyclePhase,
+  projectSlug: string,
+  options: UseWorkflowRunOptions = {},
+) {
   const workflowId = lifecycleWorkflowId(phase, projectSlug);
+  const enabled = options.enabled ?? true;
+  const observeOnly = options.observeOnly ?? false;
   const [runId, setRunId] = useState<string | null>(null);
-  const [hookStatus, setHookStatus] = useState<
-    WorkflowRunState["status"]
-  >("idle");
+  const [hookStatus, setHookStatus] = useState<WorkflowRunState["status"]>("idle");
   const [error, setError] = useState<string | null>(null);
   const [elapsedMs, setElapsedMs] = useState(0);
-  const [restoredState, setRestoredState] = useState<Record<string, unknown> | null>(null);
-  const [restoredProgress, setRestoredProgress] = useState<AgentProgress[] | null>(null);
+  const [liveRun, setLiveRun] = useState<WorkflowRun | null>(null);
 
   const startTimeRef = useRef<number>(0);
   const timerRef = useRef<ReturnType<typeof setInterval>>(undefined);
   const restoredRef = useRef(false);
+  const pendingStartAtRef = useRef<number | null>(null);
 
-  // Restore latest completed run on mount
   useEffect(() => {
-    if (restoredRef.current || !projectSlug) return;
+    restoredRef.current = false;
+    pendingStartAtRef.current = null;
+    setRunId(null);
+    setHookStatus("idle");
+    setError(null);
+    setElapsedMs(0);
+    setLiveRun(null);
+  }, [enabled, workflowId]);
+
+  const applyRunSnapshot = useCallback((run: WorkflowRun) => {
+    setLiveRun(run);
+    setRunId(run.id);
+    if (run.status === "running") {
+      startTimeRef.current = runTimestampMs(run.started_at) ?? Date.now();
+      setHookStatus("running");
+      setError(null);
+      setElapsedMs(computeElapsedMs(run));
+      return;
+    }
+    if (isTerminal(run.status)) {
+      pendingStartAtRef.current = null;
+      startTimeRef.current = 0;
+      setHookStatus(run.status as "completed" | "failed");
+      setError(run.status === "failed" ? extractRunError(run) : null);
+      setElapsedMs(computeElapsedMs(run));
+      return;
+    }
+    setHookStatus("idle");
+    setError(null);
+    setElapsedMs(0);
+  }, []);
+
+  useEffect(() => {
+    if (restoredRef.current || !projectSlug || !enabled) return;
     restoredRef.current = true;
+    let cancelled = false;
 
     lifecycleApi.getLatestRun(workflowId).then((run) => {
-      if (!run) return;
-      if (run.status === "completed" || run.status === "failed") {
-        setRunId(run.id);
-        setHookStatus(run.status as "completed" | "failed");
-        setRestoredState((run.state ?? {}) as Record<string, unknown>);
-        setRestoredProgress(extractAgentProgress(run));
-      } else if (run.status === "running") {
-        // Resume polling an in-progress run
-        startTimeRef.current = new Date(run.started_at).getTime();
-        setRunId(run.id);
-        setHookStatus("running");
-        setElapsedMs(Date.now() - startTimeRef.current);
-      }
+      if (cancelled || !run) return;
+      applyRunSnapshot(run);
     });
-  }, [projectSlug, workflowId]);
 
-  // Elapsed-time ticker (independent of polling)
+    return () => {
+      cancelled = true;
+    };
+  }, [applyRunSnapshot, enabled, projectSlug, workflowId]);
+
   useEffect(() => {
     if (hookStatus !== "running") {
       clearInterval(timerRef.current);
@@ -117,51 +240,141 @@ export function useWorkflowRun(phase: LifecyclePhase, projectSlug: string) {
     return () => clearInterval(timerRef.current);
   }, [hookStatus]);
 
-  // Poll the run status via react-query
-  const { data: runData } = useQuery<WorkflowRun>({
-    queryKey: ["workflow-run", runId],
-    queryFn: () => lifecycleApi.getRun(runId!),
-    enabled: runId !== null && hookStatus === "running",
-    refetchInterval: 2000,
-    refetchIntervalInBackground: false,
-  });
-
-  // Derive agent progress and state from the latest poll data
-  const agentProgress = restoredProgress ?? (runData ? extractAgentProgress(runData) : []);
-  const state = restoredState ?? ((runData?.state ?? {}) as Record<string, unknown>);
-
-  // React to terminal status from poll data
   useEffect(() => {
-    if (!runData || hookStatus !== "running") return;
-    if (isTerminal(runData.status)) {
-      setHookStatus(runData.status as "completed" | "failed");
-      setElapsedMs(Date.now() - startTimeRef.current);
-      // Clear restored data so live data takes over
-      setRestoredState(null);
-      setRestoredProgress(null);
-    }
-  }, [runData, hookStatus]);
+    if (!enabled || !runId) return;
+    if (!observeOnly && hookStatus !== "running") return;
+    let active = true;
+    let reconnectTimer: number | null = null;
+    let controller: AbortController | null = null;
 
-  // Start mutation: ensure workflow + start run
+    const connect = async () => {
+      while (active) {
+        controller = new AbortController();
+        try {
+          await lifecycleApi.streamRun(runId, {
+            signal: controller.signal,
+            onEvent: ({ event, data }) => {
+              if ((event !== "snapshot" && event !== "run") || !data) return;
+              const payload = JSON.parse(data) as WorkflowRun;
+              setLiveRun(payload);
+            },
+          });
+        } catch (streamError) {
+          if (!active || controller.signal.aborted) break;
+          console.debug("Workflow run stream disconnected", streamError);
+        }
+        if (!active) break;
+        try {
+          const refreshedRun = await lifecycleApi.getRun(runId);
+          setLiveRun(refreshedRun);
+          if (isTerminal(refreshedRun.status)) {
+            break;
+          }
+        } catch {
+          // Ignore transient fallback fetch failures and retry the stream.
+        }
+        await new Promise<void>((resolve) => {
+          reconnectTimer = window.setTimeout(resolve, 1000);
+        });
+      }
+    };
+
+    void connect();
+    return () => {
+      active = false;
+      controller?.abort();
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+      }
+    };
+  }, [enabled, hookStatus, observeOnly, runId]);
+
+  useEffect(() => {
+    if (!enabled || !projectSlug) return;
+    let cancelled = false;
+
+    const reconcile = async () => {
+      const pendingStartAt = pendingStartAtRef.current;
+      if (
+        pendingStartAt !== null
+        && runId === null
+        && Date.now() - pendingStartAt < START_GRACE_PERIOD_MS
+      ) {
+        return;
+      }
+      const latestRun = await lifecycleApi.getLatestRun(workflowId);
+      if (cancelled || !latestRun) return;
+      if (runId === null) {
+        applyRunSnapshot(latestRun);
+        return;
+      }
+      if (latestRun.id === runId) {
+        if (!liveRun || latestRun.status !== liveRun.status) {
+          applyRunSnapshot(latestRun);
+        }
+        return;
+      }
+      if (!isNewerRun(latestRun, liveRun)) {
+        return;
+      }
+      if (hookStatus === "running" || hookStatus === "starting" || isTerminal(latestRun.status)) {
+        applyRunSnapshot(latestRun);
+      }
+    };
+
+    void reconcile();
+    const timer = window.setInterval(() => {
+      void reconcile();
+    }, RUN_RECONCILE_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [applyRunSnapshot, enabled, hookStatus, liveRun, projectSlug, runId, workflowId]);
+
+  const agentProgress = liveRun ? extractAgentProgress(liveRun) : [];
+  const state = (liveRun?.state ?? {}) as Record<string, unknown>;
+
+  useEffect(() => {
+    if (!liveRun) return;
+    if (liveRun.status === "running") {
+      pendingStartAtRef.current = null;
+      startTimeRef.current = runTimestampMs(liveRun.started_at) ?? Date.now();
+      setHookStatus("running");
+      setElapsedMs(computeElapsedMs(liveRun));
+      return;
+    }
+    if (!isTerminal(liveRun.status)) return;
+    pendingStartAtRef.current = null;
+    startTimeRef.current = 0;
+    setHookStatus(liveRun.status as "completed" | "failed");
+    setError(liveRun.status === "failed" ? extractRunError(liveRun) : null);
+    setElapsedMs(computeElapsedMs(liveRun));
+  }, [liveRun]);
+
   const startMutation = useMutation({
     mutationFn: async (input: Record<string, unknown>) => {
       const preparation = await lifecycleApi.preparePhase(phase, projectSlug);
       return lifecycleApi.startRun(preparation.workflow_id, input);
     },
     onMutate: () => {
+      if (observeOnly) return;
+      pendingStartAtRef.current = Date.now();
       setHookStatus("starting");
       setRunId(null);
       setError(null);
       setElapsedMs(0);
-      setRestoredState(null);
-      setRestoredProgress(null);
+      setLiveRun(null);
     },
     onSuccess: ({ runId: newRunId }) => {
+      if (observeOnly) return;
       startTimeRef.current = Date.now();
       setRunId(newRunId);
       setHookStatus("running");
     },
     onError: (err: unknown) => {
+      if (observeOnly) return;
+      pendingStartAtRef.current = null;
       setHookStatus("failed");
       setError(
         err instanceof Error ? err.message : "Failed to start workflow",
@@ -171,19 +384,21 @@ export function useWorkflowRun(phase: LifecyclePhase, projectSlug: string) {
 
   const start = useCallback(
     (input: Record<string, unknown>) => {
+      if (observeOnly) return;
       startMutation.mutate(input);
     },
-    [startMutation],
+    [observeOnly, startMutation],
   );
 
   const reset = useCallback(() => {
     clearInterval(timerRef.current);
+    pendingStartAtRef.current = null;
+    startTimeRef.current = 0;
     setHookStatus("idle");
     setRunId(null);
     setError(null);
     setElapsedMs(0);
-    setRestoredState(null);
-    setRestoredProgress(null);
+    setLiveRun(null);
   }, []);
 
   return {
@@ -193,6 +408,7 @@ export function useWorkflowRun(phase: LifecyclePhase, projectSlug: string) {
     state,
     error,
     elapsedMs,
+    liveTelemetry: toLiveTelemetry(liveRun, agentProgress),
     start,
     reset,
   };

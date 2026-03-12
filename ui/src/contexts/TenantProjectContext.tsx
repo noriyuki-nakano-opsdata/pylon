@@ -2,6 +2,7 @@ import { createContext, useContext, useState, useCallback, useEffect, type React
 import { useNavigate, useLocation } from "react-router-dom";
 import { setTenantId } from "@/api/client";
 import { lifecycleApi } from "@/api/lifecycle";
+import { createUniqueProjectSlug } from "@/lib/projectSlug";
 import type { LifecycleProject } from "@/types/lifecycle";
 
 export interface Tenant {
@@ -22,8 +23,7 @@ export interface Project {
 
 export interface CreateProjectInput {
   name: string;
-  slug?: string;
-  description?: string;
+  brief?: string;
   githubRepo?: string;
 }
 
@@ -45,18 +45,6 @@ const DEMO_TENANTS: Tenant[] = [
   { id: "default", name: "Default Org", slug: "default" },
   { id: "acme", name: "Acme Corp", slug: "acme" },
 ];
-
-const PROJECT_SLUG_MAX_LENGTH = 48;
-
-function slugifyProject(value: string): string {
-  const normalized = value
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .replace(/-{2,}/g, "-");
-  return (normalized || `project-${Date.now().toString(36)}`).slice(0, PROJECT_SLUG_MAX_LENGTH);
-}
 
 function mapLifecycleProject(project: LifecycleProject, tenantId: string): Project {
   return {
@@ -131,7 +119,7 @@ export function TenantProjectProvider({ children }: { children: ReactNode }) {
       });
       return;
     }
-    const slug = match[1];
+    const slug = decodeURIComponent(match[1]);
     const matchedProject = projects.find((project) => project.slug === slug);
     if (matchedProject) {
       if (matchedProject.slug !== currentProject?.slug) {
@@ -177,14 +165,17 @@ export function TenantProjectProvider({ children }: { children: ReactNode }) {
     if (!name) {
       throw new Error("Project name is required");
     }
-    const slug = slugifyProject(input.slug?.trim() || name);
-    if (projects.some((project) => project.slug === slug)) {
-      throw new Error(`Project already exists: ${slug}`);
+    const projectId = createUniqueProjectSlug(name, projects.map((project) => project.slug));
+    if (projects.some((project) => project.id === projectId)) {
+      throw new Error(`Project already exists: ${projectId}`);
     }
 
-    const response = await lifecycleApi.saveProject(slug, {
+    const brief = input.brief?.trim() || "";
+
+    const response = await lifecycleApi.saveProject(projectId, {
       name,
-      description: input.description?.trim() || "",
+      description: brief,
+      spec: brief,
       githubRepo: input.githubRepo?.trim() || null,
     });
     const project = mapLifecycleProject(response.project, currentTenant.id);
