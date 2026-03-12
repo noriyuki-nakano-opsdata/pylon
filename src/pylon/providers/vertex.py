@@ -55,9 +55,16 @@ def _to_gemini_contents(messages: list[Message]) -> tuple[str | None, list[dict]
 
 def _extract_usage(usage_metadata: Any) -> TokenUsage:
     """Extract token usage from google-genai response."""
+    prompt_tokens = int(getattr(usage_metadata, "prompt_token_count", 0) or 0)
+    tool_use_prompt_tokens = int(getattr(usage_metadata, "tool_use_prompt_token_count", 0) or 0)
+    cached_content_tokens = int(getattr(usage_metadata, "cached_content_token_count", 0) or 0)
+    candidate_tokens = int(getattr(usage_metadata, "candidates_token_count", 0) or 0)
+    thought_tokens = int(getattr(usage_metadata, "thoughts_token_count", 0) or 0)
     return TokenUsage(
-        input_tokens=getattr(usage_metadata, "prompt_token_count", 0) or 0,
-        output_tokens=getattr(usage_metadata, "candidates_token_count", 0) or 0,
+        input_tokens=max(0, prompt_tokens + tool_use_prompt_tokens - cached_content_tokens),
+        output_tokens=max(0, candidate_tokens),
+        cache_read_tokens=max(0, cached_content_tokens),
+        reasoning_tokens=max(0, thought_tokens),
     )
 
 

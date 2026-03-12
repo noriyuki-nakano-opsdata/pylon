@@ -232,7 +232,7 @@ class E2BSandboxBackend(SandboxBackend):
         sandbox = self._sessions.get(session.id)
         if sandbox is None:
             raise RuntimeError("Session not found")
-        return await sandbox.filesystem.read(path)
+        return str(await sandbox.filesystem.read(path))
 
     async def destroy(self, session: SandboxSession) -> None:
         sandbox = self._sessions.pop(session.id, None)

@@ -930,6 +930,7 @@ class TestGraphExecutor:
             if node_id == "start":
                 return NodeResult(
                     state_patch={"should_route": False, "started": True},
+                    event_output={"started": True, "summary": "routed"},
                     artifacts=[{"kind": "report", "name": "analysis.json"}],
                     edge_decisions={"next": True, "END": False},
                     llm_events=[{"model": "test-model", "tokens": 42}],
@@ -946,7 +947,7 @@ class TestGraphExecutor:
         assert len(result.event_log) == 2
         start_event = result.event_log[0]
         assert start_event["state_patch"] == {"should_route": False, "started": True}
-        assert start_event["output"] == {"should_route": False, "started": True}
+        assert start_event["output"] == {"started": True, "summary": "routed"}
         assert start_event["edge_decisions"] == {"next": True, "END": False}
         assert start_event["edge_resolutions"] == [
             {

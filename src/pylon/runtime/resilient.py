@@ -9,6 +9,7 @@ Wraps LLMRuntime with:
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -95,131 +96,139 @@ class ResilientLLMRuntime:
         4. Execute via LLMRuntime
         5. Record health and spend
         """
-        optimization_reasoning = ""
-
-        # Step 1: Cost optimization - adjust request if budget constraints apply
-        effective_request = request
-        if self._optimizer:
-            complexity = self._optimizer.classify_complexity(
-                purpose=request.purpose,
-                input_tokens_estimate=request.input_tokens_estimate,
-                requires_tools=request.requires_tools,
-                quality_sensitive=request.quality_sensitive,
+        scope = (
+            self._runtime.tracer.start_as_current_span(
+                "llm.resilient.chat",
+                attributes={
+                    "workflow.id": workflow_id,
+                    "workflow.agent.id": agent_id,
+                },
             )
-            optimization_reasoning = f"complexity={complexity.value}"
+            if self._runtime.tracer is not None
+            else nullcontext(None)
+        )
+        with scope as span:
+            optimization_reasoning = ""
 
-            # Adjust remaining budget based on actual spend
-            if (
-                self._estimator
-                and workflow_budget_usd > 0
-                and workflow_id
-            ):
-                remaining = self._estimator.remaining_budget(
-                    "workflow", workflow_id, workflow_budget_usd,
-                )
-                effective_request = ModelRouteRequest(
+            effective_request = request
+            if self._optimizer:
+                complexity = self._optimizer.classify_complexity(
                     purpose=request.purpose,
                     input_tokens_estimate=request.input_tokens_estimate,
                     requires_tools=request.requires_tools,
-                    latency_sensitive=request.latency_sensitive,
                     quality_sensitive=request.quality_sensitive,
-                    cacheable_prefix=request.cacheable_prefix,
-                    batch_eligible=request.batch_eligible,
-                    remaining_budget_usd=remaining,
                 )
+                optimization_reasoning = f"complexity={complexity.value}"
+                if span is not None:
+                    span.set_attribute("pylon.optimizer.complexity", complexity.value)
 
-        # Step 2: Execute via base runtime (routing + provider call)
-        try:
-            result = await self._runtime.chat(
-                registry=registry,
-                request=effective_request,
-                messages=messages,
-                preferred_model=preferred_model,
-                tools=tools,
-                static_instruction=static_instruction,
-            )
-        except Exception as primary_error:
-            # Step 2b: On failure, attempt fallback via FallbackEngine
-            self._health.record_failure(
-                getattr(primary_error, "provider", "unknown"),
-                getattr(primary_error, "model_id", "unknown"),
-                primary_error,
-            )
-
-            async def _fallback_call_fn(
-                provider: str,
-                model_id: str,
-                msgs: list[Message],
-                **kw: object,
-            ) -> Response:
-                fb_provider = registry.resolve(provider, model_id)
-                return await fb_provider.chat(msgs, model=model_id, **kw)
+                if (
+                    self._estimator
+                    and workflow_budget_usd > 0
+                    and workflow_id
+                ):
+                    remaining = self._estimator.remaining_budget(
+                        "workflow", workflow_id, workflow_budget_usd,
+                    )
+                    effective_request = ModelRouteRequest(
+                        purpose=request.purpose,
+                        input_tokens_estimate=request.input_tokens_estimate,
+                        requires_tools=request.requires_tools,
+                        latency_sensitive=request.latency_sensitive,
+                        quality_sensitive=request.quality_sensitive,
+                        cacheable_prefix=request.cacheable_prefix,
+                        batch_eligible=request.batch_eligible,
+                        remaining_budget_usd=remaining,
+                    )
 
             try:
-                fb_result = await self._fallback.execute(
-                    tier=ModelTier.STANDARD,
+                result = await self._runtime.chat(
+                    registry=registry,
+                    request=effective_request,
                     messages=messages,
-                    call_fn=_fallback_call_fn,
+                    preferred_model=preferred_model,
                     tools=tools,
+                    static_instruction=static_instruction,
                 )
-            except Exception:
-                raise primary_error from None
+            except Exception as primary_error:
+                self._health.record_failure(
+                    getattr(primary_error, "provider", "unknown"),
+                    getattr(primary_error, "model_id", "unknown"),
+                    primary_error,
+                )
 
-            fb_route = ModelRouteDecision(
-                provider_name=fb_result.provider,
-                model_id=fb_result.model_id,
-                tier=fb_result.tier,
-                reasoning=f"fallback after primary failure: {primary_error}",
-            )
+                async def _fallback_call_fn(
+                    provider: str,
+                    model_id: str,
+                    msgs: list[Message],
+                    **kw: object,
+                ) -> Response:
+                    fb_provider = registry.resolve(provider, model_id)
+                    return await fb_provider.chat(msgs, model=model_id, **kw)
+
+                try:
+                    fb_result = await self._fallback.execute(
+                        tier=ModelTier.STANDARD,
+                        messages=messages,
+                        call_fn=_fallback_call_fn,
+                        tools=tools,
+                    )
+                except Exception:
+                    raise primary_error from None
+
+                fb_route = ModelRouteDecision(
+                    provider_name=fb_result.provider,
+                    model_id=fb_result.model_id,
+                    tier=fb_result.tier,
+                    reasoning=f"fallback after primary failure: {primary_error}",
+                )
+
+                self._health.record_success(
+                    fb_result.provider, fb_result.model_id,
+                )
+
+                estimated_cost = 0.0
+                if self._estimator and fb_result.response.usage:
+                    estimated_cost = self._estimator.estimate_and_record(
+                        fb_result.provider,
+                        fb_result.model_id,
+                        fb_result.response.usage,
+                        session_id=session_id,
+                        workflow_id=workflow_id,
+                        agent_id=agent_id,
+                    )
+
+                return ResilientChatResult(
+                    response=fb_result.response,
+                    route=fb_route,
+                    estimated_cost_usd=estimated_cost,
+                    was_fallback=True,
+                    fallback_attempts=fb_result.attempt,
+                    optimization_reasoning=optimization_reasoning,
+                )
 
             self._health.record_success(
-                fb_result.provider, fb_result.model_id,
+                result.route.provider_name,
+                result.route.model_id,
             )
 
-            estimated_cost = 0.0
-            if self._estimator and fb_result.response.usage:
+            estimated_cost = result.estimated_cost_usd
+            if self._estimator and result.response.usage:
                 estimated_cost = self._estimator.estimate_and_record(
-                    fb_result.provider,
-                    fb_result.model_id,
-                    fb_result.response.usage,
+                    result.route.provider_name,
+                    result.route.model_id,
+                    result.response.usage,
                     session_id=session_id,
                     workflow_id=workflow_id,
                     agent_id=agent_id,
                 )
 
             return ResilientChatResult(
-                response=fb_result.response,
-                route=fb_route,
+                response=result.response,
+                route=result.route,
                 estimated_cost_usd=estimated_cost,
-                was_fallback=True,
-                fallback_attempts=fb_result.attempt,
+                context=result.context,
+                was_fallback=False,
+                fallback_attempts=1,
                 optimization_reasoning=optimization_reasoning,
             )
-
-        # Step 3: Record health
-        self._health.record_success(
-            result.route.provider_name,
-            result.route.model_id,
-        )
-
-        # Step 4: Record spend
-        estimated_cost = result.estimated_cost_usd
-        if self._estimator and result.response.usage:
-            estimated_cost = self._estimator.estimate_and_record(
-                result.route.provider_name,
-                result.route.model_id,
-                result.response.usage,
-                session_id=session_id,
-                workflow_id=workflow_id,
-                agent_id=agent_id,
-            )
-
-        return ResilientChatResult(
-            response=result.response,
-            route=result.route,
-            estimated_cost_usd=estimated_cost,
-            context=result.context,
-            was_fallback=False,
-            fallback_attempts=1,
-            optimization_reasoning=optimization_reasoning,
-        )

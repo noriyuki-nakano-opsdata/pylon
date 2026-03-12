@@ -66,7 +66,7 @@ class SemanticToolSelector:
         if self._encoder is not None:
             try:
                 texts = [t.searchable_text for t in tools]
-                self._embeddings = self._encoder.encode(texts)
+                self._embeddings = self._encoder.encode(texts) if self._encoder else None
             except Exception:
                 self._encoder = None
                 self._embeddings = None
@@ -107,6 +107,8 @@ class SemanticToolSelector:
         try:
             import numpy as np
 
+            if not self._encoder or self._embeddings is None:
+                return self._select_by_tfidf_scored(query, top_k)
             query_emb = self._encoder.encode(query)
             similarities = np.dot(self._embeddings, query_emb) / (
                 np.linalg.norm(self._embeddings, axis=1)

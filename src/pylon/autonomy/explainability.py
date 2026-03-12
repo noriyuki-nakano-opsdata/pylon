@@ -184,7 +184,7 @@ class DecisionExplainer:
         criteria = getattr(decision, "criteria_results", [])
 
         disp_str = (
-            disposition.value if hasattr(disposition, "value") else str(disposition)
+            disposition.value if disposition is not None and hasattr(disposition, "value") else str(disposition)
         )
 
         steps = [

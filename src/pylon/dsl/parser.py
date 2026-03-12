@@ -47,6 +47,7 @@ class AgentDef(BaseModel):
     role: str = ""
     autonomy: str = "A2"
     tools: list[str] = Field(default_factory=list)
+    skills: list[str] = Field(default_factory=list)
     sandbox: str = "gvisor"
     input_trust: str = "untrusted"
 

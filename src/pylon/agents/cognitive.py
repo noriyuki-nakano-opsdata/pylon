@@ -44,7 +44,7 @@ ToolExecutor = Callable[
 ]
 
 ChatFn = Callable[
-    [list[Message], Any],  # (messages, **kwargs)
+    ...,  # (messages, **kwargs)
     Awaitable[Response],  # LLM response
 ]
 
@@ -239,15 +239,13 @@ class ReActEngine:
             if self._config.termination_condition is not None:
                 termination_state = TerminationState(
                     iterations=iteration,
-                    total_tokens=total_tokens.total_tokens,
-                    prompt_tokens=total_tokens.input_tokens,
-                    completion_tokens=total_tokens.output_tokens,
+                    token_usage=total_tokens,
                     elapsed_seconds=(time.monotonic() - step_start),
                 )
                 decision = self._config.termination_condition.evaluate(
                     termination_state
                 )
-                if decision.should_stop:
+                if decision.matched:
                     return ReActResult(
                         final_answer=response.content,
                         steps=steps,

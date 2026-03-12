@@ -6,6 +6,7 @@ Supports chat() and stream() with TokenUsage tracking.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -40,6 +41,26 @@ def _to_anthropic_messages(messages: list[Message]) -> tuple[str | None, list[di
                     }
                 ],
             })
+        elif msg.role == "assistant" and msg.tool_calls:
+            blocks: list[dict[str, Any]] = []
+            if msg.content:
+                blocks.append({"type": "text", "text": msg.content})
+            for tool_call in msg.tool_calls:
+                tool_input = tool_call.get("input", {})
+                if isinstance(tool_input, str):
+                    try:
+                        tool_input = json.loads(tool_input)
+                    except json.JSONDecodeError:
+                        tool_input = {"raw": tool_input}
+                if not isinstance(tool_input, dict):
+                    tool_input = {"raw": tool_input}
+                blocks.append({
+                    "type": "tool_use",
+                    "id": str(tool_call.get("id", "")),
+                    "name": str(tool_call.get("name", "")),
+                    "input": tool_input,
+                })
+            api_messages.append({"role": "assistant", "content": blocks})
         else:
             content: Any = msg.content
             if msg.content_blocks:
@@ -49,6 +70,25 @@ def _to_anthropic_messages(messages: list[Message]) -> tuple[str | None, list[di
 
     system_prompt = "\n\n".join(part for part in system_parts if part)
     return system_prompt or None, api_messages
+
+
+def _normalize_anthropic_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for tool in tools:
+        if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+            fn = dict(tool["function"])
+            normalized.append({
+                "name": str(fn.get("name", "")),
+                "description": str(fn.get("description", "")),
+                "input_schema": (
+                    dict(fn.get("parameters"))
+                    if isinstance(fn.get("parameters"), dict)
+                    else {"type": "object", "properties": {}}
+                ),
+            })
+        else:
+            normalized.append(tool)
+    return normalized
 
 
 def _extract_usage(usage: Any) -> TokenUsage:
@@ -114,7 +154,7 @@ class AnthropicProvider:
 
         tools = kwargs.get("tools")
         if tools:
-            create_kwargs["tools"] = tools
+            create_kwargs["tools"] = _normalize_anthropic_tools(list(tools))
 
         try:
             result = await self._client.messages.create(**create_kwargs)
@@ -163,7 +203,7 @@ class AnthropicProvider:
             create_kwargs["system"] = system_prompt
         tools = kwargs.get("tools")
         if tools:
-            create_kwargs["tools"] = tools
+            create_kwargs["tools"] = _normalize_anthropic_tools(list(tools))
 
         try:
             partial_tool_inputs: dict[int, str] = {}

@@ -46,10 +46,12 @@ class BaseTermination:
     """Common composition helpers for termination conditions."""
 
     def __or__(self, other: TerminationCondition) -> TerminationCondition:
-        return AnyTermination((self, other))
+        from typing import cast
+        return AnyTermination((cast(TerminationCondition, self), other))
 
     def __and__(self, other: TerminationCondition) -> TerminationCondition:
-        return AllTermination((self, other))
+        from typing import cast
+        return AllTermination((cast(TerminationCondition, self), other))
 
 
 def describe_termination_condition(

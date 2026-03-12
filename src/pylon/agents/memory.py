@@ -138,7 +138,7 @@ class ArchivalMemory:
         embedding = None
         if self._use_embeddings and self._encoder is not None:
             try:
-                embedding = self._encoder.encode(content).tolist()
+                embedding = self._encoder.encode(content).tolist() if self._encoder else None
             except Exception:
                 pass
 
@@ -168,6 +168,8 @@ class ArchivalMemory:
     def _search_by_embedding(self, query: str, top_k: int) -> list[MemoryEntry]:
         """Search using cosine similarity on embeddings."""
         try:
+            if not self._encoder:
+                return self._search_by_keyword(query, top_k)
             query_emb = self._encoder.encode(query)
         except Exception:
             return self._search_by_keyword(query, top_k)

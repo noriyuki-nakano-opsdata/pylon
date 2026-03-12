@@ -10,19 +10,23 @@ from pylon.observability.exporters import (
 )
 from pylon.observability.logging import LogLevel, StructuredLogger
 from pylon.observability.metrics import MetricsCollector
+from pylon.observability.otel import OpenTelemetryConfig, OpenTelemetryExporter
 from pylon.observability.query_service import (
     build_replay_query_payload,
     build_run_query_payload,
 )
 from pylon.observability.run_record import build_run_record, rebuild_run_record
-from pylon.observability.tracing import Span, Tracer
+from pylon.observability.tracing import Span, TraceContext, Tracer
 
 __all__ = [
     "MetricsCollector",
     "Tracer",
     "Span",
+    "TraceContext",
     "StructuredLogger",
     "LogLevel",
+    "OpenTelemetryConfig",
+    "OpenTelemetryExporter",
     "ConsoleExporter",
     "ExporterLogSink",
     "InMemoryExporter",

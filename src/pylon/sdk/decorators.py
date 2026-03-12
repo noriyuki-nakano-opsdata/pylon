@@ -13,6 +13,7 @@ class AgentInfo:
     name: str
     role: str
     tools: list[str]
+    skills: list[str]
     handler: Callable[..., Any]
 
 
@@ -103,6 +104,7 @@ def agent(
     name: str,
     role: str = "default",
     tools: list[str] | None = None,
+    skills: list[str] | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorator that registers a function as a Pylon agent handler.
 
@@ -118,6 +120,7 @@ def agent(
             name=name,
             role=role,
             tools=tools or [],
+            skills=skills or [],
             handler=fn,
         )
         AgentRegistry.register(info)

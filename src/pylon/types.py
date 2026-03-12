@@ -207,6 +207,7 @@ class AgentConfig:
     role: str = ""
     autonomy: AutonomyLevel = AutonomyLevel.A2
     tools: list[str] = field(default_factory=list)
+    skills: list[str] = field(default_factory=list)
     sandbox: SandboxTier = SandboxTier.GVISOR
     input_trust: TrustLevel = TrustLevel.UNTRUSTED
     capability: AgentCapability = field(default_factory=AgentCapability)

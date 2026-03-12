@@ -19,6 +19,7 @@ class NodeResult:
     llm_events: list[dict[str, Any]] = field(default_factory=list)
     tool_events: list[dict[str, Any]] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
+    event_output: dict[str, Any] | None = None
     requires_approval: bool = False
     approval_request_id: str | None = None
     approval_reason: str = ""
@@ -49,7 +50,11 @@ class NodeResult:
 
         return {
             "state_patch": dict(self.state_patch),
-            "output": dict(self.state_patch),
+            "output": (
+                dict(self.event_output)
+                if self.event_output is not None
+                else dict(self.state_patch)
+            ),
             "artifacts": artifacts,
             "edge_decisions": dict(self.edge_decisions),
             "llm_events": llm_events,

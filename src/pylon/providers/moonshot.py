@@ -43,9 +43,15 @@ def _to_openai_messages(messages: list[Message]) -> list[dict[str, Any]]:
 
 def _extract_usage(usage: Any) -> TokenUsage:
     """Extract token usage from Moonshot response."""
+    prompt_details = getattr(usage, "prompt_tokens_details", None)
+    completion_details = getattr(usage, "completion_tokens_details", None)
+    cached_tokens = getattr(prompt_details, "cached_tokens", 0) or 0
+    reasoning_tokens = getattr(completion_details, "reasoning_tokens", 0) or 0
     return TokenUsage(
-        input_tokens=getattr(usage, "prompt_tokens", 0),
-        output_tokens=getattr(usage, "completion_tokens", 0),
+        input_tokens=max(0, int(getattr(usage, "prompt_tokens", 0) or 0) - int(cached_tokens)),
+        output_tokens=max(0, int(getattr(usage, "completion_tokens", 0) or 0) - int(reasoning_tokens)),
+        cache_read_tokens=int(cached_tokens),
+        reasoning_tokens=int(reasoning_tokens),
     )
 
 

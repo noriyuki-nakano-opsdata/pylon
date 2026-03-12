@@ -21,10 +21,15 @@ class WorkflowDefinitionValidationError(WorkflowBuilderError):
 
 def _agent_def_from_metadata(metadata: Any) -> AgentDef:
     if isinstance(metadata, AgentInfo):
-        return AgentDef(role=metadata.role, tools=list(metadata.tools))
+        return AgentDef(
+            role=metadata.role,
+            tools=list(metadata.tools),
+            skills=list(metadata.skills),
+        )
     role = getattr(metadata, "role", "")
     tools = getattr(metadata, "tools", [])
-    return AgentDef(role=str(role), tools=list(tools))
+    skills = getattr(metadata, "skills", [])
+    return AgentDef(role=str(role), tools=list(tools), skills=list(skills))
 
 
 def _invoke_workflow_factory(
