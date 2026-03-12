@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from pylon.lifecycle.orchestrator import PHASE_ORDER
 
 EXECUTABLE_PHASES: tuple[str, ...] = ("research", "planning", "design", "development")
+_RESEARCH_INPUT_TOKEN_BUDGET = 6000
+RESEARCH_AUTONOMOUS_REMEDIATION_LIMIT = 2
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -15,6 +18,356 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 def _as_list(value: Any) -> list[Any]:
     return list(value) if isinstance(value, list) else []
+
+
+def _estimate_tokens(value: Any) -> int:
+    try:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        text = str(value)
+    ascii_chars = sum(1 for ch in text if ord(ch) < 128)
+    non_ascii_chars = len(text) - ascii_chars
+    return max(1, ascii_chars // 4 + int(non_ascii_chars / 1.5))
+
+
+def _truncate_text(value: Any, *, limit: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def _research_canonical_payload(research: dict[str, Any]) -> dict[str, Any]:
+    canonical = _as_dict(research.get("canonical"))
+    return canonical or research
+
+
+def _research_localized_payload(research: dict[str, Any]) -> dict[str, Any]:
+    localized = _as_dict(research.get("localized"))
+    return localized or research
+
+
+def _research_failed_quality_gates(research: dict[str, Any]) -> list[dict[str, Any]]:
+    canonical = _research_canonical_payload(research)
+    return [
+        _as_dict(item)
+        for item in _as_list(canonical.get("quality_gates"))
+        if _as_dict(item) and _as_dict(item).get("passed") is not True
+    ]
+
+
+def research_autonomous_remediation_context(
+    project_record: dict[str, Any],
+) -> dict[str, Any]:
+    research = _as_dict(project_record.get("research"))
+    if not research:
+        return {}
+    canonical = _research_canonical_payload(research)
+    failed_gates = _research_failed_quality_gates(research)
+    remediation_plan = _as_dict(canonical.get("remediation_plan"))
+    autonomous_state = _as_dict(canonical.get("autonomous_remediation"))
+    attempt_count = int(autonomous_state.get("attemptCount", 0) or 0)
+    max_attempts = int(
+        autonomous_state.get("maxAttempts", RESEARCH_AUTONOMOUS_REMEDIATION_LIMIT)
+        or RESEARCH_AUTONOMOUS_REMEDIATION_LIMIT
+    )
+    blocking_node_ids = [
+        str(item)
+        for gate in failed_gates
+        for item in _as_list(gate.get("blockingNodeIds"))
+        if str(item).strip()
+    ]
+    retry_node_ids = [
+        str(item)
+        for item in _as_list(remediation_plan.get("retryNodeIds"))
+        if str(item).strip()
+    ]
+    if not failed_gates and not retry_node_ids:
+        return {}
+    if attempt_count >= max_attempts:
+        return {}
+    node_results = [
+        _as_dict(item)
+        for item in _as_list(canonical.get("node_results"))
+        if _as_dict(item)
+    ]
+    missing_source_classes = [
+        str(item)
+        for node in node_results
+        for item in _as_list(node.get("missingSourceClasses"))
+        if str(item).strip()
+    ]
+    return {
+        "trigger": "quality_gate_recovery",
+        "attempt": attempt_count + 1,
+        "previousAttemptCount": attempt_count,
+        "maxAttempts": max_attempts,
+        "remainingAttempts": max(0, max_attempts - attempt_count),
+        "objective": str(
+            remediation_plan.get("objective")
+            or autonomous_state.get("objective")
+            or "Close the remaining research gaps so planning can continue without operator intervention."
+        ),
+        "blockingGateIds": list(dict.fromkeys(str(gate.get("id", "")) for gate in failed_gates if str(gate.get("id", "")).strip()))[:6],
+        "blockingNodeIds": list(dict.fromkeys(blocking_node_ids))[:6],
+        "retryNodeIds": list(dict.fromkeys(retry_node_ids))[:6],
+        "missingSourceClasses": list(dict.fromkeys(missing_source_classes))[:8],
+        "previousSourceLinks": [
+            _truncate_text(item, limit=180)
+            for item in _as_list(canonical.get("source_links"))
+            if str(item).strip()
+        ][:6],
+        "previousCompetitors": [
+            _truncate_text(_as_dict(item).get("name"), limit=80)
+            for item in _as_list(canonical.get("competitors"))
+            if _truncate_text(_as_dict(item).get("name"), limit=80)
+        ][:4],
+        "blockingSummary": [
+            _truncate_text(_as_dict(gate).get("reason"), limit=160)
+            for gate in failed_gates
+            if _truncate_text(_as_dict(gate).get("reason"), limit=160)
+        ][:4],
+        "lastBlockingSignature": "|".join(
+            sorted(str(gate.get("id", "")) for gate in failed_gates if str(gate.get("id", "")).strip())
+        ),
+    }
+
+
+def _compact_research_for_input(
+    research: dict[str, Any],
+    *,
+    terse: bool,
+) -> dict[str, Any]:
+    canonical = _research_canonical_payload(research)
+    localized = _research_localized_payload(research)
+    claim_limit = 3 if terse else 6
+    dissent_limit = 3 if terse else 5
+    question_limit = 4 if terse else 6
+    source_limit = 3 if terse else 6
+    competitor_limit = 2 if terse else 4
+    failed_gates = [
+        _as_dict(item)
+        for item in _as_list(canonical.get("quality_gates"))
+        if _as_dict(item) and _as_dict(item).get("passed") is not True
+    ]
+    compacted = {
+        "summary_mode": "compact-terse" if terse else "compact",
+        "display_language": str(research.get("display_language", "ja") or "ja"),
+        "readiness": canonical.get("readiness"),
+        "judge_summary": _truncate_text(
+            canonical.get("judge_summary") or localized.get("judge_summary"),
+            limit=220 if terse else 320,
+        ),
+        "confidence_summary": _as_dict(canonical.get("confidence_summary")),
+        "market_size": _truncate_text(
+            canonical.get("market_size") or localized.get("market_size"),
+            limit=180 if terse else 240,
+        ),
+        "trends": [
+            _truncate_text(item, limit=140 if terse else 180)
+            for item in _as_list(canonical.get("trends"))[: (2 if terse else 3)]
+        ],
+        "opportunities": [
+            _truncate_text(item, limit=140 if terse else 180)
+            for item in _as_list(canonical.get("opportunities"))[: (2 if terse else 3)]
+        ],
+        "threats": [
+            _truncate_text(item, limit=140 if terse else 180)
+            for item in _as_list(canonical.get("threats"))[: (2 if terse else 3)]
+        ],
+        "user_research": {
+            "segment": _truncate_text(
+                _as_dict(canonical.get("user_research")).get("segment")
+                or _as_dict(localized.get("user_research")).get("segment"),
+                limit=100 if terse else 140,
+            ),
+            "signals": [
+                _truncate_text(item, limit=140 if terse else 180)
+                for item in _as_list(_as_dict(canonical.get("user_research")).get("signals"))[: (2 if terse else 3)]
+            ],
+            "pain_points": [
+                _truncate_text(item, limit=140 if terse else 180)
+                for item in _as_list(_as_dict(canonical.get("user_research")).get("pain_points"))[: (2 if terse else 3)]
+            ],
+        },
+        "winning_theses": [
+            _truncate_text(item, limit=160 if terse else 220)
+            for item in _as_list(canonical.get("winning_theses"))[: (2 if terse else 3)]
+        ],
+        "claims": [
+            {
+                "id": _as_dict(item).get("id"),
+                "statement": _truncate_text(_as_dict(item).get("statement"), limit=180 if terse else 240),
+                "owner": _as_dict(item).get("owner"),
+                "category": _as_dict(item).get("category"),
+                "confidence": _as_dict(item).get("confidence"),
+                "status": _as_dict(item).get("status"),
+            }
+            for item in _as_list(canonical.get("claims"))[:claim_limit]
+            if _as_dict(item)
+        ],
+        "dissent": [
+            {
+                "id": _as_dict(item).get("id"),
+                "claim_id": _as_dict(item).get("claim_id"),
+                "argument": _truncate_text(_as_dict(item).get("argument"), limit=160 if terse else 220),
+                "severity": _as_dict(item).get("severity"),
+                "recommended_test": _truncate_text(_as_dict(item).get("recommended_test"), limit=140 if terse else 180),
+                "resolved": _as_dict(item).get("resolved"),
+            }
+            for item in _as_list(canonical.get("dissent"))
+            if _as_dict(item)
+        ][:dissent_limit],
+        "open_questions": [
+            _truncate_text(item, limit=160 if terse else 220)
+            for item in _as_list(canonical.get("open_questions"))[:question_limit]
+        ],
+        "competitors": [
+            {
+                "name": _truncate_text(_as_dict(item).get("name"), limit=60),
+                "url": _truncate_text(_as_dict(item).get("url"), limit=120 if terse else 180),
+                "target": _truncate_text(_as_dict(item).get("target"), limit=80),
+            }
+            for item in _as_list(canonical.get("competitors"))[:competitor_limit]
+            if _as_dict(item)
+        ],
+        "source_links": [
+            _truncate_text(item, limit=120 if terse else 180)
+            for item in _as_list(canonical.get("source_links"))[:source_limit]
+        ],
+        "quality_gates": [
+            {
+                "id": item.get("id"),
+                "title": _truncate_text(item.get("title"), limit=80),
+                "reason": _truncate_text(item.get("reason"), limit=140 if terse else 180),
+                "blockingNodeIds": _as_list(item.get("blockingNodeIds"))[:4],
+            }
+            for item in failed_gates[:4]
+        ],
+    }
+    if canonical.get("remediation_plan"):
+        compacted["remediation_plan"] = {
+            "objective": _truncate_text(_as_dict(canonical.get("remediation_plan")).get("objective"), limit=160 if terse else 220),
+            "retryNodeIds": _as_list(_as_dict(canonical.get("remediation_plan")).get("retryNodeIds"))[:4],
+        }
+    return compacted
+
+
+def _minimal_research_for_input(research: dict[str, Any]) -> dict[str, Any]:
+    canonical = _research_canonical_payload(research)
+    localized = _research_localized_payload(research)
+    failed_gates = [
+        _as_dict(item)
+        for item in _as_list(canonical.get("quality_gates"))
+        if _as_dict(item) and _as_dict(item).get("passed") is not True
+    ][:2]
+    claims = [
+        _as_dict(item)
+        for item in _as_list(canonical.get("claims"))
+        if _as_dict(item)
+    ][:2]
+    return {
+        "summary_mode": "compact-minimal",
+        "display_language": str(research.get("display_language", "ja") or "ja"),
+        "readiness": canonical.get("readiness"),
+        "judge_summary": _truncate_text(
+            canonical.get("judge_summary") or localized.get("judge_summary"),
+            limit=180,
+        ),
+        "winning_theses": [
+            _truncate_text(item, limit=120)
+            for item in _as_list(canonical.get("winning_theses"))[:1]
+        ],
+        "claims": [
+            {
+                "id": item.get("id"),
+                "statement": _truncate_text(item.get("statement"), limit=120),
+                "confidence": item.get("confidence"),
+                "status": item.get("status"),
+            }
+            for item in claims
+        ],
+        "quality_gates": [
+            {
+                "id": item.get("id"),
+                "reason": _truncate_text(item.get("reason"), limit=120),
+                "blockingNodeIds": _as_list(item.get("blockingNodeIds"))[:3],
+            }
+            for item in failed_gates
+        ],
+        "open_questions": [
+            _truncate_text(item, limit=120)
+            for item in _as_list(canonical.get("open_questions"))[:2]
+        ],
+        "source_links": [
+            _truncate_text(item, limit=120)
+            for item in _as_list(canonical.get("source_links"))[:2]
+        ],
+    }
+
+
+def _hard_cap_research_for_input(research: dict[str, Any]) -> dict[str, Any]:
+    canonical = _research_canonical_payload(research)
+    localized = _research_localized_payload(research)
+    return {
+        "summary_mode": "compact-hard-cap",
+        "display_language": str(research.get("display_language", "ja") or "ja"),
+        "readiness": canonical.get("readiness"),
+        "judge_summary": _truncate_text(
+            canonical.get("judge_summary") or localized.get("judge_summary"),
+            limit=120,
+        ),
+        "winning_theses": [
+            _truncate_text(item, limit=80)
+            for item in _as_list(canonical.get("winning_theses"))[:1]
+        ],
+        "quality_gates": [
+            {
+                "id": _as_dict(item).get("id"),
+                "reason": _truncate_text(_as_dict(item).get("reason"), limit=80),
+            }
+            for item in _as_list(canonical.get("quality_gates"))
+            if _as_dict(item) and _as_dict(item).get("passed") is not True
+        ][:2],
+        "research_context_notice": "Research context was aggressively summarized to fit the phase input budget.",
+    }
+
+
+def _research_phase_payload_for_input(project_record: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    research = _as_dict(project_record.get("research"))
+    canonical = _research_canonical_payload(research)
+    token_estimate = _estimate_tokens(canonical)
+    if token_estimate <= _RESEARCH_INPUT_TOKEN_BUDGET:
+        return canonical, {
+            "source": "canonical",
+            "compacted": False,
+            "tokenEstimate": token_estimate,
+            "tokenBudget": _RESEARCH_INPUT_TOKEN_BUDGET,
+            "displayLanguage": str(research.get("display_language", "ja") or "ja"),
+        }
+    candidates = [
+        _compact_research_for_input(research, terse=False),
+        _compact_research_for_input(research, terse=True),
+        _minimal_research_for_input(research),
+        _hard_cap_research_for_input(research),
+    ]
+    compacted = candidates[-1]
+    compacted_estimate = _estimate_tokens(compacted)
+    for candidate in candidates:
+        candidate_estimate = _estimate_tokens(candidate)
+        compacted = candidate
+        compacted_estimate = candidate_estimate
+        if candidate_estimate <= _RESEARCH_INPUT_TOKEN_BUDGET:
+            break
+    return compacted, {
+        "source": "canonical",
+        "compacted": True,
+        "summaryMode": str(compacted.get("summary_mode", "compact")),
+        "tokenEstimate": compacted_estimate,
+        "originalTokenEstimate": token_estimate,
+        "tokenBudget": _RESEARCH_INPUT_TOKEN_BUDGET,
+        "displayLanguage": str(research.get("display_language", "ja") or "ja"),
+    }
 
 
 def _phase_status(project_record: dict[str, Any], phase: str) -> str:
@@ -66,7 +419,6 @@ def lifecycle_phase_input(project_record: dict[str, Any], phase: str) -> dict[st
     """Build normalized workflow input for the requested lifecycle phase."""
     spec = str(project_record.get("spec", "") or "")
     research_config = _as_dict(project_record.get("researchConfig"))
-    research = _as_dict(project_record.get("research"))
     analysis = _as_dict(project_record.get("analysis"))
     features = _as_list(project_record.get("features"))
     milestones = _as_list(project_record.get("milestones"))
@@ -74,19 +426,31 @@ def lifecycle_phase_input(project_record: dict[str, Any], phase: str) -> dict[st
     selected_design = _selected_design_variant(project_record)
 
     if phase == "research":
-        return {
+        remediation_context = research_autonomous_remediation_context(project_record)
+        payload = {
             "spec": spec,
             "competitor_urls": _as_list(research_config.get("competitorUrls")),
             "depth": str(research_config.get("depth", "standard") or "standard"),
+            "output_language": str(research_config.get("outputLanguage", "ja") or "ja"),
         }
+        if remediation_context:
+            payload["remediation_context"] = remediation_context
+        return payload
     if phase == "planning":
-        return {"spec": spec, "research": research}
+        phase_research, meta = _research_phase_payload_for_input(project_record)
+        return {
+            "spec": spec,
+            "research": phase_research,
+            "research_context_meta": meta,
+        }
     if phase == "design":
         return {"spec": spec, "analysis": analysis, "features": features}
     if phase == "development":
+        phase_research, meta = _research_phase_payload_for_input(project_record)
         return {
             "spec": spec,
-            "research": research,
+            "research": phase_research,
+            "research_context_meta": meta,
             "analysis": analysis,
             "selected_features": features,
             "milestones": milestones,
@@ -137,14 +501,19 @@ def build_phase_contract(project_record: dict[str, Any], phase: str) -> dict[str
     status = _phase_status(project_record, phase)
 
     if phase == "research":
-        research = _as_dict(project_record.get("research"))
-        if not research:
+        stored_research = _as_dict(project_record.get("research"))
+        if not stored_research:
             return None
+        research = _research_canonical_payload(stored_research)
         user_research = _as_dict(research.get("user_research"))
         claims = [_as_dict(item) for item in _as_list(research.get("claims")) if _as_dict(item)]
         evidence = [_as_dict(item) for item in _as_list(research.get("evidence")) if _as_dict(item)]
         dissent = [_as_dict(item) for item in _as_list(research.get("dissent")) if _as_dict(item)]
         accepted_claims = [item for item in claims if item.get("status") == "accepted"]
+        node_results = [_as_dict(item) for item in _as_list(research.get("node_results")) if _as_dict(item)]
+        degraded_nodes = [
+            item for item in node_results if str(item.get("status", "")) != "success"
+        ]
         critical_unresolved = [
             item for item in dissent
             if item.get("severity") == "critical" and item.get("resolved") is not True
@@ -177,11 +546,22 @@ def build_phase_contract(project_record: dict[str, Any], phase: str) -> dict[str
                 floor >= 0.6 and bool(_as_list(research.get("winning_theses"))),
                 "research should carry at least one sufficiently supported thesis into planning",
             ),
+            _quality_gate(
+                "critical-node-health",
+                "critical research nodes が degraded / failed ではない",
+                not degraded_nodes,
+                "critical research nodes must stay healthy enough to support handoff",
+            ),
         ]
         return _contract(
             phase=phase,
             contract_type="ResearchArtifact",
-            status=status,
+            status=(
+                "ready"
+                if str(research.get("readiness", status)) == "ready"
+                and not degraded_nodes
+                else "rework"
+            ),
             summary="Evidence bundle for planning.",
             outputs={
                 "competitorCount": len(_as_list(research.get("competitors"))),
@@ -191,6 +571,7 @@ def build_phase_contract(project_record: dict[str, Any], phase: str) -> dict[str
                 "dissentCount": len(dissent),
                 "openQuestionCount": len(_as_list(research.get("open_questions"))),
                 "segment": user_research.get("segment"),
+                "degradedNodeCount": len(degraded_nodes),
             },
             quality_gates=gates,
             handoff_targets=["planning"],

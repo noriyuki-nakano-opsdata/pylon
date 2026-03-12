@@ -2491,7 +2491,7 @@ _DEVELOPMENT_HANDLERS = {
     "reviewer": dev_reviewer_handler,
 }
 
-LIFECYCLE_HANDLERS: dict[str, dict[str, object]] = {
+WORKFLOW_NODE_HANDLERS: dict[str, dict[str, object]] = {
     # Standalone workflows (backward compat)
     "market-research": _RESEARCH_HANDLERS,
     "product-planning": _PLANNING_HANDLERS,
@@ -2501,22 +2501,16 @@ LIFECYCLE_HANDLERS: dict[str, dict[str, object]] = {
         "coder": dev_coder_handler,
         "reviewer": dev_reviewer_handler,
     },
-    # Lifecycle workflows — NOW use real LLM handlers instead of deterministic stubs
-    "lifecycle-research": _RESEARCH_HANDLERS,
-    "lifecycle-planning": _PLANNING_HANDLERS,
-    "lifecycle-design": _DESIGN_HANDLERS,
-    "lifecycle-development": _DEVELOPMENT_HANDLERS,
 }
 
-# Monkey-patch register_workflow_project to auto-attach handlers
+# Monkey-patch register_workflow_project to auto-attach handlers for legacy demo workflows.
 _original_register = route_store.register_workflow_project
 
 def _patched_register(workflow_id, project, *, tenant_id="default"):
     result = _original_register(workflow_id, project, tenant_id=tenant_id)
-    # Auto-attach lifecycle handlers based on project name
     project_name = result.name if hasattr(result, "name") else ""
-    if project_name in LIFECYCLE_HANDLERS:
-        handlers = LIFECYCLE_HANDLERS[project_name]
+    if project_name in WORKFLOW_NODE_HANDLERS:
+        handlers = WORKFLOW_NODE_HANDLERS[project_name]
         route_store.control_plane_store.set_handlers(
             workflow_id,
             node_handlers=handlers,
@@ -2526,10 +2520,10 @@ def _patched_register(workflow_id, project, *, tenant_id="default"):
 
 route_store.register_workflow_project = _patched_register
 
-print(f"Lifecycle handlers ready: {list(LIFECYCLE_HANDLERS.keys())}")
+print(f"Workflow handlers ready: {list(WORKFLOW_NODE_HANDLERS.keys())}")
 
 # ── Mission Control API Endpoints ─────────────────────
-from pylon.api.server import Request, Response
+from pylon.api.server import Request, Response, _Route, _compile_path
 import time as _time
 
 _cps = route_store.control_plane_store
@@ -3827,110 +3821,203 @@ print("API: /api/v1/skills/* registered (5 endpoints)")
 print(f"Routes: {len(route_store.list_workflow_projects(tenant_id='default'))} workflows ready")
 
 # ── Async Workflow Run (override pylon's inline-blocking route) ──────────
-import threading
+import logging
 
-_async_runs: dict[str, dict] = {}  # run_id → {status, state, event_log, error, ...}
+from pylon.api.async_runs import (
+    AsyncWorkflowRunManager,
+    reconcile_lifecycle_projects_for_terminal_runs,
+    sync_lifecycle_project_for_run,
+)
+from pylon.api.schemas import WORKFLOW_RUN_SCHEMA, validate
 
-def _async_start_workflow_run(request: Request) -> Response:
-    """Start a workflow run in a background thread, return immediately with run_id."""
-    tenant_id = request.headers.get("x-tenant-id", "default")
-    workflow_id = request.path_params.get("id", "")
-    project = route_store.get_workflow_project(workflow_id, tenant_id=tenant_id)
-    if project is None:
-        return Response(status_code=404, body={"error": f"Workflow not found: {workflow_id}"})
-    body = request.body or {}
-    raw_input = body.get("input", {})
 
-    run_id = uuid.uuid4().hex[:16]
-    now = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
-    run_record = {
-        "id": run_id,
-        "workflow_id": workflow_id,
-        "workflow": workflow_id,
-        "project_name": project.name,
-        "tenant_id": tenant_id,
-        "status": "running",
-        "input": raw_input,
-        "state": dict(raw_input) if isinstance(raw_input, dict) else {},
-        "event_log": [],
-        "node_status": {},
-        "started_at": now,
-        "created_at": now,
-        "execution_mode": "async",
-    }
-    _async_runs[run_id] = run_record
+def _configure_async_run_logging() -> logging.Logger:
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        log_dir = project_root / ".pylon" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        formatter = logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s [%(threadName)s] %(message)s"
+        )
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        file_handler = logging.FileHandler(log_dir / "ui-dev-backend.log")
+        file_handler.setFormatter(formatter)
+        root_logger.setLevel(logging.INFO)
+        root_logger.addHandler(stream_handler)
+        root_logger.addHandler(file_handler)
+    return logging.getLogger("ui.start_backend.async_runs")
 
-    # Also store in the route_store so /workflows/{id}/runs and /workflow-runs/{id} work
-    route_store.control_plane_store.put_run_record(
-        run_record, workflow_id=workflow_id, tenant_id=tenant_id,
+
+_async_run_logger = _configure_async_run_logging()
+
+
+def _sync_async_lifecycle_project(run_record: dict[str, object], workflow_id: str, tenant_id: str) -> None:
+    sync_lifecycle_project_for_run(
+        route_store.control_plane_store,
+        run_record=run_record,
+        workflow_id=workflow_id,
+        tenant_id=tenant_id,
+        logger_=_async_run_logger,
     )
 
-    def _execute():
-        from pylon.runtime.engine import execute_project_sync, normalize_runtime_input
-        from pylon.control_plane.workflow_service import serialize_run
-        try:
-            print(f"[async-run] Starting {workflow_id} run {run_id}...")
-            artifacts = execute_project_sync(
-                project,
-                input_data=normalize_runtime_input(raw_input),
-                workflow_id=workflow_id,
-                node_handlers=route_store.control_plane_store.get_node_handlers(workflow_id),
-                agent_handlers=route_store.control_plane_store.get_agent_handlers(workflow_id),
-                provider_registry=provider_registry,
-            )
-            final = serialize_run(
-                artifacts,
-                project_name=project.name,
-                workflow_name=workflow_id,
-            )
-            final["id"] = run_id
-            final["status"] = "completed"
-            final["workflow_id"] = workflow_id
-            final["workflow"] = workflow_id
-            final["tenant_id"] = tenant_id
-            final["execution_mode"] = "async"
-            _async_runs[run_id] = final
-            route_store.control_plane_store.put_run_record(
-                final, workflow_id=workflow_id, tenant_id=tenant_id,
-            )
-            print(f"[async-run] {workflow_id} run {run_id} completed successfully.")
-        except Exception as exc:
-            import traceback
-            traceback.print_exc()
-            err_record = dict(_async_runs.get(run_id, run_record))
-            err_record["status"] = "failed"
-            err_record["error"] = str(exc)
-            _async_runs[run_id] = err_record
-            route_store.control_plane_store.put_run_record(
-                err_record, workflow_id=workflow_id, tenant_id=tenant_id,
-            )
-            print(f"[async-run] {workflow_id} run {run_id} FAILED: {exc}")
 
-    t = threading.Thread(target=_execute, daemon=True)
-    t.start()
+_async_run_manager = AsyncWorkflowRunManager(
+    route_store.control_plane_store,
+    provider_registry=provider_registry,
+    on_terminal_run=_sync_async_lifecycle_project,
+    logger_=_async_run_logger,
+)
+_reconciled_async_runs = _async_run_manager.reconcile_orphaned_runs()
+if _reconciled_async_runs:
+    print(f"API: reconciled {_reconciled_async_runs} orphaned async workflow run(s)")
+_backfilled_lifecycle_projects = reconcile_lifecycle_projects_for_terminal_runs(
+    route_store.control_plane_store,
+    logger_=_async_run_logger,
+)
+if _backfilled_lifecycle_projects:
+    print(
+        "API: backfilled "
+        f"{_backfilled_lifecycle_projects} lifecycle project(s) from terminal async runs"
+    )
+
+
+def _replace_route(method: str, path: str, handler) -> None:
+    api_server = http_server.api_server
+    normalized_method = method.upper()
+    api_server._routes = [
+        route
+        for route in api_server._routes
+        if not (route.method == normalized_method and route.path_template == path)
+    ]
+    pattern, param_names = _compile_path(path)
+    api_server._routes.insert(
+        0,
+        _Route(
+            method=normalized_method,
+            pattern=pattern,
+            param_names=param_names,
+            path_template=path,
+            handler=handler,
+        ),
+    )
+
+def _async_start_workflow_run(request: Request) -> Response:
+    """Start a workflow run in a background thread, return immediately."""
+    tenant_id = request.headers.get("x-tenant-id", "default")
+    workflow_id = request.path_params.get("id", "")
+    if route_store.get_workflow_project(workflow_id, tenant_id=tenant_id) is None:
+        return Response(status_code=404, body={"error": f"Workflow not found: {workflow_id}"})
+    body = request.body or {}
+    valid, errors = validate(body, WORKFLOW_RUN_SCHEMA)
+    if not valid:
+        return Response(status_code=422, body={"errors": errors})
+    raw_input = body.get("input")
+    try:
+        run_record = _async_run_manager.start_run(
+            workflow_id=workflow_id,
+            tenant_id=tenant_id,
+            input_data=raw_input,
+            parameters=body.get("parameters", {}),
+            idempotency_key=body.get("idempotency_key"),
+            correlation_id=str(request.context.get("correlation_id", "")) or None,
+            trace_id=str(request.context.get("trace_id", "")) or None,
+        )
+    except Exception as exc:
+        _async_run_logger.exception(
+            "async_workflow_run_start_request_failed workflow_id=%s tenant_id=%s",
+            workflow_id,
+            tenant_id,
+        )
+        return Response(status_code=500, body={"error": str(exc)})
 
     return Response(
         status_code=202,
-        headers={"content-type": "application/json", "location": f"/api/v1/workflow-runs/{run_id}"},
+        headers={
+            "content-type": "application/json",
+            "location": f"/api/v1/runs/{run_record['id']}",
+        },
         body=run_record,
     )
 
 def _get_async_workflow_run(request: Request) -> Response:
-    """Get a workflow run by ID (checks async runs first, then store)."""
+    """Get a workflow run by ID while reconciling orphaned async workers."""
     run_id = request.path_params.get("run_id", "")
-    if run_id in _async_runs:
-        return Response(body=_async_runs[run_id])
-    # Fallback to store
     tenant_id = request.headers.get("x-tenant-id", "default")
-    record = route_store.control_plane_store.get_run_record(run_id)
+    existing = route_store.control_plane_store.get_run_record(run_id)
+    if existing is None:
+        return Response(status_code=404, body={"error": f"Run not found: {run_id}"})
+    if existing.get("tenant_id") != tenant_id:
+        return Response(status_code=403, body={"error": "Forbidden"})
+    record = _async_run_manager.get_run(run_id, tenant_id=tenant_id)
     if record is not None:
         return Response(body=record)
     return Response(status_code=404, body={"error": f"Run not found: {run_id}"})
 
-# Override the pylon default routes with async versions
-http_server.api_server.add_route("POST", "/workflows/{id}/run", _async_start_workflow_run)
-http_server.api_server.add_route("GET", "/api/v1/workflow-runs/{run_id}", _get_async_workflow_run)
-print("API: async workflow execution routes registered (override)")
+
+def _get_async_workflow_run_for_workflow(request: Request) -> Response:
+    """Get a workflow-scoped run by ID while enforcing workflow and tenant match."""
+    run_id = request.path_params.get("run_id", "")
+    workflow_id = request.path_params.get("id", "")
+    tenant_id = request.headers.get("x-tenant-id", "default")
+    existing = route_store.control_plane_store.get_run_record(run_id)
+    if existing is None:
+        return Response(status_code=404, body={"error": f"Run not found: {run_id}"})
+    if existing.get("tenant_id") != tenant_id:
+        return Response(status_code=403, body={"error": "Forbidden"})
+    if str(existing.get("workflow_id", existing.get("workflow", ""))) != workflow_id:
+        return Response(status_code=404, body={"error": f"Run not found: {run_id}"})
+    record = _async_run_manager.get_run(run_id, tenant_id=tenant_id)
+    if record is not None:
+        return Response(body=record)
+    return Response(status_code=404, body={"error": f"Run not found: {run_id}"})
+
+
+def _list_async_workflow_runs(request: Request) -> Response:
+    """List workflow runs while reconciling stale async workers."""
+    tenant_id = request.headers.get("x-tenant-id", "default")
+    workflow_id = request.path_params.get("id", "")
+    if route_store.get_workflow_project(workflow_id, tenant_id=tenant_id) is None:
+        return Response(status_code=404, body={"error": f"Workflow not found: {workflow_id}"})
+    runs = _async_run_manager.list_runs(tenant_id=tenant_id, workflow_id=workflow_id)
+    return Response(body={"runs": runs, "count": len(runs)})
+
+
+def _list_async_runs(request: Request) -> Response:
+    """List all runs while reconciling stale async workers."""
+    tenant_id = request.headers.get("x-tenant-id", "default")
+    runs = _async_run_manager.list_runs(tenant_id=tenant_id)
+    return Response(body={"runs": runs, "count": len(runs)})
+
+# Replace the default inline routes so the lifecycle UI uses background execution too.
+for route_path in (
+    "/v1/workflows/{id}/runs",
+    "/api/v1/workflows/{id}/runs",
+):
+    _replace_route("GET", route_path, _list_async_workflow_runs)
+for route_path in (
+    "/workflows/{id}/run",
+    "/v1/workflows/{id}/runs",
+    "/api/v1/workflows/{id}/runs",
+):
+    _replace_route("POST", route_path, _async_start_workflow_run)
+for route_path in (
+    "/v1/workflows/{id}/runs/{run_id}",
+    "/api/v1/workflows/{id}/runs/{run_id}",
+):
+    _replace_route("GET", route_path, _get_async_workflow_run_for_workflow)
+for route_path in (
+    "/v1/runs/{run_id}",
+    "/api/v1/runs/{run_id}",
+    "/api/v1/workflow-runs/{run_id}",
+):
+    _replace_route("GET", route_path, _get_async_workflow_run)
+for route_path in (
+    "/v1/runs",
+    "/api/v1/workflow-runs",
+):
+    _replace_route("GET", route_path, _list_async_runs)
+print("API: async workflow execution routes replaced for UI lifecycle runs")
 
 # ── Feature manifest (enables lifecycle UI) ──────────
 def _get_features(request):

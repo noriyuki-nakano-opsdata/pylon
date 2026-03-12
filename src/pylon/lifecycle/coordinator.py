@@ -9,6 +9,7 @@ from pylon.lifecycle.contracts import (
     build_phase_contracts,
     build_phase_readiness,
     lifecycle_phase_input,
+    research_autonomous_remediation_context,
 )
 from pylon.types import AutonomyLevel
 
@@ -60,6 +61,16 @@ def _action(
     }
 
 
+def _is_self_healing_research_recovery(action: dict[str, Any]) -> bool:
+    payload = _as_dict(action.get("payload"))
+    remediation = _as_dict(payload.get("remediation"))
+    return (
+        action.get("type") == "run_phase"
+        and action.get("phase") == "research"
+        and str(remediation.get("trigger", "")) == "quality_gate_recovery"
+    )
+
+
 def resolve_lifecycle_autonomy_level(project_record: dict[str, Any]) -> AutonomyLevel:
     raw_level = str(project_record.get("autonomyLevel") or "A3").strip().upper()
     if raw_level not in {"A3", "A4"}:
@@ -91,6 +102,9 @@ def lifecycle_action_execution_budget(
     mode_override: str | None = None,
 ) -> int:
     mode = resolve_lifecycle_orchestration_mode(project_record, override=mode_override)
+    candidate = _derive_candidate_action(project_record)
+    if _is_self_healing_research_recovery(candidate):
+        return 1 if requested_steps > 0 else 0
     if mode == "workflow":
         return 0
     if mode == "guided":
@@ -105,18 +119,24 @@ def _apply_orchestration_mode(
 ) -> dict[str, Any]:
     patched = dict(action)
     executable = patched["type"] in EXECUTABLE_ACTIONS
+    self_healing = _is_self_healing_research_recovery(patched)
     patched["orchestrationMode"] = mode
-    patched["requiresTrigger"] = executable and mode in {"workflow", "guided"}
-    patched["canAutorun"] = executable and mode == "autonomous"
-    if executable and mode == "workflow":
+    patched["requiresTrigger"] = executable and mode in {"workflow", "guided"} and not self_healing
+    patched["canAutorun"] = executable and (mode == "autonomous" or self_healing)
+    if executable and mode == "workflow" and not self_healing:
         patched["reason"] = (
             f"{patched['reason']} Project is in workflow mode, so this step should be "
             "triggered explicitly through the phase workflow APIs."
         )
-    elif executable and mode == "guided":
+    elif executable and mode == "guided" and not self_healing:
         patched["reason"] = (
             f"{patched['reason']} Guided mode allows this step to run only when "
             "the operator explicitly calls the lifecycle advance endpoint."
+        )
+    elif self_healing:
+        patched["reason"] = (
+            f"{patched['reason']} Self-healing research remediation continues automatically "
+            "so the user does not get stranded on a blocked phase."
         )
     return patched
 
@@ -202,6 +222,36 @@ def _derive_candidate_action(project_record: dict[str, Any]) -> dict[str, Any]:
             payload={"input": lifecycle_phase_input(project_record, "research")},
         )
     if not research_contract["ready"]:
+        remediation_context = research_autonomous_remediation_context(project_record)
+        if remediation_context:
+            attempt = int(remediation_context.get("attempt", 1) or 1)
+            max_attempts = int(remediation_context.get("maxAttempts", attempt) or attempt)
+            retry_node_ids = [
+                str(item)
+                for item in _as_list(remediation_context.get("retryNodeIds"))
+                if str(item).strip()
+            ]
+            retry_summary = (
+                "targeting "
+                + ", ".join(retry_node_ids[:3])
+                if retry_node_ids
+                else "targeting the blocked research nodes"
+            )
+            return _action(
+                "run_phase",
+                phase="research",
+                title="Continue autonomous research recovery",
+                reason=(
+                    "Research is still missing planning handoff evidence, so the swarm will continue "
+                    f"autonomous remediation ({attempt}/{max_attempts}) {retry_summary}."
+                ),
+                can_autorun=True,
+                payload={
+                    "input": lifecycle_phase_input(project_record, "research"),
+                    "blockingIssues": readiness["research"]["blockingIssues"],
+                    "remediation": remediation_context,
+                },
+            )
         return _action(
             "review_phase",
             phase="research",
