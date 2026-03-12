@@ -122,6 +122,18 @@ def _build_repair_actions() -> dict[str, RepairAction]:
     }
 
 
+def _doctor_severity(ok: bool, exit_code: ExitCode) -> str:
+    if ok:
+        return "ok"
+    if exit_code == ExitCode.SANDBOX_ERROR:
+        return "warning"
+    return "error"
+
+
+def _doctor_blocks_success(ok: bool, exit_code: ExitCode) -> bool:
+    return not ok and _doctor_severity(ok, exit_code) == "error"
+
+
 @click.command()
 @click.option("--fix", is_flag=True, default=False, help="Auto-repair safe issues.")
 @click.pass_context
@@ -164,13 +176,15 @@ def doctor(ctx: click.Context, fix: bool, **kwargs: object) -> None:
             {
                 "message": message,
                 "ok": ok,
+                "severity": _doctor_severity(ok, exit_code),
                 "exit_code": int(exit_code),
             }
         )
-        symbol = "+" if ok else "x"
+        severity = _doctor_severity(ok, exit_code)
+        symbol = "+" if ok else "!" if severity == "warning" else "x"
         if cli_ctx.formatter.fmt == "table":
             click.echo(f"  [{symbol}] {message}")
-        if not ok:
+        if _doctor_blocks_success(ok, exit_code):
             all_ok = False
             if first_failure_code is None:
                 first_failure_code = exit_code

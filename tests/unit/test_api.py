@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import pylon.api.routes as routes_module
 from pylon.api.factory import (
     APIMiddlewareConfig,
     APIServerConfig,
@@ -44,8 +45,12 @@ from pylon.api.schemas import (
 from pylon.api.server import APIServer, Request, Response
 from pylon.control_plane import ControlPlaneBackend, InMemoryWorkflowControlPlaneStore
 from pylon.dsl.parser import PylonProject
-from pylon.providers.base import Response as ProviderResponse, TokenUsage
+from pylon.providers.base import Response as ProviderResponse
+from pylon.providers.base import TokenUsage
 from pylon.runtime.llm import ProviderRegistry
+from pylon.skills.catalog import SkillCatalog
+from pylon.skills.compat import SkillCompatibilityLayer
+from pylon.skills.runtime import SkillRuntime
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -167,6 +172,56 @@ class _FakeSkillProvider:
     @property
     def provider_name(self) -> str:
         return "fake"
+
+
+def _write_external_skill_repo(base_dir: Path) -> Path:
+    repo_root = base_dir / "marketingskills-like"
+    analytics_dir = repo_root / "skills" / "analytics-tracking"
+    context_dir = repo_root / "skills" / "product-marketing-context"
+    (analytics_dir / "references").mkdir(parents=True)
+    context_dir.mkdir(parents=True)
+    (repo_root / "tools" / "integrations").mkdir(parents=True)
+    (repo_root / "tools" / "clis").mkdir(parents=True)
+    (repo_root / "VERSIONS.md").write_text("# Versions\n", encoding="utf-8")
+    (repo_root / "tools" / "REGISTRY.md").write_text(
+        "| Tool | Category | API | MCP | CLI | SDK | Guide |\n"
+        "|---|---|---|---|---|---|---|\n"
+        "| ga4 | Analytics | ✓ | ✓ | [✓](clis/ga4.js) | ✓ | [ga4.md](integrations/ga4.md) |\n",
+        encoding="utf-8",
+    )
+    (repo_root / "tools" / "integrations" / "ga4.md").write_text(
+        "# GA4\n\nUse GA4 for analytics tracking.\n",
+        encoding="utf-8",
+    )
+    (repo_root / "tools" / "clis" / "ga4.js").write_text(
+        "process.stdin.resume(); process.stdin.on('end', () => console.log('ga4 ok'));\n",
+        encoding="utf-8",
+    )
+    (context_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: product-marketing-context\n"
+        "description: Create the shared product marketing context.\n"
+        "metadata:\n"
+        "  version: 1.1.0\n"
+        "---\n\n"
+        "Create `.agents/product-marketing-context.md` for the project.\n",
+        encoding="utf-8",
+    )
+    (analytics_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: analytics-tracking\n"
+        "description: Set up and audit analytics tracking.\n"
+        "metadata:\n"
+        "  version: 1.1.0\n"
+        "---\n\n"
+        "If `.agents/product-marketing-context.md` exists, read it before asking questions.\n",
+        encoding="utf-8",
+    )
+    (analytics_dir / "references" / "event-library.md").write_text(
+        "# Event Library\n\nTrack the important events.\n",
+        encoding="utf-8",
+    )
+    return repo_root
 
 
 def _limited_workflow_project(name: str = "limited-project") -> PylonProject:
@@ -476,8 +531,22 @@ class TestAgentRoutes:
         resp = server.handle_request("DELETE", "/agents/nonexistent")
         assert resp.status_code == 404
 
-    def test_versioned_agent_routes_support_patch_and_skills(self):
-        server, _ = _server_with_routes()
+    def test_versioned_agent_routes_support_patch_and_skills(self, monkeypatch, tmp_path: Path):
+        monkeypatch.setenv("PYLON_SKILL_IMPORT_ROOT", str(tmp_path / "imports"))
+        monkeypatch.setattr(routes_module, "build_lifecycle_skill_catalog", lambda: {})
+        server, store = _server_with_routes(
+            skill_runtime=SkillRuntime(SkillCatalog(skill_dirs=(), refresh_ttl_seconds=0)),
+            compatibility_layer=SkillCompatibilityLayer(import_root=tmp_path / "imports"),
+        )
+        store.skills["triage"] = {
+            "id": "triage",
+            "name": "triage",
+            "description": "",
+            "category": "uncategorized",
+            "risk": "unknown",
+            "source": "local",
+            "tags": [],
+        }
         create_resp = server.handle_request(
             "POST",
             "/api/v1/agents",
@@ -500,12 +569,25 @@ class TestAgentRoutes:
         assert skills_resp.body["skills"] == [
             {
                 "id": "code-review",
+                "alias": "code-review",
+                "skill_key": "code-review",
                 "name": "code-review",
                 "description": "",
                 "category": "uncategorized",
                 "risk": "unknown",
                 "source": "local",
                 "tags": [],
+                "handle": {
+                    "source_id": "",
+                    "skill_key": "code-review",
+                    "canonical_id": "code-review",
+                },
+                "version_ref": {
+                    "source_id": "",
+                    "skill_key": "code-review",
+                    "revision": "",
+                    "canonical_ref": "code-review",
+                },
             }
         ]
 
@@ -517,8 +599,13 @@ class TestAgentRoutes:
         assert update_skills.status_code == 200
         assert update_skills.body["skills"] == ["triage"]
 
-    def test_skills_and_models_compatibility_routes_return_empty_payloads(self):
-        server, _ = _server_with_routes()
+    def test_skills_and_models_compatibility_routes_return_empty_payloads(self, monkeypatch, tmp_path: Path):
+        monkeypatch.setenv("PYLON_SKILL_IMPORT_ROOT", str(tmp_path / "imports"))
+        monkeypatch.setattr(routes_module, "build_lifecycle_skill_catalog", lambda: {})
+        server, _ = _server_with_routes(
+            skill_runtime=SkillRuntime(SkillCatalog(skill_dirs=(), refresh_ttl_seconds=0)),
+            compatibility_layer=SkillCompatibilityLayer(import_root=tmp_path / "imports"),
+        )
 
         skills = server.handle_request("GET", "/api/v1/skills")
         assert skills.status_code == 200
@@ -610,6 +697,168 @@ class TestAgentRoutes:
             "model": "triage-model",
             "provider": "fake",
         }
+
+    def test_filesystem_skills_are_listed_and_assignable(self, tmp_path: Path, monkeypatch):
+        skill_dir = tmp_path / "skills" / "triage"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "id: triage\n"
+            "name: Issue Triage\n"
+            "description: Summarize issues.\n"
+            "category: operations\n"
+            "tags: [triage]\n"
+            "---\n\n"
+            "Classify severity and next action.\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            routes_module,
+            "get_default_skill_runtime",
+            lambda: SkillRuntime(
+                SkillCatalog(skill_dirs=(str(tmp_path / "skills"),), refresh_ttl_seconds=0)
+            ),
+        )
+        server, _ = _server_with_routes()
+        create = server.handle_request(
+            "POST",
+            "/api/v1/agents",
+            body={"name": "coder", "skills": []},
+        )
+        agent_id = create.body["id"]
+
+        skills = server.handle_request("GET", "/api/v1/skills")
+        assert skills.status_code == 200
+        assert skills.body["skills"][0]["id"] == "triage"
+
+        update = server.handle_request(
+            "PATCH",
+            f"/api/v1/agents/{agent_id}/skills",
+            body={"skills": ["triage"]},
+        )
+        assert update.status_code == 200
+        assigned = server.handle_request("GET", f"/api/v1/agents/{agent_id}/skills")
+        assert assigned.body["skills"][0]["id"] == "triage"
+
+    def test_external_skill_sources_import_agent_skills_repositories(self, tmp_path: Path, monkeypatch):
+        repo_root = _write_external_skill_repo(tmp_path)
+        import_root = tmp_path / "imports"
+        monkeypatch.setenv("PYLON_SKILL_IMPORT_ROOT", str(import_root))
+        server, _ = _server_with_routes(
+            skill_runtime=SkillRuntime(SkillCatalog(skill_dirs=(), refresh_ttl_seconds=0)),
+            compatibility_layer=SkillCompatibilityLayer(import_root=import_root),
+        )
+
+        created = server.handle_request(
+            "POST",
+            "/api/v1/skill-sources",
+            body={"location": str(repo_root), "kind": "local-dir"},
+        )
+
+        assert created.status_code == 201
+        assert created.body["source_format"] == "agent-skills-spec"
+        assert created.body["adapter_profile"] == "marketingskills"
+        assert created.body["imported_skill_count"] == 2
+        assert created.body["last_report"]["snapshot_id"]
+        assert created.body["last_report"]["snapshot"]["snapshot_id"] == created.body["last_report"]["snapshot_id"]
+
+        listed = server.handle_request("GET", "/api/v1/skill-sources")
+        assert listed.status_code == 200
+        assert listed.body["count"] == 1
+
+        source_id = created.body["id"]
+        imported = server.handle_request("GET", f"/api/v1/skill-sources/{source_id}/skills")
+        assert imported.status_code == 200
+        assert {item["id"] for item in imported.body["skills"]} == {
+            f"{source_id}:analytics-tracking",
+            f"{source_id}:product-marketing-context",
+        }
+        analytics_manifest = next(
+            item for item in imported.body["skills"] if item["alias"] == "analytics-tracking"
+        )
+        assert analytics_manifest["handle"]["canonical_id"] == f"{source_id}:analytics-tracking"
+        assert analytics_manifest["version_ref"]["canonical_ref"].startswith(
+            f"{source_id}:analytics-tracking@"
+        )
+        assert analytics_manifest["tool_candidates"][0]["review"]["state"] == "pending"
+        assert analytics_manifest["tool_candidates"][0]["review"]["promoted"] is False
+
+        skills = server.handle_request("GET", "/api/v1/skills")
+        assert skills.status_code == 200
+        analytics = next(
+            item for item in skills.body["skills"] if item["alias"] == "analytics-tracking"
+        )
+        assert analytics["id"] == f"{source_id}:analytics-tracking"
+        assert analytics["source_kind"] == "imported"
+        assert analytics["source_format"] == "agent-skills-spec"
+        assert analytics["handle"]["canonical_id"] == f"{source_id}:analytics-tracking"
+        assert analytics["version_ref"]["canonical_ref"].startswith(
+            f"{source_id}:analytics-tracking@"
+        )
+        assert "tools" not in analytics
+
+        references = server.handle_request(
+            "GET",
+            f"/api/v1/skills/{source_id}:analytics-tracking/references",
+        )
+        assert references.status_code == 200
+        assert references.body["skill_id"] == f"{source_id}:analytics-tracking"
+        assert references.body["references"][0]["path"] == "references/event-library.md"
+
+        contracts = server.handle_request(
+            "GET",
+            f"/api/v1/skills/{source_id}:analytics-tracking/context-contracts",
+        )
+        assert contracts.status_code == 200
+        assert contracts.body["skill_id"] == f"{source_id}:analytics-tracking"
+        assert contracts.body["context_contracts"][0]["path_patterns"][0] == ".agents/product-marketing-context.md"
+
+    def test_skill_source_tool_candidate_approval_promotes_executable_binding(self, tmp_path: Path, monkeypatch):
+        repo_root = _write_external_skill_repo(tmp_path)
+        import_root = tmp_path / "imports"
+        monkeypatch.setenv("PYLON_SKILL_IMPORT_ROOT", str(import_root))
+        server, _ = _server_with_routes(
+            skill_runtime=SkillRuntime(SkillCatalog(skill_dirs=(), refresh_ttl_seconds=0)),
+            compatibility_layer=SkillCompatibilityLayer(import_root=import_root),
+        )
+
+        created = server.handle_request(
+            "POST",
+            "/api/v1/skill-sources",
+            body={"location": str(repo_root), "kind": "local-dir"},
+        )
+        assert created.status_code == 201
+        source_id = created.body["id"]
+
+        listed_candidates = server.handle_request(
+            "GET",
+            f"/api/v1/skill-sources/{source_id}/tool-candidates",
+        )
+        assert listed_candidates.status_code == 200
+        assert listed_candidates.body["count"] == 1
+        candidate = listed_candidates.body["candidates"][0]
+        assert candidate["candidate_id"] == "analytics-tracking:ga4:cli"
+        assert candidate["review"]["state"] == "pending"
+        assert listed_candidates.body["states"] == {"pending": 1}
+
+        approved = server.handle_request(
+            "PATCH",
+            f"/api/v1/skill-sources/{source_id}/tool-candidates/analytics-tracking:ga4:cli",
+            body={"state": "approved", "note": "Reviewed and allowed for runtime use"},
+        )
+        assert approved.status_code == 200
+        assert approved.body["candidate"]["review"]["state"] == "approved"
+        assert approved.body["candidate"]["review"]["promoted"] is True
+        assert approved.body["candidate"]["review"]["note"] == "Reviewed and allowed for runtime use"
+        assert approved.body["report"]["promoted_tool_count"] == 1
+        assert approved.body["report"]["tool_candidate_states"] == {"approved": 1}
+
+        skills = server.handle_request("GET", "/api/v1/skills")
+        assert skills.status_code == 200
+        analytics = next(
+            item for item in skills.body["skills"] if item["alias"] == "analytics-tracking"
+        )
+        assert analytics["tools"][0]["id"] == "ga4"
 
     def test_features_endpoint_returns_product_surface_manifest(self):
         server, _ = _server_with_routes()
@@ -791,6 +1040,31 @@ class TestProjectOperationsRoutes:
         assert server.handle_request("DELETE", f"/api/v1/memories/{memory.body['entry_id']}").status_code == 204
         assert server.handle_request("DELETE", f"/api/v1/tasks/{task_id}").status_code == 204
         assert server.handle_request("DELETE", f"/api/v1/teams/{created_team.body['id']}").status_code == 204
+
+    def test_team_routes_seed_specialist_roster_for_empty_tenant(self):
+        server, _ = _server_with_routes()
+
+        teams = server.handle_request(
+            "GET",
+            "/api/v1/teams",
+            headers={"X-Tenant-ID": "opp"},
+        )
+        assert teams.status_code == 200
+        assert any(team["id"] == "platform" for team in teams.body)
+        assert any(team["id"] == "operations" for team in teams.body)
+
+        activity = server.handle_request(
+            "GET",
+            "/api/v1/agents/activity",
+            headers={"X-Tenant-ID": "opp"},
+        )
+        assert activity.status_code == 200
+        ids = [agent["id"] for agent in activity.body]
+        assert len(ids) == len(set(ids))
+        assert any(agent["name"] == "Product Orchestrator" for agent in activity.body)
+        assert any(agent["team"] == "platform" for agent in activity.body)
+        assert any(agent["team"] == "operations" for agent in activity.body)
+        assert len(activity.body) >= 10
 
     def test_ads_routes_return_coherent_reference_payloads(self):
         server, store = _server_with_routes()
@@ -1104,6 +1378,53 @@ class TestLifecycleRoutes:
         assert listed_projects.status_code == 200
         assert any(project["projectId"] == "orbit" for project in listed_projects.body["projects"])
 
+    def test_lifecycle_project_events_stream_runtime_snapshot(self):
+        server, _ = _server_with_routes()
+        patched = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/orbit",
+            body={"spec": "STREAM_SPEC_SENTINEL"},
+        )
+        assert patched.status_code == 200
+
+        streamed = server.handle_request(
+            "GET",
+            "/api/v1/lifecycle/projects/orbit/events?phase=research&once=1",
+        )
+
+        assert streamed.status_code == 200
+        assert streamed.headers["content-type"].startswith("text/event-stream")
+        chunks = list(streamed.body.chunks)
+        assert any("event: project-runtime" in chunk for chunk in chunks)
+        assert any("event: run-live" in chunk for chunk in chunks)
+        project_runtime = next(chunk for chunk in chunks if "event: project-runtime" in chunk)
+        run_live = next(chunk for chunk in chunks if "event: run-live" in chunk)
+        assert '"phaseSummary"' in project_runtime
+        assert '"phase": "research"' in project_runtime
+        assert '"blockingSummary"' in project_runtime
+        assert '"activePhaseSummary"' in project_runtime
+        assert '"agents"' in project_runtime
+        assert '"Competitor Scout"' in project_runtime
+        assert "STREAM_SPEC_SENTINEL" not in project_runtime
+        assert '"input"' not in project_runtime
+        assert '"recentNodeIds"' in run_live or "data: null" in run_live
+        assert '"activeFocusNodeId"' in run_live or "data: null" in run_live
+
+    def test_lifecycle_project_events_stream_reports_active_phase_separately(self):
+        server, _ = _server_with_routes()
+
+        streamed = server.handle_request(
+            "GET",
+            "/api/v1/lifecycle/projects/orbit/events?phase=planning&once=1",
+        )
+
+        assert streamed.status_code == 200
+        chunks = list(streamed.body.chunks)
+        project_runtime = next(chunk for chunk in chunks if "event: project-runtime" in chunk)
+        assert '"observedPhase": "planning"' in project_runtime
+        assert '"activePhase": "planning"' in project_runtime
+        assert '"activePhaseSummary"' in project_runtime
+
     def test_lifecycle_projects_support_project_metadata_for_selector_creation(self):
         server, _ = _server_with_routes()
 
@@ -1165,12 +1486,14 @@ class TestLifecycleRoutes:
         assert updated.body["project"]["orchestrationMode"] == "autonomous"
         assert updated.body["project"]["autonomyLevel"] == "A4"
         assert updated.body["project"]["research"]["competitors"][0]["url"] == "https://example.com"
-        assert updated.body["project"]["analysis"] is not None
-        assert updated.body["project"]["buildCode"].startswith("<!doctype html>")
-        assert updated.body["project"]["releases"]
-        assert updated.body["project"]["approvalStatus"] == "approved"
-        assert any(action["action"]["type"] == "auto_approve" for action in updated.body["actions"])
-        assert updated.body["nextAction"]["phase"] == "iterate"
+        assert updated.body["project"]["research"]["readiness"] == "rework"
+        assert updated.body["project"]["analysis"] is None
+        assert updated.body["project"]["buildCode"] is None
+        assert updated.body["project"]["releases"] == []
+        assert updated.body["project"]["approvalStatus"] == "pending"
+        assert not any(action["action"]["type"] == "auto_approve" for action in updated.body["actions"])
+        assert updated.body["nextAction"]["phase"] == "research"
+        assert updated.body["nextAction"]["type"] == "review_phase"
 
     @pytest.mark.parametrize(
         ("phase", "input_data"),
@@ -1242,6 +1565,11 @@ class TestLifecycleRoutes:
         assert workflow_id == f"lifecycle-{phase}-orbit"
         assert store.get_workflow_project(workflow_id, tenant_id="default") is not None
         assert any(skill_id in store.skills for skill_id in prepared.body["blueprint"]["team"][0]["skills"])
+        lifecycle_project = store.get_surface_record("lifecycle-project", "default:orbit")
+        if lifecycle_project is not None and phase == "research":
+            phase_lookup = {item["phase"]: item["status"] for item in lifecycle_project["phaseStatuses"]}
+            assert phase_lookup["research"] == "in_progress"
+            assert phase_lookup["planning"] == "locked"
 
         started = server.handle_request(
             "POST",
@@ -1600,6 +1928,23 @@ class TestWorkflowRoutes:
         assert resp.body["runtime_metrics"]["iterations"] == 2
         assert isinstance(resp.body["event_log"], list)
         assert resp.body["id"] == run_id
+
+    def test_stream_workflow_run_events_returns_sse_chunks(self):
+        server, store = _server_with_routes()
+        store.register_workflow_project("wf1", _workflow_project())
+        create_resp = server.handle_request("POST", "/api/v1/workflows/wf1/runs", body={})
+        run_id = create_resp.body["id"]
+
+        streamed = server.handle_request("GET", f"/api/v1/runs/{run_id}/events?once=1")
+
+        assert streamed.status_code == 200
+        assert streamed.headers["content-type"].startswith("text/event-stream")
+        chunks = list(streamed.body.chunks)
+        assert any("event: snapshot" in chunk for chunk in chunks)
+        assert any("event: terminal" in chunk for chunk in chunks)
+        snapshot = next(chunk for chunk in chunks if "event: snapshot" in chunk)
+        assert '"event_log"' in snapshot
+        assert '"node_status"' in snapshot
 
     def test_start_workflow_run_honors_idempotency_key(self):
         server, store = _server_with_routes()
