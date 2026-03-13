@@ -188,7 +188,8 @@ class WorkflowControlPlaneStore(Protocol):
         namespace: str,
         record_id: str,
         payload: Mapping[str, Any],
-    ) -> None: ...
+        expected_record_version: int | None = None,
+    ) -> dict[str, Any]: ...
 
     def delete_surface_record(
         self,

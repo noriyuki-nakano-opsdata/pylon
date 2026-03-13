@@ -395,12 +395,35 @@ class JsonFileWorkflowControlPlaneStore:
         namespace: str,
         record_id: str,
         payload: dict[str, Any],
-    ) -> None:
+        expected_record_version: int | None = None,
+    ) -> dict[str, Any]:
         with self._lock:
             state = self._read_state()
             namespace_records = state["surface_records"].setdefault(namespace, {})
-            namespace_records[record_id] = dict(payload)
+            existing = namespace_records.get(record_id)
+            current_version = (
+                int(existing.get("record_version", 0))
+                if isinstance(existing, dict)
+                else 0
+            )
+            if (
+                expected_record_version is not None
+                and current_version != expected_record_version
+            ):
+                raise ConcurrencyError(
+                    f"Surface record version conflict for {namespace}/{record_id}",
+                    details={
+                        "namespace": namespace,
+                        "record_id": record_id,
+                        "expected_record_version": expected_record_version,
+                        "actual_record_version": current_version,
+                    },
+                )
+            stored = dict(payload)
+            stored["record_version"] = current_version + 1
+            namespace_records[record_id] = stored
             self._write_state(state)
+            return dict(stored)
 
     def delete_surface_record(
         self,

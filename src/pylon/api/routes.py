@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import threading
 import time
 import uuid
 from collections.abc import MutableMapping
@@ -16,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pylon.api.authz import require_scopes
-from pylon.api.health import build_default_checker, build_default_readiness_checker
+from pylon.api.health import HealthCheckResult, build_default_checker, build_default_readiness_checker
 from pylon.api.observability import APIObservabilityBundle
 from pylon.api.public_contract import (
     PublicContractRegistry,
@@ -79,6 +81,10 @@ from pylon.lifecycle import (
     resolve_lifecycle_orchestration_mode,
     sync_lifecycle_project_with_run,
 )
+from pylon.lifecycle.runtime_projection import (
+    lifecycle_runtime_payload,
+    runtime_active_phase,
+)
 from pylon.providers.base import Message, TokenUsage
 from pylon.repository.audit import default_hmac_key
 from pylon.runtime.llm import ProviderRegistry
@@ -86,11 +92,16 @@ from pylon.skills.compat import (
     SkillCompatibilityLayer,
     get_default_skill_compatibility_layer,
 )
+from pylon.skills.import_types import ToolCandidateDecision
 from pylon.skills.runtime import SkillRuntime, get_default_skill_runtime
+from pylon.taskqueue.queue import Task as QueueTask, TaskStatus
+from pylon.taskqueue.retry import FixedRetry
+from pylon.taskqueue.store_queue import StoreBackedTaskQueue
+from pylon.taskqueue.worker import Worker
 from pylon.types import AutonomyLevel
+from pylon.errors import ConcurrencyError
 
 logger = logging.getLogger(__name__)
-LIFECYCLE_RUNTIME_EXECUTABLE_PHASES: tuple[str, ...] = ("research", "planning", "design", "development")
 
 
 MISSION_TASK_STATUSES = {"backlog", "in_progress", "review", "done"}
@@ -811,8 +822,14 @@ class RouteStore:
         namespace: str,
         record_id: str,
         payload: dict[str, Any],
-    ) -> None:
-        self._control_plane_store.put_surface_record(namespace, record_id, payload)
+        expected_record_version: int | None = None,
+    ) -> dict[str, Any]:
+        return self._control_plane_store.put_surface_record(
+            namespace,
+            record_id,
+            payload,
+            expected_record_version=expected_record_version,
+        )
 
     def delete_surface_record(
         self,
@@ -891,6 +908,85 @@ def register_routes(
         workflow_service = WorkflowRunService(s, provider_registry=provider_registry)
     skill_runtime = skill_runtime or get_default_skill_runtime()
     compatibility_layer = compatibility_layer or get_default_skill_compatibility_layer()
+    skill_import_lock = threading.RLock()
+
+    class _SkillImportQueueStore:
+        namespace = "skill_import_queue_tasks"
+
+        def get_queue_task_record(self, task_id: str) -> dict[str, Any] | None:
+            payload = s.get_surface_record(self.namespace, task_id)
+            return None if payload is None else dict(payload)
+
+        def put_queue_task_record(self, task_payload: dict[str, Any]) -> None:
+            s.put_surface_record(self.namespace, str(task_payload["id"]), dict(task_payload))
+
+        def delete_queue_task_record(self, task_id: str) -> bool:
+            return s.delete_surface_record(self.namespace, task_id)
+
+        def list_queue_task_records(self, *, status: str | None = None) -> list[dict[str, Any]]:
+            records = [
+                dict(record)
+                for record in s.list_surface_records(self.namespace)
+            ]
+            if status is not None:
+                records = [
+                    record for record in records if str(record.get("status", "")) == status
+                ]
+            records.sort(
+                key=lambda item: (
+                    str(item.get("created_at", "")),
+                    str(item.get("id", "")),
+                )
+            )
+            return records
+
+    skill_import_queue = StoreBackedTaskQueue(_SkillImportQueueStore())
+    skill_import_retry_policy = FixedRetry(max_retries=3, delay_seconds=0.05)
+    skill_import_worker = Worker(name="skill-import-worker")
+    skill_import_worker_stop = threading.Event()
+    skill_import_worker_owner = f"{os.getpid()}:{uuid.uuid4().hex[:8]}"
+    skill_import_leader_namespace = "skill_import_worker_leases"
+    skill_import_leader_key = "primary"
+    skill_import_leader_ttl_seconds = 60.0
+    skill_import_metrics = observability.metrics if observability is not None else None
+
+    def _record_skill_import_queue_metrics() -> None:
+        if skill_import_metrics is None:
+            return
+        for status in (TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.FAILED):
+            skill_import_metrics.gauge(
+                "skill_import_queue_depth",
+                float(skill_import_queue.size(status)),
+                labels={"status": status.value},
+            )
+
+    def _record_skill_import_worker_state(*, is_leader: bool) -> None:
+        if skill_import_metrics is None:
+            return
+        skill_import_metrics.gauge(
+            "skill_import_worker_is_leader",
+            1.0 if is_leader else 0.0,
+        )
+        skill_import_metrics.gauge(
+            "skill_import_worker_heartbeat_unix",
+            time.time(),
+        )
+
+    def _record_skill_import_job_outcome(
+        *,
+        operation: str,
+        status: str,
+        duration_seconds: float,
+    ) -> None:
+        if skill_import_metrics is None:
+            return
+        labels = {"operation": operation, "status": status}
+        skill_import_metrics.counter("skill_import_job_count", 1, labels=labels)
+        skill_import_metrics.histogram(
+            "skill_import_job_duration_seconds",
+            max(duration_seconds, 0.0),
+            labels=labels,
+        )
 
     def _workflow_summary(
         workflow_id: str,
@@ -1159,6 +1255,602 @@ def register_routes(
             return None
         return dict(payload)
 
+    def _skill_tool_candidate_record_id(tenant_id: str, source_id: str, candidate_id: str) -> str:
+        return f"{tenant_id}:{source_id}:{candidate_id}"
+
+    def _list_skill_tool_candidate_records(
+        source_id: str,
+        *,
+        tenant_id: str,
+    ) -> list[dict[str, Any]]:
+        records = [
+            dict(record)
+            for record in s.list_surface_records("skill_tool_candidates", tenant_id=tenant_id)
+            if str(record.get("source_id", "")) == source_id
+        ]
+        records.sort(
+            key=lambda item: (
+                str(item.get("skill_id", "")),
+                str(item.get("proposed_tool_id", "")),
+                str(item.get("candidate_id", "")),
+            )
+        )
+        return records
+
+    def _tool_candidate_decisions_for_source(
+        source_id: str,
+        *,
+        tenant_id: str,
+    ) -> dict[str, ToolCandidateDecision]:
+        decisions: dict[str, ToolCandidateDecision] = {}
+        for record in _list_skill_tool_candidate_records(source_id, tenant_id=tenant_id):
+            review = dict(record.get("review", {}))
+            state = str(review.get("state", "")).strip().lower()
+            fingerprint = str(review.get("fingerprint", "")).strip()
+            if state not in {"approved", "rejected"} or not fingerprint:
+                continue
+            candidate_id = str(record.get("candidate_id", "")).strip()
+            if not candidate_id:
+                continue
+            decisions[candidate_id] = ToolCandidateDecision(
+                candidate_id=candidate_id,
+                fingerprint=fingerprint,
+                state=state,
+                note=str(review.get("note", "")).strip(),
+                decided_at=str(review.get("decided_at", "")).strip(),
+            )
+        return decisions
+
+    def _sync_skill_tool_candidate_records(
+        source_id: str,
+        *,
+        tenant_id: str,
+    ) -> list[dict[str, Any]]:
+        current = {
+            str(record.get("id", "")): dict(record)
+            for record in _list_skill_tool_candidate_records(source_id, tenant_id=tenant_id)
+        }
+        now = _utc_now_iso()
+        seen: set[str] = set()
+        records: list[dict[str, Any]] = []
+        for candidate in compatibility_layer.list_tool_candidates(source_id):
+            record_id = _skill_tool_candidate_record_id(
+                tenant_id,
+                source_id,
+                str(candidate.get("candidate_id", "")),
+            )
+            existing = current.get(record_id, {})
+            payload = {
+                **dict(candidate),
+                "id": record_id,
+                "tenant_id": tenant_id,
+                "source_id": source_id,
+                "created_at": existing.get("created_at", now),
+                "updated_at": now,
+            }
+            s.put_surface_record("skill_tool_candidates", record_id, payload)
+            records.append(payload)
+            seen.add(record_id)
+        for record_id in current:
+            if record_id not in seen:
+                s.delete_surface_record("skill_tool_candidates", record_id)
+        records.sort(
+            key=lambda item: (
+                str(item.get("skill_id", "")),
+                str(item.get("proposed_tool_id", "")),
+                str(item.get("candidate_id", "")),
+            )
+        )
+        return records
+
+    def _list_skill_import_jobs(
+        *,
+        tenant_id: str,
+        source_id: str = "",
+    ) -> list[dict[str, Any]]:
+        jobs = [
+            dict(record)
+            for record in s.list_surface_records("skill_import_jobs", tenant_id=tenant_id)
+            if not source_id or str(record.get("source_id", "")) == source_id
+        ]
+        jobs.sort(
+            key=lambda item: (
+                str(item.get("created_at", "")),
+                str(item.get("id", "")),
+            ),
+            reverse=True,
+        )
+        return jobs
+
+    def _list_skill_import_queue_records(
+        *,
+        tenant_id: str,
+        source_id: str = "",
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for record in s.list_surface_records("skill_import_queue_tasks"):
+            payload = dict(record.get("payload", {}))
+            if str(payload.get("tenant_id", "")) != tenant_id:
+                continue
+            if source_id and str(payload.get("source_id", "")) != source_id:
+                continue
+            records.append(dict(record))
+        records.sort(
+            key=lambda item: (
+                str(item.get("created_at", "")),
+                str(item.get("id", "")),
+            ),
+            reverse=True,
+        )
+        return records
+
+    def _metric_gauge_value(
+        snapshot: dict[str, Any],
+        name: str,
+        *,
+        labels: dict[str, str] | None = None,
+    ) -> float | None:
+        for series in snapshot.get("gauges", []):
+            if not isinstance(series, dict):
+                continue
+            if str(series.get("name", "")) != name:
+                continue
+            if dict(series.get("labels", {})) != dict(labels or {}):
+                continue
+            try:
+                return float(series.get("value", 0.0))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _skill_import_summary_payload(
+        *,
+        tenant_id: str,
+        source_id: str = "",
+    ) -> dict[str, Any]:
+        jobs = _list_skill_import_jobs(tenant_id=tenant_id, source_id=source_id)
+        queue_records = _list_skill_import_queue_records(tenant_id=tenant_id, source_id=source_id)
+        sources = [
+            _skill_source_payload(record)
+            for record in s.list_surface_records("skill_sources", tenant_id=tenant_id)
+            if not source_id or str(record.get("id", "")) == source_id
+        ]
+        candidates: list[dict[str, Any]] = []
+        for source in sources:
+            source_key = str(source.get("id", ""))
+            if not source_key:
+                continue
+            source_candidates = _list_skill_tool_candidate_records(source_key, tenant_id=tenant_id)
+            if not source_candidates:
+                source_candidates = _sync_skill_tool_candidate_records(source_key, tenant_id=tenant_id)
+            candidates.extend(source_candidates)
+
+        job_counts: dict[str, int] = {}
+        for job in jobs:
+            status = str(job.get("status", "unknown") or "unknown")
+            job_counts[status] = job_counts.get(status, 0) + 1
+
+        queue_counts: dict[str, int] = {}
+        running_task_ids: list[str] = []
+        oldest_pending_created_at = ""
+        for record in queue_records:
+            status = str(record.get("status", "unknown") or "unknown")
+            queue_counts[status] = queue_counts.get(status, 0) + 1
+            if status == "running":
+                running_task_ids.append(str(record.get("id", "")))
+            if status == "pending":
+                created_at = str(record.get("created_at", ""))
+                if created_at and (not oldest_pending_created_at or created_at < oldest_pending_created_at):
+                    oldest_pending_created_at = created_at
+
+        source_counts: dict[str, int] = {}
+        latest_jobs_by_source: dict[str, dict[str, Any]] = {}
+        for job in jobs:
+            source_key = str(job.get("source_id", ""))
+            if source_key and source_key not in latest_jobs_by_source:
+                latest_jobs_by_source[source_key] = job
+        source_items: list[dict[str, Any]] = []
+        for source in sorted(sources, key=lambda item: str(item.get("id", ""))):
+            status = str(source.get("status", "unknown") or "unknown")
+            source_counts[status] = source_counts.get(status, 0) + 1
+            latest_job = latest_jobs_by_source.get(str(source.get("id", "")))
+            last_report = dict(source.get("last_report", {}))
+            source_items.append({
+                "id": str(source.get("id", "")),
+                "status": status,
+                "adapter_profile": source.get("adapter_profile"),
+                "source_format": source.get("source_format"),
+                "source_revision": source.get("source_revision"),
+                "imported_skill_count": int(source.get("imported_skill_count", 0) or 0),
+                "promoted_tool_count": int(last_report.get("promoted_tool_count", 0) or 0),
+                "updated_at": source.get("updated_at"),
+                "last_job": (
+                    {
+                        "id": str(latest_job.get("id", "")),
+                        "status": str(latest_job.get("status", "")),
+                        "operation": str(latest_job.get("operation", "")),
+                        "updated_at": latest_job.get("updated_at"),
+                    }
+                    if isinstance(latest_job, dict)
+                    else None
+                ),
+            })
+
+        review_states: dict[str, int] = {}
+        promoted_count = 0
+        for candidate in candidates:
+            review = dict(candidate.get("review", {}))
+            state = str(review.get("state", "pending") or "pending")
+            review_states[state] = review_states.get(state, 0) + 1
+            if bool(review.get("promoted")):
+                promoted_count += 1
+
+        lease = s.get_surface_record(skill_import_leader_namespace, skill_import_leader_key)
+        now = time.time()
+        lease_owner = str(lease.get("owner", "")) if isinstance(lease, dict) else ""
+        lease_expires_at = str(lease.get("expires_at", "")) if isinstance(lease, dict) else ""
+        lease_active = False
+        if lease_owner and lease_expires_at:
+            try:
+                lease_active = datetime.fromisoformat(lease_expires_at).timestamp() > now
+            except ValueError:
+                lease_active = False
+        metrics_snapshot = skill_import_metrics.get_metrics() if skill_import_metrics is not None else {}
+
+        return {
+            "tenant_id": tenant_id,
+            "source_id": source_id or None,
+            "worker": {
+                "owner": lease_owner,
+                "is_leader": lease_active and lease_owner == skill_import_worker_owner,
+                "lease_expires_at": lease_expires_at or None,
+                "record_version": int(lease.get("record_version", 0) or 0) if isinstance(lease, dict) else 0,
+                "heartbeat_unix": _metric_gauge_value(
+                    metrics_snapshot,
+                    "skill_import_worker_heartbeat_unix",
+                ),
+            },
+            "queue": {
+                "counts": queue_counts,
+                "oldest_pending_created_at": oldest_pending_created_at or None,
+                "running_task_ids": running_task_ids,
+                "tasks": [
+                    {
+                        "id": str(record.get("id", "")),
+                        "status": str(record.get("status", "")),
+                        "created_at": record.get("created_at"),
+                        "started_at": record.get("started_at"),
+                        "completed_at": record.get("completed_at"),
+                        "source_id": dict(record.get("payload", {})).get("source_id"),
+                        "job_id": dict(record.get("payload", {})).get("job_id"),
+                        "retries": int(record.get("retries", 0) or 0),
+                    }
+                    for record in queue_records[:10]
+                ],
+            },
+            "jobs": {
+                "counts": job_counts,
+                "recent": [
+                    {
+                        "id": str(job.get("id", "")),
+                        "source_id": str(job.get("source_id", "")),
+                        "operation": str(job.get("operation", "")),
+                        "status": str(job.get("status", "")),
+                        "queue_task_id": str(job.get("queue_task_id", "")),
+                        "updated_at": job.get("updated_at"),
+                        "error": str(job.get("error", "")) or None,
+                    }
+                    for job in jobs[:10]
+                ],
+            },
+            "sources": {
+                "counts": source_counts,
+                "items": source_items,
+            },
+            "reviews": {
+                "states": review_states,
+                "candidate_count": len(candidates),
+                "promoted_count": promoted_count,
+            },
+            "metrics": {
+                "queue_depth": {
+                    status.value: _metric_gauge_value(
+                        metrics_snapshot,
+                        "skill_import_queue_depth",
+                        labels={"status": status.value},
+                    )
+                    for status in (TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.FAILED)
+                },
+            },
+        }
+
+    def _skill_import_readiness() -> HealthCheckResult:
+        queue_records = [dict(record) for record in s.list_surface_records("skill_import_queue_tasks")]
+        pending_count = sum(1 for record in queue_records if str(record.get("status", "")) == "pending")
+        running_count = sum(1 for record in queue_records if str(record.get("status", "")) == "running")
+        failed_count = sum(1 for record in queue_records if str(record.get("status", "")) == "failed")
+        lease = s.get_surface_record(skill_import_leader_namespace, skill_import_leader_key)
+        lease_owner = str(lease.get("owner", "")) if isinstance(lease, dict) else ""
+        lease_expires_at = str(lease.get("expires_at", "")) if isinstance(lease, dict) else ""
+        lease_active = False
+        if lease_owner and lease_expires_at:
+            try:
+                lease_active = datetime.fromisoformat(lease_expires_at).timestamp() > time.time()
+            except ValueError:
+                lease_active = False
+        heartbeat_unix = None
+        if skill_import_metrics is not None:
+            heartbeat_unix = _metric_gauge_value(
+                skill_import_metrics.get_metrics(),
+                "skill_import_worker_heartbeat_unix",
+            )
+        if pending_count + running_count > 0 and not lease_active:
+            return HealthCheckResult(
+                name="skill_import_worker",
+                status="unhealthy",
+                message="Skill import backlog exists without an active worker lease",
+                details={
+                    "pending": pending_count,
+                    "running": running_count,
+                    "failed": failed_count,
+                    "lease_owner": lease_owner or None,
+                    "lease_expires_at": lease_expires_at or None,
+                    "heartbeat_unix": heartbeat_unix,
+                },
+            )
+        return HealthCheckResult(
+            name="skill_import_worker",
+            status="healthy",
+            message="Skill import worker is idle" if pending_count + running_count == 0 else "Skill import worker is processing backlog",
+            details={
+                "pending": pending_count,
+                "running": running_count,
+                "failed": failed_count,
+                "lease_owner": lease_owner or None,
+                "lease_expires_at": lease_expires_at or None,
+                "heartbeat_unix": heartbeat_unix,
+            },
+        )
+
+    def _get_skill_import_job(job_id: str, *, tenant_id: str) -> dict[str, Any] | None:
+        payload = s.get_surface_record("skill_import_jobs", job_id)
+        if payload is None:
+            return None
+        if str(payload.get("tenant_id", "")) != tenant_id:
+            return None
+        return dict(payload)
+
+    def _perform_skill_source_sync(
+        source_payload: dict[str, Any],
+        *,
+        tenant_id: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        source_id = str(source_payload["id"])
+        mutable_payload = dict(source_payload)
+        with skill_import_lock:
+            try:
+                report = compatibility_layer.sync_source(
+                    mutable_payload,
+                    tool_candidate_decisions=_tool_candidate_decisions_for_source(
+                        source_id,
+                        tenant_id=tenant_id,
+                    ),
+                )
+            except Exception as exc:
+                mutable_payload["status"] = "error"
+                mutable_payload["error"] = str(exc)
+                mutable_payload["updated_at"] = _utc_now_iso()
+                s.put_surface_record("skill_sources", source_id, mutable_payload)
+                raise
+            mutable_payload["status"] = "ready"
+            mutable_payload.pop("error", None)
+            mutable_payload["source_revision"] = report["source_revision"]
+            mutable_payload["adapter_profile"] = report["adapter_profile"]
+            mutable_payload["source_format"] = report["source_format"]
+            mutable_payload["updated_at"] = _utc_now_iso()
+            s.put_surface_record("skill_sources", source_id, mutable_payload)
+            _sync_skill_tool_candidate_records(source_id, tenant_id=tenant_id)
+            skill_runtime.rescan(tenant_id=tenant_id)
+            return mutable_payload, report
+
+    def _skill_import_leader_deadline(now: float | None = None) -> str:
+        effective_now = now if now is not None else time.time()
+        expires_at = datetime.fromtimestamp(
+            effective_now + skill_import_leader_ttl_seconds,
+            tz=UTC,
+        )
+        return expires_at.isoformat()
+
+    def _acquire_skill_import_leader() -> bool:
+        now = time.time()
+        current = s.get_surface_record(skill_import_leader_namespace, skill_import_leader_key)
+        current_version = (
+            int(current.get("record_version", 0))
+            if isinstance(current, dict)
+            else 0
+        )
+        if current is not None:
+            owner = str(current.get("owner", ""))
+            expires_at = str(current.get("expires_at", ""))
+            try:
+                expires_epoch = datetime.fromisoformat(expires_at).timestamp() if expires_at else 0.0
+            except ValueError:
+                expires_epoch = 0.0
+            if owner and owner != skill_import_worker_owner and expires_epoch > now:
+                return False
+        lease = {
+            "id": skill_import_leader_key,
+            "owner": skill_import_worker_owner,
+            "expires_at": _skill_import_leader_deadline(now),
+            "created_at": (
+                str(current.get("created_at", "")) if isinstance(current, dict) else _utc_now_iso()
+            ),
+            "updated_at": _utc_now_iso(),
+        }
+        try:
+            s.put_surface_record(
+                skill_import_leader_namespace,
+                skill_import_leader_key,
+                lease,
+                expected_record_version=current_version,
+            )
+        except ConcurrencyError:
+            return False
+        return True
+
+    def _release_skill_import_leader() -> None:
+        current = s.get_surface_record(skill_import_leader_namespace, skill_import_leader_key)
+        if current is None:
+            return
+        if str(current.get("owner", "")) != skill_import_worker_owner:
+            return
+        s.delete_surface_record(skill_import_leader_namespace, skill_import_leader_key)
+
+    def _execute_skill_import_job(job_id: str, *, tenant_id: str) -> dict[str, Any]:
+        current = _get_skill_import_job(job_id, tenant_id=tenant_id)
+        if current is None:
+            raise KeyError(f"Skill import job not found: {job_id}")
+        source_id = str(current.get("source_id", ""))
+        current["status"] = "running"
+        current["started_at"] = _utc_now_iso()
+        current["updated_at"] = current["started_at"]
+        s.put_surface_record("skill_import_jobs", job_id, current)
+        running_source = dict(current.get("source_payload", {}))
+        running_source["status"] = "syncing"
+        running_source["updated_at"] = _utc_now_iso()
+        s.put_surface_record("skill_sources", source_id, running_source)
+        synced_source, report = _perform_skill_source_sync(
+            running_source,
+            tenant_id=tenant_id,
+        )
+        completed = _get_skill_import_job(job_id, tenant_id=tenant_id) or dict(current)
+        completed["status"] = "completed"
+        completed["completed_at"] = _utc_now_iso()
+        completed["updated_at"] = completed["completed_at"]
+        completed["report"] = report
+        completed["source"] = _skill_source_payload(synced_source)
+        s.put_surface_record("skill_import_jobs", job_id, completed)
+        return completed
+
+    def _start_skill_import_worker() -> None:
+        def _loop() -> None:
+            skill_import_queue.recover_running()
+            _record_skill_import_queue_metrics()
+            while not skill_import_worker_stop.is_set():
+                _record_skill_import_worker_state(is_leader=False)
+                if not _acquire_skill_import_leader():
+                    skill_import_worker_stop.wait(0.1)
+                    continue
+                _record_skill_import_worker_state(is_leader=True)
+                task = skill_import_queue.dequeue(
+                    lease_owner=skill_import_worker.id,
+                    lease_timeout_seconds=30.0,
+                )
+                _record_skill_import_queue_metrics()
+                if task is None:
+                    skill_import_worker_stop.wait(0.05)
+                    continue
+                result = skill_import_worker.process(
+                    task,
+                    lambda current_task: _execute_skill_import_job(
+                        str(current_task.payload.get("job_id", "")),
+                        tenant_id=str(current_task.payload.get("tenant_id", "")),
+                    ),
+                )
+                skill_import_queue.save(task)
+                _record_skill_import_queue_metrics()
+                job_id = str(task.payload.get("job_id", ""))
+                tenant_id = str(task.payload.get("tenant_id", ""))
+                operation = str(task.payload.get("operation", "scan") or "scan")
+                if result.success:
+                    _record_skill_import_job_outcome(
+                        operation=operation,
+                        status="completed",
+                        duration_seconds=result.duration_seconds,
+                    )
+                    continue
+                if skill_import_retry_policy.should_retry(task):
+                    _record_skill_import_job_outcome(
+                        operation=operation,
+                        status="retrying",
+                        duration_seconds=result.duration_seconds,
+                    )
+                    retrying = _get_skill_import_job(job_id, tenant_id=tenant_id)
+                    if retrying is not None:
+                        retrying["status"] = "retrying"
+                        retrying["error"] = result.error
+                        retrying["updated_at"] = _utc_now_iso()
+                        retrying["queue_retries"] = task.retries + 1
+                        s.put_surface_record("skill_import_jobs", job_id, retrying)
+                    skill_import_worker_stop.wait(skill_import_retry_policy.next_delay(task))
+                    skill_import_queue.requeue(task.id)
+                    _record_skill_import_queue_metrics()
+                    continue
+                failed = _get_skill_import_job(job_id, tenant_id=tenant_id)
+                if failed is None:
+                    continue
+                _record_skill_import_job_outcome(
+                    operation=operation,
+                    status="failed",
+                    duration_seconds=result.duration_seconds,
+                )
+                failed["status"] = "failed"
+                failed["error"] = result.error or "Skill import job failed"
+                failed["completed_at"] = _utc_now_iso()
+                failed["updated_at"] = failed["completed_at"]
+                failed["queue_retries"] = task.retries
+                s.put_surface_record("skill_import_jobs", job_id, failed)
+            _record_skill_import_worker_state(is_leader=False)
+            _release_skill_import_leader()
+
+        threading.Thread(
+            target=_loop,
+            name="pylon-skill-import-worker",
+            daemon=True,
+        ).start()
+
+    def _enqueue_skill_import_job(
+        *,
+        source_payload: dict[str, Any],
+        tenant_id: str,
+        operation: str,
+    ) -> dict[str, Any]:
+        source_id = str(source_payload["id"])
+        now = _utc_now_iso()
+        job_id = uuid.uuid4().hex
+        job_payload = {
+            "id": job_id,
+            "tenant_id": tenant_id,
+            "source_id": source_id,
+            "operation": operation,
+            "status": "pending",
+            "created_at": now,
+            "updated_at": now,
+            "source_payload": dict(source_payload),
+        }
+        queue_task = QueueTask(
+            name="skill-import-job",
+            payload={
+                "job_id": job_id,
+                "tenant_id": tenant_id,
+                "operation": operation,
+                "source_id": source_id,
+            },
+            priority=1,
+            max_retries=skill_import_retry_policy.max_retries,
+        )
+        job_payload["queue_task_id"] = queue_task.id
+        s.put_surface_record("skill_import_jobs", job_id, job_payload)
+        skill_import_queue.enqueue(queue_task)
+        _record_skill_import_queue_metrics()
+        return job_payload
+
+    _start_skill_import_worker()
+    if hasattr(server, "add_shutdown_hook"):
+        server.add_shutdown_hook(lambda: skill_import_worker_stop.set())
+        server.add_shutdown_hook(_release_skill_import_leader)
+    readiness_checker.register("skill_import_worker", _skill_import_readiness)
+
     def _agent_skill_payload(skill_id: str, *, tenant_id: str) -> dict[str, Any]:
         catalog = _effective_skill_catalog(tenant_id)
         payload, _ = _resolve_skill_payload(catalog, skill_id)
@@ -1406,489 +2098,6 @@ def register_routes(
         response.update(extra)
         return response
 
-    def _phase_blueprint(project: dict[str, Any], phase: str) -> dict[str, Any]:
-        blueprints = project.get("blueprints")
-        if isinstance(blueprints, dict):
-            blueprint = blueprints.get(phase)
-            if isinstance(blueprint, dict):
-                return dict(blueprint)
-        project_id = str(project.get("projectId", project.get("id", "catalog")) or "catalog")
-        return dict(build_lifecycle_phase_blueprints(project_id).get(phase, {}))
-
-    def _phase_team(project: dict[str, Any], phase: str) -> list[dict[str, Any]]:
-        team = _phase_blueprint(project, phase).get("team")
-        return [dict(item) for item in team if isinstance(item, dict)] if isinstance(team, list) else []
-
-    def _phase_team_index(project: dict[str, Any], phase: str) -> dict[str, dict[str, Any]]:
-        return {
-            str(item.get("id", "")).strip(): item
-            for item in _phase_team(project, phase)
-            if str(item.get("id", "")).strip()
-        }
-
-    def _run_node_status_map(run: dict[str, Any] | None) -> dict[str, str]:
-        if not isinstance(run, dict):
-            return {}
-        node_status = run.get("node_status")
-        if isinstance(node_status, dict):
-            return {str(key): str(value) for key, value in node_status.items()}
-        state = run.get("state")
-        if not isinstance(state, dict):
-            return {}
-        execution = state.get("execution")
-        if not isinstance(execution, dict):
-            return {}
-        node_status = execution.get("node_status")
-        if isinstance(node_status, dict):
-            return {str(key): str(value) for key, value in node_status.items()}
-        return {}
-
-    def _run_event_log(run: dict[str, Any] | None) -> list[dict[str, Any]]:
-        if not isinstance(run, dict):
-            return []
-        event_log = run.get("event_log")
-        return [dict(item) for item in event_log if isinstance(item, dict)] if isinstance(event_log, list) else []
-
-    def _phase_records_for_run(
-        records: Any,
-        *,
-        phase: str,
-        run_id: str,
-    ) -> list[dict[str, Any]]:
-        if not isinstance(records, list):
-            return []
-        phase_records = [dict(item) for item in records if isinstance(item, dict) and item.get("phase") == phase]
-        if not run_id:
-            return phase_records
-        run_records = [item for item in phase_records if str(item.get("runId", "")) == run_id]
-        return run_records or phase_records
-
-    def _latest_record_by_agent(
-        records: list[dict[str, Any]],
-        *,
-        agent_key: str = "agentId",
-    ) -> dict[str, dict[str, Any]]:
-        latest: dict[str, dict[str, Any]] = {}
-        for item in reversed(records):
-            agent_id = str(item.get(agent_key, "")).strip()
-            if agent_id and agent_id not in latest:
-                latest[agent_id] = item
-        return latest
-
-    def _delegation_focus(delegation: dict[str, Any]) -> str:
-        skill = str(delegation.get("skill", "")).strip()
-        peer = str(delegation.get("peer", "")).strip()
-        task = delegation.get("task")
-        if isinstance(task, dict):
-            metadata = task.get("metadata")
-            if isinstance(metadata, dict):
-                skill = skill or str(metadata.get("skill", "")).strip()
-                peer = peer or str(metadata.get("receiver", "")).strip()
-        if skill and peer:
-            return f"{skill} を {peer} に委譲"
-        if skill:
-            return f"{skill} を委譲"
-        if peer:
-            return f"{peer} と連携"
-        return "委譲を実行"
-
-    def _resolve_runtime_agent_id(
-        project: dict[str, Any],
-        phase: str,
-        *,
-        node_id: str,
-        agent_hint: str = "",
-    ) -> str:
-        team_index = _phase_team_index(project, phase)
-        hint = agent_hint.strip()
-        node = node_id.strip()
-        if hint and hint in team_index:
-            return hint
-        if node and node in team_index:
-            return node
-        return hint or node
-
-    def _runtime_agent_status_from_nodes(statuses: list[str], *, observed: bool) -> str:
-        normalized = [status.strip() for status in statuses if status.strip()]
-        if any(status == "running" for status in normalized):
-            return "running"
-        if any(status == "failed" for status in normalized):
-            return "failed"
-        if any(status in {"completed", "succeeded"} for status in normalized) or observed:
-            return "completed"
-        return "idle"
-
-    def _runtime_node_focus(node_id: str, agent: dict[str, Any] | None) -> str:
-        label = str((agent or {}).get("label", "")).strip()
-        if label and node_id and node_id != str((agent or {}).get("id", "")).strip():
-            return f"{label} の {node_id}"
-        return node_id or label
-
-    def _runtime_human_task_summary(text: str, fallback: str = "") -> str:
-        value = " ".join(str(text or "").strip().split())
-        if not value:
-            return fallback
-        lowered = value.lower()
-        if lowered.startswith("research phase skill executed by "):
-            return "調査タスクを実行"
-        if value.startswith("{") or value.startswith("["):
-            return "構造化タスクを整理中"
-        if len(value) > 180:
-            return f"{value[:177].rstrip()}..."
-        return value
-
-    def _runtime_safe_next_action(next_action: dict[str, Any] | None) -> dict[str, Any] | None:
-        if not isinstance(next_action, dict):
-            return None
-        payload = next_action.get("payload")
-        payload_summary: dict[str, Any] = {}
-        if isinstance(payload, dict):
-            remediation = payload.get("remediation")
-            if isinstance(remediation, dict):
-                payload_summary["remediation"] = {
-                    "trigger": str(remediation.get("trigger", "")).strip() or None,
-                    "attempt": int(remediation.get("attempt", 0) or 0),
-                    "maxAttempts": int(remediation.get("maxAttempts", 0) or 0),
-                    "retryNodeIds": [
-                        str(item).strip()
-                        for item in remediation.get("retryNodeIds", [])
-                        if str(item).strip()
-                    ][:6],
-                    "blockingSummary": [
-                        str(item).strip()
-                        for item in remediation.get("blockingSummary", [])
-                        if str(item).strip()
-                    ][:4],
-                }
-            blocking_issues = [
-                str(item).strip()
-                for item in payload.get("blockingIssues", [])
-                if str(item).strip()
-            ] if isinstance(payload, dict) else []
-            if blocking_issues:
-                payload_summary["blockingIssues"] = blocking_issues[:4]
-        safe_action = {
-            "type": str(next_action.get("type", "")),
-            "phase": next_action.get("phase"),
-            "title": str(next_action.get("title", "")),
-            "reason": str(next_action.get("reason", "")),
-            "canAutorun": bool(next_action.get("canAutorun")),
-            "requiresTrigger": bool(next_action.get("requiresTrigger")),
-            "orchestrationMode": next_action.get("orchestrationMode"),
-            "payload": payload_summary,
-        }
-        return safe_action
-
-    def _runtime_active_phase(project: dict[str, Any], requested_phase: str) -> str:
-        for entry in project.get("phaseStatuses", []):
-            if (
-                isinstance(entry, dict)
-                and str(entry.get("phase", "")).strip() in LIFECYCLE_RUNTIME_EXECUTABLE_PHASES
-                and str(entry.get("status", "")).strip() == "in_progress"
-            ):
-                return str(entry.get("phase", "")).strip()
-        next_action = project.get("nextAction")
-        if (
-            isinstance(next_action, dict)
-            and bool(next_action.get("canAutorun"))
-            and str(next_action.get("phase", "")).strip() in LIFECYCLE_RUNTIME_EXECUTABLE_PHASES
-        ):
-            return str(next_action.get("phase", "")).strip()
-        if requested_phase in LIFECYCLE_RUNTIME_EXECUTABLE_PHASES:
-            return requested_phase
-        return requested_phase
-
-    def _phase_runtime_agents(
-        project: dict[str, Any],
-        phase: str,
-        latest_run: dict[str, Any] | None,
-    ) -> list[dict[str, Any]]:
-        team_index = _phase_team_index(project, phase)
-        team = list(team_index.values())
-        if not team_index:
-            return []
-        run_id = str(latest_run.get("id", "")) if isinstance(latest_run, dict) else ""
-        phase_status = "available"
-        for entry in project.get("phaseStatuses", []):
-            if isinstance(entry, dict) and entry.get("phase") == phase:
-                phase_status = str(entry.get("status", phase_status))
-                break
-        node_status = _run_node_status_map(latest_run)
-        event_log = _run_event_log(latest_run)
-        latest_event_by_agent: dict[str, dict[str, Any]] = {}
-        latest_event_by_node: dict[str, dict[str, Any]] = {}
-        node_status_by_agent: dict[str, list[str]] = {}
-        for event in event_log:
-            node_id = str(event.get("node_id", "")).strip()
-            agent_id = _resolve_runtime_agent_id(
-                project,
-                phase,
-                node_id=node_id,
-                agent_hint=str(event.get("agent", "")),
-            )
-            if node_id:
-                latest_event_by_node[node_id] = event
-            if agent_id in team_index:
-                latest_event_by_agent[agent_id] = event
-        for node_id, status in node_status.items():
-            agent_id = _resolve_runtime_agent_id(
-                project,
-                phase,
-                node_id=str(node_id),
-                agent_hint=str(latest_event_by_node.get(str(node_id), {}).get("agent", "")),
-            )
-            if agent_id in team_index:
-                node_status_by_agent.setdefault(agent_id, []).append(str(status))
-        skill_records = _phase_records_for_run(project.get("skillInvocations"), phase=phase, run_id=run_id)
-        delegation_records = _phase_records_for_run(project.get("delegations"), phase=phase, run_id=run_id)
-        artifact_records = _phase_records_for_run(project.get("artifacts"), phase=phase, run_id=run_id)
-        latest_skill_by_agent = _latest_record_by_agent(skill_records)
-        latest_delegation_by_agent = _latest_record_by_agent(delegation_records)
-        latest_artifact_by_agent = _latest_record_by_agent(artifact_records, agent_key="producer")
-        status_priority = {"running": 0, "failed": 1, "completed": 2, "idle": 3}
-        agents: list[dict[str, Any]] = []
-        for agent in team:
-            agent_id = str(agent.get("id", "")).strip()
-            if not agent_id:
-                continue
-            status = _runtime_agent_status_from_nodes(
-                node_status_by_agent.get(agent_id, []),
-                observed=(
-                    agent_id in latest_event_by_agent
-                    or (
-                        phase_status == "completed"
-                        and (agent_id in latest_skill_by_agent or agent_id in latest_artifact_by_agent)
-                    )
-                ),
-            )
-            latest_delegation = latest_delegation_by_agent.get(agent_id)
-            latest_skill = latest_skill_by_agent.get(agent_id)
-            latest_artifact = latest_artifact_by_agent.get(agent_id)
-            current_task = str(agent.get("role", "")).strip() or f"{str(agent.get('label', agent_id))} task"
-            if isinstance(latest_skill, dict):
-                summary = str(latest_skill.get("summary", "")).strip()
-                if summary:
-                    current_task = _runtime_human_task_summary(summary, current_task)
-            if isinstance(latest_delegation, dict):
-                current_task = _delegation_focus(latest_delegation)
-            if status == "running" and not isinstance(latest_delegation, dict) and not isinstance(latest_skill, dict):
-                event = latest_event_by_agent.get(agent_id) or {}
-                node_id = str(event.get("node_id", "")).strip()
-                current_focus = _runtime_node_focus(node_id, agent)
-                if current_focus:
-                    current_task = f"{current_focus} を実行中"
-            current_task = _runtime_human_task_summary(current_task, str(agent.get("role", "")).strip())
-            agents.append(
-                {
-                    "agentId": agent_id,
-                    "label": str(agent.get("label", agent_id)),
-                    "role": str(agent.get("role", "")).strip(),
-                    "status": status,
-                    "currentTask": current_task,
-                    "delegatedTo": (
-                        str(latest_delegation.get("peer", "")).strip()
-                        if isinstance(latest_delegation, dict) and str(latest_delegation.get("peer", "")).strip()
-                        else None
-                    ),
-                    "lastArtifactTitle": (
-                        str(latest_artifact.get("title", "")).strip()
-                        if isinstance(latest_artifact, dict) and str(latest_artifact.get("title", "")).strip()
-                        else None
-                    ),
-                }
-            )
-        agents.sort(key=lambda item: (status_priority.get(str(item.get("status", "idle")), 9), str(item.get("label", ""))))
-        return agents
-
-    def _phase_runtime_recent_actions(
-        project: dict[str, Any],
-        phase: str,
-        latest_run: dict[str, Any] | None,
-    ) -> list[dict[str, Any]]:
-        event_log = _run_event_log(latest_run)
-        team_index = _phase_team_index(project, phase)
-        agents = {str(item.get("agentId", "")): item for item in _phase_runtime_agents(project, phase, latest_run)}
-        if not event_log:
-            planned_actions: list[dict[str, Any]] = []
-            status_priority = {"running": 0, "failed": 1, "completed": 2, "idle": 3}
-            for agent in agents.values():
-                agent_id = str(agent.get("agentId", "")).strip()
-                if not agent_id:
-                    continue
-                summary = str(agent.get("currentTask", "")).strip()
-                if not summary:
-                    continue
-                planned_actions.append(
-                    {
-                        "nodeId": agent_id,
-                        "label": str(agent.get("label", "")).strip() or agent_id,
-                        "status": str(agent.get("status", "idle") or "idle"),
-                        "summary": summary,
-                        "agent": agent_id,
-                        "agentLabel": str(agent.get("label", "")).strip() or None,
-                        "nodeLabel": _runtime_node_focus(agent_id, team_index.get(agent_id)),
-                    }
-                )
-            planned_actions.sort(
-                key=lambda item: (
-                    status_priority.get(str(item.get("status", "idle")), 9),
-                    str(item.get("label", "")),
-                )
-            )
-            return planned_actions[:5]
-        node_status = _run_node_status_map(latest_run)
-        recent_actions: list[dict[str, Any]] = []
-        seen_node_ids: set[str] = set()
-        for event in reversed(event_log):
-            node_id = str(event.get("node_id", "")).strip()
-            if not node_id or node_id in seen_node_ids:
-                continue
-            seen_node_ids.add(node_id)
-            agent_id = _resolve_runtime_agent_id(
-                project,
-                phase,
-                node_id=node_id,
-                agent_hint=str(event.get("agent", "")),
-            )
-            agent = agents.get(agent_id, {})
-            label = str(agent.get("label", "")).strip() or str(team_index.get(agent_id, {}).get("label", "")).strip() or node_id
-            summary = _runtime_human_task_summary(
-                str(agent.get("currentTask", "")).strip() or str(event.get("agent", "")).strip() or node_id,
-                node_id,
-            )
-            recent_actions.append(
-                {
-                    "nodeId": node_id,
-                    "label": label,
-                    "status": str(node_status.get(node_id, "completed") or "completed"),
-                    "summary": summary,
-                    "agent": str(agent_id).strip() or None,
-                    "agentLabel": str(agent.get("label", "")).strip() or None,
-                    "nodeLabel": _runtime_node_focus(node_id, team_index.get(agent_id)),
-                }
-            )
-            if len(recent_actions) == 5:
-                break
-        return recent_actions
-
-    def _lifecycle_phase_runtime_summary(
-        project: dict[str, Any],
-        phase: str,
-        *,
-        latest_run: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        phase_status = "available"
-        for entry in project.get("phaseStatuses", []):
-            if isinstance(entry, dict) and entry.get("phase") == phase:
-                phase_status = str(entry.get("status", phase_status))
-                break
-        summary: dict[str, Any] = {
-            "phase": phase,
-            "status": phase_status,
-            "blockingSummary": [],
-            "canAutorun": bool((project.get("nextAction") or {}).get("canAutorun")),
-        }
-        next_action = project.get("nextAction")
-        if isinstance(next_action, dict) and next_action.get("phase") == phase:
-            objective = next_action.get("title") or next_action.get("reason")
-            if isinstance(objective, str) and objective.strip():
-                summary["objective"] = objective.strip()
-            reason = str(next_action.get("reason", "")).strip()
-            if reason:
-                summary["nextAutomaticAction"] = reason
-        summary["agents"] = _phase_runtime_agents(project, phase, latest_run)
-        summary["recentActions"] = _phase_runtime_recent_actions(project, phase, latest_run)
-        if phase != "research":
-            return summary
-        research = project.get("research")
-        if not isinstance(research, dict):
-            return summary
-        readiness = research.get("readiness")
-        if isinstance(readiness, str) and readiness:
-            summary["readiness"] = readiness
-        quality_gates = research.get("quality_gates")
-        if isinstance(quality_gates, list):
-            failed_gates = [
-                gate for gate in quality_gates
-                if isinstance(gate, dict) and gate.get("passed") is not True
-            ]
-            summary["failedGateCount"] = len(failed_gates)
-            if not summary["blockingSummary"]:
-                summary["blockingSummary"] = [
-                    str(gate.get("reason", "")).strip()
-                    for gate in failed_gates
-                    if str(gate.get("reason", "")).strip()
-                ][:3]
-        node_results = research.get("node_results")
-        if isinstance(node_results, list):
-            summary["degradedNodeCount"] = len([
-                item
-                for item in node_results
-                if isinstance(item, dict) and str(item.get("status", "success")) != "success"
-            ])
-        autonomous_remediation = research.get("autonomous_remediation")
-        if isinstance(autonomous_remediation, dict):
-            if isinstance(autonomous_remediation.get("objective"), str) and autonomous_remediation.get("objective", "").strip():
-                summary["objective"] = str(autonomous_remediation["objective"]).strip()
-            if isinstance(autonomous_remediation.get("attemptCount"), int):
-                summary["attemptCount"] = int(autonomous_remediation["attemptCount"])
-            if isinstance(autonomous_remediation.get("maxAttempts"), int):
-                summary["maxAttempts"] = int(autonomous_remediation["maxAttempts"])
-            if not summary["blockingSummary"]:
-                summary["blockingSummary"] = [
-                    str(item).strip()
-                    for item in autonomous_remediation.get("blockingSummary", [])
-                    if str(item).strip()
-                ][:3]
-        remediation_plan = research.get("remediation_plan")
-        if isinstance(remediation_plan, dict) and not summary.get("objective"):
-            objective = str(remediation_plan.get("objective", "")).strip()
-            if objective:
-                summary["objective"] = objective
-        return summary
-
-    def _lifecycle_active_phase_runtime_summary(
-        project: dict[str, Any],
-        *,
-        requested_phase: str,
-        active_phase: str,
-        active_run: dict[str, Any] | None,
-    ) -> dict[str, Any]:
-        return _lifecycle_phase_runtime_summary(
-            project,
-            active_phase or requested_phase,
-            latest_run=active_run,
-        )
-
-    def _lifecycle_runtime_payload(
-        project: dict[str, Any],
-        *,
-        phase: str,
-        active_phase: str,
-        latest_run: dict[str, Any] | None = None,
-        observed_run: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        return {
-            "updatedAt": project.get("updatedAt", project.get("createdAt", "")),
-            "savedAt": project.get("savedAt", project.get("updatedAt", project.get("createdAt", ""))),
-            "phaseStatuses": list(project.get("phaseStatuses", [])),
-            "nextAction": _runtime_safe_next_action(project.get("nextAction") if isinstance(project.get("nextAction"), dict) else None),
-            "autonomyState": (
-                dict(project.get("autonomyState") or {})
-                if project.get("autonomyState") is not None
-                else None
-            ),
-            "observedPhase": phase,
-            "activePhase": active_phase,
-            "phaseSummary": _lifecycle_phase_runtime_summary(project, phase, latest_run=observed_run),
-            "activePhaseSummary": _lifecycle_active_phase_runtime_summary(
-                project,
-                requested_phase=phase,
-                active_phase=active_phase,
-                active_run=latest_run,
-            ),
-        }
-
     def _workflow_run_live_payload(run: dict[str, Any] | None, *, phase: str | None = None) -> dict[str, Any] | None:
         if run is None:
             return None
@@ -2068,11 +2277,11 @@ def register_routes(
             if project_record is None:
                 break
             project_payload = _lifecycle_project_payload(project_record)
-            active_phase = _runtime_active_phase(project_payload, phase)
+            active_phase = runtime_active_phase(project_payload, phase)
             active_workflow_id = _lifecycle_workflow_id(project_id, active_phase)
             observed_run = _latest_workflow_run_payload(tenant_id, workflow_id)
             active_run = observed_run if active_phase == phase else _latest_workflow_run_payload(tenant_id, active_workflow_id)
-            runtime_payload = _lifecycle_runtime_payload(
+            runtime_payload = lifecycle_runtime_payload(
                 project_payload,
                 phase=phase,
                 active_phase=active_phase,
@@ -4469,6 +4678,35 @@ def register_routes(
         records.sort(key=lambda item: str(item.get("id", "")))
         return Response(body={"sources": records, "count": len(records)})
 
+    def list_skill_import_jobs(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        source_id = _query_string(request, "source_id", "")
+        jobs = _list_skill_import_jobs(tenant_id=tenant_id, source_id=source_id)
+        return Response(body={"jobs": jobs, "count": len(jobs)})
+
+    def get_skill_import_summary(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        source_id = _query_string(request, "source_id", "")
+        if source_id:
+            payload = _get_skill_source_record(source_id, tenant_id=tenant_id)
+            if payload is None:
+                return Response(status_code=404, body={"error": f"Skill source not found: {source_id}"})
+        return Response(body=_skill_import_summary_payload(tenant_id=tenant_id, source_id=source_id))
+
+    def get_skill_import_job(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        job_id = request.path_params.get("job_id", "")
+        payload = _get_skill_import_job(job_id, tenant_id=tenant_id)
+        if payload is None:
+            return Response(status_code=404, body={"error": f"Skill import job not found: {job_id}"})
+        return Response(body=payload)
+
     def create_skill_source(request: Request) -> Response:
         tenant_id = _require_tenant_id(request)
         if tenant_id is None:
@@ -4481,21 +4719,27 @@ def register_routes(
         now = _utc_now_iso()
         payload["created_at"] = now
         payload["updated_at"] = now
-        try:
-            report = compatibility_layer.sync_source(payload)
-        except Exception as exc:
-            payload["status"] = "error"
-            payload["error"] = str(exc)
-            s.put_surface_record("skill_sources", str(payload["id"]), payload)
-            return Response(status_code=400, body={"error": str(exc)})
-        payload["status"] = "ready"
-        payload["source_revision"] = report["source_revision"]
-        payload["adapter_profile"] = report["adapter_profile"]
-        payload["source_format"] = report["source_format"]
-        payload["updated_at"] = _utc_now_iso()
         s.put_surface_record("skill_sources", str(payload["id"]), payload)
-        skill_runtime.rescan(tenant_id=tenant_id)
-        return Response(status_code=201, body=_skill_source_payload(payload))
+        if _query_bool(request, "async", default=False):
+            queued_payload = dict(payload)
+            queued_payload["status"] = "queued"
+            queued_payload["updated_at"] = _utc_now_iso()
+            s.put_surface_record("skill_sources", str(payload["id"]), queued_payload)
+            job = _enqueue_skill_import_job(
+                source_payload=queued_payload,
+                tenant_id=tenant_id,
+                operation="create",
+            )
+            return Response(
+                status_code=202,
+                headers={"location": v1(f"/skill-import-jobs/{job['id']}")},
+                body={"job": job, "source": _skill_source_payload(queued_payload)},
+            )
+        try:
+            synced_source, report = _perform_skill_source_sync(payload, tenant_id=tenant_id)
+        except Exception as exc:
+            return Response(status_code=400, body={"error": str(exc)})
+        return Response(status_code=201, body=_skill_source_payload(synced_source))
 
     def get_skill_source(request: Request) -> Response:
         tenant_id = _require_tenant_id(request)
@@ -4515,23 +4759,26 @@ def register_routes(
         payload = _get_skill_source_record(source_id, tenant_id=tenant_id)
         if payload is None:
             return Response(status_code=404, body={"error": f"Skill source not found: {source_id}"})
+        if _query_bool(request, "async", default=False):
+            queued_payload = dict(payload)
+            queued_payload["status"] = "queued"
+            queued_payload["updated_at"] = _utc_now_iso()
+            s.put_surface_record("skill_sources", source_id, queued_payload)
+            job = _enqueue_skill_import_job(
+                source_payload=queued_payload,
+                tenant_id=tenant_id,
+                operation="scan",
+            )
+            return Response(
+                status_code=202,
+                headers={"location": v1(f"/skill-import-jobs/{job['id']}")},
+                body={"job": job, "source": _skill_source_payload(queued_payload)},
+            )
         try:
-            report = compatibility_layer.sync_source(payload)
+            synced_source, report = _perform_skill_source_sync(payload, tenant_id=tenant_id)
         except Exception as exc:
-            payload["status"] = "error"
-            payload["error"] = str(exc)
-            payload["updated_at"] = _utc_now_iso()
-            s.put_surface_record("skill_sources", source_id, payload)
             return Response(status_code=400, body={"error": str(exc)})
-        payload["status"] = "ready"
-        payload.pop("error", None)
-        payload["source_revision"] = report["source_revision"]
-        payload["adapter_profile"] = report["adapter_profile"]
-        payload["source_format"] = report["source_format"]
-        payload["updated_at"] = _utc_now_iso()
-        s.put_surface_record("skill_sources", source_id, payload)
-        skill_runtime.rescan(tenant_id=tenant_id)
-        return Response(body={"source": _skill_source_payload(payload), "report": report})
+        return Response(body={"source": _skill_source_payload(synced_source), "report": report})
 
     def list_skill_source_skills(request: Request) -> Response:
         tenant_id = _require_tenant_id(request)
@@ -4556,7 +4803,9 @@ def register_routes(
         payload = _get_skill_source_record(source_id, tenant_id=tenant_id)
         if payload is None:
             return Response(status_code=404, body={"error": f"Skill source not found: {source_id}"})
-        candidates = compatibility_layer.list_tool_candidates(source_id)
+        candidates = _list_skill_tool_candidate_records(source_id, tenant_id=tenant_id)
+        if not candidates:
+            candidates = _sync_skill_tool_candidate_records(source_id, tenant_id=tenant_id)
         states: dict[str, int] = {}
         for candidate in candidates:
             state = str(candidate.get("review", {}).get("state", "pending"))
@@ -4587,46 +4836,44 @@ def register_routes(
                 body={"error": "Field 'state' must be one of ['pending', 'approved', 'rejected']"},
             )
         candidate_id = request.path_params.get("candidate_id", "")
-        try:
-            compatibility_layer.set_tool_candidate_state(
-                source_id=source_id,
-                candidate_id=candidate_id,
-                state=state,
-                note=note,
-            )
-        except KeyError:
+        record_id = _skill_tool_candidate_record_id(tenant_id, source_id, candidate_id)
+        candidate_record = s.get_surface_record("skill_tool_candidates", record_id)
+        if candidate_record is None:
             return Response(
                 status_code=404,
                 body={"error": f"Tool candidate not found: {candidate_id}"},
             )
-        except ValueError as exc:
-            return Response(status_code=422, body={"error": str(exc)})
+        updated_candidate_record = dict(candidate_record)
+        review = dict(updated_candidate_record.get("review", {}))
+        if state == "pending":
+            review["state"] = "pending"
+            review["note"] = ""
+            review["decided_at"] = ""
+            review["decision_source"] = "none"
+        else:
+            review["state"] = state
+            review["note"] = note
+            review["decided_at"] = _utc_now_iso()
+            review["decision_source"] = "manual"
+        review.setdefault("candidate_id", candidate_id)
+        updated_candidate_record["review"] = review
+        updated_candidate_record["updated_at"] = _utc_now_iso()
+        s.put_surface_record("skill_tool_candidates", record_id, updated_candidate_record)
         try:
-            report = compatibility_layer.sync_source(payload)
+            synced_source, report = _perform_skill_source_sync(payload, tenant_id=tenant_id)
         except Exception as exc:
-            payload["status"] = "error"
-            payload["error"] = str(exc)
-            payload["updated_at"] = _utc_now_iso()
-            s.put_surface_record("skill_sources", source_id, payload)
             return Response(status_code=400, body={"error": str(exc)})
-        payload["status"] = "ready"
-        payload.pop("error", None)
-        payload["source_revision"] = report["source_revision"]
-        payload["adapter_profile"] = report["adapter_profile"]
-        payload["source_format"] = report["source_format"]
-        payload["updated_at"] = _utc_now_iso()
-        s.put_surface_record("skill_sources", source_id, payload)
-        skill_runtime.rescan(tenant_id=tenant_id)
+        updated_candidates = _sync_skill_tool_candidate_records(source_id, tenant_id=tenant_id)
         updated_candidate = next(
             (
                 item
-                for item in compatibility_layer.list_tool_candidates(source_id)
+                for item in updated_candidates
                 if str(item.get("candidate_id", "")) == candidate_id
             ),
             None,
         )
         return Response(body={
-            "source": _skill_source_payload(payload),
+            "source": _skill_source_payload(synced_source),
             "candidate": updated_candidate,
             "report": report,
         })
@@ -5492,6 +5739,9 @@ def register_routes(
     _public("GET", v1("/skills"), list_skills, all_of=("agents:read",))
     _public("GET", v1("/skills/categories"), list_skill_categories, all_of=("agents:read",))
     _public("POST", v1("/skills/scan"), scan_skills, all_of=("agents:read",))
+    _public("GET", v1("/skill-import/summary"), get_skill_import_summary, all_of=("agents:read",))
+    _public("GET", v1("/skill-import-jobs"), list_skill_import_jobs, all_of=("agents:read",))
+    _public("GET", v1("/skill-import-jobs/{job_id}"), get_skill_import_job, all_of=("agents:read",))
     _public("GET", v1("/skill-sources"), list_skill_sources, all_of=("agents:read",))
     _public("POST", v1("/skill-sources"), create_skill_source, all_of=("agents:write",))
     _public("GET", v1("/skill-sources/{source_id}"), get_skill_source, all_of=("agents:read",))

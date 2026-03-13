@@ -116,6 +116,8 @@ class SkillRecord:
     max_prompt_chars: int = 5000
     digest: str = ""
     references: tuple[str, ...] = ()
+    reference_assets: tuple[dict[str, Any], ...] = ()
+    default_reference_bundle: tuple[str, ...] = ()
     context_contracts: tuple[dict[str, Any], ...] = ()
     source_id: str = ""
     source_revision: str = ""
@@ -165,6 +167,8 @@ class SkillRecord:
             "toolsets": list(self.toolsets),
             "digest": self.digest,
             "references": list(self.references),
+            "reference_assets": [dict(item) for item in self.reference_assets],
+            "default_reference_bundle": list(self.default_reference_bundle),
             "context_contracts": [dict(item) for item in self.context_contracts],
             "source_id": self.source_id,
             "source_revision": self.source_revision,
@@ -229,7 +233,9 @@ class EffectiveSkillSet:
     available_tools: tuple[ResolvedSkillTool, ...] = ()
     unavailable_tools: tuple[ResolvedSkillTool, ...] = ()
     loaded_contexts: tuple[dict[str, Any], ...] = ()
+    loaded_references: tuple[dict[str, Any], ...] = ()
     context_warnings: tuple[str, ...] = ()
+    reference_warnings: tuple[str, ...] = ()
 
     @property
     def skill_ids(self) -> list[str]:

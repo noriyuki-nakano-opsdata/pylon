@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
   RefreshCw, ArrowLeft, MessageSquare, BarChart3, Lightbulb, Zap, RotateCcw,
@@ -9,13 +9,21 @@ import {
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { lifecycleApi } from "@/api/lifecycle";
+import { buildFeedbackPayload } from "@/lifecycle/inputs";
 import type { FeedbackItem } from "@/types/lifecycle";
-import { useLifecycle } from "./LifecycleContext";
+import { useLifecycleActions, useLifecycleState } from "./LifecycleContext";
+import {
+  selectCompletedPhaseCount,
+  selectSelectedDesign,
+  selectSelectedFeatures,
+  selectSortedFeedbackItems,
+} from "@/lifecycle/selectors";
 
 export function IteratePhase() {
   const navigate = useNavigate();
   const { projectSlug } = useParams();
-  const lc = useLifecycle();
+  const lc = useLifecycleState();
+  const actions = useLifecycleActions();
   const [feedbackText, setFeedbackText] = useState("");
   const [feedbackType, setFeedbackType] = useState<FeedbackItem["type"]>("improvement");
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -26,13 +34,11 @@ export function IteratePhase() {
     if (!projectSlug || !feedbackText.trim()) return;
     setIsSubmitting(true);
     try {
-      const impact = feedbackType === "bug" ? "high" : feedbackType === "feature" ? "medium" : "low";
-      const response = await lifecycleApi.addFeedback(projectSlug, {
-        text: feedbackText,
-        type: feedbackType,
-        impact,
-      });
-      lc.applyProject(response.project);
+      const response = await lifecycleApi.addFeedback(
+        projectSlug,
+        buildFeedbackPayload(feedbackType, feedbackText),
+      );
+      actions.applyProject(response.project);
       setFeedbackText("");
     } finally {
       setIsSubmitting(false);
@@ -44,7 +50,7 @@ export function IteratePhase() {
     setVotingId(feedbackId);
     try {
       const response = await lifecycleApi.voteFeedback(projectSlug, feedbackId, delta);
-      lc.applyProject(response.project);
+      actions.applyProject(response.project);
     } finally {
       setVotingId(null);
     }
@@ -66,22 +72,16 @@ export function IteratePhase() {
     bug: "バグ", feature: "機能要望", improvement: "改善", praise: "良い点",
   };
 
-  const sorted = [...lc.feedbackItems].sort((a, b) => b.votes - a.votes);
+  const sorted = selectSortedFeedbackItems(lc);
 
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
     research: false, planning: false, design: false, development: false, deploy: false,
   });
   const toggleSection = (key: string) => setExpandedSections((prev) => ({ ...prev, [key]: !prev[key] }));
 
-  const selectedDesign = useMemo(
-    () => lc.selectedDesignId ? lc.designVariants.find((v) => v.id === lc.selectedDesignId) : null,
-    [lc.selectedDesignId, lc.designVariants],
-  );
-  const selectedFeatures = useMemo(() => lc.features.filter((f) => f.selected), [lc.features]);
-  const completedPhases = useMemo(
-    () => lc.phaseStatuses.filter((p) => p.status === "completed").length,
-    [lc.phaseStatuses],
-  );
+  const selectedDesign = selectSelectedDesign(lc);
+  const selectedFeatures = selectSelectedFeatures(lc);
+  const completedPhases = selectCompletedPhaseCount(lc);
   const [showPreview, setShowPreview] = useState(false);
 
   return (

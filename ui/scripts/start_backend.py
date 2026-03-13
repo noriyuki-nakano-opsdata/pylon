@@ -29,6 +29,11 @@ if env_file.exists():
                     os.environ[k] = v
 
 import anthropic
+try:
+    from ui.scripts.dev_seed_agents import upsert_seeded_agents as reconcile_seeded_agents
+except ModuleNotFoundError:
+    from dev_seed_agents import upsert_seeded_agents as reconcile_seeded_agents
+
 from pylon.api.factory import (
     APIServerConfig,
     APIMiddlewareConfig,
@@ -45,6 +50,7 @@ from pylon.runtime.llm import ProviderRegistry
 client_anthropic = anthropic.Anthropic()
 MODEL = "claude-sonnet-4-6"
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
+AUTONOMOUS_REVIEWER_NAME = "milestone-reviewer"
 
 import openai as _openai
 client_openai = _openai.OpenAI()
@@ -533,6 +539,7 @@ _AGENT_DEFAULT_SKILLS: dict[str, list[str]] = {
     "backend-coder": ["code-review", "api-designer"],
     "fullstack-builder": ["code-review", "api-designer"],
     "reviewer": ["code-review", "security-scan"],
+    AUTONOMOUS_REVIEWER_NAME: ["code-review", "security-scan"],
     "tester": ["test-generator"],
     "devops-engineer": ["deployment-helper"],
     "ui-designer": [],
@@ -564,22 +571,18 @@ def _agent_team(name: str) -> str:
     if "security" in n: return "security"
     return "product"
 
-for agent_def in _agents_to_register:
-    agent_id = uuid.uuid4().hex[:12]
-    route_store.agents[agent_id] = {
-        "id": agent_id,
-        "name": agent_def["name"],
-        "model": agent_def["model"],
-        "role": agent_def["role"],
-        "autonomy": agent_def["autonomy"],
-        "tools": agent_def["tools"],
-        "sandbox": agent_def["sandbox"],
-        "status": "ready",
-        "tenant_id": "default",
-        "team": _agent_team(agent_def["name"]),
-        "skills": _AGENT_DEFAULT_SKILLS.get(agent_def["name"], []),
-    }
-print(f"Agents: {len(_agents_to_register)} registered")
+seed_summary = reconcile_seeded_agents(
+    route_store.agents,
+    [(f"core:{agent_def['name']}", agent_def) for agent_def in _agents_to_register],
+    tenant_id="default",
+    team_for_name=_agent_team,
+    default_skills_by_name=_AGENT_DEFAULT_SKILLS,
+    prune_prefixes=("core:",),
+)
+print(
+    "Agents: reconciled seeded registry",
+    f"(desired={seed_summary['desired']}, updated={seed_summary['updated']}, removed_duplicates={seed_summary['removed_duplicates']}, pruned={seed_summary['pruned']})",
+)
 
 # ── Register demo workflow ─────────────────────────────
 from pylon.dsl.parser import PylonProject
@@ -1001,7 +1004,7 @@ def autonomous_review_handler(node_id: str, state: dict) -> dict:
     selected_features = state.get("selected_features", [])
     iteration = state.get("_build_iteration", 0)
 
-    _track_task(task_id=f"wf_{node_id}", title="自律レビュー", description="マイルストーン達成度とコード品質の評価", status="in_progress", assignee="reviewer", priority="high", phase="autonomous-build", node_id=node_id)
+    _track_task(task_id=f"wf_{node_id}", title="自律レビュー", description="マイルストーン達成度とコード品質の評価", status="in_progress", assignee=AUTONOMOUS_REVIEWER_NAME, priority="high", phase="autonomous-build", node_id=node_id)
     print(f"[auto-review] Iteration {iteration}, reviewing against {len(milestones)} milestones...")
     response = client_anthropic.messages.create(
         model=MODEL, max_tokens=4096,
@@ -1055,7 +1058,7 @@ def autonomous_review_handler(node_id: str, state: dict) -> dict:
     )
     cost = (total_in * 3 / 1_000_000) + (total_out * 15 / 1_000_000)
 
-    _track_task(task_id=f"wf_{node_id}", title="自律レビュー", description="", status="done" if all_met else "backlog", assignee="reviewer")
+    _track_task(task_id=f"wf_{node_id}", title="自律レビュー", description="", status="done" if all_met else "backlog", assignee=AUTONOMOUS_REVIEWER_NAME)
     print(f"[auto-review] Done. All milestones met: {all_met}, quality: {quality:.2f}, cost: ${cost:.4f}")
     return {
         "review": review,
@@ -1089,7 +1092,7 @@ try:
                 "tools": ["file-write"],
                 "sandbox": "docker",
             },
-            "reviewer": {
+            AUTONOMOUS_REVIEWER_NAME: {
                 "model": f"anthropic/{MODEL}",
                 "role": "QA reviewer evaluating code against milestones",
                 "autonomy": "A3",
@@ -1103,7 +1106,7 @@ try:
                 "plan": {"agent": "architect", "node_type": "agent", "next": "build"},
                 "build": {"agent": "builder", "node_type": "agent", "next": "review"},
                 "review": {
-                    "agent": "reviewer",
+                    "agent": AUTONOMOUS_REVIEWER_NAME,
                     "node_type": "loop",
                     "loop_max_iterations": 5,
                     "loop_criterion": "state_value",
@@ -1124,16 +1127,25 @@ try:
             "review": autonomous_review_handler,
         },
     )
-    # Also add reviewer agent
-    reviewer_id = uuid.uuid4().hex[:12]
-    route_store.agents[reviewer_id] = {
-        "id": reviewer_id, "name": "reviewer",
-        "model": f"anthropic/{MODEL}",
-        "role": "QA reviewer evaluating code against milestones",
-        "autonomy": "A3", "tools": [], "sandbox": "gvisor",
-        "status": "ready", "tenant_id": "default",
-        "skills": _AGENT_DEFAULT_SKILLS.get("reviewer", []),
-    }
+    seed_summary = reconcile_seeded_agents(
+        route_store.agents,
+        [("workflow:autonomous-builder:reviewer", {
+            "name": AUTONOMOUS_REVIEWER_NAME,
+            "model": f"anthropic/{MODEL}",
+            "role": "QA reviewer evaluating code against milestones",
+            "autonomy": "A3",
+            "tools": [],
+            "sandbox": "gvisor",
+        })],
+        tenant_id="default",
+        team_for_name=_agent_team,
+        default_skills_by_name=_AGENT_DEFAULT_SKILLS,
+        prune_prefixes=("workflow:autonomous-builder:",),
+    )
+    print(
+        "Agents: reconciled seeded registry",
+        f"(desired={seed_summary['desired']}, updated={seed_summary['updated']}, removed_duplicates={seed_summary['removed_duplicates']}, pruned={seed_summary['pruned']})",
+    )
     print(f"Workflow: autonomous-builder registered (loop review, max 5 iterations)")
 except Exception as e:
     print(f"Warning: Could not register autonomous-builder: {e}")
@@ -2856,8 +2868,11 @@ def _create_team(request: Request) -> Response:
     _teams[team_id] = team
     return Response(status_code=201, body=team)
 
+def _team_path_param(request: Request) -> str:
+    return request.path_params.get("team_id", "") or request.path_params.get("id", "")
+
 def _update_team(request: Request) -> Response:
-    team_id = request.path_params.get("team_id", "")
+    team_id = _team_path_param(request)
     team = _teams.get(team_id)
     if not team:
         return Response(status_code=404, body={"error": "Team not found"})
@@ -2868,7 +2883,7 @@ def _update_team(request: Request) -> Response:
     return Response(body=team)
 
 def _delete_team(request: Request) -> Response:
-    team_id = request.path_params.get("team_id", "")
+    team_id = _team_path_param(request)
     if team_id not in _teams:
         return Response(status_code=404, body={"error": "Team not found"})
     del _teams[team_id]
@@ -3901,6 +3916,12 @@ def _replace_route(method: str, path: str, handler) -> None:
             handler=handler,
         ),
     )
+
+
+_replace_route("GET", "/api/v1/teams", _list_teams)
+_replace_route("POST", "/api/v1/teams", _create_team)
+_replace_route("PATCH", "/api/v1/teams/{id}", _update_team)
+_replace_route("DELETE", "/api/v1/teams/{id}", _delete_team)
 
 def _async_start_workflow_run(request: Request) -> Response:
     """Start a workflow run in a background thread, return immediately."""

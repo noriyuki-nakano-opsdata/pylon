@@ -303,6 +303,69 @@ def test_imported_agent_skill_loads_workspace_context_contract(tmp_path: Path, m
     assert node_event["metrics"]["loaded_skill_contexts"][0]["path"].endswith(
         ".agents/product-marketing-context.md"
     )
+    assert node_event["metrics"]["loaded_skill_references"] == [
+        {
+            "skill_id": "marketingskills-like:analytics-tracking",
+            "path": "references/event-library.md",
+            "title": "Event Library",
+        }
+    ]
+
+
+def test_imported_agent_skill_lazily_loads_reference_assets_from_hints(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo_root = _write_external_skill_repo(tmp_path)
+    import_root = tmp_path / "imports"
+    monkeypatch.setenv("PYLON_SKILL_IMPORT_ROOT", str(import_root))
+    compatibility = SkillCompatibilityLayer(import_root=import_root)
+    compatibility.sync_source(
+        compatibility.normalize_source_payload(
+            {"location": str(repo_root), "kind": "local-dir"},
+            tenant_id="default",
+        )
+    )
+    project = PylonProject.model_validate(
+        {
+            "version": "1",
+            "name": "compat-reference-runtime",
+            "agents": {
+                "assistant": {
+                    "model": "fake/demo",
+                    "role": "Default assistant role.",
+                    "skills": ["analytics-tracking"],
+                }
+            },
+            "workflow": {"nodes": {"start": {"agent": "assistant", "next": "END"}}},
+        }
+    )
+    provider = _CapturingProvider("demo")
+    registry = ProviderRegistry({"fake": lambda model_id: provider})
+    runtime = SkillRuntime(SkillCatalog(skill_dirs=(), refresh_ttl_seconds=0))
+
+    artifacts = execute_project_sync(
+        project,
+        input_data={
+            "prompt": "Audit our tracking",
+            "skill_reference_hints": {
+                "analytics-tracking": ["references/event-library.md"],
+            },
+        },
+        workflow_id="compat-reference-runtime",
+        provider_registry=registry,
+        skill_runtime=runtime,
+    )
+
+    assert any("Track important events." in message for message in provider.system_messages)
+    node_event = artifacts.run.event_log[0]
+    assert node_event["metrics"]["loaded_skill_references"] == [
+        {
+            "skill_id": "marketingskills-like:analytics-tracking",
+            "path": "references/event-library.md",
+            "title": "Event Library",
+        }
+    ]
 
 
 def test_sync_source_uses_single_checkout_and_persists_snapshot_metadata(

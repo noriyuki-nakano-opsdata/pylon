@@ -110,6 +110,11 @@ class CompatibilityAdapter(ABC):
         external_name = str(frontmatter.get("name", skill_dir.name)).strip() or skill_dir.name
         skill_id = self.normalize_skill_key(external_name=external_name, skill_dir=skill_dir)
         references = self.build_references(skill_dir=skill_dir, skill_id=skill_id)
+        default_reference_bundle = self.default_reference_bundle(
+            skill_id=skill_id,
+            references=references,
+            body=body,
+        )
         context_contracts = self.build_context_contracts(skill_id=skill_id, body=body)
         tool_candidates = self.build_tool_candidates(
             source_root=source_root,
@@ -138,6 +143,7 @@ class CompatibilityAdapter(ABC):
             content=body,
             version=version or "0.0.1",
             references=tuple(references),
+            default_reference_bundle=tuple(default_reference_bundle),
             context_contracts=tuple(context_contracts),
             tool_candidates=tuple(tool_candidates),
             inference_log=tuple(inference_log),
@@ -184,6 +190,15 @@ class CompatibilityAdapter(ABC):
         for contract in contracts:
             deduped[contract.contract_id] = contract
         return list(deduped.values())
+
+    def default_reference_bundle(
+        self,
+        *,
+        skill_id: str,
+        references: list[ImportedReference],
+        body: str,
+    ) -> list[str]:
+        return []
 
     def build_tool_candidates(self, *, source_root: Path, skill_id: str) -> list[ToolCandidate]:
         return []

@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import json
 import re
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from urllib.parse import parse_qs, urlsplit
 
 
@@ -83,6 +84,7 @@ class APIServer:
     def __init__(self) -> None:
         self._routes: list[_Route] = []
         self._middlewares: list[Middleware] = []
+        self._shutdown_hooks: list[Callable[[], None]] = []
 
     def add_route(self, method: str, path: str, handler: HandlerFunc) -> None:
         """Register a route handler."""
@@ -98,6 +100,18 @@ class APIServer:
     def add_middleware(self, middleware: Middleware) -> None:
         """Add middleware (executed in registration order)."""
         self._middlewares.append(middleware)
+
+    def add_shutdown_hook(self, hook: Callable[[], None]) -> None:
+        """Register a callback that runs when the server shuts down."""
+        self._shutdown_hooks.append(hook)
+
+    def shutdown(self) -> None:
+        """Run registered shutdown hooks in reverse registration order."""
+        for hook in reversed(self._shutdown_hooks):
+            try:
+                hook()
+            except Exception:  # pragma: no cover - defensive lifecycle cleanup
+                logging.getLogger(__name__).exception("APIServer shutdown hook failed")
 
     def list_routes(self) -> list[tuple[str, str]]:
         """Return registered routes as (method, path_template) pairs."""

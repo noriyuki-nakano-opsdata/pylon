@@ -8,10 +8,34 @@ import {
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { useLifecycle } from "./LifecycleContext";
+import { useLifecycleActions, useLifecycleState } from "./LifecycleContext";
 import { lifecycleApi } from "@/api/lifecycle";
 import { AgentProgressView } from "@/components/lifecycle/AgentProgressView";
 import { useWorkflowRun } from "@/hooks/useWorkflowRun";
+import {
+  formatAutonomousRemediationStatus,
+  formatClaimCategory,
+  formatClaimStatus,
+  formatDissentSeverity,
+  formatNodeStatus,
+  formatParseStatus,
+  formatResearchDegradationReason,
+  formatResearchGateTitle,
+  formatResearchNodeLabel,
+  formatSourceClassLabel,
+  polishResearchCopy,
+} from "@/lifecycle/presentation";
+import {
+  selectPhaseStatus,
+  selectResearchProgressState,
+  selectResearchReadinessState,
+  selectResearchRuntimeSummary,
+  selectResearchRuntimeTelemetry,
+} from "@/lifecycle/selectors";
+import {
+  buildResearchProjectPatch,
+  buildResearchWorkflowInput,
+} from "@/lifecycle/inputs";
 import type {
   MarketResearch,
   ResearchNodeResult,
@@ -26,78 +50,6 @@ const RESEARCH_AGENTS = [
   { id: "tech-evaluator", label: "技術評価" },
   { id: "research-synthesizer", label: "統合分析" },
 ];
-
-const RESEARCH_NODE_LABELS: Record<string, string> = {
-  "competitor-analyst": "競合分析",
-  "market-researcher": "市場調査",
-  "user-researcher": "ユーザー調査",
-  "tech-evaluator": "技術評価",
-  "research-synthesizer": "統合分析",
-  "evidence-librarian": "根拠整理",
-  "devils-advocate-researcher": "反証レビュー",
-  "cross-examiner": "相互検証",
-  "research-judge": "最終判定",
-};
-
-const SOURCE_CLASS_LABELS: Record<string, string> = {
-  vendor_page: "競合の製品ページ",
-  pricing_page: "料金ページ",
-  integration_doc: "導入 / 連携ドキュメント",
-  market_report: "市場レポート",
-  user_signal: "ユーザーシグナル",
-  secondary_user_source: "補助的なユーザー情報",
-  technical_source: "技術ソース",
-};
-
-const CLAIM_STATUS_LABELS: Record<string, string> = {
-  accepted: "採択",
-  blocked: "要再検討",
-  contested: "反証あり",
-  provisional: "仮置き",
-};
-
-const CLAIM_CATEGORY_LABELS: Record<string, string> = {
-  competition: "競合",
-  market: "市場",
-  user: "ユーザー",
-  technical: "技術",
-  research: "調査",
-};
-
-const PARSE_STATUS_LABELS: Record<string, string> = {
-  strict: "JSON厳密",
-  repaired: "JSON修復",
-  fallback: "フォールバック",
-  failed: "解析失敗",
-};
-
-const NODE_STATUS_LABELS: Record<string, string> = {
-  success: "正常",
-  degraded: "要再確認",
-  failed: "失敗",
-};
-
-const DISSENT_SEVERITY_LABELS: Record<string, string> = {
-  critical: "重大",
-  high: "高",
-  medium: "中",
-  low: "低",
-};
-
-const AUTONOMOUS_REMEDIATION_STATUS_LABELS: Record<string, string> = {
-  not_needed: "不要",
-  queued: "自動補完を継続予定",
-  retrying: "自動補完中",
-  resolved: "自動補完で解消",
-  blocked: "自動補完の上限に到達",
-};
-
-const DEGRADATION_REASON_LABELS: Record<string, string> = {
-  llm_json_parse_failed: "LLM 応答を構造化できませんでした",
-  llm_response_repaired: "LLM 応答を JSON として修復しました",
-  empty_llm_response: "LLM 応答が空でした",
-  critical_dissent_unresolved: "重大な反証が未解決です",
-};
 
 const STRUCTURED_TEXT_KEYS = [
   "question",
@@ -127,58 +79,6 @@ function formatCompetitorHost(raw: string): string {
   } catch {
     return raw;
   }
-}
-
-function stripSourceLead(text: string): string {
-  let next = text.replace(/\*\*/g, "").replace(/^#+\s*/, "").trim();
-  if (next.includes(": #")) {
-    next = next.split(": #").slice(-1)[0]?.trim() ?? next;
-  }
-  const parts = next.split(":");
-  if (parts.length >= 3) {
-    const head = parts[0]?.trim();
-    const tail = parts.slice(1).join(":").trim();
-    if (head && tail.toLowerCase().startsWith(head.toLowerCase())) {
-      next = tail;
-    }
-  }
-  if (next.includes("**")) {
-    next = next.split("**").slice(-1)[0]?.trim() ?? next;
-  }
-  const japaneseIndex = next.search(/[ぁ-んァ-ヶ一-龠]/u);
-  if (japaneseIndex > 16) {
-    const prefix = next.slice(0, japaneseIndex);
-    if (/^[ -~\s:;,.#\-$()%/]+$/.test(prefix)) {
-      next = next.slice(japaneseIndex).trim();
-    }
-  }
-  return next;
-}
-
-function polishResearchCopy(value: string): string {
-  return stripSourceLead(value)
-    .replace(/\s+/g, " ")
-    .replace("外部 URL に grounded された evidence が不足しています。", "外部 URL の根拠が不足しています。")
-    .replace("external url evidence is missing", "外部 URL の根拠が不足しています")
-    .replace("主要仮説に対する反証が生成されています。", "主要仮説に対する反証は確保できています。")
-    .replace("低下したノード", "要再確認ノード")
-    .replace(/Research needs rework/gi, "調査結果の見直しが必要です")
-    .replace(/confidence floor/gi, "信頼度下限")
-    .replace(/winning theses?/gi, "有力仮説")
-    .replace(/\bthesis\b/gi, "仮説")
-    .replace(/critical dissent/gi, "重大な反証")
-    .replace(/\bdissent\b/gi, "反証")
-    .replace(/\bevidence\b/gi, "根拠")
-    .replace(/\bgrounded\b/gi, "紐づいた")
-    .replace(/\bplanning\b/gi, "企画")
-    .replace(/\bdegraded\b/gi, "要再確認")
-    .replace(/\bblocked\b/gi, "未達")
-    .replace(/\bpass\b/gi, "通過")
-    .replace(/有力仮説 数/g, "有力仮説数")
-    .replace(/どの論文も/g, "どの仮説も")
-    .replace(/論文/g, "仮説")
-    .replace(/ゼロの解決が記録された/g, "解決がまだ記録されていない")
-    .trim();
 }
 
 function buildResearchFallback(): MarketResearch {
@@ -301,40 +201,6 @@ function normalizeCopyValue(value: unknown, fallback = "", charLimit = 180): str
   return first ?? fallback;
 }
 
-function formatNodeLabel(nodeId: string): string {
-  return RESEARCH_NODE_LABELS[nodeId] ?? nodeId;
-}
-
-function formatSourceClassLabel(code: string): string {
-  return SOURCE_CLASS_LABELS[code] ?? code;
-}
-
-function formatClaimStatus(status: string): string {
-  return CLAIM_STATUS_LABELS[status] ?? status;
-}
-
-function formatClaimCategory(category: string): string {
-  return CLAIM_CATEGORY_LABELS[category] ?? category;
-}
-
-function formatParseStatus(status: string): string {
-  return PARSE_STATUS_LABELS[status] ?? status;
-}
-
-function formatNodeStatus(status: string): string {
-  return NODE_STATUS_LABELS[status] ?? status;
-}
-
-function formatAutonomousRemediationStatus(status: string): string {
-  return AUTONOMOUS_REMEDIATION_STATUS_LABELS[status] ?? status;
-}
-
-function toAgentProgressStatus(
-  status: "idle" | "running" | "completed" | "failed",
-): "pending" | "running" | "completed" | "failed" {
-  return status === "idle" ? "pending" : status;
-}
-
 function formatRuntimeConnectionState(
   state: "inactive" | "connecting" | "live" | "reconnecting",
 ): string {
@@ -377,40 +243,19 @@ function formatLiveEventStatus(status: WorkflowRunLiveEvent["status"]): string {
   return "待機";
 }
 
-function formatDegradationReason(reason: string): string {
-  if (DEGRADATION_REASON_LABELS[reason]) return DEGRADATION_REASON_LABELS[reason];
-  if (reason.startsWith("missing_source_classes:")) {
-    const values = reason.replace("missing_source_classes:", "").split(",").map((item) => item.trim()).filter(Boolean);
-    return `不足ソース: ${values.map(formatSourceClassLabel).join(" / ")}`;
+function resolveResearchPayload(value: unknown): unknown {
+  if (!value || typeof value !== "object") return value;
+  const research = value as Record<string, unknown>;
+  if (research.view_model && typeof research.view_model === "object") {
+    return research.view_model;
   }
-  if (reason.startsWith("quality_gate_failed:")) {
-    const gateId = reason.replace("quality_gate_failed:", "");
-    const gateLabel: Record<string, string> = {
-      "source-grounding": "外部根拠の接地不足",
-      "critical-dissent-resolved": "重大な反証が未解決",
-      "confidence-floor": "信頼度下限が未達",
-      "critical-node-health": "主要ノードの健全性が未達",
-      "counterclaim-coverage": "反証カバレッジが不足",
-    };
-    return gateLabel[gateId] ?? gateId;
-  }
-  return polishResearchCopy(reason.replaceAll("_", " "));
-}
-
-function formatGateTitle(gateId: string, title: string): string {
-  const labels: Record<string, string> = {
-    "source-grounding": "採択主張が外部根拠に紐づいている",
-    "counterclaim-coverage": "主要仮説に対する反証が確保されている",
-    "critical-dissent-resolved": "重大な反証が未解決のまま残っていない",
-    "confidence-floor": "企画に渡せる信頼度を満たしている",
-    "critical-node-health": "主要ノードが要再確認 / 失敗ではない",
-  };
-  return labels[gateId] ?? polishResearchCopy(title);
+  return value;
 }
 
 function hasResearchContent(value: unknown): boolean {
-  if (!value || typeof value !== "object") return false;
-  const research = value as Record<string, unknown>;
+  const resolved = resolveResearchPayload(value);
+  if (!resolved || typeof resolved !== "object") return false;
+  const research = resolved as Record<string, unknown>;
   return [
     research.market_size,
     research.user_research,
@@ -435,8 +280,9 @@ function normalizeResearch(value: unknown): MarketResearch {
     floor: 0,
     accepted: 0,
   };
-  const research = value && typeof value === "object"
-    ? value as Record<string, unknown>
+  const resolved = resolveResearchPayload(value);
+  const research = resolved && typeof resolved === "object"
+    ? resolved as Record<string, unknown>
     : {};
   const technical = research.tech_feasibility && typeof research.tech_feasibility === "object"
     ? research.tech_feasibility as Record<string, unknown>
@@ -623,7 +469,8 @@ function normalizeResearch(value: unknown): MarketResearch {
 export function ResearchPhase() {
   const navigate = useNavigate();
   const { projectSlug } = useParams();
-  const lc = useLifecycle();
+  const lc = useLifecycleState();
+  const actions = useLifecycleActions();
   const workflow = useWorkflowRun("research", projectSlug ?? "");
   const researchAgents = lc.blueprints.research.team.length > 0
     ? lc.blueprints.research.team.map((agent) => ({ id: agent.id, label: agent.label }))
@@ -656,9 +503,9 @@ export function ResearchPhase() {
     if (syncedRunRef.current === workflow.runId) return;
     syncedRunRef.current = workflow.runId;
     void lifecycleApi.syncPhaseRun(projectSlug, "research", workflow.runId).then(({ project }) => {
-      lc.applyProject(project);
+      actions.applyProject(project);
     });
-  }, [workflow.runId, workflow.status, projectSlug, lc]);
+  }, [actions, workflow.runId, workflow.status, projectSlug]);
 
   const runResearch = async () => {
     if (!lc.spec.trim() || !projectSlug) return;
@@ -672,22 +519,12 @@ export function ResearchPhase() {
     try {
       const response = await lifecycleApi.saveProject(
         projectSlug,
-        {
-          spec: lc.spec.trim(),
-          orchestrationMode: "workflow",
-          autonomyLevel: "A3",
-          researchConfig,
-        },
+        buildResearchProjectPatch(lc, researchConfig),
         { autoRun: false },
       );
-      lc.applyProject(response.project);
-      lc.advancePhase("research");
-      workflow.start({
-        spec: lc.spec.trim(),
-        competitor_urls: researchConfig.competitorUrls,
-        depth: researchConfig.depth,
-        output_language: researchConfig.outputLanguage,
-      });
+      actions.applyProject(response.project);
+      actions.advancePhase("research");
+      workflow.start(buildResearchWorkflowInput(lc, researchConfig));
     } catch (err) {
       setLaunchError(err instanceof Error ? err.message : "調査の開始に失敗しました");
     } finally {
@@ -706,7 +543,7 @@ export function ResearchPhase() {
       setNewUrl("");
       return;
     }
-    lc.setResearchConfig({
+    actions.updateResearchConfig({
       ...lc.researchConfig,
       competitorUrls: [...competitorUrls, trimmed],
     });
@@ -715,7 +552,7 @@ export function ResearchPhase() {
 
   const goNext = () => {
     if (!researchReady) return;
-    lc.completePhase("research");
+    actions.completePhase("research");
     navigate(`/p/${projectSlug}/lifecycle/planning`);
   };
 
@@ -729,97 +566,45 @@ export function ResearchPhase() {
     launchError
     ?? (workflow.status === "failed" ? workflow.error : null)
     ?? completionGapMessage;
-  const researchPhaseStatus = lc.phaseStatuses.find((item) => item.phase === "research")?.status ?? "available";
-  const runtimeResearchSummary =
-    lc.runtimeActivePhase === "research"
-      ? lc.runtimeActivePhaseSummary
-      : lc.runtimePhaseSummary?.phase === "research"
-        ? lc.runtimePhaseSummary
-        : null;
-  const runtimeResearchTelemetry =
-    (lc.runtimeLiveTelemetry?.phase ?? lc.runtimeActivePhase) === "research"
-      ? lc.runtimeLiveTelemetry
-      : null;
-  const runtimeResearchProgress = (runtimeResearchSummary?.agents ?? []).map((agent) => ({
-    nodeId: agent.agentId,
-    agent: agent.label,
-    status: toAgentProgressStatus(agent.status),
-  }));
-  const runtimeResearchStartedAt = runtimeResearchTelemetry?.run?.startedAt
-    ? new Date(runtimeResearchTelemetry.run.startedAt).getTime()
-    : null;
-  const runtimeResearchElapsedMs = runtimeResearchStartedAt
-    ? Math.max(0, liveNow - runtimeResearchStartedAt)
-    : 0;
-  const runtimeRunningNodes = runtimeResearchTelemetry?.runningNodeIds ?? [];
-  const runtimeRecentNodes = runtimeResearchTelemetry?.recentNodeIds ?? [];
-  const runtimeRecentEvents = runtimeResearchTelemetry?.recentEvents ?? [];
-  const runtimeRecentActions = runtimeResearchSummary?.recentActions ?? [];
-  const runtimeAgentCards = (runtimeResearchSummary?.agents ?? []).slice(0, 6);
-  const isRunning =
-    isPreparing
-    || workflow.status === "starting"
-    || workflow.status === "running";
-  const isResearchRunLive =
-    runtimeResearchTelemetry?.run != null
-    && runtimeResearchTelemetry.run.status !== "completed"
-    && runtimeResearchTelemetry.run.status !== "failed";
-  const isInitialResearchRun = !research && (isRunning || isResearchRunLive);
-  const isResearchRefreshRunning = !!research && (isRunning || isResearchRunLive);
-  const visibleProgress = workflow.agentProgress.length > 0
-    ? workflow.agentProgress
-    : runtimeResearchProgress;
-  const runtimeTotalSteps = Math.max(
-    visibleProgress.length,
-    runtimeResearchSummary?.agents?.length ?? 0,
-    1,
-  );
-  const runtimeCompletedSteps = runtimeResearchTelemetry?.completedNodeCount
-    ?? visibleProgress.filter((agent) => agent.status === "completed").length;
-  const runtimeProgressPercent = Math.max(
-    6,
-    Math.min(100, Math.round((runtimeCompletedSteps / runtimeTotalSteps) * 100)),
-  );
+  const researchPhaseStatus = selectPhaseStatus(lc.phaseStatuses, "research");
+  const runtimeResearchSummary = selectResearchRuntimeSummary(lc);
+  const runtimeResearchTelemetry = selectResearchRuntimeTelemetry(lc);
+  const {
+    runtimeElapsedMs: runtimeResearchElapsedMs,
+    runtimeRunningNodes,
+    runtimeRecentNodes,
+    runtimeRecentEvents,
+    runtimeRecentActions,
+    runtimeAgentCards,
+    isRunning,
+    isResearchRunLive,
+    isInitialResearchRun: shouldShowInitialResearchRun,
+    visibleProgress,
+    totalSteps: runtimeTotalSteps,
+    completedSteps: runtimeCompletedSteps,
+    progressPercent: runtimeProgressPercent,
+  } = selectResearchProgressState({
+    workflow,
+    runtimeSummary: runtimeResearchSummary,
+    runtimeTelemetry: runtimeResearchTelemetry,
+    isPreparing,
+    nowMs: liveNow,
+  });
 
   const r = research ?? buildResearchFallback();
-  const hasExternalSources =
-    (r.source_links?.some((link) => /^https?:\/\//i.test(link)) ?? false)
-    || (r.evidence?.some((item) => item.source_type === "url" && /^https?:\/\//i.test(item.source_ref)) ?? false);
-  const hasWinningTheses = (r.winning_theses?.length ?? 0) > 0;
-  const researchReady = !!research && researchPhaseStatus === "completed" && hasExternalSources && hasWinningTheses;
-  const confidenceFloor = r.confidence_summary?.floor ?? 0;
-  const criticalDissentCount =
-    r.critical_dissent_count
-    ?? (r.dissent ?? []).filter((item) => item.severity === "critical" && !item.resolved).length;
-  const autonomousRemediation = r.autonomous_remediation;
-  const nextActionAutoResearch =
-    lc.nextAction?.phase === "research"
-    && lc.nextAction?.type === "run_phase"
-    && lc.nextAction?.canAutorun;
-  const isAutonomousRecoveryActive = !!research && !researchReady && (
-    autonomousRemediation?.status === "queued"
-    || autonomousRemediation?.status === "retrying"
-    || nextActionAutoResearch
-  );
-  const researchGateIssues = !researchReady && research
-    ? [
-        !hasExternalSources
-          ? "外部ソースへの根拠リンクが不足しています。"
-          : null,
-        !hasWinningTheses
-          ? "企画に渡せる有力仮説が不足しています。"
-          : null,
-        confidenceFloor < 0.6
-          ? `信頼度下限が ${(confidenceFloor * 100).toFixed(0)}% で、企画に渡す基準の 60% を下回っています。`
-          : null,
-        criticalDissentCount > 0
-          ? `未解決の重大な反証が ${criticalDissentCount} 件あります。`
-          : null,
-      ].filter((issue): issue is string => Boolean(issue))
-    : [];
-  const researchWarning = !researchReady && research
-    ? researchGateIssues[0] ?? "品質ゲートを満たしていません。企画へ進む前に追加調査が必要です。"
-    : null;
+  const {
+    researchReady,
+    confidenceFloor,
+    criticalDissentCount,
+    autonomousRemediation,
+    isAutonomousRecoveryActive,
+    gateIssues: researchGateIssues,
+    warning: researchWarning,
+  } = selectResearchReadinessState({
+    research,
+    phaseStatus: researchPhaseStatus,
+    nextAction: lc.nextAction,
+  });
   const researchWarningTitle = isAutonomousRecoveryActive
     ? "AI が不足している根拠を自動補完しています"
     : "追加調査または見直しが必要です";
@@ -828,7 +613,9 @@ export function ResearchPhase() {
     : researchWarning;
 
   // Input state
-  if (!research && !isRunning) {
+  const isResearchRefreshRunning = !!research && (isRunning || isResearchRunLive);
+
+  if (!research && !shouldShowInitialResearchRun) {
     return (
       <div className="flex h-full flex-col">
         <div className="border-b border-border px-6 py-4">
@@ -870,7 +657,7 @@ export function ResearchPhase() {
                 </p>
                 <textarea
                   value={lc.spec}
-                  onChange={(e) => lc.setSpec(e.target.value)}
+                  onChange={(e) => actions.editSpec(e.target.value)}
                   placeholder="例: タスク整理が苦手なチーム向けに、優先度と進捗を可視化する ToDo ツールを作りたい。複数人での進行管理と振り返りを簡単にしたい。"
                   rows={6}
                   className="w-full rounded-lg border border-border bg-background p-4 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring resize-none"
@@ -919,7 +706,7 @@ export function ResearchPhase() {
                             <Badge key={i} variant="secondary" className="gap-1 pr-1">
                               <Globe className="h-3 w-3" />{formatCompetitorHost(url)}
                               <button
-                                onClick={() => lc.setResearchConfig({
+                                onClick={() => actions.updateResearchConfig({
                                   ...lc.researchConfig,
                                   competitorUrls: competitorUrls.filter((_, j) => j !== i),
                                 })}
@@ -939,7 +726,7 @@ export function ResearchPhase() {
                           {([["quick", "簡易", "競合 2-3 社の基本分析"], ["standard", "標準", "競合 + 市場 + 技術評価"], ["deep", "詳細", "包括的な機会 / 脅威整理と提言"]] as const).map(([val, label, desc]) => (
                           <button
                             key={val}
-                            onClick={() => lc.setResearchConfig({ ...lc.researchConfig, depth: val })}
+                            onClick={() => actions.updateResearchConfig({ ...lc.researchConfig, depth: val })}
                             className={cn(
                               "rounded-lg border p-3 text-left transition-colors",
                               depth === val ? "border-primary bg-primary/5" : "border-border hover:bg-accent/50",
@@ -1008,7 +795,7 @@ export function ResearchPhase() {
   }
 
   // Running state
-  if (isInitialResearchRun) {
+  if (shouldShowInitialResearchRun) {
     const progress = visibleProgress.length > 0
       ? visibleProgress
       : researchAgents.map((agent) => ({
@@ -1200,7 +987,7 @@ export function ResearchPhase() {
                     {runtimeRunningNodes.map((nodeId) => (
                       <Badge key={nodeId} variant="secondary" className="gap-1 border border-primary/20 bg-primary/10 text-primary">
                         <Loader2 className="h-3 w-3 animate-spin" />
-                        {formatNodeLabel(nodeId)}
+                        {formatResearchNodeLabel(nodeId)}
                       </Badge>
                     ))}
                   </div>
@@ -1215,7 +1002,7 @@ export function ResearchPhase() {
                           {action.agentLabel ?? action.label}
                         </p>
                         <Badge variant="secondary" className="border border-border bg-background text-[10px] text-muted-foreground">
-                          {action.nodeLabel ?? formatNodeLabel(action.nodeId)}
+                          {action.nodeLabel ?? formatResearchNodeLabel(action.nodeId)}
                         </Badge>
                       </div>
                       <p className="mt-1 text-[11px] text-muted-foreground">
@@ -1248,7 +1035,7 @@ export function ResearchPhase() {
                         </div>
                         <div className="flex-1 space-y-1">
                           <div className="flex items-center gap-2">
-                            <p className="text-xs font-medium text-foreground">{formatNodeLabel(event.nodeId)}</p>
+                            <p className="text-xs font-medium text-foreground">{formatResearchNodeLabel(event.nodeId)}</p>
                             <Badge variant="secondary" className="border border-border bg-background text-[10px] text-muted-foreground">
                               {formatLiveEventStatus(event.status)}
                             </Badge>
@@ -1295,7 +1082,7 @@ export function ResearchPhase() {
               )}
               {!!runtimeRecentNodes.length && (
                 <p className="mt-4 text-xs text-primary/80">
-                  直近の流れ: {runtimeRecentNodes.map(formatNodeLabel).join(" → ")}
+                  直近の流れ: {runtimeRecentNodes.map(formatResearchNodeLabel).join(" → ")}
                 </p>
               )}
               {visibleProgress.length > 0 && (
@@ -1318,7 +1105,7 @@ export function ResearchPhase() {
                       {agent.status === "running" && <Loader2 className="h-3 w-3 animate-spin" />}
                       {agent.status === "completed" && <Check className="h-3 w-3" />}
                       {agent.status === "failed" && <AlertCircle className="h-3 w-3" />}
-                      {formatNodeLabel(agent.nodeId)}
+                      {formatResearchNodeLabel(agent.nodeId)}
                     </Badge>
                   ))}
                 </div>
@@ -1339,7 +1126,7 @@ export function ResearchPhase() {
                   {r.quality_gates.map((gate) => (
                     <div key={gate.id} className="rounded-lg border border-border/80 bg-background px-3 py-2">
                       <div className="flex items-center justify-between gap-2">
-                        <p className="text-xs font-medium text-foreground">{formatGateTitle(gate.id, gate.title)}</p>
+                        <p className="text-xs font-medium text-foreground">{formatResearchGateTitle(gate.id, gate.title)}</p>
                         <Badge variant={gate.passed ? "default" : "secondary"} className="text-[10px]">
                           {gate.passed ? "通過" : "未達"}
                         </Badge>
@@ -1347,7 +1134,7 @@ export function ResearchPhase() {
                       <p className="mt-1 text-[11px] text-muted-foreground">{polishResearchCopy(gate.reason)}</p>
                       {!!gate.blockingNodeIds.length && (
                         <p className="mt-1 text-[11px] text-muted-foreground">
-                          関連ノード: {gate.blockingNodeIds.map(formatNodeLabel).join(" / ")}
+                          関連ノード: {gate.blockingNodeIds.map(formatResearchNodeLabel).join(" / ")}
                         </p>
                       )}
                     </div>
@@ -1361,7 +1148,7 @@ export function ResearchPhase() {
                   {(r.node_results ?? []).map((node) => (
                     <div key={node.nodeId} className="rounded-lg border border-border/80 bg-background px-3 py-2">
                       <div className="flex items-center justify-between gap-2">
-                        <p className="text-xs font-medium text-foreground">{formatNodeLabel(node.nodeId)}</p>
+                        <p className="text-xs font-medium text-foreground">{formatResearchNodeLabel(node.nodeId)}</p>
                         <Badge variant={node.status === "success" ? "default" : "secondary"} className="text-[10px]">
                           {formatNodeStatus(node.status)}
                         </Badge>
@@ -1377,7 +1164,7 @@ export function ResearchPhase() {
                       )}
                       {!!node.degradationReasons.length && (
                         <p className="mt-1 text-[11px] text-muted-foreground">
-                          {Array.from(new Set(node.degradationReasons.map(formatDegradationReason))).join(" / ")}
+                          {Array.from(new Set(node.degradationReasons.map(formatResearchDegradationReason))).join(" / ")}
                         </p>
                       )}
                     </div>
@@ -1392,7 +1179,7 @@ export function ResearchPhase() {
                     <p className="mt-1 text-[11px] text-muted-foreground">{r.remediation_plan.objective}</p>
                     {!!r.remediation_plan.retryNodeIds.length && (
                       <p className="mt-1 text-[11px] text-muted-foreground">
-                        再調査対象: {r.remediation_plan.retryNodeIds.map(formatNodeLabel).join(" / ")}
+                        再調査対象: {r.remediation_plan.retryNodeIds.map(formatResearchNodeLabel).join(" / ")}
                       </p>
                     )}
                   </div>
@@ -1415,7 +1202,7 @@ export function ResearchPhase() {
                     )}
                     {!!autonomousRemediation.retryNodeIds.length && (
                       <p className="mt-1 text-[11px] text-muted-foreground">
-                        補完対象: {autonomousRemediation.retryNodeIds.map(formatNodeLabel).join(" / ")}
+                        補完対象: {autonomousRemediation.retryNodeIds.map(formatResearchNodeLabel).join(" / ")}
                       </p>
                     )}
                     {!!autonomousRemediation.blockingSummary?.length && (
@@ -1570,7 +1357,7 @@ export function ResearchPhase() {
                       <div>
                         <p className="text-sm font-medium text-foreground">{claim.statement}</p>
                         <p className="mt-1 text-[11px] text-muted-foreground">
-                          {formatNodeLabel(claim.owner)} · {formatClaimCategory(claim.category)}
+                          {formatResearchNodeLabel(claim.owner)} · {formatClaimCategory(claim.category)}
                         </p>
                       </div>
                       <Badge variant={claim.status === "accepted" ? "default" : "secondary"} className="shrink-0 text-[10px]">
@@ -1598,7 +1385,7 @@ export function ResearchPhase() {
                   <div key={item.id} className="rounded-lg border border-border/80 bg-background px-3 py-2">
                     <div className="flex items-center justify-between gap-2">
                       <p className="text-xs font-medium text-foreground">{item.argument}</p>
-                      <Badge variant="outline" className="text-[10px]">{DISSENT_SEVERITY_LABELS[item.severity] ?? item.severity}</Badge>
+                      <Badge variant="outline" className="text-[10px]">{formatDissentSeverity(item.severity)}</Badge>
                     </div>
                     <p className="mt-1 text-[11px] text-muted-foreground">
                       {item.resolved ? "解決済み" : "未解決"} · {item.recommended_test ?? "追加検証を定義"}

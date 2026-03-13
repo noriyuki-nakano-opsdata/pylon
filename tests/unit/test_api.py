@@ -19,6 +19,7 @@ from pylon.api.factory import (
     build_api_server,
 )
 from pylon.api.health import HealthChecker, HealthCheckResult
+from pylon.api.observability import build_api_observability_bundle
 from pylon.api.middleware import (
     AuthMiddleware,
     InMemoryRateLimitStore,
@@ -45,6 +46,7 @@ from pylon.api.schemas import (
 from pylon.api.server import APIServer, Request, Response
 from pylon.control_plane import ControlPlaneBackend, InMemoryWorkflowControlPlaneStore
 from pylon.dsl.parser import PylonProject
+from pylon.errors import ConcurrencyError
 from pylon.providers.base import Response as ProviderResponse
 from pylon.providers.base import TokenUsage
 from pylon.runtime.llm import ProviderRegistry
@@ -147,6 +149,39 @@ def _workflow_project(name: str = "demo-project") -> PylonProject:
             },
         }
     )
+
+
+def _wait_for_skill_import_job(
+    server: APIServer,
+    job_id: str,
+    *,
+    timeout_seconds: float = 2.0,
+) -> dict[str, object]:
+    deadline = time.time() + timeout_seconds
+    last_body: dict[str, object] | None = None
+    while time.time() < deadline:
+        response = server.handle_request("GET", f"/api/v1/skill-import-jobs/{job_id}")
+        assert response.status_code == 200
+        assert isinstance(response.body, dict)
+        last_body = response.body
+        if response.body.get("status") in {"completed", "failed"}:
+            return response.body
+        time.sleep(0.02)
+    raise AssertionError(f"Timed out waiting for skill import job {job_id}: {last_body}")
+
+
+def _metric_series(
+    snapshot: dict[str, object],
+    group: str,
+    name: str,
+) -> list[dict[str, object]]:
+    series = snapshot.get(group, [])
+    assert isinstance(series, list)
+    return [
+        item
+        for item in series
+        if isinstance(item, dict) and str(item.get("name", "")) == name
+    ]
 
 
 class _FakeSkillProvider:
@@ -262,6 +297,43 @@ def _approval_project(name: str = "approval-project") -> PylonProject:
             },
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# Route store
+# ---------------------------------------------------------------------------
+
+class TestRouteStore:
+    def test_surface_records_support_compare_and_set(self):
+        store = RouteStore(control_plane_store=InMemoryWorkflowControlPlaneStore())
+
+        created = store.put_surface_record(
+            "skill_import_worker_leases",
+            "primary",
+            {"id": "primary", "owner": "worker-a"},
+            expected_record_version=0,
+        )
+        assert created["record_version"] == 1
+
+        updated = store.put_surface_record(
+            "skill_import_worker_leases",
+            "primary",
+            {
+                "id": "primary",
+                "owner": "worker-a",
+                "expires_at": "2026-03-13T00:00:00+00:00",
+            },
+            expected_record_version=1,
+        )
+        assert updated["record_version"] == 2
+
+        with pytest.raises(ConcurrencyError):
+            store.put_surface_record(
+                "skill_import_worker_leases",
+                "primary",
+                {"id": "primary", "owner": "worker-b"},
+                expected_record_version=1,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -852,6 +924,7 @@ class TestAgentRoutes:
         assert approved.body["candidate"]["review"]["note"] == "Reviewed and allowed for runtime use"
         assert approved.body["report"]["promoted_tool_count"] == 1
         assert approved.body["report"]["tool_candidate_states"] == {"approved": 1}
+        assert not (import_root / source_id / "tool-candidate-decisions.json").exists()
 
         skills = server.handle_request("GET", "/api/v1/skills")
         assert skills.status_code == 200
@@ -859,6 +932,142 @@ class TestAgentRoutes:
             item for item in skills.body["skills"] if item["alias"] == "analytics-tracking"
         )
         assert analytics["tools"][0]["id"] == "ga4"
+
+        rescanned = server.handle_request(
+            "POST",
+            f"/api/v1/skill-sources/{source_id}/scan",
+        )
+        assert rescanned.status_code == 200
+        assert rescanned.body["report"]["promoted_tool_count"] == 1
+        listed_again = server.handle_request(
+            "GET",
+            f"/api/v1/skill-sources/{source_id}/tool-candidates",
+        )
+        assert listed_again.body["candidates"][0]["review"]["state"] == "approved"
+
+    def test_skill_source_import_jobs_run_async_and_update_source_state(self, tmp_path: Path, monkeypatch):
+        repo_root = _write_external_skill_repo(tmp_path)
+        import_root = tmp_path / "imports"
+        monkeypatch.setenv("PYLON_SKILL_IMPORT_ROOT", str(import_root))
+        server = APIServer()
+        server.add_middleware(TenantMiddleware(require_tenant=False))
+        store = RouteStore(control_plane_store=InMemoryWorkflowControlPlaneStore())
+        observability = build_api_observability_bundle(
+            control_plane_store=store.control_plane_store,
+            auth_backend="none",
+            rate_limit_backend=None,
+            metrics_namespace="pylon",
+            enable_prometheus_exporter=False,
+        )
+        register_routes(
+            server,
+            store=store,
+            observability=observability,
+            skill_runtime=SkillRuntime(SkillCatalog(skill_dirs=(), refresh_ttl_seconds=0)),
+            compatibility_layer=SkillCompatibilityLayer(import_root=import_root),
+        )
+
+        created = server.handle_request(
+            "POST",
+            "/api/v1/skill-sources?async=1",
+            body={"location": str(repo_root), "kind": "local-dir"},
+        )
+        assert created.status_code == 202
+        assert created.body["source"]["status"] == "queued"
+        queue_task_id = str(created.body["job"]["queue_task_id"])
+
+        create_job = _wait_for_skill_import_job(server, str(created.body["job"]["id"]))
+        assert create_job["status"] == "completed"
+        assert create_job["operation"] == "create"
+        source_id = str(create_job["source_id"])
+        queue_record = store.get_surface_record("skill_import_queue_tasks", queue_task_id)
+        assert queue_record is not None
+        assert queue_record["status"] == "completed"
+        assert queue_record["record_version"] >= 1
+        assert queue_record["payload"]["source_id"] == source_id
+        lease_record = store.get_surface_record("skill_import_worker_leases", "primary")
+        assert lease_record is not None
+        assert lease_record["record_version"] >= 1
+
+        fetched_source = server.handle_request("GET", f"/api/v1/skill-sources/{source_id}")
+        assert fetched_source.status_code == 200
+        assert fetched_source.body["status"] == "ready"
+
+        rescanned = server.handle_request(
+            "POST",
+            f"/api/v1/skill-sources/{source_id}/scan?async=1",
+        )
+        assert rescanned.status_code == 202
+        assert rescanned.body["source"]["status"] == "queued"
+
+        scan_job = _wait_for_skill_import_job(server, str(rescanned.body["job"]["id"]))
+        assert scan_job["status"] == "completed"
+        assert scan_job["operation"] == "scan"
+
+        listed_jobs = server.handle_request("GET", f"/api/v1/skill-import-jobs?source_id={source_id}")
+        assert listed_jobs.status_code == 200
+        assert listed_jobs.body["count"] >= 2
+        summary = server.handle_request("GET", f"/api/v1/skill-import/summary?source_id={source_id}")
+        assert summary.status_code == 200
+        assert summary.body["source_id"] == source_id
+        assert summary.body["worker"]["record_version"] >= 1
+        assert summary.body["jobs"]["counts"]["completed"] >= 2
+        assert summary.body["sources"]["counts"]["ready"] == 1
+        assert summary.body["sources"]["items"][0]["id"] == source_id
+        assert summary.body["reviews"]["candidate_count"] == 1
+        assert summary.body["reviews"]["states"]["pending"] == 1
+        assert summary.body["queue"]["tasks"][0]["source_id"] == source_id
+        metrics_snapshot = observability.metrics.get_metrics()
+        completed_jobs = _metric_series(metrics_snapshot, "counters", "skill_import_job_count")
+        assert any(
+            series.get("labels") == {"operation": "create", "status": "completed"}
+            and float(series.get("value", 0.0)) >= 1.0
+            for series in completed_jobs
+        )
+        assert any(
+            series.get("labels") == {"operation": "scan", "status": "completed"}
+            and float(series.get("value", 0.0)) >= 1.0
+            for series in completed_jobs
+        )
+        queue_depth = _metric_series(metrics_snapshot, "gauges", "skill_import_queue_depth")
+        assert any(series.get("labels") == {"status": "pending"} for series in queue_depth)
+        leader_state = _metric_series(metrics_snapshot, "gauges", "skill_import_worker_is_leader")
+        assert any(float(series.get("value", 0.0)) >= 0.0 for series in leader_state)
+        heartbeat = _metric_series(metrics_snapshot, "gauges", "skill_import_worker_heartbeat_unix")
+        assert any(float(series.get("value", 0.0)) > 0.0 for series in heartbeat)
+
+        server.shutdown()
+        time.sleep(0.05)
+        assert store.get_surface_record("skill_import_worker_leases", "primary") is None
+
+    def test_ready_reports_skill_import_worker_backlog_without_active_lease(self, tmp_path: Path, monkeypatch):
+        repo_root = _write_external_skill_repo(tmp_path)
+        import_root = tmp_path / "imports"
+        monkeypatch.setenv("PYLON_SKILL_IMPORT_ROOT", str(import_root))
+        server, _ = _server_with_routes(
+            skill_runtime=SkillRuntime(SkillCatalog(skill_dirs=(), refresh_ttl_seconds=0)),
+            compatibility_layer=SkillCompatibilityLayer(import_root=import_root),
+        )
+
+        server.shutdown()
+        queued = server.handle_request(
+            "POST",
+            "/api/v1/skill-sources?async=1",
+            body={"location": str(repo_root), "kind": "local-dir"},
+        )
+        assert queued.status_code == 202
+        time.sleep(0.05)
+
+        ready = server.handle_request("GET", "/ready")
+        assert ready.status_code == 503
+        check = next(
+            item
+            for item in ready.body["checks"]
+            if item["name"] == "skill_import_worker"
+        )
+        assert check["status"] == "unhealthy"
+        assert check["pending"] >= 1
+        assert "backlog exists" in check["message"]
 
     def test_features_endpoint_returns_product_surface_manifest(self):
         server, _ = _server_with_routes()

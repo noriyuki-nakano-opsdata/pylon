@@ -34,6 +34,72 @@ export interface SkillExecuteResponse {
   provider: string;
 }
 
+export interface SkillImportSummary {
+  tenant_id: string;
+  source_id?: string | null;
+  worker: {
+    owner?: string | null;
+    is_leader: boolean;
+    lease_expires_at?: string | null;
+    record_version: number;
+    heartbeat_unix?: number | null;
+  };
+  queue: {
+    counts: Record<string, number>;
+    oldest_pending_created_at?: string | null;
+    running_task_ids: string[];
+    tasks: Array<{
+      id: string;
+      status: string;
+      created_at?: string | null;
+      started_at?: string | null;
+      completed_at?: string | null;
+      source_id?: string | null;
+      job_id?: string | null;
+      retries: number;
+    }>;
+  };
+  jobs: {
+    counts: Record<string, number>;
+    recent: Array<{
+      id: string;
+      source_id: string;
+      operation: string;
+      status: string;
+      queue_task_id: string;
+      updated_at?: string | null;
+      error?: string | null;
+    }>;
+  };
+  sources: {
+    counts: Record<string, number>;
+    items: Array<{
+      id: string;
+      status: string;
+      adapter_profile?: string | null;
+      source_format?: string | null;
+      source_revision?: string | null;
+      imported_skill_count: number;
+      promoted_tool_count: number;
+      updated_at?: string | null;
+      last_job?: {
+        id: string;
+        status: string;
+        operation: string;
+        updated_at?: string | null;
+      } | null;
+    }>;
+  };
+  reviews: {
+    states: Record<string, number>;
+    candidate_count: number;
+    promoted_count: number;
+  };
+  metrics: {
+    queue_depth: Record<string, number | null>;
+  };
+}
+
 export const skillsApi = {
   list: (params?: { category?: string; source?: string; search?: string }) => {
     const q = new URLSearchParams();
@@ -60,4 +126,6 @@ export const skillsApi = {
       method: "POST",
     }),
   categories: () => apiFetch<Record<string, number>>("/v1/skills/categories"),
+  importSummary: (sourceId?: string) =>
+    apiFetch<SkillImportSummary>(`/v1/skill-import/summary${sourceId ? `?source_id=${encodeURIComponent(sourceId)}` : ""}`),
 };

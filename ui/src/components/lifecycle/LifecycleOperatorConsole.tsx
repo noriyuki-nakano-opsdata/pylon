@@ -1,5 +1,14 @@
 import type { ReactNode } from "react";
 import { Badge } from "@/components/ui/badge";
+import {
+  formatAutonomousRemediationStatus,
+  formatPhaseLabel,
+  formatPhaseStatus,
+  formatResearchGateTitle,
+  formatResearchNodeLabel,
+  formatRunStatus,
+  polishConsoleCopy,
+} from "@/lifecycle/presentation";
 import { cn } from "@/lib/utils";
 import type {
   LifecycleArtifact,
@@ -25,36 +34,6 @@ interface OperatorConsoleProps {
   phaseSummary?: LifecyclePhaseRuntimeSummary | null;
   activePhaseSummary?: LifecyclePhaseRuntimeSummary | null;
   className?: string;
-}
-
-const PHASE_LABELS: Record<LifecyclePhase, string> = {
-  research: "調査",
-  planning: "企画",
-  design: "デザイン",
-  approval: "承認",
-  development: "開発",
-  deploy: "デプロイ",
-  iterate: "改善",
-};
-
-const RESEARCH_NODE_LABELS: Record<string, string> = {
-  "competitor-analyst": "競合分析",
-  "market-researcher": "市場調査",
-  "user-researcher": "ユーザー調査",
-  "tech-evaluator": "技術評価",
-  "research-synthesizer": "統合分析",
-  "evidence-librarian": "根拠整理",
-  "devils-advocate-researcher": "反証レビュー",
-  "cross-examiner": "相互検証",
-  "research-judge": "最終判定",
-};
-
-function phaseLabel(phase: LifecyclePhase): string {
-  return PHASE_LABELS[phase] ?? phase;
-}
-
-function nodeLabel(nodeId: string): string {
-  return RESEARCH_NODE_LABELS[nodeId] ?? nodeId;
 }
 
 function compactText(value: string, limit = 120): string {
@@ -126,98 +105,6 @@ function delegationSummary(delegation: LifecycleDelegation): string {
     return `${skillLabel(delegation.skill)} を${peer}に委譲`;
   }
   return peer ? `${peer} と連携` : "委譲を実行";
-}
-
-function polishConsoleCopy(value: string): string {
-  return value
-    .replace(/\s+/g, " ")
-    .replace("外部 URL に grounded された evidence が不足しています。", "外部 URL の根拠が不足しています。")
-    .replace("Phase outputs did not satisfy readiness checks.", "品質ゲートを満たせなかったため、見直しが必要です。")
-    .replace(/critical research dissent/gi, "重大な反証")
-    .replace(/critical research nodes/gi, "重要ノード")
-    .replace(/support handoff/gi, "後続フェーズへの引き継ぎ")
-    .replace(/requires rework/gi, "見直しが必要")
-    .replace(/project brief/gi, "プロジェクト要約")
-    .replace(/public web evidence/gi, "公開 Web 根拠")
-    .replace(/mix vendor pages with neutral analyst or practitioner sources before finalizing claims\./gi, "主張を確定する前に、ベンダーページだけでなく第三者ソースも混ぜて根拠を厚くしてください。")
-    .replace(/call out where the result is based on public web evidence versus the project brief\./gi, "公開 Web 根拠と project brief 由来の内容を明確に分けてください。")
-    .replace(/prefer source diversity over adding more snippets from the same domain\./gi, "同じドメインの断片を増やすより、異なるソースの多様性を優先してください。")
-    .replace(/reviewed (\d+) grounded sources for research\./gi, "調査のために接地済みソースを $1 件確認しました。")
-    .replace(/research phase skill executed by /gi, "")
-    .replace(/Delegate /g, "")
-    .replace(/for lifecycle phase research on project [^.:]+\.?/gi, "")
-    .replace(/for research\/[a-z-]+: /gi, "")
-    .replace(/current cycle/gi, "現サイクル")
-    .replace(/未解決の critical dissent が (\d+) 件残っています。/g, "未解決の重大な反証が $1 件残っています。")
-    .replace(/confidence floor は ([0-9.]+)、winning thesis 数は (\d+) です。/g, "信頼度下限は $1、有力仮説数は $2 です。")
-    .replace(/Research Judgement/g, "調査判定")
-    .replace(/Research Cross Examination/g, "相互検証")
-    .replace(/Claim Ledger/g, "主張台帳")
-    .replace(/Research Dissent/g, "反証レビュー")
-    .replace(/Research Report/g, "調査レポート")
-    .replace(/Research Swarm requires rework/g, "調査結果の見直しが必要")
-    .replace(/Downstream lifecycle outputs invalidated/g, "後続成果物を再生成")
-    .replace(/Research execution inputs changed; regenerate research and all downstream artifacts\./g, "調査入力が変わったため、research と後続成果物を再生成します。")
-    .replace(/lineage_reset/g, "系譜リセット")
-    .replace(/phase_outcome/g, "フェーズ判定")
-    .replace(/Completed/g, "完了")
-    .replace(/Running/g, "実行中")
-    .replace(/Failed/g, "失敗")
-    .replace(/deterministic-reference/g, "内部参照")
-    .replace(/competitive-intelligence/gi, "競争分析")
-    .replace(/market-sizing/gi, "市場規模推定")
-    .replace(/market-research/gi, "市場調査")
-    .replace(/persona-research/gi, "ペルソナ分析")
-    .replace(/local/gi, "ローカル")
-    .replace(/task:/gi, "タスク:")
-    .replace(/evidence/gi, "根拠")
-    .replace(/dissent/gi, "反証")
-    .replace(/thesis/gi, "仮説")
-    .replace(/planning/gi, "企画")
-    .replace(/grounded/gi, "紐づいた")
-    .replace(/confidence floor/gi, "信頼度下限")
-    .replace(/\s+\./g, ".")
-    .trim();
-}
-
-function runStatusLabel(status: string): string {
-  const labels: Record<string, string> = {
-    completed: "完了",
-    running: "実行中",
-    failed: "失敗",
-    pending: "待機",
-  };
-  return labels[status.toLowerCase()] ?? polishConsoleCopy(status);
-}
-
-function remediationStatusLabel(status: string): string {
-  const labels: Record<string, string> = {
-    not_needed: "不要",
-    queued: "継続予定",
-    retrying: "補完中",
-    resolved: "解消",
-    blocked: "上限到達",
-  };
-  return labels[status] ?? polishConsoleCopy(status);
-}
-
-function researchGateTitle(id: string, title: string): string {
-  const labels: Record<string, string> = {
-    "source-grounding": "採択主張が外部根拠に紐づいている",
-    "critical-dissent-resolved": "重大な反証が未解決のまま残っていない",
-    "confidence-floor": "企画に渡せる信頼度を満たしている",
-  };
-  return labels[id] ?? polishConsoleCopy(title);
-}
-
-function phaseStatusLabel(status: string): string {
-  const labels: Record<string, string> = {
-    available: "開始可能",
-    in_progress: "進行中",
-    completed: "完了",
-    locked: "未解放",
-  };
-  return labels[status] ?? polishConsoleCopy(status);
 }
 
 function agentRuntimeStatusLabel(status: string): string {
@@ -303,8 +190,10 @@ export function LifecycleOperatorConsole({
     ? ((research?.source_links ?? []).length || (research?.evidence ?? []).length)
     : 0;
   const autonomousRemediation = phase === "research" ? research?.autonomous_remediation : undefined;
-  const liveFocusNode = liveTelemetry?.activeFocusNodeId ? nodeLabel(liveTelemetry.activeFocusNodeId) : null;
-  const recentLiveNodes = (liveTelemetry?.recentNodeIds ?? []).map(nodeLabel);
+  const liveFocusNode = liveTelemetry?.activeFocusNodeId
+    ? formatResearchNodeLabel(liveTelemetry.activeFocusNodeId)
+    : null;
+  const recentLiveNodes = (liveTelemetry?.recentNodeIds ?? []).map(formatResearchNodeLabel);
   const runtimeAgents = displayedPhaseSummary?.agents ?? [];
   const runtimeActions = displayedPhaseSummary?.recentActions ?? [];
 
@@ -312,7 +201,7 @@ export function LifecycleOperatorConsole({
     <aside className={cn("flex flex-col border-l border-border bg-card/40", className)}>
       <div className="border-b border-border px-4 py-3">
         <p className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground/70">運用パネル</p>
-        <h2 className="mt-1 text-sm font-bold text-foreground">{phaseLabel(phase)}</h2>
+        <h2 className="mt-1 text-sm font-bold text-foreground">{formatPhaseLabel(phase)}</h2>
       </div>
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
         <ConsoleSection title="実行サマリー">
@@ -320,7 +209,7 @@ export function LifecycleOperatorConsole({
             <div className="rounded-lg border border-border bg-card p-3 text-xs">
               <div className="flex items-center justify-between gap-2">
                 <span className="font-mono text-foreground">{phaseRun.runId.slice(0, 8)}</span>
-                <Badge variant="outline" className="text-[10px]">{runStatusLabel(phaseRun.status)}</Badge>
+                <Badge variant="outline" className="text-[10px]">{formatRunStatus(phaseRun.status)}</Badge>
               </div>
               <div className="mt-2 grid grid-cols-2 gap-2 text-[11px] text-muted-foreground">
                 <span>成果物 {phaseRun.artifactCount}</span>
@@ -345,7 +234,7 @@ export function LifecycleOperatorConsole({
             <div className="rounded-lg border border-border bg-card p-3 text-xs">
               <div className="flex items-center justify-between gap-2">
                 <span className="font-mono text-foreground">{liveTelemetry.run.id.slice(0, 8)}</span>
-                <Badge variant="outline" className="text-[10px]">{runStatusLabel(liveTelemetry.run.status)}</Badge>
+                <Badge variant="outline" className="text-[10px]">{formatRunStatus(liveTelemetry.run.status)}</Badge>
               </div>
               <div className="mt-2 grid grid-cols-2 gap-2 text-[11px] text-muted-foreground">
                 <span>イベント {liveTelemetry.eventCount}</span>
@@ -354,14 +243,14 @@ export function LifecycleOperatorConsole({
                 <span>失敗 {liveTelemetry.failedNodeIds.length}</span>
               </div>
               {liveTelemetry.phase && liveTelemetry.phase !== phase && (
-                <p className="mt-2 text-muted-foreground">実行フェーズ: {phaseLabel(liveTelemetry.phase)}</p>
+                <p className="mt-2 text-muted-foreground">実行フェーズ: {formatPhaseLabel(liveTelemetry.phase)}</p>
               )}
               {liveFocusNode && (
                 <p className="mt-2 text-foreground">現在地: {liveFocusNode}</p>
               )}
               {liveTelemetry.runningNodeIds.length > 0 && (
                 <p className="mt-2 text-muted-foreground">
-                  実行中: {liveTelemetry.runningNodeIds.map(nodeLabel).join(" / ")}
+                  実行中: {liveTelemetry.runningNodeIds.map(formatResearchNodeLabel).join(" / ")}
                 </p>
               )}
               {recentLiveNodes.length > 0 && (
@@ -374,7 +263,7 @@ export function LifecycleOperatorConsole({
               )}
               {liveTelemetry.failedNodeIds.length > 0 && (
                 <p className="mt-1 text-muted-foreground">
-                  失敗: {liveTelemetry.failedNodeIds.map(nodeLabel).join(" / ")}
+                  失敗: {liveTelemetry.failedNodeIds.map(formatResearchNodeLabel).join(" / ")}
                 </p>
               )}
               {liveTelemetry.lastEventSeq !== null && (
@@ -388,12 +277,12 @@ export function LifecycleOperatorConsole({
           <ConsoleSection title="AIの現在地">
             <div className="rounded-lg border border-border bg-card p-3 text-xs">
               <div className="flex items-center justify-between gap-2">
-                <span className="font-medium text-foreground">{phaseLabel(displayedPhaseSummary.phase)}</span>
-                <Badge variant="outline" className="text-[10px]">{phaseStatusLabel(displayedPhaseSummary.status)}</Badge>
+                <span className="font-medium text-foreground">{formatPhaseLabel(displayedPhaseSummary.phase)}</span>
+                <Badge variant="outline" className="text-[10px]">{formatPhaseStatus(displayedPhaseSummary.status)}</Badge>
               </div>
               {displayedPhaseSummary.phase !== phase && (
                 <p className="mt-2 text-muted-foreground">
-                  表示中は {phaseLabel(phase)}、AI がいま動かしているのは {phaseLabel(livePhase)} です。
+                  表示中は {formatPhaseLabel(phase)}、AI がいま動かしているのは {formatPhaseLabel(livePhase)} です。
                 </p>
               )}
               {displayedPhaseSummary.objective && (
@@ -483,13 +372,13 @@ export function LifecycleOperatorConsole({
               {failedResearchGates.length > 0 ? failedResearchGates.map((gate) => (
                 <div key={gate.id} className="rounded-lg border border-border bg-card p-3 text-xs">
                   <div className="flex items-center justify-between gap-2">
-                    <span className="font-medium text-foreground">{researchGateTitle(gate.id, gate.title)}</span>
+                    <span className="font-medium text-foreground">{formatResearchGateTitle(gate.id, gate.title)}</span>
                     <Badge variant="secondary" className="text-[10px]">未達</Badge>
                   </div>
                   <p className="mt-1 text-muted-foreground">{compactText(polishConsoleCopy(gate.reason), 140)}</p>
                   {gate.blockingNodeIds.length > 0 && (
                     <p className="mt-1 text-[11px] text-muted-foreground">
-                      関連: {gate.blockingNodeIds.map(nodeLabel).join(" / ")}
+                      関連: {gate.blockingNodeIds.map(formatResearchNodeLabel).join(" / ")}
                     </p>
                   )}
                 </div>
@@ -504,7 +393,7 @@ export function LifecycleOperatorConsole({
                   <p className="font-medium text-foreground">{compactText(research.remediation_plan.objective, 160)}</p>
                   {research.remediation_plan.retryNodeIds.length > 0 && (
                     <p className="mt-2 text-muted-foreground">
-                      再調査対象: {research.remediation_plan.retryNodeIds.map(nodeLabel).join(" / ")}
+                      再調査対象: {research.remediation_plan.retryNodeIds.map(formatResearchNodeLabel).join(" / ")}
                     </p>
                   )}
                 </div>
@@ -515,7 +404,7 @@ export function LifecycleOperatorConsole({
               <ConsoleSection title="AI 自動補完">
                 <div className="rounded-lg border border-border bg-card p-3 text-xs">
                   <div className="flex items-center justify-between gap-2">
-                    <span className="font-medium text-foreground">{remediationStatusLabel(autonomousRemediation.status)}</span>
+                    <span className="font-medium text-foreground">{formatAutonomousRemediationStatus(autonomousRemediation.status)}</span>
                     <Badge variant={autonomousRemediation.status === "blocked" ? "secondary" : "outline"} className="text-[10px]">
                       {autonomousRemediation.attemptCount}/{autonomousRemediation.maxAttempts || 0}
                     </Badge>
@@ -525,7 +414,7 @@ export function LifecycleOperatorConsole({
                   )}
                   {autonomousRemediation.retryNodeIds.length > 0 && (
                     <p className="mt-2 text-muted-foreground">
-                      補完対象: {autonomousRemediation.retryNodeIds.map(nodeLabel).join(" / ")}
+                      補完対象: {autonomousRemediation.retryNodeIds.map(formatResearchNodeLabel).join(" / ")}
                     </p>
                   )}
                   {autonomousRemediation.blockingSummary && autonomousRemediation.blockingSummary.length > 0 && (
@@ -609,7 +498,7 @@ export function LifecycleOperatorConsole({
                 <span className="font-medium text-foreground">{delegation.peer}</span>
                 <Badge variant="outline" className="text-[10px]">{skillLabel(delegation.skill)}</Badge>
               </div>
-              <p className="mt-1 text-muted-foreground">{nodeLabel(delegation.agentId)} {"→"} {delegation.peer}</p>
+              <p className="mt-1 text-muted-foreground">{formatResearchNodeLabel(delegation.agentId)} {"→"} {delegation.peer}</p>
               <p className="mt-1 text-muted-foreground">{delegationSummary(delegation)}</p>
             </div>
             ))}

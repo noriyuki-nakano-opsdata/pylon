@@ -18,6 +18,34 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 from pylon.agents.cognitive import ReActEngine
 from pylon.autonomy.routing import ModelRouteRequest
+from pylon.lifecycle.services.research_localization import (
+    merge_research_localization,
+    research_localization_payload,
+    translate_fixed_research_text,
+)
+from pylon.lifecycle.services.research_quality import (
+    collect_research_node_results,
+    evaluate_research_quality,
+    research_node_result,
+)
+from pylon.lifecycle.services.research_sources import (
+    pricing_hint_from_packet as _pricing_hint_from_packet,
+    research_context as _research_context,
+    source_observations as _source_observations,
+)
+from pylon.lifecycle.services.research_runtime import (
+    claim_confidence_overrides as _claim_confidence_overrides,
+    first_research_text as _first_research_text,
+    normalize_space as _normalize_space,
+    normalized_research_strings as _normalized_research_strings,
+    parse_research_structured_value as _parse_research_structured_value,
+    research_autonomous_remediation_state as _research_autonomous_remediation_state,
+    research_judgement_artifact as _research_judgement_artifact,
+    research_runtime_output as _research_runtime_output,
+    research_text_fragments as _research_text_fragments,
+    truncate_research_text as _truncate_research_text,
+)
+from pylon.lifecycle.services.research_view_model import build_research_view_model
 from pylon.providers.base import Message
 from pylon.runtime.llm import LLMRuntime, ProviderRegistry
 from pylon.skills.runtime import SkillRuntime, get_default_skill_runtime
@@ -388,28 +416,6 @@ _RESEARCH_LOCALIZATION_FIXED_JA = {
     "Claims that survived dissent are passed to planning together with unresolved questions.": "反証を踏まえて残った仮説を、未解決の問いと一緒に planning に引き渡します。",
 }
 
-_RESEARCH_TEXT_KEYS = (
-    "question",
-    "statement",
-    "thesis",
-    "claim_statement",
-    "core_claim",
-    "primary",
-    "signal",
-    "pain_point",
-    "segment",
-    "summary",
-    "title",
-    "name",
-    "text",
-    "draft",
-    "argument",
-    "recommendation",
-    "rationale",
-    "target",
-    "notes",
-)
-
 _RESEARCH_NON_PRODUCT_PATH_HINTS = (
     "article",
     "articles",
@@ -472,735 +478,11 @@ _RESEARCH_ARTICLE_TEXT_HINTS = (
     "vs ",
 )
 
-
-def _normalize_space(value: Any) -> str:
-    return re.sub(r"\s+", " ", str(value or "")).strip()
-
-
-def _truncate_research_text(value: Any, *, limit: int = 220) -> str:
-    text = _normalize_space(value)
-    if len(text) <= limit:
-        return text
-    clipped = text[:limit].rsplit(" ", 1)[0].strip()
-    clipped = clipped or text[:limit].strip()
-    return f"{clipped}..."
-
-
-def _parse_research_structured_value(value: Any) -> Any:
-    if isinstance(value, (dict, list)):
-        return value
-    raw = str(value or "").strip()
-    if not raw or raw[0] not in "{[":
-        return value
-    for loader in (json.loads, ast.literal_eval):
-        try:
-            parsed = loader(raw)
-        except Exception:
-            continue
-        if isinstance(parsed, (dict, list)):
-            return parsed
-    return value
-
-
-def _research_text_fragments(
-    value: Any,
-    *,
-    max_items: int = 6,
-    char_limit: int = 180,
-) -> list[str]:
-    items: list[str] = []
-
-    def _visit(current: Any) -> None:
-        if len(items) >= max_items:
-            return
-        parsed = _parse_research_structured_value(current)
-        if isinstance(parsed, list):
-            for child in parsed:
-                _visit(child)
-                if len(items) >= max_items:
-                    break
-            return
-        if isinstance(parsed, dict):
-            preferred: list[str] = []
-            for key in _RESEARCH_TEXT_KEYS:
-                if key not in parsed:
-                    continue
-                for fragment in _research_text_fragments(parsed.get(key), max_items=1, char_limit=char_limit):
-                    if fragment:
-                        preferred.append(fragment)
-            if preferred:
-                items.extend(preferred[: max_items - len(items)])
-                return
-            for child in parsed.values():
-                _visit(child)
-                if len(items) >= max_items:
-                    break
-            return
-        text = _truncate_research_text(parsed, limit=char_limit)
-        if text:
-            items.append(text)
-
-    _visit(value)
-    return _dedupe_strings(items)[:max_items]
-
-
-def _first_research_text(value: Any, *, default: str = "", char_limit: int = 180) -> str:
-    fragments = _research_text_fragments(value, max_items=1, char_limit=char_limit)
-    return fragments[0] if fragments else default
-
-
-def _claim_confidence_overrides(value: Any) -> dict[str, Any]:
-    parsed = _parse_research_structured_value(value)
-    overrides: dict[str, Any] = {}
-    if isinstance(parsed, dict):
-        for claim_id, confidence in parsed.items():
-            normalized_id = _first_research_text(claim_id, char_limit=64)
-            if normalized_id:
-                overrides[normalized_id] = confidence
-        return overrides
-    if not isinstance(parsed, list):
-        return overrides
-    for item in parsed:
-        payload = _as_dict(_parse_research_structured_value(item))
-        claim_id = _first_research_text(payload.get("claim_id") or payload.get("id"), char_limit=64)
-        confidence = payload.get("confidence", payload.get("score"))
-        if claim_id and confidence is not None:
-            overrides[claim_id] = confidence
-    return overrides
-
-
-def _research_required_source_classes(node_id: str) -> list[str]:
-    mapping = {
-        "competitor-analyst": ["vendor_page"],
-        "market-researcher": ["market_report"],
-        "user-researcher": ["user_signal"],
-        "tech-evaluator": ["technical_source"],
-    }
-    return list(mapping.get(node_id, []))
-
-
-def _research_source_classes_for_packets(
-    node_id: str,
-    packets: list[dict[str, Any]],
-) -> list[str]:
-    classes: set[str] = set()
-    url_packets = [
-        packet
-        for packet in packets
-        if str(packet.get("source_type", "")).strip() == "url"
-    ]
-    if node_id == "competitor-analyst":
-        if any(_looks_like_vendor_product_packet(packet) for packet in url_packets):
-            classes.add("vendor_page")
-        if any("/pricing" in str(packet.get("url", "")) for packet in url_packets):
-            classes.add("pricing_page")
-    elif node_id == "market-researcher":
-        if url_packets:
-            classes.add("market_report")
-    elif node_id == "user-researcher":
-        if len(url_packets) >= 2:
-            classes.add("secondary_user_source")
-        if url_packets:
-            classes.add("user_signal")
-    elif node_id == "tech-evaluator":
-        if url_packets:
-            classes.add("technical_source")
-    return sorted(classes)
-
-
 def _research_retry_count(state: dict[str, Any], node_id: str) -> int:
     return int(
         _as_dict(state.get(_node_state_key(node_id, "result"))).get("retryCount", 0)
         or 0
     )
-
-
-def _research_node_result(
-    node_id: str,
-    *,
-    status: str,
-    parse_status: str,
-    artifact: dict[str, Any] | None = None,
-    source_packets: list[dict[str, Any]] | None = None,
-    degradation_reasons: list[str] | None = None,
-    raw_preview: str = "",
-    llm_events: list[dict[str, Any]] | None = None,
-    retry_count: int = 0,
-) -> dict[str, Any]:
-    packets = list(source_packets or [])
-    satisfied = _research_source_classes_for_packets(node_id, packets)
-    required = _research_required_source_classes(node_id)
-    missing = [item for item in required if item not in satisfied]
-    reasons = _dedupe_strings(list(degradation_reasons or []))
-    if missing:
-        reasons.append(f"missing_source_classes:{','.join(missing)}")
-    normalized_status = status
-    if normalized_status == "success" and (missing or parse_status in {"fallback", "failed"}):
-        normalized_status = "degraded"
-    event = next(
-        (
-            item
-            for item in reversed(list(llm_events or []))
-            if isinstance(item, dict) and not str(item.get("error", "")).strip()
-        ),
-        {},
-    )
-    payload = {
-        "nodeId": node_id,
-        "status": normalized_status,
-        "parseStatus": parse_status,
-        "degradationReasons": reasons,
-        "sourceClassesSatisfied": satisfied,
-        "missingSourceClasses": missing,
-        "artifact": dict(artifact or {}),
-        "retryCount": retry_count,
-    }
-    if raw_preview:
-        payload["rawPreview"] = raw_preview[:400]
-    if event:
-        payload["llmModel"] = str(event.get("model", ""))
-        payload["llmProvider"] = str(event.get("provider", ""))
-    return payload
-
-
-def _collect_research_node_results(state: dict[str, Any]) -> list[dict[str, Any]]:
-    node_ids = list(_RESEARCH_PROPOSAL_NODES) + list(_RESEARCH_REVIEW_NODES)
-    results: list[dict[str, Any]] = []
-    for node_id in node_ids:
-        item = _as_dict(state.get(_node_state_key(node_id, "result")))
-        if item:
-            results.append(item)
-    return results
-
-
-def _research_has_external_evidence(research: dict[str, Any]) -> bool:
-    source_links = [
-        item for item in _as_list(research.get("source_links")) if _is_external_url(item)
-    ]
-    if source_links:
-        return True
-    return any(
-        isinstance(item, dict)
-        and str(item.get("source_type", "")).strip() == "url"
-        and _is_external_url(item.get("source_ref"))
-        for item in _as_list(research.get("evidence"))
-    )
-
-
-def _blocking_claim_node_ids(research: dict[str, Any]) -> list[str]:
-    node_ids: list[str] = []
-    for item in _as_list(research.get("claims")):
-        claim = _as_dict(item)
-        status = str(claim.get("status", "")).strip()
-        if status == "accepted":
-            continue
-        owner = str(claim.get("owner", "")).strip()
-        if owner:
-            node_ids.append(owner)
-    return _dedupe_strings(node_ids)
-
-
-def _research_quality_gate_payload(
-    gate_id: str,
-    title: str,
-    passed: bool,
-    reason: str,
-    blocking_node_ids: list[str] | None = None,
-) -> dict[str, Any]:
-    return {
-        "id": gate_id,
-        "title": title,
-        "passed": passed,
-        "reason": reason,
-        "blockingNodeIds": _dedupe_strings(list(blocking_node_ids or [])),
-    }
-
-
-def _evaluate_research_quality(
-    research: dict[str, Any],
-    *,
-    node_results: list[dict[str, Any]],
-    remaining_iterations: int,
-) -> tuple[list[dict[str, Any]], str, dict[str, Any] | None]:
-    winning_theses = _normalized_research_strings(research.get("winning_theses"), limit=3, char_limit=220)
-    floor = float(_as_dict(research.get("confidence_summary")).get("floor", 0.0) or 0.0)
-    critical_dissent = int(research.get("critical_dissent_count", 0) or 0)
-    degraded_nodes = [
-        item for item in node_results if str(item.get("status", "")) != "success"
-    ]
-    degraded_ids = [str(item.get("nodeId", "")) for item in degraded_nodes if str(item.get("nodeId", "")).strip()]
-    source_gate_nodes = [
-        str(item.get("nodeId", ""))
-        for item in node_results
-        if _as_list(item.get("missingSourceClasses"))
-    ]
-    accepted_claim_nodes = _blocking_claim_node_ids(research)
-    has_external_evidence = _research_has_external_evidence(research)
-    gates = [
-        _research_quality_gate_payload(
-            "source-grounding",
-            "採択主張が source と evidence に接地している",
-            has_external_evidence,
-            (
-                "external url evidence is present"
-                if has_external_evidence
-                else "external url evidence is missing"
-            ),
-            source_gate_nodes or accepted_claim_nodes,
-        ),
-        _research_quality_gate_payload(
-            "counterclaim-coverage",
-            "主要仮説に対する反証が生成されている",
-            bool(_as_list(research.get("dissent"))),
-            "dissent coverage present" if bool(_as_list(research.get("dissent"))) else "dissent coverage missing",
-            ["devils-advocate-researcher"],
-        ),
-        _research_quality_gate_payload(
-            "critical-dissent-resolved",
-            "重大な dissent が未解決のまま残っていない",
-            critical_dissent == 0,
-            (
-                "no unresolved critical dissent"
-                if critical_dissent == 0
-                else f"{critical_dissent} unresolved critical dissent remain"
-            ),
-            ["cross-examiner", "research-judge", *accepted_claim_nodes],
-        ),
-        _research_quality_gate_payload(
-            "confidence-floor",
-            "採択 thesis が planning に渡せる信頼度を満たしている",
-            floor >= 0.6 and bool(winning_theses),
-            (
-                "confidence floor satisfied"
-                if floor >= 0.6 and bool(winning_theses)
-                else f"confidence floor={floor:.2f}, winning_theses={len(winning_theses)}"
-            ),
-            accepted_claim_nodes or ["research-judge"],
-        ),
-        _research_quality_gate_payload(
-            "critical-node-health",
-            "critical research nodes が degraded / failed ではない",
-            not degraded_ids,
-            (
-                "all critical nodes healthy"
-                if not degraded_ids
-                else f"degraded nodes: {', '.join(degraded_ids)}"
-            ),
-            degraded_ids,
-        ),
-    ]
-    ready = all(item.get("passed") is True for item in gates)
-    if ready:
-        return gates, "ready", None
-    retry_candidates = _dedupe_strings(
-        [
-            node_id
-            for gate in gates
-            if gate.get("passed") is not True
-            for node_id in _as_list(gate.get("blockingNodeIds"))
-            if str(node_id).strip()
-        ]
-    )
-    retry_node_ids = [
-        node_id
-        for node_id in _dedupe_strings(
-            retry_candidates + degraded_ids + source_gate_nodes + accepted_claim_nodes
-        )
-        if node_id in _RESEARCH_PROPOSAL_NODES
-        or node_id in {"devils-advocate-researcher", "cross-examiner"}
-    ]
-    remediation_plan = None
-    if remaining_iterations > 0 and retry_node_ids:
-        remediation_plan = {
-            "objective": "Address degraded nodes, strengthen source grounding, and re-evaluate blocked claims.",
-            "retryNodeIds": retry_node_ids[:4],
-            "maxIterations": remaining_iterations,
-        }
-    return gates, "rework", remediation_plan
-
-
-def _translate_fixed_research_text(value: Any, *, target_language: str) -> Any:
-    text = str(value or "").strip()
-    if not text or target_language != "ja":
-        return value
-    translated = _RESEARCH_LOCALIZATION_FIXED_JA.get(text)
-    if translated:
-        return translated
-    if text.startswith("confidence floor="):
-        return (
-            text.replace("confidence floor=", "confidence floor は ")
-            .replace(", winning_theses=", "、winning thesis 数は ")
-            + " です。"
-        )
-    if text.endswith(" unresolved critical dissent remain"):
-        count = text.split(" ", 1)[0]
-        return f"未解決の critical dissent が {count} 件残っています。"
-    if text.startswith("degraded nodes: "):
-        return f"degraded node: {text.removeprefix('degraded nodes: ')}"
-    return value
-
-
-def _translatable_research_text(value: Any, *, char_limit: int) -> str:
-    text = _first_research_text(value, char_limit=char_limit)
-    if not text or _contains_japanese(text) or _looks_like_machine_token(text):
-        return ""
-    return text
-
-
-def _research_localization_payload(research: dict[str, Any]) -> dict[str, Any]:
-    payload: dict[str, Any] = {}
-
-    def assign(key: str, value: Any) -> None:
-        if value:
-            payload[key] = value
-
-    def translated_list(values: Any, *, limit: int = 8) -> list[str]:
-        return [
-            text
-            for text in _normalized_research_strings(values, limit=limit, char_limit=280)
-            if text and not _contains_japanese(text) and not _looks_like_machine_token(text)
-        ]
-
-    assign("market_size", _translatable_research_text(research.get("market_size"), char_limit=220))
-    assign("trends", translated_list(research.get("trends"), limit=4))
-    assign("opportunities", translated_list(research.get("opportunities"), limit=4))
-    assign("threats", translated_list(research.get("threats"), limit=4))
-    tech = _as_dict(research.get("tech_feasibility"))
-    tech_notes = _translatable_research_text(tech.get("notes"), char_limit=280)
-    if tech_notes:
-        assign("tech_feasibility", {"notes": tech_notes})
-    user = _as_dict(research.get("user_research"))
-    user_payload = {
-        "signals": translated_list(user.get("signals"), limit=4),
-        "pain_points": translated_list(user.get("pain_points"), limit=4),
-    }
-    segment = _translatable_research_text(user.get("segment"), char_limit=80)
-    if segment:
-        user_payload["segment"] = segment
-    if any(user_payload.values()):
-        assign("user_research", user_payload)
-    claims = []
-    for item in _as_list(research.get("claims")):
-        claim = _as_dict(item)
-        statement = _first_research_text(claim.get("statement"), char_limit=220)
-        if not statement or _contains_japanese(statement) or _looks_like_machine_token(statement):
-            continue
-        claims.append({"id": str(claim.get("id", "")), "statement": statement})
-    assign("claims", claims)
-    dissent = []
-    for item in _as_list(research.get("dissent")):
-        record = _as_dict(item)
-        translated = {
-            "id": str(record.get("id", "")),
-            "argument": _first_research_text(record.get("argument"), char_limit=220),
-            "recommended_test": _first_research_text(record.get("recommended_test"), char_limit=220),
-            "resolution": _first_research_text(record.get("resolution"), char_limit=220),
-        }
-        if any(
-            text
-            and not _contains_japanese(text)
-            and not _looks_like_machine_token(text)
-            for text in translated.values()
-            if isinstance(text, str)
-        ):
-            dissent.append(translated)
-    assign("dissent", dissent)
-    assign("open_questions", translated_list(research.get("open_questions"), limit=8))
-    assign("winning_theses", translated_list(research.get("winning_theses"), limit=4))
-    assign("judge_summary", _translatable_research_text(research.get("judge_summary"), char_limit=280))
-    quality_gates = []
-    for item in _as_list(research.get("quality_gates")):
-        gate = _as_dict(item)
-        reason = _first_research_text(gate.get("reason"), char_limit=220)
-        if not reason or _contains_japanese(reason):
-            continue
-        quality_gates.append({"id": str(gate.get("id", "")), "reason": reason})
-    assign("quality_gates", quality_gates)
-    remediation_plan = _as_dict(research.get("remediation_plan"))
-    objective = _first_research_text(remediation_plan.get("objective"), char_limit=220)
-    if objective and not _contains_japanese(objective):
-        assign("remediation_plan", {"objective": objective})
-    execution_trace = []
-    for item in _as_list(research.get("execution_trace")):
-        trace = _as_dict(item)
-        objective = _first_research_text(trace.get("objective"), char_limit=220)
-        if objective and not _contains_japanese(objective):
-            execution_trace.append({"iteration": trace.get("iteration"), "objective": objective})
-    assign("execution_trace", execution_trace)
-    return payload
-
-
-def _research_runtime_output(research: dict[str, Any]) -> dict[str, Any]:
-    quality_gates = [
-        {
-            "id": _as_dict(item).get("id"),
-            "passed": _as_dict(item).get("passed"),
-            "reason": _first_research_text(_as_dict(item).get("reason"), char_limit=160),
-        }
-        for item in _as_list(research.get("quality_gates"))[:4]
-        if _as_dict(item)
-    ]
-    claims = [
-        {
-            "id": _as_dict(item).get("id"),
-            "statement": _first_research_text(_as_dict(item).get("statement"), char_limit=180),
-            "status": _as_dict(item).get("status"),
-            "confidence": _as_dict(item).get("confidence"),
-        }
-        for item in _as_list(research.get("claims"))[:4]
-        if _as_dict(item)
-    ]
-    remediation_plan = _as_dict(research.get("remediation_plan"))
-    autonomous_remediation = _as_dict(research.get("autonomous_remediation"))
-    return {
-        "kind": "research-runtime-output",
-        "readiness": research.get("readiness"),
-        "display_language": research.get("display_language", "ja"),
-        "localization_status": research.get("localization_status"),
-        "judge_summary": _first_research_text(research.get("judge_summary"), char_limit=220),
-        "winning_theses": _normalized_research_strings(
-            research.get("winning_theses"),
-            limit=3,
-            char_limit=180,
-        ),
-        "claims": claims,
-        "quality_gates": quality_gates,
-        "source_links": _as_list(research.get("source_links"))[:4],
-        "remediation_plan": (
-            {
-                "objective": _first_research_text(
-                    remediation_plan.get("objective"),
-                    char_limit=180,
-                ),
-                "retryNodeIds": _as_list(remediation_plan.get("retryNodeIds"))[:4],
-            }
-            if remediation_plan
-            else None
-        ),
-        "autonomous_remediation": (
-            {
-                "status": autonomous_remediation.get("status"),
-                "attemptCount": autonomous_remediation.get("attemptCount"),
-                "maxAttempts": autonomous_remediation.get("maxAttempts"),
-                "remainingAttempts": autonomous_remediation.get("remainingAttempts"),
-                "objective": _first_research_text(
-                    autonomous_remediation.get("objective"),
-                    char_limit=180,
-                ),
-                "retryNodeIds": _as_list(autonomous_remediation.get("retryNodeIds"))[:4],
-                "blockingGateIds": _as_list(autonomous_remediation.get("blockingGateIds"))[:4],
-                "stopReason": _first_research_text(
-                    autonomous_remediation.get("stopReason"),
-                    char_limit=180,
-                ),
-            }
-            if autonomous_remediation
-            else None
-        ),
-    }
-
-
-def _research_autonomous_remediation_state(
-    research: dict[str, Any],
-    *,
-    quality_gates: list[dict[str, Any]],
-    remediation_plan: dict[str, Any] | None,
-    remediation_context: dict[str, Any],
-    readiness: str,
-) -> dict[str, Any]:
-    failed_gates = [
-        _as_dict(item)
-        for item in quality_gates
-        if _as_dict(item) and _as_dict(item).get("passed") is not True
-    ]
-    blocking_node_ids = [
-        str(item)
-        for gate in failed_gates
-        for item in _as_list(gate.get("blockingNodeIds"))
-        if str(item).strip()
-    ]
-    retry_node_ids = [
-        str(item)
-        for item in _as_list(_as_dict(remediation_plan).get("retryNodeIds"))
-        if str(item).strip()
-    ]
-    if not retry_node_ids:
-        retry_node_ids = [
-            str(item)
-            for item in _as_list(remediation_context.get("retryNodeIds"))
-            if str(item).strip()
-        ]
-    missing_source_classes = [
-        str(item)
-        for node in _as_list(research.get("node_results"))
-        for item in _as_list(_as_dict(node).get("missingSourceClasses"))
-        if str(item).strip()
-    ]
-    attempt_count = int(remediation_context.get("attempt", 0) or 0)
-    max_attempts = int(remediation_context.get("maxAttempts", 2) or 2)
-    remaining_attempts = max(0, max_attempts - attempt_count)
-    auto_runnable = readiness != "ready" and bool(failed_gates) and remaining_attempts > 0
-    if readiness == "ready":
-        status = "resolved" if attempt_count > 0 else "not_needed"
-        stop_reason = ""
-    elif auto_runnable:
-        status = "retrying" if attempt_count > 0 else "queued"
-        stop_reason = ""
-    else:
-        status = "blocked"
-        stop_reason = (
-            "Autonomous remediation budget is exhausted."
-            if failed_gates and remaining_attempts == 0
-            else "The current research blockers need operator guidance."
-        )
-    return {
-        "status": status,
-        "attemptCount": attempt_count,
-        "maxAttempts": max_attempts,
-        "remainingAttempts": remaining_attempts,
-        "autoRunnable": auto_runnable,
-        "objective": str(
-            _as_dict(remediation_plan).get("objective")
-            or remediation_context.get("objective")
-            or ""
-        ),
-        "retryNodeIds": list(dict.fromkeys(retry_node_ids))[:6],
-        "blockingGateIds": list(
-            dict.fromkeys(
-                str(gate.get("id", ""))
-                for gate in failed_gates
-                if str(gate.get("id", "")).strip()
-            )
-        )[:6],
-        "blockingNodeIds": list(dict.fromkeys(blocking_node_ids))[:6],
-        "missingSourceClasses": list(dict.fromkeys(missing_source_classes))[:8],
-        "blockingSummary": [
-            _first_research_text(_as_dict(gate).get("reason"), char_limit=180)
-            for gate in failed_gates
-            if _first_research_text(_as_dict(gate).get("reason"), char_limit=180)
-        ][:4],
-        "lastBlockingSignature": "|".join(
-            sorted(
-                str(gate.get("id", ""))
-                for gate in failed_gates
-                if str(gate.get("id", "")).strip()
-            )
-        ),
-        "stopReason": stop_reason,
-    }
-
-
-def _research_judgement_artifact(research: dict[str, Any]) -> dict[str, Any]:
-    node_results = [
-        {
-            "nodeId": _as_dict(item).get("nodeId"),
-            "status": _as_dict(item).get("status"),
-            "parseStatus": _as_dict(item).get("parseStatus"),
-            "retryCount": _as_dict(item).get("retryCount"),
-            "degradationReasons": _as_list(_as_dict(item).get("degradationReasons"))[:4],
-            "missingSourceClasses": _as_list(_as_dict(item).get("missingSourceClasses"))[:4],
-        }
-        for item in _as_list(research.get("node_results"))[:8]
-        if _as_dict(item)
-    ]
-    return {
-        "name": "research-judgement",
-        "kind": "research",
-        **_research_runtime_output(research),
-        "node_results": node_results,
-    }
-
-
-def _merge_research_localization(
-    research: dict[str, Any],
-    translated: dict[str, Any],
-) -> dict[str, Any]:
-    localized = dict(research)
-    if translated.get("market_size"):
-        localized["market_size"] = translated["market_size"]
-    for key in ("trends", "opportunities", "threats", "open_questions", "winning_theses"):
-        values = _normalized_research_strings(translated.get(key), limit=8, char_limit=280)
-        if values:
-            localized[key] = values
-    tech = _as_dict(localized.get("tech_feasibility"))
-    translated_tech = _as_dict(translated.get("tech_feasibility"))
-    if translated_tech.get("notes"):
-        localized["tech_feasibility"] = {**tech, "notes": _first_research_text(translated_tech.get("notes"), char_limit=280)}
-    user = _as_dict(localized.get("user_research"))
-    translated_user = _as_dict(translated.get("user_research"))
-    if translated_user:
-        localized["user_research"] = {
-            **user,
-            "signals": _normalized_research_strings(translated_user.get("signals"), limit=4, char_limit=220) or _normalized_research_strings(user.get("signals"), limit=4, char_limit=220),
-            "pain_points": _normalized_research_strings(translated_user.get("pain_points"), limit=4, char_limit=220) or _normalized_research_strings(user.get("pain_points"), limit=4, char_limit=220),
-            "segment": _first_research_text(translated_user.get("segment"), default=str(user.get("segment", "")), char_limit=80),
-        }
-    translated_claims = {
-        str(_as_dict(item).get("id", "")): _first_research_text(_as_dict(item).get("statement"), char_limit=220)
-        for item in _as_list(translated.get("claims"))
-        if str(_as_dict(item).get("id", "")).strip()
-    }
-    if translated_claims:
-        localized["claims"] = [
-            {
-                **_as_dict(item),
-                "statement": translated_claims.get(str(_as_dict(item).get("id", "")), _as_dict(item).get("statement")),
-            }
-            for item in _as_list(localized.get("claims"))
-        ]
-    translated_dissent = {
-        str(_as_dict(item).get("id", "")): _as_dict(item)
-        for item in _as_list(translated.get("dissent"))
-        if str(_as_dict(item).get("id", "")).strip()
-    }
-    if translated_dissent:
-        localized["dissent"] = [
-            {
-                **_as_dict(item),
-                **{
-                    key: value
-                    for key, value in translated_dissent.get(str(_as_dict(item).get("id", "")), {}).items()
-                    if key in {"argument", "recommended_test", "resolution"} and value
-                },
-            }
-            for item in _as_list(localized.get("dissent"))
-        ]
-    if translated.get("judge_summary"):
-        localized["judge_summary"] = _first_research_text(translated.get("judge_summary"), char_limit=280)
-    translated_gate_reasons = {
-        str(_as_dict(item).get("id", "")): _first_research_text(_as_dict(item).get("reason"), char_limit=220)
-        for item in _as_list(translated.get("quality_gates"))
-        if str(_as_dict(item).get("id", "")).strip()
-    }
-    if translated_gate_reasons:
-        localized["quality_gates"] = [
-            {
-                **_as_dict(item),
-                "reason": translated_gate_reasons.get(str(_as_dict(item).get("id", "")), _as_dict(item).get("reason")),
-            }
-            for item in _as_list(localized.get("quality_gates"))
-        ]
-    remediation_plan = _as_dict(localized.get("remediation_plan"))
-    translated_plan = _as_dict(translated.get("remediation_plan"))
-    if remediation_plan and translated_plan.get("objective"):
-        localized["remediation_plan"] = {
-            **remediation_plan,
-            "objective": _first_research_text(translated_plan.get("objective"), char_limit=220),
-        }
-    translated_trace = {
-        str(_as_dict(item).get("iteration", "")): _first_research_text(_as_dict(item).get("objective"), char_limit=220)
-        for item in _as_list(translated.get("execution_trace"))
-        if str(_as_dict(item).get("iteration", "")).strip()
-    }
-    if translated_trace:
-        localized["execution_trace"] = [
-            {
-                **_as_dict(item),
-                "objective": translated_trace.get(str(_as_dict(item).get("iteration", "")), _as_dict(item).get("objective")),
-            }
-            for item in _as_list(localized.get("execution_trace"))
-        ]
-    return localized
 
 
 def _research_depth(state: dict[str, Any]) -> str:
@@ -1606,45 +888,6 @@ def _collect_research_source_packets(
     return packets
 
 
-def _source_observations(packets: list[dict[str, Any]], *, limit: int = 3) -> list[str]:
-    observations: list[str] = []
-    seen: set[str] = set()
-    for packet in packets:
-        title = _normalize_space(packet.get("title"))
-        excerpt = _truncate_research_text(packet.get("excerpt") or packet.get("description") or packet.get("text_excerpt"), limit=170)
-        if not title and not excerpt:
-            continue
-        summary = f"{title}: {excerpt}" if title and excerpt else (title or excerpt)
-        summary = _truncate_research_text(summary, limit=190)
-        if not summary or summary in seen:
-            continue
-        seen.add(summary)
-        observations.append(summary)
-        if len(observations) >= limit:
-            break
-    return observations
-
-
-def _pricing_hint_from_packet(packet: dict[str, Any]) -> str:
-    text = " ".join(
-        [
-            str(packet.get("description", "") or ""),
-            str(packet.get("excerpt", "") or ""),
-            str(packet.get("text_excerpt", "") or ""),
-        ]
-    )
-    price_match = re.search(
-        r"(\$\s?\d[\d,]*(?:\.\d+)?(?:\s*/\s*(?:month|mo|year|yr|user|seat))?)",
-        text,
-        re.IGNORECASE,
-    )
-    if price_match:
-        return _normalize_space(price_match.group(1))
-    if re.search(r"\bpricing\b|\bplans?\b|料金|価格", text, re.IGNORECASE):
-        return "Pricing page found"
-    return "Not publicly listed"
-
-
 def _infer_product_kind(spec: str) -> str:
     tokens = set(_keywords(spec))
     if "ec" in tokens:
@@ -1660,23 +903,6 @@ def _infer_product_kind(spec: str) -> str:
     if top_score > 0:
         return top_kind
     return "generic"
-
-
-def _research_context(state: dict[str, Any]) -> dict[str, Any]:
-    research = _as_dict(state.get("research"))
-    user_research = _as_dict(research.get("user_research")) or _as_dict(state.get("user_research"))
-    return {
-        "research": research,
-        "user_signals": _normalized_research_strings(user_research.get("signals"), limit=4),
-        "pain_points": _normalized_research_strings(user_research.get("pain_points"), limit=4),
-        "opportunities": _normalized_research_strings(research.get("opportunities"), limit=4),
-        "threats": _normalized_research_strings(research.get("threats"), limit=4),
-        "segment": _first_research_text(
-            user_research.get("segment"),
-            default=_segment_from_spec(str(state.get("spec", ""))),
-            char_limit=80,
-        ),
-    }
 
 
 def _base_design_tokens(spec: str) -> dict[str, Any]:
@@ -1789,7 +1015,7 @@ def _base_design_tokens(spec: str) -> dict[str, Any]:
 def _build_persona_bundle(state: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     spec = str(state.get("spec", ""))
     kind = _infer_product_kind(spec)
-    context = _research_context(state)
+    context = _research_context(state, segment_from_spec=_segment_from_spec)
     signals = context["user_signals"] or ["価値をすばやく理解したい", "迷わず次の行動に進みたい"]
     pain_points = context["pain_points"] or ["文脈が失われやすい", "品質の見通しが持ちづらい"]
     segment = context["segment"]
@@ -2285,7 +1511,7 @@ def _solution_bundle(state: dict[str, Any]) -> dict[str, Any]:
 def _planning_recommendations(state: dict[str, Any]) -> list[str]:
     spec = str(state.get("spec", ""))
     kind = _infer_product_kind(spec)
-    context = _research_context(state)
+    context = _research_context(state, segment_from_spec=_segment_from_spec)
     technical = _as_dict(_as_dict(state.get("research")).get("tech_feasibility"))
     score = float(technical.get("score", 0.75) or 0.75)
 
@@ -2913,14 +2139,14 @@ async def _localize_research_output(
         localized["localization_status"] = "skipped"
         return localized, [], {"status": "skipped"}
 
-    localized["judge_summary"] = _translate_fixed_research_text(
+    localized["judge_summary"] = translate_fixed_research_text(
         localized.get("judge_summary"),
         target_language=target_language,
     )
     localized["quality_gates"] = [
         {
             **_as_dict(item),
-            "reason": _translate_fixed_research_text(
+            "reason": translate_fixed_research_text(
                 _as_dict(item).get("reason"),
                 target_language=target_language,
             ),
@@ -2931,7 +2157,7 @@ async def _localize_research_output(
     if remediation_plan:
         localized["remediation_plan"] = {
             **remediation_plan,
-            "objective": _translate_fixed_research_text(
+            "objective": translate_fixed_research_text(
                 remediation_plan.get("objective"),
                 target_language=target_language,
             ),
@@ -2939,7 +2165,7 @@ async def _localize_research_output(
     localized["execution_trace"] = [
         {
             **_as_dict(item),
-            "objective": _translate_fixed_research_text(
+            "objective": translate_fixed_research_text(
                 _as_dict(item).get("objective"),
                 target_language=target_language,
             ),
@@ -2947,7 +2173,7 @@ async def _localize_research_output(
         for item in _as_list(localized.get("execution_trace"))
     ]
 
-    payload = _research_localization_payload(localized)
+    payload = research_localization_payload(localized)
     if not payload:
         localized["display_language"] = target_language
         localized["localization_status"] = "noop"
@@ -2977,7 +2203,7 @@ async def _localize_research_output(
         phase="research",
     )
     if isinstance(translated, dict):
-        localized = _merge_research_localization(localized, translated)
+        localized = merge_research_localization(localized, translated)
         localized["localization_status"] = str(llm_meta.get("parse_status", "strict"))
     else:
         localized["localization_status"] = str(llm_meta.get("parse_status", "fallback"))
@@ -4989,7 +4215,7 @@ def _research_competitor_handler(node_id: str, state: dict[str, Any]) -> NodeRes
             confidence=0.7 if not competitors else min(0.82, 0.66 + len(evidence) * 0.04),
         ),
     ]
-    node_result = _research_node_result(
+    node_result = research_node_result(
         node_id,
         status="success" if competitors and source_packets else "degraded",
         parse_status="strict",
@@ -5077,7 +4303,7 @@ def _research_market_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
             confidence=0.65 if not external_packets else min(0.83, 0.67 + len(evidence) * 0.04),
         ),
     ]
-    node_result = _research_node_result(
+    node_result = research_node_result(
         node_id,
         status="success" if external_packets else "degraded",
         parse_status="strict",
@@ -5153,7 +4379,7 @@ def _research_user_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
             confidence=0.67 if not external_packets else min(0.84, 0.69 + len(evidence) * 0.04),
         ),
     ]
-    node_result = _research_node_result(
+    node_result = research_node_result(
         node_id,
         status="success" if external_packets else "degraded",
         parse_status="strict",
@@ -5238,7 +4464,7 @@ def _research_tech_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
             confidence=0.7 if not external_packets else min(0.84, 0.68 + len(evidence) * 0.04),
         ),
     ]
-    node_result = _research_node_result(
+    node_result = research_node_result(
         node_id,
         status="success" if external_packets else "degraded",
         parse_status="strict",
@@ -5260,11 +4486,6 @@ def _research_tech_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
             {"name": "tech-claims", "kind": "research", "claims": claims, "evidence": evidence},
         ),
     )
-
-
-def _normalized_research_strings(values: Any, *, limit: int = 3, char_limit: int = 180) -> list[str]:
-    return _research_text_fragments(values, max_items=limit, char_limit=char_limit)
-
 
 async def _research_peer_delegations(
     *,
@@ -5432,7 +4653,7 @@ async def _research_competitor_autonomous_handler(
             confidence=confidence,
         ),
     ]
-    node_result = _research_node_result(
+    node_result = research_node_result(
         node_id,
         status="success" if competitors and source_packets and llm_meta.get("parse_status") != "failed" else "degraded",
         parse_status=str(llm_meta.get("parse_status", "strict")),
@@ -5541,7 +4762,7 @@ async def _research_market_autonomous_handler(
             confidence=confidence,
         ),
     ]
-    node_result = _research_node_result(
+    node_result = research_node_result(
         node_id,
         status="success" if source_packets and llm_meta.get("parse_status") != "failed" else "degraded",
         parse_status=str(llm_meta.get("parse_status", "strict")),
@@ -5644,7 +4865,7 @@ async def _research_user_autonomous_handler(
             confidence=confidence,
         ),
     ]
-    node_result = _research_node_result(
+    node_result = research_node_result(
         node_id,
         status="success" if source_packets and llm_meta.get("parse_status") != "failed" else "degraded",
         parse_status=str(llm_meta.get("parse_status", "strict")),
@@ -5742,7 +4963,7 @@ async def _research_tech_autonomous_handler(
             confidence=confidence,
         ),
     ]
-    node_result = _research_node_result(
+    node_result = research_node_result(
         node_id,
         status="success" if source_packets and llm_meta.get("parse_status") != "failed" else "degraded",
         parse_status=str(llm_meta.get("parse_status", "strict")),
@@ -5982,7 +5203,7 @@ async def _research_devils_advocate_handler(
             fallback_questions = llm_questions
     else:
         llm_meta = {"parse_status": "strict", "raw_preview": ""}
-    node_result = _research_node_result(
+    node_result = research_node_result(
         node_id,
         status="success" if fallback_dissent else "degraded",
         parse_status=str(llm_meta.get("parse_status", "strict")),
@@ -6048,7 +5269,7 @@ def _research_cross_examiner_handler(
         updated_dissent.extend(resolved_claim_dissent)
         if evidence_count < 2:
             open_questions.append(f"{claim.get('statement')} を裏づける追加 evidence が必要")
-    node_result = _research_node_result(
+    node_result = research_node_result(
         node_id,
         status="success" if not [item for item in updated_dissent if str(item.get("severity")) == "critical" and item.get("resolved") is not True] else "degraded",
         parse_status="strict",
@@ -6194,7 +5415,10 @@ async def _research_judge_handler(
 
         winners = _winning_claims(claims)
         confidence_values = [float(item.get("confidence", 0.0) or 0.0) for item in claims]
-        node_results = _collect_research_node_results(working_state)
+        node_results = collect_research_node_results(
+            working_state,
+            list(_RESEARCH_PROPOSAL_NODES) + list(_RESEARCH_REVIEW_NODES),
+        )
         final_research = {
             **research,
             "claims": claims,
@@ -6244,13 +5468,15 @@ async def _research_judge_handler(
             ),
             "execution_trace": remediation_trace,
         }
-        quality_gates, readiness, remediation_plan = _evaluate_research_quality(
+        quality_gates, readiness, remediation_plan = evaluate_research_quality(
             final_research,
             node_results=node_results,
             remaining_iterations=max(
                 0,
                 max_remediation_iterations - remediation_iteration,
             ),
+            proposal_node_ids=list(_RESEARCH_PROPOSAL_NODES),
+            review_node_ids=list(_RESEARCH_REVIEW_NODES),
         )
         judge_reasons = list(llm_meta.get("degradation_reasons", []))
         if readiness != "ready":
@@ -6261,7 +5487,7 @@ async def _research_judge_handler(
                     if gate.get("passed") is not True
                 ]
             )
-        judge_result = _research_node_result(
+        judge_result = research_node_result(
             node_id,
             status="success" if readiness == "ready" else "degraded",
             parse_status=str(llm_meta.get("parse_status", "strict")),
@@ -6311,6 +5537,7 @@ async def _research_judge_handler(
             "canonical": canonical_research,
             "localized": dict(localized_research),
         }
+        final_research["view_model"] = build_research_view_model(final_research)
         runtime_output = _research_runtime_output(final_research)
         if localization_meta.get("status") not in {None, "noop", "skipped"}:
             judge_result["artifact"]["localized"] = True
@@ -6590,7 +5817,7 @@ def _planning_assumption_auditor_handler(
 ) -> NodeResult:
     del provider_registry, llm_runtime
     personas = [_as_dict(item) for item in _as_list(state.get("persona_report")) if _as_dict(item)]
-    research = _research_context(state)
+    research = _research_context(state, segment_from_spec=_segment_from_spec)
     assumptions = _dedupe_strings(
         [
             f"{str(personas[0].get('name', 'Primary user')) if personas else 'Primary user'} will trade setup breadth for stronger control and traceability.",

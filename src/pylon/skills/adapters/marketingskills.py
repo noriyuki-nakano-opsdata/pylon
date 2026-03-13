@@ -6,7 +6,7 @@ from pathlib import Path
 
 from pylon.skills.adapters.agent_skills_basic import AgentSkillsBasicAdapter
 from pylon.skills.adapters.base import tool_registry_index
-from pylon.skills.import_types import ContextContract, ToolCandidate
+from pylon.skills.import_types import ContextContract, ImportedReference, ToolCandidate
 
 
 class MarketingskillsAdapter(AgentSkillsBasicAdapter):
@@ -91,6 +91,21 @@ class MarketingskillsAdapter(AgentSkillsBasicAdapter):
                     )
                 )
         return candidates
+
+    def default_reference_bundle(
+        self,
+        *,
+        skill_id: str,
+        references: list[ImportedReference],
+        body: str,
+    ) -> list[str]:
+        if skill_id == "analytics-tracking":
+            return [
+                reference.path
+                for reference in references
+                if reference.path == "references/event-library.md"
+            ]
+        return []
 
     @staticmethod
     def _tool_map() -> dict[str, tuple[str, ...]]:

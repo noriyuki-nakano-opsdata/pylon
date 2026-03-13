@@ -38,6 +38,7 @@ export const queryKeys = {
     all: ["skills"] as const,
     detail: (id: string) => ["skills", id] as const,
     categories: ["skills", "categories"] as const,
+    importSummary: ["skills", "import-summary"] as const,
   },
   ads: {
     reports: () => ["ads", "reports"] as const,
