@@ -9,27 +9,31 @@ import {
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { useLifecycle } from "./LifecycleContext";
+import { useLifecycleActions, useLifecycleState } from "./LifecycleContext";
 import { useWorkflowRun } from "@/hooks/useWorkflowRun";
 import { lifecycleApi } from "@/api/lifecycle";
 import { AgentProgressView } from "@/components/lifecycle/AgentProgressView";
+import { buildDesignWorkflowInput } from "@/lifecycle/inputs";
+import {
+  selectPhaseTeam,
+  selectSelectedFeatureCount,
+} from "@/lifecycle/selectors";
 import type { DesignVariant } from "@/types/lifecycle";
 
 const DESIGN_AGENTS = [
-  { id: "claude-designer", label: "Claude Sonnet 4.6" },
-  { id: "openai-designer", label: "GPT-5 Mini" },
-  { id: "gemini-designer", label: "Gemini 3 Flash" },
-  { id: "design-evaluator", label: "デザイン審査" },
+  { id: "claude-designer", label: "Claude Sonnet 4.6", role: "案出し", autonomy: "A2", tools: [], skills: [] },
+  { id: "openai-designer", label: "GPT-5 Mini", role: "案出し", autonomy: "A2", tools: [], skills: [] },
+  { id: "gemini-designer", label: "Gemini 3 Flash", role: "案出し", autonomy: "A2", tools: [], skills: [] },
+  { id: "design-evaluator", label: "デザイン審査", role: "評価", autonomy: "A2", tools: [], skills: [] },
 ];
 
 export function DesignPhase() {
   const navigate = useNavigate();
   const { projectSlug } = useParams();
-  const lc = useLifecycle();
+  const lc = useLifecycleState();
+  const actions = useLifecycleActions();
   const workflow = useWorkflowRun("design", projectSlug ?? "");
-  const designAgents = lc.blueprints.design.team.length > 0
-    ? lc.blueprints.design.team.map((agent) => ({ id: agent.id, label: agent.label }))
-    : DESIGN_AGENTS;
+  const designAgents = selectPhaseTeam(lc, "design", DESIGN_AGENTS);
   const [previewDevice, setPreviewDevice] = useState<"desktop" | "tablet" | "mobile">("desktop");
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [selectError, setSelectError] = useState<string | null>(null);
@@ -40,23 +44,19 @@ export function DesignPhase() {
     if (syncedRunRef.current === workflow.runId) return;
     syncedRunRef.current = workflow.runId;
     void lifecycleApi.syncPhaseRun(projectSlug, "design", workflow.runId).then(({ project }) => {
-      lc.applyProject(project);
+      actions.applyProject(project);
     });
-  }, [workflow.runId, workflow.status, projectSlug, lc]);
+  }, [actions, workflow.runId, workflow.status, projectSlug]);
 
   const isGenerating = workflow.status === "starting" || workflow.status === "running";
 
   const generate = () => {
-    lc.advancePhase("design");
-    workflow.start({
-      spec: lc.spec,
-      features: lc.features.filter((f) => f.selected),
-      analysis: lc.analysis,
-    });
+    actions.advancePhase("design");
+    workflow.start(buildDesignWorkflowInput(lc));
   };
 
   const goNext = () => {
-    lc.completePhase("design");
+    actions.completePhase("design");
     navigate(`/p/${projectSlug}/lifecycle/approval`);
   };
   const goBack = () => navigate(`/p/${projectSlug}/lifecycle/planning`);
@@ -68,14 +68,14 @@ export function DesignPhase() {
   const selectDesign = (designId: string) => {
     setSelectError(null);
     if (!projectSlug) {
-      lc.setSelectedDesignId(designId);
+      actions.selectDesign(designId);
       return;
     }
     // Optimistically update local state
-    lc.setSelectedDesignId(designId);
+    actions.selectDesign(designId);
     void lifecycleApi.saveProject(projectSlug, { selectedDesignId: designId })
       .then((response) => {
-        lc.applyProject(response.project);
+        actions.applyProject(response.project);
       })
       .catch((err) => {
         setSelectError(err instanceof Error ? err.message : "デザインの保存に失敗しました");
@@ -83,7 +83,7 @@ export function DesignPhase() {
   };
 
   if (lc.designVariants.length === 0 && !isGenerating) {
-    const selectedFeatureCount = lc.features.filter((f) => f.selected).length;
+    const selectedFeatureCount = selectSelectedFeatureCount(lc);
     const planningReady = Boolean(lc.analysis);
     return (
       <div className="flex h-full items-center justify-center p-6">

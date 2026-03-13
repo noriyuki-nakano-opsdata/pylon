@@ -654,10 +654,37 @@ class SQLiteWorkflowControlPlaneStore:
         namespace: str,
         record_id: str,
         payload: dict[str, Any],
-    ) -> None:
-        tenant_id = payload.get("tenant_id")
-        updated_at = payload.get("updated_at", payload.get("created_at"))
+        expected_record_version: int | None = None,
+    ) -> dict[str, Any]:
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT payload_json
+                FROM surface_records
+                WHERE namespace = ? AND record_id = ?
+                """,
+                (namespace, record_id),
+            ).fetchone()
+            current_version = 0
+            if existing is not None:
+                current_version = int(
+                    self._load_json(str(existing["payload_json"])).get("record_version", 0)
+                )
+            if expected_record_version is not None and current_version != expected_record_version:
+                raise ConcurrencyError(
+                    f"Surface record version conflict for {namespace}/{record_id}",
+                    details={
+                        "namespace": namespace,
+                        "record_id": record_id,
+                        "expected_record_version": expected_record_version,
+                        "actual_record_version": current_version,
+                    },
+                )
+            stored = dict(payload)
+            stored["record_version"] = current_version + 1
+            tenant_id = stored.get("tenant_id")
+            updated_at = stored.get("updated_at", stored.get("created_at"))
             connection.execute(
                 """
                 INSERT OR REPLACE INTO surface_records (
@@ -669,10 +696,11 @@ class SQLiteWorkflowControlPlaneStore:
                     record_id,
                     None if tenant_id is None else str(tenant_id),
                     None if updated_at is None else str(updated_at),
-                    json.dumps(dict(payload), sort_keys=True, default=str),
+                    json.dumps(stored, sort_keys=True, default=str),
                 ),
             )
             connection.commit()
+        return dict(stored)
 
     def delete_surface_record(
         self,

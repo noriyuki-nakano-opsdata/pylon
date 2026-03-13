@@ -54,6 +54,12 @@ def skill_record_from_mapping(skill_id: str, payload: dict[str, Any]) -> SkillRe
         max_prompt_chars=int(payload.get("max_prompt_chars", 5000) or 5000),
         digest=str(payload.get("digest", "")),
         references=tuple(str(item) for item in payload.get("references", []) if str(item).strip()) if isinstance(payload.get("references"), list) else (),
+        reference_assets=tuple(
+            dict(item) for item in payload.get("reference_assets", []) if isinstance(item, dict)
+        ) if isinstance(payload.get("reference_assets"), list) else (),
+        default_reference_bundle=tuple(
+            str(item) for item in payload.get("default_reference_bundle", []) if str(item).strip()
+        ) if isinstance(payload.get("default_reference_bundle"), list) else (),
         context_contracts=tuple(
             dict(item) for item in payload.get("context_contracts", []) if isinstance(item, dict)
         ) if isinstance(payload.get("context_contracts"), list) else (),
@@ -94,6 +100,7 @@ class SkillRuntime:
         explicit_skill_ids: list[str] | tuple[str, ...] = (),
         control_plane_skills: dict[str, dict[str, Any]] | None = None,
         workspace: str | Path | None = None,
+        reference_hints: dict[str, Any] | list[str] | tuple[str, ...] | None = None,
     ) -> EffectiveSkillSet:
         catalog = self.effective_catalog(
             tenant_id=tenant_id,
@@ -129,13 +136,19 @@ class SkillRuntime:
             activations,
             workspace=workspace,
         )
+        loaded_references, reference_warnings = _resolve_reference_assets(
+            activations,
+            reference_hints=reference_hints,
+        )
         return EffectiveSkillSet(
             activations=tuple(activations),
             prompt_prefix=prompt_prefix,
             available_tools=tuple(_dedupe_tools(available_tools)),
             unavailable_tools=tuple(unavailable_tools),
             loaded_contexts=tuple(loaded_contexts),
+            loaded_references=tuple(loaded_references),
             context_warnings=tuple(context_warnings),
+            reference_warnings=tuple(reference_warnings),
         )
 
     def augment_instruction(
@@ -147,6 +160,7 @@ class SkillRuntime:
         explicit_skill_ids: list[str] | tuple[str, ...] = (),
         control_plane_skills: dict[str, dict[str, Any]] | None = None,
         workspace: str | Path | None = None,
+        reference_hints: dict[str, Any] | list[str] | tuple[str, ...] | None = None,
     ) -> tuple[str, EffectiveSkillSet]:
         effective = self.resolve_effective_skill_set(
             tenant_id=tenant_id,
@@ -154,11 +168,13 @@ class SkillRuntime:
             explicit_skill_ids=explicit_skill_ids,
             control_plane_skills=control_plane_skills,
             workspace=workspace,
+            reference_hints=reference_hints,
         )
         context_prefix = _build_context_prompt_prefix(effective.loaded_contexts)
+        reference_prefix = _build_reference_prompt_prefix(effective.loaded_references)
         prompt_sections = [
             section
-            for section in (effective.prompt_prefix, context_prefix)
+            for section in (effective.prompt_prefix, context_prefix, reference_prefix)
             if str(section).strip()
         ]
         combined_prefix = "\n\n".join(prompt_sections).strip()
@@ -372,6 +388,119 @@ def _build_context_prompt_prefix(values: tuple[dict[str, Any], ...] | list[dict[
             [
                 "",
                 f"=== Context File: {item.get('path', '')} ===",
+                str(item.get("content", "")).strip(),
+            ]
+        )
+    return "\n".join(sections).strip()
+
+
+def _resolve_reference_assets(
+    activations: list[SkillActivation],
+    *,
+    reference_hints: dict[str, Any] | list[str] | tuple[str, ...] | None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    loaded: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for activation in activations:
+        requested_paths = _requested_reference_paths(
+            activation.skill,
+            reference_hints=reference_hints,
+        )
+        if not requested_paths:
+            continue
+        assets = _reference_assets_for_skill(activation.skill)
+        asset_index = {
+            str(asset.get("path", "")).strip(): dict(asset)
+            for asset in assets
+            if str(asset.get("path", "")).strip()
+        }
+        for requested_path in requested_paths:
+            asset = asset_index.get(requested_path)
+            if asset is None:
+                warnings.append(
+                    f"unknown reference for skill '{activation.skill.id}': {requested_path}"
+                )
+                continue
+            key = (activation.skill.id, requested_path)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            reference_file = (Path(activation.skill.path).expanduser().resolve() / requested_path).resolve()
+            skill_root = Path(activation.skill.path).expanduser().resolve()
+            if skill_root not in reference_file.parents:
+                warnings.append(
+                    f"reference path escapes skill root for skill '{activation.skill.id}': {requested_path}"
+                )
+                continue
+            if not reference_file.exists() or not reference_file.is_file():
+                warnings.append(
+                    f"missing reference for skill '{activation.skill.id}': {requested_path}"
+                )
+                continue
+            max_chars = int(asset.get("max_chars", 4000) or 4000)
+            content = reference_file.read_text(encoding="utf-8")[:max_chars].strip()
+            if not content:
+                continue
+            loaded.append(
+                {
+                    "skill_id": activation.skill.id,
+                    "path": requested_path,
+                    "title": str(asset.get("title", reference_file.stem)).strip(),
+                    "digest": str(asset.get("digest", "")).strip(),
+                    "content": content,
+                }
+            )
+    return loaded, warnings
+
+
+def _reference_assets_for_skill(skill: SkillRecord) -> list[dict[str, Any]]:
+    if skill.reference_assets:
+        return [dict(item) for item in skill.reference_assets]
+    return [{"path": path, "title": Path(path).stem.replace("-", " ")} for path in skill.references]
+
+
+def _requested_reference_paths(
+    skill: SkillRecord,
+    *,
+    reference_hints: dict[str, Any] | list[str] | tuple[str, ...] | None,
+) -> list[str]:
+    requested = list(skill.default_reference_bundle)
+    if reference_hints is None:
+        return _dedupe_strings([str(item) for item in requested if str(item).strip()])
+    if isinstance(reference_hints, (list, tuple)):
+        requested.extend(str(item) for item in reference_hints if str(item).strip())
+        return _dedupe_strings([str(item) for item in requested if str(item).strip()])
+    if not isinstance(reference_hints, dict):
+        return _dedupe_strings([str(item) for item in requested if str(item).strip()])
+    candidate_keys = {
+        skill.id,
+        skill.effective_alias,
+        skill.effective_skill_key,
+        skill.handle.canonical_id,
+    }
+    source_scoped = reference_hints.get(str(skill.source_id)) if skill.source_id else None
+    for key, value in reference_hints.items():
+        if key in candidate_keys or key in {"*", "all"}:
+            if isinstance(value, (list, tuple)):
+                requested.extend(str(item) for item in value if str(item).strip())
+        elif isinstance(source_scoped, dict) and key in candidate_keys:
+            nested = source_scoped.get(key)
+            if isinstance(nested, (list, tuple)):
+                requested.extend(str(item) for item in nested if str(item).strip())
+    return _dedupe_strings([str(item) for item in requested if str(item).strip()])
+
+
+def _build_reference_prompt_prefix(values: tuple[dict[str, Any], ...] | list[dict[str, Any]]) -> str:
+    if not values:
+        return ""
+    sections = ["You also have the following skill reference files loaded on demand."]
+    for item in values:
+        title = str(item.get("title", item.get("path", ""))).strip()
+        sections.extend(
+            [
+                "",
+                f"=== Reference: {title} ({item.get('path', '')}) ===",
                 str(item.get("content", "")).strip(),
             ]
         )

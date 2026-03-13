@@ -31,53 +31,30 @@ import type {
   WorkflowRunLiveTelemetry,
 } from "@/types/lifecycle";
 
-export interface LifecycleState {
+export interface LifecycleWorkspaceView {
   spec: string;
-  setSpec: (s: string) => void;
   orchestrationMode: LifecycleOrchestrationMode;
-  setOrchestrationMode: (mode: LifecycleOrchestrationMode) => void;
   autonomyLevel: LifecycleAutonomyLevel;
-  setAutonomyLevel: (level: LifecycleAutonomyLevel) => void;
   researchConfig: LifecycleResearchConfig;
-  setResearchConfig: (config: LifecycleResearchConfig) => void;
   research: MarketResearch | null;
-  setResearch: (r: MarketResearch | null) => void;
   analysis: AnalysisResult | null;
-  setAnalysis: (a: AnalysisResult | null) => void;
   features: FeatureSelection[];
-  setFeatures: (f: FeatureSelection[]) => void;
   milestones: Milestone[];
-  setMilestones: (m: Milestone[]) => void;
   designVariants: DesignVariant[];
-  setDesignVariants: (v: DesignVariant[]) => void;
   selectedDesignId: string | null;
-  setSelectedDesignId: (id: string | null) => void;
   approvalStatus: "pending" | "approved" | "rejected" | "revision_requested";
-  setApprovalStatus: (s: "pending" | "approved" | "rejected" | "revision_requested") => void;
   approvalComments: ApprovalComment[];
-  setApprovalComments: (c: ApprovalComment[]) => void;
   buildCode: string | null;
-  setBuildCode: (c: string | null) => void;
   buildCost: number;
-  setBuildCost: (c: number) => void;
   buildIteration: number;
-  setBuildIteration: (i: number) => void;
   milestoneResults: MilestoneResult[];
-  setMilestoneResults: (r: MilestoneResult[]) => void;
   planEstimates: PlanEstimate[];
-  setPlanEstimates: (e: PlanEstimate[]) => void;
   selectedPreset: PlanPreset;
-  setSelectedPreset: (p: PlanPreset) => void;
   phaseStatuses: PhaseStatus[];
-  setPhaseStatuses: (s: PhaseStatus[]) => void;
   deployChecks: DeployCheck[];
-  setDeployChecks: (c: DeployCheck[]) => void;
   releases: ReleaseRecord[];
-  setReleases: (r: ReleaseRecord[]) => void;
   feedbackItems: FeedbackItem[];
-  setFeedbackItems: (f: FeedbackItem[]) => void;
   recommendations: LifecycleRecommendation[];
-  setRecommendations: (r: LifecycleRecommendation[]) => void;
   artifacts: LifecycleArtifact[];
   decisionLog: LifecycleDecision[];
   skillInvocations: LifecycleSkillInvocation[];
@@ -93,15 +70,37 @@ export interface LifecycleState {
   runtimeConnectionState: "inactive" | "connecting" | "live" | "reconnecting";
   blueprints: Record<LifecyclePhase, PhaseBlueprint>;
   isHydrating: boolean;
+}
+
+export interface LifecycleActions {
+  editSpec: (s: string) => void;
+  updateResearchConfig: (config: LifecycleResearchConfig) => void;
+  replaceFeatures: (f: FeatureSelection[]) => void;
+  replaceMilestones: (m: Milestone[]) => void;
+  selectDesign: (id: string | null) => void;
+  recordBuildIteration: (i: number) => void;
+  recordMilestoneResults: (r: MilestoneResult[]) => void;
+  selectPreset: (p: PlanPreset) => void;
   applyProject: (project: LifecycleProject) => void;
   advancePhase: (phase: LifecyclePhase) => void;
   completePhase: (phase: LifecyclePhase) => void;
 }
 
-export const LifecycleContext = createContext<LifecycleState | null>(null);
+export interface LifecycleContextValue {
+  state: LifecycleWorkspaceView;
+  actions: LifecycleActions;
+}
 
-export function useLifecycle() {
+export const LifecycleContext = createContext<LifecycleContextValue | null>(null);
+
+export function useLifecycleState() {
   const ctx = useContext(LifecycleContext);
-  if (!ctx) throw new Error("useLifecycle must be used within LifecycleLayout");
-  return ctx;
+  if (!ctx) throw new Error("useLifecycleState must be used within LifecycleLayout");
+  return ctx.state;
+}
+
+export function useLifecycleActions() {
+  const ctx = useContext(LifecycleContext);
+  if (!ctx) throw new Error("useLifecycleActions must be used within LifecycleLayout");
+  return ctx.actions;
 }

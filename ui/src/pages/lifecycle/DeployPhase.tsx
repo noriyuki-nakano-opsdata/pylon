@@ -8,12 +8,14 @@ import {
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { lifecycleApi } from "@/api/lifecycle";
-import { useLifecycle } from "./LifecycleContext";
+import { useLifecycleActions, useLifecycleState } from "./LifecycleContext";
+import { selectDeploySummary } from "@/lifecycle/selectors";
 
 export function DeployPhase() {
   const navigate = useNavigate();
   const { projectSlug } = useParams();
-  const lc = useLifecycle();
+  const lc = useLifecycleState();
+  const actions = useLifecycleActions();
   const [device, setDevice] = useState<"desktop" | "tablet" | "mobile">("desktop");
   const [isChecking, setIsChecking] = useState(false);
   const [isDeploying, setIsDeploying] = useState(false);
@@ -36,7 +38,7 @@ export function DeployPhase() {
     setIsChecking(true);
     try {
       const response = await lifecycleApi.runDeployChecks(projectSlug, lc.buildCode ?? undefined);
-      lc.applyProject(response.project);
+      actions.applyProject(response.project);
     } finally {
       setIsChecking(false);
     }
@@ -47,8 +49,8 @@ export function DeployPhase() {
     setIsDeploying(true);
     try {
       const response = await lifecycleApi.createRelease(projectSlug, releaseNote);
-      lc.applyProject(response.project);
-      lc.completePhase("deploy");
+      actions.applyProject(response.project);
+      actions.completePhase("deploy");
       setReleaseNote("");
     } finally {
       setIsDeploying(false);
@@ -69,14 +71,16 @@ export function DeployPhase() {
   const goNext = () => navigate(`/p/${projectSlug}/lifecycle/iterate`);
   const goBack = () => navigate(`/p/${projectSlug}/lifecycle/development`);
 
-  const checks = lc.deployChecks;
-  const allPassed = checks.length > 0 && checks.every((item) => item.status !== "fail");
-  const deployed = lc.releases.length > 0;
-  const latestRelease = lc.releases[0];
+  const {
+    checks,
+    allPassed,
+    deployed,
+    latestRelease,
+    passedCount,
+    warningCount,
+    failedCount,
+  } = selectDeploySummary(lc);
   const deviceWidth = device === "desktop" ? "100%" : device === "tablet" ? "768px" : "375px";
-  const passedCount = checks.filter((item) => item.status === "pass").length;
-  const warningCount = checks.filter((item) => item.status === "warning").length;
-  const failedCount = checks.filter((item) => item.status === "fail").length;
 
   return (
     <div className="flex h-full flex-col">

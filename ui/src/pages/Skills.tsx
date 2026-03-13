@@ -16,6 +16,10 @@ import {
   ShieldAlert,
   Minus,
   Plus,
+  Activity,
+  Bot,
+  Clock3,
+  GitBranch,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -23,7 +27,7 @@ import { Input } from "@/components/ui/input";
 import { Card } from "@/components/ui/card";
 import { PageSkeleton } from "@/components/PageSkeleton";
 import { queryKeys } from "@/lib/queryKeys";
-import { skillsApi, type SkillInfo, type SkillExecuteResponse } from "@/api/skills";
+import { skillsApi, type SkillImportSummary, type SkillInfo, type SkillExecuteResponse } from "@/api/skills";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -100,6 +104,144 @@ function StatsBar({ total, sources }: { total: number; sources: Record<string, n
         );
       })}
     </div>
+  );
+}
+
+function OpsSummaryCard({
+  title,
+  value,
+  detail,
+  icon: Icon,
+}: {
+  title: string;
+  value: string;
+  detail: string;
+  icon: React.ElementType;
+}) {
+  return (
+    <Card className="p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div className="space-y-1">
+          <p className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">{title}</p>
+          <p className="text-2xl font-semibold text-foreground">{value}</p>
+          <p className="text-xs leading-relaxed text-muted-foreground">{detail}</p>
+        </div>
+        <span className="rounded-full border border-border bg-muted/60 p-2 text-muted-foreground">
+          <Icon className="h-4 w-4" />
+        </span>
+      </div>
+    </Card>
+  );
+}
+
+function ImportOperationsPanel({ summary }: { summary: SkillImportSummary }) {
+  const pending = summary.queue.counts.pending ?? 0;
+  const running = summary.queue.counts.running ?? 0;
+  const failed = summary.queue.counts.failed ?? 0;
+  const completedJobs = summary.jobs.counts.completed ?? 0;
+  const readySources = summary.sources.counts.ready ?? 0;
+  const reviewPending = summary.reviews.states.pending ?? 0;
+  const queueDepth = summary.metrics.queue_depth.pending ?? 0;
+
+  return (
+    <section className="space-y-3">
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-sm font-semibold text-foreground">Import Operations</h2>
+          <p className="text-xs text-muted-foreground">
+            外部 skill source の同期状態、review backlog、worker lease を集約表示
+          </p>
+        </div>
+        <div className="rounded-full border border-border px-2.5 py-1 text-[11px] text-muted-foreground">
+          worker {summary.worker.is_leader ? "leader" : "standby"}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <OpsSummaryCard
+          title="Queue"
+          value={`${pending}/${running}`}
+          detail={`pending ${pending}, running ${running}, gauge ${queueDepth ?? 0}`}
+          icon={Activity}
+        />
+        <OpsSummaryCard
+          title="Worker"
+          value={summary.worker.is_leader ? "active" : "idle"}
+          detail={summary.worker.owner ? `lease owner ${summary.worker.owner}` : "active lease なし"}
+          icon={Bot}
+        />
+        <OpsSummaryCard
+          title="Sources"
+          value={`${readySources}`}
+          detail={`${summary.sources.items.length} source, completed jobs ${completedJobs}`}
+          icon={GitBranch}
+        />
+        <OpsSummaryCard
+          title="Reviews"
+          value={`${reviewPending}`}
+          detail={`pending review ${reviewPending}, promoted ${summary.reviews.promoted_count}`}
+          icon={Clock3}
+        />
+      </div>
+
+      {(failed > 0 || summary.sources.items.length > 0 || summary.jobs.recent.length > 0) && (
+        <div className="grid grid-cols-1 gap-3 xl:grid-cols-[1.3fr,1fr]">
+          <Card className="p-4">
+            <div className="mb-3 flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-foreground">Source Status</h3>
+              <span className="text-xs text-muted-foreground">{summary.sources.items.length} sources</span>
+            </div>
+            <div className="space-y-2">
+              {summary.sources.items.length === 0 ? (
+                <p className="text-xs text-muted-foreground">外部 source はまだ登録されていません。</p>
+              ) : (
+                summary.sources.items.slice(0, 4).map((source) => (
+                  <div key={source.id} className="flex items-center justify-between rounded-lg border border-border bg-muted/30 px-3 py-2">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium text-foreground">{source.id}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {source.adapter_profile ?? "unknown"} / skills {source.imported_skill_count} / promoted tools {source.promoted_tool_count}
+                      </p>
+                    </div>
+                    <div className="text-right">
+                      <p className="text-xs font-medium text-foreground">{source.status}</p>
+                      <p className="text-[11px] text-muted-foreground">{source.last_job?.operation ?? "no job"}</p>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </Card>
+
+          <Card className="p-4">
+            <div className="mb-3 flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-foreground">Recent Jobs</h3>
+              <span className="text-xs text-muted-foreground">{completedJobs} completed</span>
+            </div>
+            <div className="space-y-2">
+              {summary.jobs.recent.length === 0 ? (
+                <p className="text-xs text-muted-foreground">skill import job はまだありません。</p>
+              ) : (
+                summary.jobs.recent.slice(0, 5).map((job) => (
+                  <div key={job.id} className="rounded-lg border border-border bg-muted/30 px-3 py-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">{job.operation}</p>
+                      <p className="text-xs text-foreground">{job.status}</p>
+                    </div>
+                    <p className="mt-1 truncate text-sm text-foreground">{job.source_id}</p>
+                    {job.error ? (
+                      <p className="mt-1 text-xs text-red-400">{job.error}</p>
+                    ) : (
+                      <p className="mt-1 text-xs text-muted-foreground">{job.updated_at ?? "timestamp unavailable"}</p>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+          </Card>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -484,6 +626,10 @@ export function Skills() {
         search: search || undefined,
       }),
   });
+  const { data: importSummary } = useQuery({
+    queryKey: queryKeys.skills.importSummary,
+    queryFn: () => skillsApi.importSummary(),
+  });
 
   const scanMutation = useMutation({
     mutationFn: skillsApi.scan,
@@ -541,6 +687,8 @@ export function Skills() {
 
       {/* Stats */}
       <StatsBar total={data?.total ?? 0} sources={sources} />
+
+      {importSummary && <ImportOperationsPanel summary={importSummary} />}
 
       {/* Filters */}
       <div className="flex flex-wrap items-center gap-3">

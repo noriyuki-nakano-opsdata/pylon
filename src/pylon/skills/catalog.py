@@ -160,6 +160,8 @@ def parse_skill_dir(skill_dir: Path, *, source: str = "local", source_kind: str 
         max_prompt_chars=int(frontmatter.get("max_prompt_chars", 5000) or 5000),
         digest=_sha256_text(json.dumps(digest_payload, sort_keys=True, ensure_ascii=False)),
         references=_coerce_str_list(frontmatter.get("references")),
+        reference_assets=_coerce_mapping_list(frontmatter.get("reference_assets")),
+        default_reference_bundle=_coerce_str_list(frontmatter.get("default_reference_bundle")),
         context_contracts=_coerce_mapping_list(frontmatter.get("context_contracts")),
         source_id=str(frontmatter.get("source_id", "")).strip(),
         source_revision=str(frontmatter.get("source_revision", "")).strip(),

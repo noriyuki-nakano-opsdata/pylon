@@ -128,6 +128,7 @@ class ImportedSkillRecord:
     content: str
     version: str
     references: tuple[ImportedReference, ...] = ()
+    default_reference_bundle: tuple[str, ...] = ()
     context_contracts: tuple[ContextContract, ...] = ()
     tool_candidates: tuple[ToolCandidate, ...] = ()
     inference_log: tuple[str, ...] = ()

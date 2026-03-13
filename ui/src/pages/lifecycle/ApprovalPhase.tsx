@@ -8,24 +8,28 @@ import {
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { lifecycleApi } from "@/api/lifecycle";
-import { useLifecycle } from "./LifecycleContext";
+import { buildApprovalPayload } from "@/lifecycle/inputs";
+import { useLifecycleActions, useLifecycleState } from "./LifecycleContext";
+import { selectApprovalViewModel } from "@/lifecycle/selectors";
 
 export function ApprovalPhase() {
   const navigate = useNavigate();
   const { projectSlug } = useParams();
-  const lc = useLifecycle();
+  const lc = useLifecycleState();
+  const actions = useLifecycleActions();
   const [comment, setComment] = useState("");
   const [submitting, setSubmitting] = useState<"comment" | "approve" | "reject" | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
-
-  const selectedFeatureCount = lc.features.filter((f) => f.selected).length;
-  const selectedDesign = lc.designVariants.find((v) => v.id === lc.selectedDesignId);
-  const milestoneCount = lc.milestones.length;
-  const reviewLinks = [
-    { label: "調査を確認", phase: "research", ready: !!lc.research },
-    { label: "企画を修正", phase: "planning", ready: !!lc.analysis },
-    { label: "デザインを修正", phase: "design", ready: !!lc.selectedDesignId },
-  ] as const;
+  const {
+    allChecked,
+    checkItems,
+    checklistProgressPercent,
+    completedChecklistCount,
+    milestoneCount,
+    reviewLinks,
+    selectedDesign,
+    selectedFeatureCount,
+  } = selectApprovalViewModel(lc);
 
   const submitComment = async (type: "comment" | "approve" | "reject") => {
     if (!projectSlug) return;
@@ -34,14 +38,11 @@ export function ApprovalPhase() {
     setSubmitting(type);
     setSubmitError(null);
     try {
-      const payload = {
-        text: comment || (type === "approve" ? "承認しました" : "差し戻しました"),
-        type,
-      } as const;
+      const payload = buildApprovalPayload(type, comment);
       const project = await lifecycleApi.addApprovalComment(projectSlug, payload);
-      lc.applyProject(project);
+      actions.applyProject(project);
       if (type === "approve") {
-        lc.completePhase("approval");
+        actions.completePhase("approval");
       }
       setComment("");
     } catch (err) {
@@ -53,15 +54,6 @@ export function ApprovalPhase() {
 
   const goNext = () => navigate(`/p/${projectSlug}/lifecycle/development`);
   const goBack = () => navigate(`/p/${projectSlug}/lifecycle/design`);
-
-  const checkItems = [
-    { label: "プロダクト仕様が明確", done: !!lc.spec.trim(), phase: "research" },
-    { label: "UX分析が完了", done: !!lc.analysis, phase: "planning" },
-    { label: "機能スコープが確定", done: selectedFeatureCount > 0, phase: "planning" },
-    { label: "デザインパターンが選択済み", done: !!lc.selectedDesignId, phase: "design" },
-    { label: "マイルストーンが定義済み", done: milestoneCount > 0, phase: "planning" },
-  ];
-  const allChecked = checkItems.every((c) => c.done);
 
   return (
     <div className="flex h-full flex-col">
@@ -239,9 +231,9 @@ export function ApprovalPhase() {
                 ))}
               </div>
               <div className="mt-3 h-2 rounded-full bg-muted overflow-hidden">
-                <div className="h-full rounded-full bg-success transition-all" style={{ width: `${(checkItems.filter((c) => c.done).length / checkItems.length) * 100}%` }} />
+                <div className="h-full rounded-full bg-success transition-all" style={{ width: `${checklistProgressPercent}%` }} />
               </div>
-              <p className="mt-1 text-[10px] text-muted-foreground text-right">{checkItems.filter((c) => c.done).length}/{checkItems.length} 完了</p>
+              <p className="mt-1 text-[10px] text-muted-foreground text-right">{completedChecklistCount}/{checkItems.length} 完了</p>
             </div>
 
             {/* Cost estimate */}

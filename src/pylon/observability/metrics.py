@@ -27,6 +27,11 @@ PREDEFINED_METRICS: dict[str, MetricType] = {
     "provider_fallback_count": MetricType.COUNTER,
     "provider_circuit_open_count": MetricType.COUNTER,
     "llm_cache_savings_usd": MetricType.COUNTER,
+    "skill_import_job_count": MetricType.COUNTER,
+    "skill_import_job_duration_seconds": MetricType.HISTOGRAM,
+    "skill_import_queue_depth": MetricType.GAUGE,
+    "skill_import_worker_is_leader": MetricType.GAUGE,
+    "skill_import_worker_heartbeat_unix": MetricType.GAUGE,
 }
 
 

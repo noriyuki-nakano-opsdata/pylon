@@ -486,6 +486,7 @@ def execute_project_sync(
                             base_instruction,
                             assigned_skill_ids=list(getattr(agent, "skills", [])),
                             workspace=_workspace_for_state(state),
+                            reference_hints=state.get("skill_reference_hints"),
                         )
                         available_skill_tools = [
                             tool.provider_tool()
@@ -541,6 +542,17 @@ def execute_project_sync(
                         ]
                         metrics["skill_context_warnings"] = list(
                             effective_skills.context_warnings
+                        )
+                        metrics["loaded_skill_references"] = [
+                            {
+                                "skill_id": item.get("skill_id"),
+                                "path": item.get("path"),
+                                "title": item.get("title"),
+                            }
+                            for item in effective_skills.loaded_references
+                        ]
+                        metrics["skill_reference_warnings"] = list(
+                            effective_skills.reference_warnings
                         )
                         metrics["unavailable_skill_tools"] = [
                             {

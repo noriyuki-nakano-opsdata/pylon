@@ -186,6 +186,9 @@ describe("stable API contract", () => {
     apiFetch.mockResolvedValueOnce({});
     await expectApiCall(skillsApi.categories(), "/v1/skills/categories");
 
+    apiFetch.mockResolvedValueOnce({});
+    await expectApiCall(skillsApi.importSummary(), "/v1/skill-import/summary");
+
     apiFetch.mockResolvedValueOnce({ providers: {}, fallback_chain: [], policies: {} });
     await expectApiCall(modelsApi.list(), "/v1/models");
 

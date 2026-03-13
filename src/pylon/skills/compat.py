@@ -116,7 +116,12 @@ class SkillCompatibilityLayer:
         }
         return normalized
 
-    def sync_source(self, source_payload: dict[str, Any]) -> dict[str, Any]:
+    def sync_source(
+        self,
+        source_payload: dict[str, Any],
+        *,
+        tool_candidate_decisions: dict[str, ToolCandidateDecision] | None = None,
+    ) -> dict[str, Any]:
         source_id = str(source_payload["id"])
         session = self._begin_import_session(source_payload)
         source_format, detected_profile = self._adapter_registry.classify(session.checkout_dir)
@@ -142,12 +147,16 @@ class SkillCompatibilityLayer:
                         skill_dir=skill_dir,
                     )
                 )
-        tool_candidate_decisions = self._load_tool_candidate_decisions(source_id)
+        resolved_tool_candidate_decisions = (
+            dict(tool_candidate_decisions)
+            if tool_candidate_decisions is not None
+            else self._load_tool_candidate_decisions(source_id)
+        )
         tool_candidate_reviews = self._build_tool_candidate_reviews(
             source_id=source_id,
             source_revision=revision,
             imported=imported,
-            decisions=tool_candidate_decisions,
+            decisions=resolved_tool_candidate_decisions,
         )
         self._materialize_imported_skills(
             artifact_root=session.staging_dir,
@@ -667,6 +676,8 @@ class SkillCompatibilityLayer:
                 "trust_class": str(source_payload.get("trust_class", "internal")),
                 "approval_class": "auto",
                 "references": [item.path for item in record.references],
+                "reference_assets": [asdict(item) for item in record.references],
+                "default_reference_bundle": list(record.default_reference_bundle),
                 "context_contracts": [asdict(item) for item in record.context_contracts],
                 "import_inference_log": list(record.inference_log),
             }

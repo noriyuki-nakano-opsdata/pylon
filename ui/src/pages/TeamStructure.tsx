@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { formatUptime } from "@/lib/time";
 import {
   Bot, User, Users, Shield, Code2, Palette, PenTool, Monitor, Network,
-  Zap, ChevronRight, X, Loader2, Cpu, MemoryStick, Clock, Wifi, WifiOff,
+  Zap, ChevronRight, X, Loader2, Cpu, MemoryStick, Clock, Wifi, WifiOff, Megaphone,
   CheckCircle2, Plus, Pencil, Trash2, Save,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -14,6 +14,13 @@ import {
   createAgent, updateAgent, deleteAgent,
   type AgentActivity, type Task, type TeamDef as ApiTeamDef,
 } from "@/api/mission-control";
+import {
+  AVAILABLE_MODELS,
+  buildModelOptions,
+  getTeamMeta,
+  mergeTeamDefs,
+  resolveTeamDef,
+} from "@/pages/teamStructureData";
 
 type ViewTab = "team" | "workspace";
 type AgentStatus = "online" | "offline" | "busy";
@@ -33,73 +40,11 @@ interface Team {
 }
 
 const ICON_MAP: Record<string, React.ElementType> = {
-  Code2, Palette, PenTool, Zap, Shield, Network, Users, Monitor, Bot,
+  Code2, Palette, PenTool, Zap, Shield, Network, Users, Monitor, Bot, Megaphone,
 };
 function resolveIcon(name: string): React.ElementType {
   return ICON_MAP[name] ?? Users;
 }
-
-const FALLBACK_TEAMS: ApiTeamDef[] = [
-  { id: "product", name: "Product Strategy", nameJa: "プロダクト戦略", icon: "Network", color: "text-orange-400", bg: "bg-orange-600" },
-  { id: "research", name: "Research Intelligence", nameJa: "リサーチ", icon: "PenTool", color: "text-emerald-400", bg: "bg-emerald-600" },
-  { id: "design", name: "UX & Design Systems", nameJa: "UX / デザインシステム", icon: "Palette", color: "text-purple-400", bg: "bg-pink-600" },
-  { id: "development", name: "Application Engineering", nameJa: "アプリケーション開発", icon: "Code2", color: "text-blue-400", bg: "bg-blue-600" },
-  { id: "platform", name: "Platform & Infra", nameJa: "プラットフォーム / 基盤", icon: "Monitor", color: "text-sky-400", bg: "bg-sky-600" },
-  { id: "data", name: "Data & Evaluation", nameJa: "データ / 評価", icon: "Zap", color: "text-cyan-400", bg: "bg-cyan-600" },
-  { id: "security", name: "Security & Governance", nameJa: "セキュリティ / ガバナンス", icon: "Shield", color: "text-red-400", bg: "bg-red-600" },
-  { id: "operations", name: "Operations & Release", nameJa: "運用 / リリース", icon: "Bot", color: "text-amber-400", bg: "bg-amber-600" },
-];
-
-const TEAM_META: Record<string, { description: string; emptyState: string; recommendedRoles: string[] }> = {
-  product: {
-    description: "企画、優先順位、承認判断、全体ハンドオフを束ねる中核チーム。",
-    emptyState: "まだ product specialist が配備されていません。",
-    recommendedRoles: ["Product Orchestrator", "Delivery Manager"],
-  },
-  research: {
-    description: "市場、競合、ユーザー仮説を検証し、planning の根拠を作るチーム。",
-    emptyState: "調査担当が不在です。research の質が落ちます。",
-    recommendedRoles: ["Competitive Researcher", "User Insight Analyst"],
-  },
-  design: {
-    description: "IA、UX、プロトタイプ品質、アクセシビリティを引き上げるチーム。",
-    emptyState: "design specialist が未配備です。",
-    recommendedRoles: ["UX Architect", "Design Critic"],
-  },
-  development: {
-    description: "UI/API の実装と統合を進め、成果物に落とし込むチーム。",
-    emptyState: "実装担当が不足しています。",
-    recommendedRoles: ["Frontend Builder", "Backend Integrator"],
-  },
-  platform: {
-    description: "実行基盤、観測性、デプロイ導線を支えるチーム。",
-    emptyState: "platform 担当がいません。実行基盤が弱くなります。",
-    recommendedRoles: ["Platform Engineer"],
-  },
-  data: {
-    description: "評価、実験、品質計測を担当し、意思決定を定量で支えるチーム。",
-    emptyState: "評価担当がいません。改善サイクルが鈍ります。",
-    recommendedRoles: ["Evaluation Analyst"],
-  },
-  security: {
-    description: "安全性、ガバナンス、承認ゲートを監督するチーム。",
-    emptyState: "security / governance の監視役が未配備です。",
-    recommendedRoles: ["Safety Guardian"],
-  },
-  operations: {
-    description: "リリース運用、監視、インシデント初動を担うチーム。",
-    emptyState: "運用 / リリース担当が未配備です。",
-    recommendedRoles: ["Release Operator"],
-  },
-};
-
-const AVAILABLE_MODELS = [
-  "anthropic/claude-sonnet-4-6",
-  "openai/gpt-5-mini",
-  "moonshot/kimi-k2.5",
-  "zhipu/glm-4-plus",
-  "gemini/gemini-3-pro-preview",
-];
 
 function stableUnit(seed: string): number {
   let hash = 2166136261;
@@ -112,17 +57,6 @@ function stableUnit(seed: string): number {
 
 function stableMetric(seed: string, min: number, max: number): number {
   return min + stableUnit(seed) * (max - min);
-}
-
-function mergeTeamDefs(teamDefs?: ApiTeamDef[]): ApiTeamDef[] {
-  const merged = new Map(FALLBACK_TEAMS.map((team) => [team.id, team]));
-  for (const team of teamDefs ?? []) {
-    merged.set(team.id, {
-      ...(merged.get(team.id) ?? {}),
-      ...team,
-    });
-  }
-  return [...merged.values()];
 }
 
 function dedupeAgents(agents: AgentActivity[]): AgentActivity[] {
@@ -143,7 +77,7 @@ function dedupeAgents(agents: AgentActivity[]): AgentActivity[] {
 
 function buildMember(agent: AgentActivity, teamDefs: ApiTeamDef[]): AgentMember {
   const teamId = agent.team ?? "product";
-  const def = teamDefs.find((d) => d.id === teamId) ?? teamDefs[0] ?? FALLBACK_TEAMS[0];
+  const def = resolveTeamDef(teamId, teamDefs);
   const hasTask = agent.current_task !== null;
   const status: AgentStatus = hasTask ? "busy" : agent.status === "ready" ? "online" : "offline";
   const taskSeed = agent.current_task?.id ?? "idle";
@@ -164,7 +98,25 @@ const STATUS_CFG: Record<AgentStatus, { dot: string; label: string; variant: "su
   busy: { dot: "bg-yellow-500", label: "ビジー", variant: "warning" },
 };
 
+type AgentEditForm = {
+  name: string;
+  model: string;
+  role: string;
+  team: string;
+};
+
 const inputCls = "w-full rounded border border-border bg-background px-3 py-1.5 text-sm";
+
+function buildAgentPatch(agent: AgentMember, draft: AgentEditForm): Parameters<typeof updateAgent>[1] {
+  const nextName = draft.name.trim();
+  const nextRole = draft.role.trim();
+  const patch: Parameters<typeof updateAgent>[1] = {};
+  if (nextName && nextName !== agent.name) patch.name = nextName;
+  if (draft.model !== agent.model) patch.model = draft.model;
+  if (nextRole && nextRole !== agent.role) patch.role = nextRole;
+  if (draft.team !== agent.teamId) patch.team = draft.team;
+  return patch;
+}
 
 export function TeamStructure() {
   const queryClient = useQueryClient();
@@ -183,7 +135,10 @@ export function TeamStructure() {
   const queryError = agentsError || tasksError || teamsError;
   const error = queryError ? (queryError instanceof Error ? queryError.message : "データの取得に失敗しました") : null;
 
-  const teamDefs = useMemo(() => mergeTeamDefs(teamsData), [teamsData]);
+  const teamDefs = useMemo(
+    () => mergeTeamDefs(teamsData, agentsData?.map((agent) => agent.team)),
+    [agentsData, teamsData],
+  );
 
   const [tab, setTab] = useState<ViewTab>("team");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -211,9 +166,9 @@ export function TeamStructure() {
         ...def,
         icon: resolveIcon(def.icon),
         members: (teamMap[def.id] ?? []).slice().sort((left, right) => left.name.localeCompare(right.name)),
-        description: TEAM_META[def.id]?.description ?? "チームの役割説明は未設定です。",
-        emptyState: TEAM_META[def.id]?.emptyState ?? "まだメンバーが配備されていません。",
-        recommendedRoles: TEAM_META[def.id]?.recommendedRoles ?? [],
+        description: getTeamMeta(def.id).description,
+        emptyState: getTeamMeta(def.id).emptyState,
+        recommendedRoles: getTeamMeta(def.id).recommendedRoles,
       }));
     return { allMembers: members, teams: builtTeams, tasksCount: doneCount };
   }, [agentsData, tasksData, teamDefs]);
@@ -276,6 +231,7 @@ function CreateAgentModal({ teamDefs, mutation, onClose }: {
   onClose: () => void;
 }) {
   const [form, setForm] = useState({ name: "", model: AVAILABLE_MODELS[0], role: "", team: teamDefs[0]?.id ?? "", tools: "" });
+  const modelOptions = buildModelOptions(form.model);
   const set = (k: string, v: string) => setForm((f) => ({ ...f, [k]: v }));
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -297,7 +253,7 @@ function CreateAgentModal({ teamDefs, mutation, onClose }: {
         </div>
         <form onSubmit={handleSubmit} className="space-y-3">
           <div><label className="mb-1 block text-xs text-muted-foreground">名前 *</label><input className={inputCls} value={form.name} onChange={(e) => set("name", e.target.value)} required /></div>
-          <div><label className="mb-1 block text-xs text-muted-foreground">モデル</label><select className={inputCls} value={form.model} onChange={(e) => set("model", e.target.value)}>{AVAILABLE_MODELS.map((m) => <option key={m} value={m}>{m}</option>)}</select></div>
+          <div><label className="mb-1 block text-xs text-muted-foreground">モデル</label><select className={inputCls} value={form.model} onChange={(e) => set("model", e.target.value)}>{modelOptions.map((m) => <option key={m} value={m}>{m}</option>)}</select></div>
           <div><label className="mb-1 block text-xs text-muted-foreground">ロール *</label><input className={inputCls} value={form.role} onChange={(e) => set("role", e.target.value)} required /></div>
           <div><label className="mb-1 block text-xs text-muted-foreground">チーム</label><select className={inputCls} value={form.team} onChange={(e) => set("team", e.target.value)}>{teamDefs.map((t) => <option key={t.id} value={t.id}>{t.nameJa}</option>)}</select></div>
           <div><label className="mb-1 block text-xs text-muted-foreground">ツール (カンマ区切り)</label><input className={inputCls} value={form.tools} onChange={(e) => set("tools", e.target.value)} placeholder="bash, read, write" /></div>
@@ -465,8 +421,9 @@ function DetailPanel({ agent, team, teamDefs, onClose }: {
   const cfg = STATUS_CFG[agent.status];
 
   const [editing, setEditing] = useState(false);
-  const [editForm, setEditForm] = useState({ name: agent.name, model: agent.model, role: agent.role, team: agent.teamId });
+  const [editForm, setEditForm] = useState<AgentEditForm>({ name: agent.name, model: agent.model, role: agent.role, team: agent.teamId });
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const modelOptions = buildModelOptions(editForm.model);
 
   const updateMut = useMutation({
     mutationFn: (patch: Parameters<typeof updateAgent>[1]) => updateAgent(agent.id, patch),
@@ -479,7 +436,13 @@ function DetailPanel({ agent, team, teamDefs, onClose }: {
   });
 
   const handleSave = () => {
-    updateMut.mutate({ name: editForm.name, model: editForm.model, role: editForm.role, team: editForm.team });
+    if (!editForm.name.trim() || !editForm.role.trim()) return;
+    const patch = buildAgentPatch(agent, editForm);
+    if (Object.keys(patch).length === 0) {
+      setEditing(false);
+      return;
+    }
+    updateMut.mutate(patch);
   };
 
   const setField = (k: string, v: string) => setEditForm((f) => ({ ...f, [k]: v }));
@@ -511,7 +474,7 @@ function DetailPanel({ agent, team, teamDefs, onClose }: {
             <section className="space-y-3">
               <h3 className="text-sm font-medium">エージェント編集</h3>
               <div><label className="mb-1 block text-xs text-muted-foreground">名前</label><input className={inputCls} value={editForm.name} onChange={(e) => setField("name", e.target.value)} /></div>
-              <div><label className="mb-1 block text-xs text-muted-foreground">モデル</label><select className={inputCls} value={editForm.model} onChange={(e) => setField("model", e.target.value)}>{AVAILABLE_MODELS.map((m) => <option key={m} value={m}>{m}</option>)}</select></div>
+              <div><label className="mb-1 block text-xs text-muted-foreground">モデル</label><select className={inputCls} value={editForm.model} onChange={(e) => setField("model", e.target.value)}>{modelOptions.map((m) => <option key={m} value={m}>{m}</option>)}</select></div>
               <div><label className="mb-1 block text-xs text-muted-foreground">ロール</label><input className={inputCls} value={editForm.role} onChange={(e) => setField("role", e.target.value)} /></div>
               <div><label className="mb-1 block text-xs text-muted-foreground">チーム</label><select className={inputCls} value={editForm.team} onChange={(e) => setField("team", e.target.value)}>{teamDefs.map((t) => <option key={t.id} value={t.id}>{t.nameJa}</option>)}</select></div>
               <div className="flex gap-2 pt-1">

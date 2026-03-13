@@ -8,9 +8,13 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
-import { useLifecycle } from "./LifecycleContext";
+import { useLifecycleActions, useLifecycleState } from "./LifecycleContext";
 import { useWorkflowRun } from "@/hooks/useWorkflowRun";
 import { lifecycleApi } from "@/api/lifecycle";
+import { buildDevelopmentWorkflowInput } from "@/lifecycle/inputs";
+import {
+  selectDevelopmentViewModel,
+} from "@/lifecycle/selectors";
 
 /* ── Utility: extract CSS / JS / body sections from a single HTML string ── */
 interface HtmlSections {
@@ -57,17 +61,17 @@ type CodeTab = "full" | "css" | "js" | "body";
 export function DevelopmentPhase() {
   const navigate = useNavigate();
   const { projectSlug } = useParams();
-  const lc = useLifecycle();
+  const lc = useLifecycleState();
+  const actions = useLifecycleActions();
   const workflow = useWorkflowRun("development", projectSlug ?? "");
-  const buildTeam = lc.blueprints.development.team.length > 0
-    ? lc.blueprints.development.team
-    : [
-        { id: "planner", label: "ビルド設計", role: "作業分解", autonomy: "A2", tools: [], skills: [] },
-        { id: "frontend-builder", label: "フロントエンド", role: "UI 実装", autonomy: "A2", tools: [], skills: [] },
-        { id: "backend-builder", label: "バックエンド", role: "Domain 設計", autonomy: "A2", tools: [], skills: [] },
-        { id: "integrator", label: "インテグレーター", role: "統合", autonomy: "A2", tools: [], skills: [] },
-        { id: "reviewer", label: "リリースレビュー", role: "品質判定", autonomy: "A2", tools: [], skills: [] },
-      ];
+  const {
+    buildTeam,
+    canStartBuild,
+    maxIterations,
+    milestoneCount,
+    selectedDesign,
+    selectedFeatureCount,
+  } = selectDevelopmentViewModel(lc);
   const syncedRunRef = useRef<string | null>(null);
 
   // Sync terminal workflow runs back into the lifecycle project.
@@ -76,20 +80,20 @@ export function DevelopmentPhase() {
     if (syncedRunRef.current === workflow.runId) return;
     syncedRunRef.current = workflow.runId;
     void lifecycleApi.syncPhaseRun(projectSlug, "development", workflow.runId).then(({ project }) => {
-      lc.applyProject(project);
+      actions.applyProject(project);
     });
-  }, [workflow.runId, workflow.status, projectSlug, lc]);
+  }, [actions, workflow.runId, workflow.status, projectSlug]);
 
   // Track build iteration from workflow state
   useEffect(() => {
     if (workflow.state._build_iteration != null) {
       const iteration = Number(workflow.state._build_iteration) || 1;
-      lc.setBuildIteration(iteration);
+      actions.recordBuildIteration(iteration);
     }
     if (workflow.state.review) {
       const review = workflow.state.review as Record<string, unknown>;
       if (Array.isArray(review.milestone_results)) {
-        lc.setMilestoneResults(review.milestone_results as any);
+        actions.recordMilestoneResults(review.milestone_results as any);
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -98,26 +102,12 @@ export function DevelopmentPhase() {
   const isBuilding = workflow.status === "starting" || workflow.status === "running";
 
   const startBuild = () => {
-    lc.advancePhase("development");
-    workflow.start({
-      spec: lc.spec,
-      selected_features: lc.features
-        .filter((f) => f.selected)
-        .map((f) => ({ feature: f.feature, priority: f.priority, category: f.category })),
-      analysis: lc.analysis,
-      design: lc.selectedDesignId
-        ? lc.designVariants.find((v) => v.id === lc.selectedDesignId)
-        : undefined,
-      milestones: lc.milestones.map((m) => ({
-        id: m.id,
-        name: m.name,
-        criteria: m.criteria,
-      })),
-    });
+    actions.advancePhase("development");
+    workflow.start(buildDevelopmentWorkflowInput(lc));
   };
 
   const goNext = () => {
-    lc.completePhase("development");
+    actions.completePhase("development");
     navigate(`/p/${projectSlug}/lifecycle/deploy`);
   };
 
@@ -137,8 +127,6 @@ export function DevelopmentPhase() {
 
   // Pre-build view
   if (!isBuilding && !lc.buildCode) {
-    const selectedFeatureCount = lc.features.filter((f) => f.selected).length;
-    const selectedDesign = lc.designVariants.find((variant) => variant.id === lc.selectedDesignId);
     return (
       <div className="flex h-full items-center justify-center p-6">
         <div className="max-w-4xl w-full space-y-6">
@@ -146,8 +134,8 @@ export function DevelopmentPhase() {
             <Rocket className="h-12 w-12 text-primary mx-auto" />
             <h2 className="text-xl font-bold text-foreground">自律開発</h2>
             <p className="text-sm text-muted-foreground">
-              {lc.milestones.length > 0
-                ? `${lc.milestones.length}個のマイルストーン達成まで、AIエージェントが自律的に改善を繰り返します`
+              {milestoneCount > 0
+                ? `${milestoneCount}個のマイルストーン達成まで、AIエージェントが自律的に改善を繰り返します`
                 : "AIエージェントがプロダクトを構築します"}
             </p>
           </div>
@@ -161,11 +149,11 @@ export function DevelopmentPhase() {
                 </div>
                 <div className="rounded-lg border border-border bg-background p-3">
                   <p className="text-xs text-muted-foreground">マイルストーン</p>
-                  <p className="text-lg font-bold text-foreground">{lc.milestones.length}</p>
+                  <p className="text-lg font-bold text-foreground">{milestoneCount}</p>
                 </div>
                 <div className="rounded-lg border border-border bg-background p-3">
                   <p className="text-xs text-muted-foreground">最大イテレーション</p>
-                  <p className="text-lg font-bold text-foreground">{lc.milestones.length > 0 ? 5 : 1}</p>
+                  <p className="text-lg font-bold text-foreground">{maxIterations}</p>
                 </div>
               </div>
 
@@ -205,7 +193,7 @@ export function DevelopmentPhase() {
                       {i < arr.length - 1 && <ArrowRight className="mt-[-16px] h-3 w-3 text-muted-foreground" />}
                     </div>
                   ))}
-                  {lc.milestones.length > 0 && <RefreshCw className="ml-1 mt-[-16px] h-3 w-3 text-primary" />}
+                  {milestoneCount > 0 && <RefreshCw className="ml-1 mt-[-16px] h-3 w-3 text-primary" />}
                 </div>
               </div>
             </div>
@@ -236,10 +224,10 @@ export function DevelopmentPhase() {
                 </button>
                 <button
                   onClick={startBuild}
-                  disabled={lc.approvalStatus !== "approved" || selectedFeatureCount === 0 || selectedDesign == null}
+                  disabled={!canStartBuild}
                   className={cn(
                     "flex-1 flex items-center justify-center gap-2 rounded-lg py-3 text-sm font-medium transition-colors",
-                    lc.approvalStatus === "approved" && selectedFeatureCount > 0 && selectedDesign != null
+                    canStartBuild
                       ? "bg-primary text-primary-foreground hover:bg-primary/90"
                       : "bg-muted text-muted-foreground cursor-not-allowed",
                   )}
@@ -263,7 +251,7 @@ export function DevelopmentPhase() {
             <Rocket className="h-12 w-12 text-primary mx-auto animate-bounce" />
             <h2 className="text-xl font-bold text-foreground mt-3">AIが自律開発中...</h2>
             <p className="text-sm text-muted-foreground">
-              {lc.milestones.length > 0
+              {milestoneCount > 0
                 ? `マイルストーン達成まで自律改善（イテレーション ${lc.buildIteration + 1}/5）`
                 : "プロダクトを構築しています"}
             </p>
@@ -272,7 +260,7 @@ export function DevelopmentPhase() {
             </p>
           </div>
 
-          <div className={cn("grid gap-6", lc.milestones.length > 0 ? "grid-cols-1 lg:grid-cols-2" : "grid-cols-1 max-w-md mx-auto")}>
+          <div className={cn("grid gap-6", milestoneCount > 0 ? "grid-cols-1 lg:grid-cols-2" : "grid-cols-1 max-w-md mx-auto")}>
             {/* Agent progress */}
             <div className="space-y-2">
               <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2">エージェント進捗</h3>
@@ -291,7 +279,7 @@ export function DevelopmentPhase() {
             </div>
 
             {/* Milestone progress */}
-            {lc.milestones.length > 0 && (
+            {milestoneCount > 0 && (
               <div className="space-y-2">
                 <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2">
                   <Flag className="inline h-3 w-3 mr-1" /> マイルストーン進捗
@@ -351,7 +339,7 @@ export function DevelopmentPhase() {
 }
 
 function BuildCompleteView({ onNext }: { onNext: () => void }) {
-  const lc = useLifecycle();
+  const lc = useLifecycleState();
   const [viewMode, setViewMode] = useState<"preview" | "code">("preview");
   const [codeTab, setCodeTab] = useState<CodeTab>("full");
   const [fullscreen, setFullscreen] = useState(false);
