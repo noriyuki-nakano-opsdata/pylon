@@ -165,6 +165,7 @@ def test_sqlite_store_persists_surface_records_and_sequences(tmp_path: Path) -> 
     assert reopened.allocate_sequence_value("memories") == 3
     assert reopened.get_surface_record("tasks", "task-1") == {
         "id": "task-1",
+        "record_version": 1,
         "tenant_id": "tenant-a",
         "title": "Audit ads pipeline",
         "updated_at": "2026-03-11T00:00:00Z",

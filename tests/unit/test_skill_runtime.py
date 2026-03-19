@@ -181,6 +181,100 @@ def _write_basic_agent_skills_repo(base_dir: Path) -> Path:
     return repo_root
 
 
+def _write_agency_agents_repo(base_dir: Path) -> Path:
+    repo_root = base_dir / "agency-agents"
+    (repo_root / "engineering").mkdir(parents=True)
+    (repo_root / "testing").mkdir(parents=True)
+    (repo_root / "specialized").mkdir(parents=True)
+    (repo_root / "strategy" / "coordination").mkdir(parents=True)
+    (repo_root / "strategy" / "playbooks").mkdir(parents=True)
+    (repo_root / "README.md").write_text(
+        "# The Agency\n\nAI specialists.\n",
+        encoding="utf-8",
+    )
+    (repo_root / "engineering" / "engineering-frontend-developer.md").write_text(
+        textwrap.dedent(
+            """\
+            ---
+            name: Frontend Developer
+            description: Builds polished frontend experiences.
+            ---
+
+            Build responsive interfaces.
+            """
+        ),
+        encoding="utf-8",
+    )
+    (repo_root / "testing" / "testing-evidence-collector.md").write_text(
+        textwrap.dedent(
+            """\
+            ---
+            name: Evidence Collector
+            description: Requires screenshot evidence before approval.
+            ---
+
+            Review `public/qa-screenshots/test-results.json` before deciding.
+            """
+        ),
+        encoding="utf-8",
+    )
+    (repo_root / "specialized" / "agents-orchestrator.md").write_text(
+        textwrap.dedent(
+            """\
+            ---
+            name: Agents Orchestrator
+            description: Coordinates the NEXUS delivery workflow.
+            ---
+
+            Use the NEXUS pipeline and enforce structured handoffs.
+            """
+        ),
+        encoding="utf-8",
+    )
+    (repo_root / "specialized" / "zk-steward.md").write_text(
+        textwrap.dedent(
+            """\
+            ---
+            name: ZK Steward
+            description: Knowledge-base steward. Default perspective: Luhmann; use links first.
+            ---
+
+            Keep the knowledge network connected.
+            """
+        ),
+        encoding="utf-8",
+    )
+    (repo_root / "strategy" / "nexus-strategy.md").write_text(
+        "# NEXUS Strategy\n\nStructured multi-agent execution.\n",
+        encoding="utf-8",
+    )
+    (repo_root / "strategy" / "QUICKSTART.md").write_text(
+        "# Quick Start\n\nStart with a mode. Follow the playbook.\n",
+        encoding="utf-8",
+    )
+    (repo_root / "strategy" / "coordination" / "handoff-templates.md").write_text(
+        "# Handoff Templates\n\nUse a standard handoff document.\n",
+        encoding="utf-8",
+    )
+    (repo_root / "strategy" / "coordination" / "agent-activation-prompts.md").write_text(
+        "# Agent Activation Prompts\n\nLaunch the orchestrator with full context.\n",
+        encoding="utf-8",
+    )
+    (repo_root / "strategy" / "playbooks" / "phase-2-foundation.md").write_text(
+        "# Phase 2\n\nCreate the technical foundation.\n",
+        encoding="utf-8",
+    )
+    (repo_root / "strategy" / "playbooks" / "phase-3-build.md").write_text(
+        "# Phase 3\n\nRun the Dev-QA loop.\n",
+        encoding="utf-8",
+    )
+    (repo_root / "strategy" / "playbooks" / "phase-4-hardening.md").write_text(
+        "# Phase 4\n\nRequire evidence before release.\n",
+        encoding="utf-8",
+    )
+    return repo_root
+
+
 def test_skill_catalog_loads_filesystem_skill_and_tool(tmp_path: Path) -> None:
     _write_skill(tmp_path)
     catalog = SkillCatalog(skill_dirs=(str(tmp_path / "skills"),), refresh_ttl_seconds=0)
@@ -190,6 +284,27 @@ def test_skill_catalog_loads_filesystem_skill_and_tool(tmp_path: Path) -> None:
     assert [skill.id for skill in skills] == ["greeter"]
     assert skills[0].tools[0].id == "echo-json"
     assert skills[0].content == "You are a greeting specialist."
+
+
+def test_bundled_agency_skills_load_without_external_import() -> None:
+    bundled_root = (
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "pylon"
+        / "skills"
+        / "bundled"
+        / "agency-agents"
+    )
+    catalog = SkillCatalog(skill_dirs=(str(bundled_root),), refresh_ttl_seconds=0)
+
+    orchestrator = catalog.get_skill("agency-agents:agents-orchestrator")
+    evidence = catalog.get_skill("agency-agents:evidence-collector")
+
+    assert orchestrator is not None
+    assert evidence is not None
+    assert orchestrator.source == "bundled://agency-agents"
+    assert evidence.source_kind == "bundled"
+    assert "strategy/QUICKSTART.md" in orchestrator.default_reference_bundle
 
 
 def test_default_adapter_registry_classifies_profiles(tmp_path: Path) -> None:
@@ -204,6 +319,11 @@ def test_default_adapter_registry_classifies_profiles(tmp_path: Path) -> None:
     source_format, profile = registry.classify(basic_repo)
     assert source_format == "agent-skills-spec"
     assert profile == "agent-skills-basic"
+
+    agency_repo = _write_agency_agents_repo(tmp_path)
+    source_format, profile = registry.classify(agency_repo)
+    assert source_format == "agency-agents"
+    assert profile == "agency-agents"
 
 
 def test_execute_project_sync_uses_skill_prompt_and_local_tool(tmp_path: Path) -> None:
@@ -476,3 +596,97 @@ def test_sync_source_does_not_promote_non_bindable_candidates(
     assert candidates[0]["review"]["bindable"] is False
     assert candidates[0]["review"]["promoted"] is False
     assert "not executable" in candidates[0]["review"]["promotion_blocked_reason"]
+
+
+def test_imported_agency_agents_skills_load_default_references_and_qa_context(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo_root = _write_agency_agents_repo(tmp_path)
+    import_root = tmp_path / "imports"
+    monkeypatch.setenv("PYLON_SKILL_IMPORT_ROOT", str(import_root))
+    compatibility = SkillCompatibilityLayer(import_root=import_root)
+    compatibility.sync_source(
+        compatibility.normalize_source_payload(
+            {"location": str(repo_root), "kind": "local-dir"},
+            tenant_id="default",
+        )
+    )
+    manifest = compatibility.manifest_for_source("agency-agents") or {}
+    manifest_skill_categories = {
+        item["alias"]: item["category"] for item in manifest.get("skills", [])
+    }
+    assert manifest_skill_categories["frontend-developer"] == "engineering"
+    assert manifest_skill_categories["evidence-collector"] == "testing"
+    assert manifest_skill_categories["zk-steward"] == "specialized"
+    workspace = tmp_path / "workspace"
+    qa_dir = workspace / "public" / "qa-screenshots"
+    qa_dir.mkdir(parents=True)
+    (qa_dir / "test-results.json").write_text(
+        "{\"status\":\"pass\",\"screenshots\":3}\n",
+        encoding="utf-8",
+    )
+    project = PylonProject.model_validate(
+        {
+            "version": "1",
+            "name": "agency-runtime",
+            "agents": {
+                "assistant": {
+                    "model": "fake/demo",
+                    "role": "Default assistant role.",
+                    "skills": ["agents-orchestrator", "evidence-collector"],
+                }
+            },
+            "workflow": {"nodes": {"start": {"agent": "assistant", "next": "END"}}},
+        }
+    )
+    provider = _CapturingProvider("demo")
+    registry = ProviderRegistry({"fake": lambda model_id: provider})
+    runtime = SkillRuntime(SkillCatalog(skill_dirs=(), refresh_ttl_seconds=0))
+
+    artifacts = execute_project_sync(
+        project,
+        input_data={"prompt": "Run the delivery workflow", "workspace": str(workspace)},
+        workflow_id="agency-runtime",
+        provider_registry=registry,
+        skill_runtime=runtime,
+    )
+
+    assert any(
+        "Start with a mode. Follow the playbook." in message
+        for message in provider.system_messages
+    )
+    assert any(
+        "Use a standard handoff document." in message
+        for message in provider.system_messages
+    )
+    assert any('"screenshots":3' in message for message in provider.system_messages)
+    node_event = artifacts.run.event_log[0]
+    assert node_event["metrics"]["activated_skill_aliases"] == [
+        "agents-orchestrator",
+        "evidence-collector",
+    ]
+    assert node_event["metrics"]["loaded_skill_references"] == [
+        {
+            "skill_id": "agency-agents:agents-orchestrator",
+            "path": "strategy/QUICKSTART.md",
+            "title": "Quick Start",
+        },
+        {
+            "skill_id": "agency-agents:agents-orchestrator",
+            "path": "strategy/coordination/handoff-templates.md",
+            "title": "Handoff Templates",
+        },
+        {
+            "skill_id": "agency-agents:evidence-collector",
+            "path": "strategy/coordination/handoff-templates.md",
+            "title": "Handoff Templates",
+        },
+    ]
+    assert node_event["metrics"]["loaded_skill_contexts"] == [
+        {
+            "skill_id": "agency-agents:evidence-collector",
+            "contract_id": "evidence-collector:qa-screenshot-results",
+            "path": str((qa_dir / "test-results.json").resolve()),
+        }
+    ]

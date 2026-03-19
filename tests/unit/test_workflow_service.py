@@ -7,6 +7,7 @@ import pytest
 from pylon.control_plane import JsonFileWorkflowControlPlaneStore, WorkflowRunService
 from pylon.dsl.parser import PylonProject
 from pylon.errors import ConcurrencyError
+from pylon.lifecycle import build_lifecycle_workflow_definition
 from pylon.observability.tracing import Tracer
 from pylon.types import RunStatus
 
@@ -191,6 +192,7 @@ def test_json_file_store_persists_surface_records_and_sequences(tmp_path: Path) 
     assert reopened.allocate_sequence_value("memories") == 3
     assert reopened.get_surface_record("tasks", "task-1") == {
         "id": "task-1",
+        "record_version": 1,
         "tenant_id": "tenant-a",
         "title": "Investigate funnel leak",
         "updated_at": "2026-03-11T00:00:00Z",
@@ -217,6 +219,32 @@ def test_start_run_supports_queued_execution_mode(tmp_path: Path) -> None:
     queue_state = stored["state"]["queue"]
     assert queue_state["completed_task_ids"] == list(stored["queue_task_ids"])
     assert queue_state["failed_task_ids"] == []
+
+
+def test_start_run_rehydrates_lifecycle_handlers_after_store_reload(tmp_path: Path) -> None:
+    state_path = tmp_path / "control-plane.json"
+    workflow_id = "lifecycle-research-demo-project"
+    store = _store(state_path)
+    store.register_workflow_project(
+        workflow_id,
+        build_lifecycle_workflow_definition("demo-project", "research")["project"],
+        tenant_id="tenant-a",
+    )
+
+    reopened = _store(state_path)
+    assert reopened.get_node_handlers(workflow_id) in (None, {})
+
+    stored = WorkflowRunService(reopened).start_run(
+        workflow_id=workflow_id,
+        tenant_id="tenant-a",
+        input_data={"spec": "Operator-led lifecycle workspace"},
+    )
+
+    assert stored["status"] == RunStatus.COMPLETED.value
+    assert reopened.get_node_handlers(workflow_id)
+    research = stored["state"].get("research")
+    assert isinstance(research, dict)
+    assert research
 
 
 def test_start_run_uses_active_trace_context_when_not_explicit(tmp_path: Path) -> None:
