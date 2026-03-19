@@ -49,6 +49,8 @@ def build_research_view_model(research: Mapping[str, Any] | None) -> dict[str, A
     user_research = _as_dict(payload.get("user_research"))
     remediation_plan = _as_dict(payload.get("remediation_plan"))
     autonomous = _as_dict(payload.get("autonomous_remediation"))
+    research_context = _as_dict(payload.get("research_context"))
+    operator_copy = _as_dict(payload.get("operator_copy"))
 
     competitors = []
     for item in _as_list(payload.get("competitors")):
@@ -254,6 +256,24 @@ def build_research_view_model(research: Mapping[str, Any] | None) -> dict[str, A
                     limit=4,
                     char_limit=180,
                 ),
+                "recoveryMode": _text_value(autonomous.get("recoveryMode"), limit=32) or None,
+                "recommendedOperatorAction": _text_value(autonomous.get("recommendedOperatorAction"), limit=40) or None,
+                "conditionalHandoffAllowed": autonomous.get("conditionalHandoffAllowed") is True,
+                "strategySummary": _text_value(autonomous.get("strategySummary"), limit=220) or None,
+                "strategyChecklist": _text_list(
+                    autonomous.get("strategyChecklist"),
+                    limit=4,
+                    char_limit=180,
+                ),
+                "planningGuardrails": _text_list(
+                    autonomous.get("planningGuardrails"),
+                    limit=4,
+                    char_limit=180,
+                ),
+                "followUpQuestion": _text_value(autonomous.get("followUpQuestion"), limit=180) or None,
+                "stalledSignature": autonomous.get("stalledSignature") is True,
+                "confidenceFloor": float(autonomous.get("confidenceFloor", 0.0) or 0.0),
+                "targetConfidenceFloor": float(autonomous.get("targetConfidenceFloor", 0.0) or 0.0),
                 "stopReason": _text_value(autonomous.get("stopReason"), limit=180) or None,
             }
             if autonomous
@@ -262,6 +282,45 @@ def build_research_view_model(research: Mapping[str, Any] | None) -> dict[str, A
         "display_language": _text_value(payload.get("display_language"), "ja", limit=8),
         "localization_status": _text_value(payload.get("localization_status"), limit=32) or None,
     }
+    if research_context:
+        view_model["research_context"] = {
+            "decision_stage": _text_value(research_context.get("decision_stage"), limit=48),
+            "decision_stage_label": _text_value(research_context.get("decision_stage_label"), limit=80),
+            "segment": _text_value(research_context.get("segment"), limit=80),
+            "core_question": _text_value(research_context.get("core_question"), limit=220),
+            "thesis_headline": _text_value(research_context.get("thesis_headline"), limit=220),
+            "thesis_snapshot": _text_list(research_context.get("thesis_snapshot"), limit=3, char_limit=220),
+            "confidence_floor": float(research_context.get("confidence_floor", 0.0) or 0.0),
+            "target_confidence_floor": float(research_context.get("target_confidence_floor", 0.0) or 0.0),
+            "external_source_count": int(research_context.get("external_source_count", 0) or 0),
+            "winning_thesis_count": int(research_context.get("winning_thesis_count", 0) or 0),
+            "critical_dissent_count": int(research_context.get("critical_dissent_count", 0) or 0),
+            "evidence_priorities": _text_list(research_context.get("evidence_priorities"), limit=3, char_limit=180),
+            "blocking_summary": _text_list(research_context.get("blocking_summary"), limit=3, char_limit=180),
+            "planning_guardrails": _text_list(research_context.get("planning_guardrails"), limit=3, char_limit=180),
+        }
+    if operator_copy:
+        view_model["operator_copy"] = {
+            "council_cards": [
+                {
+                    "id": _text_value(_as_dict(item).get("id"), limit=64),
+                    "agent": _text_value(_as_dict(item).get("agent"), limit=64),
+                    "lens": _text_value(_as_dict(item).get("lens"), limit=64),
+                    "title": _text_value(_as_dict(item).get("title"), limit=180),
+                    "summary": _text_value(_as_dict(item).get("summary"), limit=220),
+                    "action_label": _text_value(_as_dict(item).get("action_label"), limit=80),
+                    "target_section": _text_value(_as_dict(item).get("target_section"), limit=64) or None,
+                    "tone": _text_value(_as_dict(item).get("tone"), limit=24) or None,
+                }
+                for item in _as_list(operator_copy.get("council_cards"))
+                if _as_dict(item)
+            ],
+            "handoff_brief": {
+                "headline": _text_value(_as_dict(operator_copy.get("handoff_brief")).get("headline"), limit=180),
+                "summary": _text_value(_as_dict(operator_copy.get("handoff_brief")).get("summary"), limit=220),
+                "bullets": _text_list(_as_dict(operator_copy.get("handoff_brief")).get("bullets"), limit=4, char_limit=180),
+            } if _as_dict(operator_copy.get("handoff_brief")) else None,
+        }
     if not view_model["user_research"]:
         view_model.pop("user_research")
     if not view_model["remediation_plan"]:
@@ -270,4 +329,11 @@ def build_research_view_model(research: Mapping[str, Any] | None) -> dict[str, A
         view_model.pop("autonomous_remediation")
     if not view_model["judge_summary"]:
         view_model.pop("judge_summary")
+    if "operator_copy" in view_model:
+        if not view_model["operator_copy"]["council_cards"]:
+            view_model["operator_copy"].pop("council_cards")
+        if not view_model["operator_copy"].get("handoff_brief"):
+            view_model["operator_copy"].pop("handoff_brief", None)
+        if not view_model["operator_copy"]:
+            view_model.pop("operator_copy")
     return view_model

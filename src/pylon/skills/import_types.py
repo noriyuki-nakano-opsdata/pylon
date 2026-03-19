@@ -127,6 +127,7 @@ class ImportedSkillRecord:
     description: str
     content: str
     version: str
+    category: str = "other"
     references: tuple[ImportedReference, ...] = ()
     default_reference_bundle: tuple[str, ...] = ()
     context_contracts: tuple[ContextContract, ...] = ()

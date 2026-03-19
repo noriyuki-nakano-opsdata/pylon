@@ -17,6 +17,7 @@ from pylon.control_plane.adapters import (
     StoreBackedApprovalStore,
     StoreBackedAuditRepository,
 )
+from pylon.control_plane.lifecycle_handlers import ensure_lifecycle_workflow_handlers
 from pylon.dsl.parser import PylonProject
 from pylon.errors import ConcurrencyError
 from pylon.observability.query_service import (
@@ -1026,6 +1027,14 @@ class WorkflowRunService:
             project = self._store.get_workflow_project(workflow_id, tenant_id=tenant_id)
             if project is None:
                 raise KeyError(f"Workflow not found: {workflow_id}")
+            ensure_lifecycle_workflow_handlers(
+                self._store,
+                workflow_id=workflow_id,
+                tenant_id=tenant_id,
+                provider_registry=self._provider_registry,
+                llm_runtime=self._llm_runtime,
+                skill_runtime=self._skill_runtime,
+            )
             if execution_mode == "queued":
                 stored_run = self._start_queued_run(
                     workflow_id=workflow_id,
@@ -1141,6 +1150,14 @@ class WorkflowRunService:
             project = self._store.get_workflow_project(workflow_id, tenant_id=tenant_id)
             if project is None:
                 raise KeyError(f"Workflow not found: {workflow_id}")
+            ensure_lifecycle_workflow_handlers(
+                self._store,
+                workflow_id=workflow_id,
+                tenant_id=tenant_id,
+                provider_registry=self._provider_registry,
+                llm_runtime=self._llm_runtime,
+                skill_runtime=self._skill_runtime,
+            )
             raw_input = run.get("input") if input_data is None else input_data
             artifacts = resume_project_sync(
                 project,
@@ -1376,19 +1393,40 @@ class WorkflowRunService:
             approval_run_id = str(approval.get("run_id", ""))
             if run_id is not None and approval_run_id != run_id:
                 continue
-            run = self._store.get_run_record(approval_run_id)
-            if run is None:
+            if approval_run_id:
+                run = self._store.get_run_record(approval_run_id)
+                if run is None:
+                    continue
+                if run.get("tenant_id", tenant_id) != tenant_id:
+                    continue
+                if workflow_id is not None and run.get("workflow_id") != workflow_id:
+                    continue
+                approvals.append(
+                    {
+                        **approval,
+                        "workflow_id": run.get("workflow_id"),
+                        "tenant_id": run.get("tenant_id"),
+                        "run_status": run.get("status"),
+                    }
+                )
                 continue
-            if run.get("tenant_id", tenant_id) != tenant_id:
+            context = dict(approval.get("context") or {})
+            resource_type = str(context.get("resource_type", ""))
+            if resource_type != "experiment_campaign":
                 continue
-            if workflow_id is not None and run.get("workflow_id") != workflow_id:
+            approval_tenant_id = str(approval.get("tenant_id") or context.get("tenant_id") or "default")
+            if approval_tenant_id != tenant_id:
+                continue
+            if workflow_id is not None:
                 continue
             approvals.append(
                 {
                     **approval,
-                    "workflow_id": run.get("workflow_id"),
-                    "tenant_id": run.get("tenant_id"),
-                    "run_status": run.get("status"),
+                    "workflow_id": None,
+                    "tenant_id": approval_tenant_id,
+                    "run_status": None,
+                    "resource_type": resource_type,
+                    "resource_id": str(context.get("resource_id") or context.get("campaign_id") or ""),
                 }
             )
         approvals.sort(key=lambda payload: str(payload.get("created_at", "")), reverse=True)

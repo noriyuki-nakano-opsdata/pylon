@@ -390,6 +390,7 @@ def execute_project_sync(
     node_handlers: dict[str, Any] | None = None,
     agent_handlers: dict[str, Any] | None = None,
     skill_runtime: SkillRuntime | None = None,
+    progress_callback: Any | None = None,
     expected_resume_input: dict[str, Any] | None | object = _UNSET,
 ) -> ExecutionArtifacts:
     """Execute a DSL project through the shared runtime."""
@@ -408,6 +409,7 @@ def execute_project_sync(
         executor = GraphExecutor(
             checkpoint_repo=repo,
             approval_manager=effective_approval_manager,
+            progress_observer=progress_callback,
         )
         graph = compile_project_graph(project)
         run = existing_run or WorkflowRun(id=f"run_{uuid.uuid4().hex}", workflow_id=workflow_id)
@@ -749,6 +751,7 @@ def resume_project_sync(
     node_handlers: dict[str, Any] | None = None,
     agent_handlers: dict[str, Any] | None = None,
     skill_runtime: SkillRuntime | None = None,
+    progress_callback: Any | None = None,
 ) -> ExecutionArtifacts:
     """Resume a previously suspended project run through the shared runtime."""
     return execute_project_sync(
@@ -768,6 +771,7 @@ def resume_project_sync(
         node_handlers=node_handlers,
         agent_handlers=agent_handlers,
         skill_runtime=skill_runtime,
+        progress_callback=progress_callback,
         expected_resume_input=normalize_runtime_input(run_payload.get("input")),
     )
 

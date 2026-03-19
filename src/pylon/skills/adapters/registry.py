@@ -5,6 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+from pylon.skills.adapters.agency_agents import AgencyAgentsAdapter
 from pylon.skills.adapters.agent_skills_basic import AgentSkillsBasicAdapter
 from pylon.skills.adapters.base import CompatibilityAdapter
 from pylon.skills.adapters.marketingskills import MarketingskillsAdapter
@@ -38,5 +39,6 @@ class CompatibilityAdapterRegistry:
 def get_default_adapter_registry() -> CompatibilityAdapterRegistry:
     registry = CompatibilityAdapterRegistry()
     registry.register(AgentSkillsBasicAdapter())
+    registry.register(AgencyAgentsAdapter())
     registry.register(MarketingskillsAdapter())
     return registry

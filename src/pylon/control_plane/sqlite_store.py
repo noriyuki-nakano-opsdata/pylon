@@ -38,6 +38,10 @@ class SQLiteWorkflowControlPlaneStore:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._path, timeout=30.0)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA temp_store=MEMORY")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA wal_autocheckpoint=200")
+        connection.execute("PRAGMA journal_size_limit=67108864")
         return connection
 
     def _init_db(self) -> None:
@@ -200,6 +204,15 @@ class SQLiteWorkflowControlPlaneStore:
             raise ValueError("Stored control-plane payload must be an object")
         return raw
 
+    def _dump_json(self, payload: dict[str, Any]) -> str:
+        return json.dumps(
+            payload,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+
     def register_workflow_project(
         self,
         workflow_id: str,
@@ -221,7 +234,7 @@ class SQLiteWorkflowControlPlaneStore:
                 (
                     tenant_id,
                     workflow_id,
-                    json.dumps(resolved.model_dump(mode="json"), sort_keys=True),
+                    self._dump_json(resolved.model_dump(mode="json")),
                 ),
             )
             connection.commit()
@@ -352,7 +365,7 @@ class SQLiteWorkflowControlPlaneStore:
                     workflow_id,
                     str(stored.get("status", "")),
                     stored.get("created_at"),
-                    json.dumps(stored, sort_keys=True, default=str),
+                    self._dump_json(stored),
                 ),
             )
             connection.commit()
@@ -445,7 +458,7 @@ class SQLiteWorkflowControlPlaneStore:
                 (
                     str(checkpoint_payload["id"]),
                     str(checkpoint_payload.get("run_id", "")),
-                    json.dumps(dict(checkpoint_payload), sort_keys=True, default=str),
+                    self._dump_json(dict(checkpoint_payload)),
                 ),
             )
             connection.commit()
@@ -483,7 +496,7 @@ class SQLiteWorkflowControlPlaneStore:
                 (
                     str(approval_payload["id"]),
                     str(approval_payload.get("run_id", "")),
-                    json.dumps(dict(approval_payload), sort_keys=True, default=str),
+                    self._dump_json(dict(approval_payload)),
                 ),
             )
             connection.commit()
@@ -545,7 +558,7 @@ class SQLiteWorkflowControlPlaneStore:
                     str(audit_payload.get("tenant_id", "default")),
                     str(audit_payload.get("event_type", "")),
                     str(audit_payload.get("created_at", "")),
-                    json.dumps(audit_payload, sort_keys=True, default=str),
+                    self._dump_json(audit_payload),
                 ),
             )
             connection.commit()
@@ -602,7 +615,7 @@ class SQLiteWorkflowControlPlaneStore:
                     str(task_payload["id"]),
                     str(task_payload.get("status", "")),
                     str(task_payload.get("created_at", "")),
-                    json.dumps(task_payload, sort_keys=True, default=str),
+                    self._dump_json(task_payload),
                 ),
             )
             connection.commit()
@@ -696,10 +709,11 @@ class SQLiteWorkflowControlPlaneStore:
                     record_id,
                     None if tenant_id is None else str(tenant_id),
                     None if updated_at is None else str(updated_at),
-                    json.dumps(stored, sort_keys=True, default=str),
+                    self._dump_json(stored),
                 ),
             )
             connection.commit()
+            connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
         return dict(stored)
 
     def delete_surface_record(

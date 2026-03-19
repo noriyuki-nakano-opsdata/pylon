@@ -12,6 +12,7 @@ from pylon.lifecycle.coordinator import (
     derive_lifecycle_next_action,
     lifecycle_action_execution_budget,
     resolve_lifecycle_autonomy_level,
+    resolve_lifecycle_governance_mode,
     resolve_lifecycle_orchestration_mode,
 )
 from pylon.lifecycle.operator_console import (
@@ -24,6 +25,7 @@ from pylon.lifecycle.operator_console import (
 )
 from pylon.lifecycle.orchestrator import (
     PHASE_ORDER,
+    backfill_planning_artifacts,
     build_deploy_checks,
     build_lifecycle_phase_blueprints,
     build_lifecycle_workflow_definition,
@@ -38,6 +40,40 @@ from pylon.lifecycle.state import (
     prune_lifecycle_records_from_phase,
     rebuild_lifecycle_phase_statuses,
 )
+from pylon.lifecycle.services.requirements_engine import (
+    build_requirements_bundle,
+    classify_ears_pattern,
+    evaluate_requirements_quality,
+    merge_requirements_with_reverse_engineering,
+)
+from pylon.lifecycle.services.task_decomposition import (
+    decompose_features_to_tasks,
+    validate_task_decomposition,
+)
+from pylon.lifecycle.services.dcs_analysis import (
+    analyze_edge_cases,
+    analyze_impact,
+    analyze_state_transitions,
+    evaluate_dcs_quality,
+    generate_rubber_duck_prd,
+    generate_sequence_diagrams,
+)
+from pylon.lifecycle.services.technical_design import (
+    build_technical_design_bundle,
+    evaluate_technical_design_quality,
+)
+from pylon.lifecycle.services.reverse_engineering import (
+    build_reverse_engineering_result,
+    evaluate_reverse_engineering_quality,
+)
+from pylon.lifecycle.services.native_artifacts import (
+    backfill_native_artifacts,
+    normalize_dcs_analysis,
+    normalize_requirements_bundle,
+    normalize_reverse_engineering_result,
+    normalize_task_decomposition,
+    normalize_technical_design_bundle,
+)
 
 __all__ = [
     "build_phase_contract",
@@ -49,8 +85,10 @@ __all__ = [
     "derive_lifecycle_next_action",
     "lifecycle_action_execution_budget",
     "resolve_lifecycle_autonomy_level",
+    "resolve_lifecycle_governance_mode",
     "resolve_lifecycle_orchestration_mode",
     "PHASE_ORDER",
+    "backfill_planning_artifacts",
     "build_deploy_checks",
     "build_lifecycle_phase_blueprints",
     "build_lifecycle_workflow_definition",
@@ -68,4 +106,26 @@ __all__ = [
     "lifecycle_decision",
     "merge_operator_records",
     "sync_lifecycle_project_with_run",
+    "build_requirements_bundle",
+    "classify_ears_pattern",
+    "evaluate_requirements_quality",
+    "merge_requirements_with_reverse_engineering",
+    "decompose_features_to_tasks",
+    "validate_task_decomposition",
+    "analyze_edge_cases",
+    "analyze_impact",
+    "analyze_state_transitions",
+    "evaluate_dcs_quality",
+    "generate_rubber_duck_prd",
+    "generate_sequence_diagrams",
+    "build_technical_design_bundle",
+    "evaluate_technical_design_quality",
+    "build_reverse_engineering_result",
+    "evaluate_reverse_engineering_quality",
+    "backfill_native_artifacts",
+    "normalize_dcs_analysis",
+    "normalize_requirements_bundle",
+    "normalize_reverse_engineering_result",
+    "normalize_task_decomposition",
+    "normalize_technical_design_bundle",
 ]
