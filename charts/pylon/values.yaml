@@ -64,6 +64,14 @@ config:
   logLevel: info
   environment: production
 
+sandbox:
+  firecrackerRunnerMode: ""
+  firecrackerDelegateCommand: ""
+  firecrackerDockerImage: ""
+  firecrackerExecutorMode: ""
+  firecrackerVmCommand: ""
+  firecrackerAllowProcessFallback: false
+
 ## PostgreSQL (Bitnami)
 postgresql:
   enabled: true

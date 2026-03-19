@@ -1033,7 +1033,8 @@ Strongest areas today:
 Main gaps today:
 
 - many infrastructure modules are reference implementations backed by in-memory stores
-- sandbox runtime integrations are not yet wired to real gVisor/Firecracker backends
+- general gVisor runtime integration is still pending
+- experiment campaigns now have a self-hosted sandbox path: Docker-backed local execution plus a delegated Firecracker executor hook for AWS/Linux
 - replay currently reconstructs state and operator summaries, but it is not yet a full general-purpose distributed durable execution substrate
 
 ## 13. Documentation Map

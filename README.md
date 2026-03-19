@@ -199,6 +199,35 @@ make typecheck     # mypy src/pylon/
 make format        # ruff format src tests
 ```
 
+## Self-Hosted Experiment Sandbox
+
+Experiment campaigns now ship with a bundled app-side runner and operator-side
+executor exposed as `pylon-firecracker-runner` and
+`pylon-firecracker-executor`.
+
+For local execution on macOS or Linux, use Docker-backed isolation:
+
+```bash
+export PYLON_FIRECRACKER_RUNNER_MODE=docker
+export PYLON_FIRECRACKER_DOCKER_IMAGE=python:3.12-slim
+```
+
+For production on AWS/Linux, point the bundled runner at an operator-managed
+executor that provides the actual Firecracker microVM launch path:
+
+```bash
+export PYLON_FIRECRACKER_RUNNER_MODE=delegate
+export PYLON_FIRECRACKER_DELEGATE_COMMAND=/usr/local/bin/pylon-firecracker-executor
+export PYLON_FIRECRACKER_EXECUTOR_MODE=delegate
+export PYLON_FIRECRACKER_VM_COMMAND=/opt/pylon/bin/firecracker-vm-command
+```
+
+`process` mode exists only for explicit development and test fallback:
+
+```bash
+export PYLON_FIRECRACKER_RUNNER_MODE=process
+```
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.

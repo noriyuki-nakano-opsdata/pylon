@@ -1,0 +1,6 @@
+interface:
+  display_name: "Revops Forecasting"
+  short_description: "Pipeline hygiene and forecast operations"
+  default_prompt: "Use $revops-forecasting to inspect pipeline hygiene, forecast assumptions, and funnel risks for this GTM motion."
+policy:
+  allow_implicit_invocation: true

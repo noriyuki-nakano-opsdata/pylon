@@ -29,8 +29,10 @@ export const fallbackFeatureManifest: FeatureManifest = {
     project: {
       runs: true,
       approvals: true,
+      experiments: true,
       studio: false,
       lifecycle: true,
+      gtm: true,
       tasks: true,
       team: true,
       memory: true,

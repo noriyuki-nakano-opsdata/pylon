@@ -8,13 +8,14 @@ import { EmptyState } from "@/components/EmptyState";
 import { PageSkeleton } from "@/components/PageSkeleton";
 import { queryKeys } from "@/lib/queryKeys";
 import { agentsApi, type Agent } from "@/api/agents";
+import { useI18n } from "@/contexts/I18nContext";
 import { cn } from "@/lib/utils";
 
 const TABS = [
-  { key: "all", label: "All" },
-  { key: "active", label: "Active" },
-  { key: "paused", label: "Paused" },
-  { key: "error", label: "Error" },
+  { key: "all", labelKey: "agents.tab.all" },
+  { key: "active", labelKey: "agents.tab.active" },
+  { key: "paused", labelKey: "agents.tab.paused" },
+  { key: "error", labelKey: "agents.tab.error" },
 ] as const;
 
 const TAB_FILTERS: Record<string, (a: Agent) => boolean> = {
@@ -25,6 +26,7 @@ const TAB_FILTERS: Record<string, (a: Agent) => boolean> = {
 };
 
 export function Agents() {
+  const { t } = useI18n();
   const [currentTab, setCurrentTab] = useState("all");
   const navigate = useNavigate();
 
@@ -44,14 +46,14 @@ export function Agents() {
     <div className="space-y-6 p-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight">エージェント一覧</h1>
+          <h1 className="text-2xl font-bold tracking-tight">{t("agents.title")}</h1>
           <p className="text-sm text-muted-foreground">
-            {agents.length} エージェント登録済み
+            {t("agents.registeredCount", { count: agents.length })}
           </p>
         </div>
         <Button size="sm" onClick={() => navigate("/agents/new")}>
           <Plus className="mr-1 h-4 w-4" />
-          エージェント追加
+          {t("agents.add")}
         </Button>
       </div>
 
@@ -70,7 +72,7 @@ export function Agents() {
                   : "border-transparent text-muted-foreground hover:text-foreground",
               )}
             >
-              {tab.label}
+              {t(tab.labelKey)}
             </button>
           );
         })}
@@ -80,9 +82,9 @@ export function Agents() {
       {filtered.length === 0 ? (
         <EmptyState
           icon={Bot}
-          title="No agents found"
-          description="Create your first agent to get started."
-          action={{ label: "New Agent", onClick: () => navigate("/agents/new") }}
+          title={t("agents.empty.title")}
+          description={t("agents.empty.description")}
+          action={{ label: t("agents.empty.action"), onClick: () => navigate("/agents/new") }}
         />
       ) : (
         <div className="space-y-2">
@@ -108,7 +110,7 @@ export function Agents() {
                       <span>|</span>
                       <span className="inline-flex items-center gap-1">
                         <Wand2 className="h-3 w-3" />
-                        {agent.skills.length} スキル
+                        {t("agents.skillsCount", { count: agent.skills.length })}
                       </span>
                     </>
                   )}

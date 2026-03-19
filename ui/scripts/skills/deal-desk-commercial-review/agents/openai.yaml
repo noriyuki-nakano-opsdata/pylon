@@ -1,0 +1,6 @@
+interface:
+  display_name: "Deal Desk Commercial Review"
+  short_description: "Quote packaging, approvals, and commercial guardrails"
+  default_prompt: "Use $deal-desk-commercial-review to package a non-standard deal, pricing exception, or renewal decision for finance and legal review."
+policy:
+  allow_implicit_invocation: true

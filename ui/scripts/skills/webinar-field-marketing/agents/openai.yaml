@@ -1,0 +1,6 @@
+interface:
+  display_name: "Webinar Field Marketing"
+  short_description: "Event runbooks, invite cadence, and follow-up routing"
+  default_prompt: "Use $webinar-field-marketing to plan a webinar or field event, including reminders, lead capture, and post-event follow-up."
+policy:
+  allow_implicit_invocation: true

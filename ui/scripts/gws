@@ -1,0 +1,65 @@
+#!/bin/sh
+set -eu
+
+resolve_gws_bin() {
+  if [ -n "${GWS_BIN:-}" ] && [ -x "${GWS_BIN}" ]; then
+    echo "${GWS_BIN}"
+    return 0
+  fi
+
+  if command -v gws >/dev/null 2>&1; then
+    command -v gws
+    return 0
+  fi
+
+  if [ -x "${HOME}/.cargo/bin/gws" ]; then
+    echo "${HOME}/.cargo/bin/gws"
+    return 0
+  fi
+
+  return 1
+}
+
+if [ -z "${GOOGLE_WORKSPACE_CLI_TOKEN:-}" ] && \
+   [ -n "${GWS_DELEGATED_SERVICE_ACCOUNT_FILE:-}" ] && \
+   [ -n "${GWS_DELEGATED_SUBJECT:-}" ] && \
+   [ -n "${GWS_DELEGATED_SCOPES:-}" ]; then
+  delegated_token="$(
+    python3 "$(dirname "$0")/gws_delegated_token.py" \
+      --service-account-file "${GWS_DELEGATED_SERVICE_ACCOUNT_FILE}" \
+      --subject "${GWS_DELEGATED_SUBJECT}" \
+      --scopes "${GWS_DELEGATED_SCOPES}"
+  )"
+  export GOOGLE_WORKSPACE_CLI_TOKEN="${delegated_token}"
+fi
+
+if [ -z "${GOOGLE_WORKSPACE_CLI_TOKEN:-}" ] && \
+   [ -n "${GWS_DELEGATED_SERVICE_ACCOUNT_EMAIL:-}" ] && \
+   [ -n "${GWS_DELEGATED_SUBJECT:-}" ] && \
+   [ -n "${GWS_DELEGATED_SCOPES:-}" ] && \
+   [ -n "${GWS_OPERATOR_ACCESS_TOKEN:-}" ]; then
+  delegated_token="$(
+    python3 "$(dirname "$0")/gws_delegated_token.py" \
+      --service-account-email "${GWS_DELEGATED_SERVICE_ACCOUNT_EMAIL}" \
+      --operator-access-token "${GWS_OPERATOR_ACCESS_TOKEN}" \
+      --subject "${GWS_DELEGATED_SUBJECT}" \
+      --scopes "${GWS_DELEGATED_SCOPES}"
+  )"
+  export GOOGLE_WORKSPACE_CLI_TOKEN="${delegated_token}"
+fi
+
+if [ -z "${GOOGLE_WORKSPACE_CLI_TOKEN:-}" ] && \
+   { [ -n "${GWS_DELEGATED_SERVICE_ACCOUNT_FILE:-}" ] || [ -n "${GWS_DELEGATED_SERVICE_ACCOUNT_EMAIL:-}" ] || [ -n "${GWS_DELEGATED_SUBJECT:-}" ] || [ -n "${GWS_DELEGATED_SCOPES:-}" ] || [ -n "${GWS_OPERATOR_ACCESS_TOKEN:-}" ]; }; then
+  echo "Delegated auth requires either:" >&2
+  echo "  1) GWS_DELEGATED_SERVICE_ACCOUNT_FILE + GWS_DELEGATED_SUBJECT + GWS_DELEGATED_SCOPES" >&2
+  echo "  2) GWS_DELEGATED_SERVICE_ACCOUNT_EMAIL + GWS_OPERATOR_ACCESS_TOKEN + GWS_DELEGATED_SUBJECT + GWS_DELEGATED_SCOPES" >&2
+  exit 2
+fi
+
+if gws_bin="$(resolve_gws_bin)"; then
+  exec "${gws_bin}" "$@"
+fi
+
+echo "gws binary not found." >&2
+echo "Install Google Workspace CLI first, or set GWS_BIN to the executable path." >&2
+exit 127

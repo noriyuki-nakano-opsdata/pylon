@@ -53,7 +53,13 @@ import {
   presentVariantTitle,
 } from "@/lifecycle/designDecisionPresentation";
 import { buildDesignWorkflowInput } from "@/lifecycle/inputs";
+import {
+  downstreamTopbarClassName,
+  downstreamWorkspaceClassName,
+} from "@/lifecycle/downstreamTheme";
 import { hasRestorablePhaseRun } from "@/lifecycle/phaseStatus";
+import { BehaviorModelPanel } from "./BehaviorModelPanel";
+import { TechnicalDesignPanel } from "./TechnicalDesignPanel";
 import {
   selectPhaseStatus,
   selectPhaseTeam,
@@ -1047,8 +1053,8 @@ export function DesignPhase() {
       : freshnessLabel(activeVariant);
 
   return (
-    <div className="flex min-h-full flex-col bg-[radial-gradient(circle_at_top,rgba(37,99,235,0.08),transparent_32%),linear-gradient(180deg,rgba(255,255,255,0.9),rgba(244,247,252,0.92))] dark:bg-[radial-gradient(circle_at_top,rgba(37,99,235,0.14),transparent_26%),linear-gradient(180deg,rgba(4,9,18,0.96),rgba(7,11,20,1))]">
-      <div className="sticky top-0 z-20 flex flex-wrap items-center gap-3 border-b border-border/70 bg-background/78 px-6 py-3 backdrop-blur">
+    <div className={cn(downstreamWorkspaceClassName, "flex min-h-full flex-col")}>
+      <div className={cn(downstreamTopbarClassName, "sticky top-0 z-20 flex flex-wrap items-center gap-3 px-6 py-3")}>
         <button aria-label="企画へ戻る" onClick={goBack} className="rounded-full border border-border/70 p-2 text-muted-foreground transition-colors hover:text-foreground">
           <ArrowLeft className="h-4 w-4" />
         </button>
@@ -2119,6 +2125,8 @@ export function DesignPhase() {
             </div>
           </section>
           ) : null}
+          <BehaviorModelPanel analysis={lc.dcsAnalysis ?? null} />
+          <TechnicalDesignPanel bundle={lc.technicalDesign ?? null} />
         </div>
       </div>
     </div>

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   AlertTriangle,
@@ -26,6 +26,21 @@ import {
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
+import {
+  planningActionVariants,
+  planningBodyLabelClassName,
+  planningChipVariants,
+  planningDataValueClassName,
+  planningDetailCardVariants,
+  planningEyebrowClassName,
+  planningMetricTileVariants,
+  planningMicroLabelClassName,
+  planningMutedCopyClassName,
+  planningSectionTitleClassName,
+  planningSoftBadgeVariants,
+  planningSurfaceVariants,
+  planningTabVariants,
+} from "@/lifecycle/planningTheme";
 import {
   selectPlanningReviewViewModel,
   type PlanningReviewTab,
@@ -56,6 +71,17 @@ const KANO_CHART_WIDTH = 720;
 const KANO_CHART_HEIGHT = 400;
 const KANO_CHART_PADDING = { top: 30, right: 30, bottom: 50, left: 60 } as const;
 const KANO_COST_BASE: Record<string, number> = { low: 0.15, medium: 0.5, high: 0.85 };
+const KANO_COST_LABELS: Record<string, string> = { low: "低", medium: "中", high: "高" };
+const KANO_CATEGORY_HELP: Record<string, string> = {
+  "must-be": "無いと不満が大きい基礎品質です。",
+  "one-dimensional": "増やすほど満足度が素直に伸びる領域です。",
+  attractive: "あると驚きが生まれる魅力要素です。",
+  indifferent: "増やしても体験改善が限定的な領域です。",
+  reverse: "増やすほど逆効果になりうる要素です。",
+};
+const PROFICIENCY_LABELS: Record<string, string> = { high: "高い", medium: "中程度", low: "低い" };
+const SEVERITY_TEXT_LABELS: Record<string, string> = { critical: "重大", high: "高", medium: "中", low: "低" };
+const USE_CASE_PRIORITY_LABELS: Record<string, string> = { must: "必須", should: "推奨", could: "任意" };
 
 type KanoSortKey = "index" | "feature" | "category" | "delight" | "cost";
 type SortDir = "asc" | "desc";
@@ -73,10 +99,10 @@ const REVIEW_TAB_ICONS = {
   "design-tokens": Palette,
 } as const;
 
-const ACTOR_TYPE_STYLE: Record<string, { bg: string; text: string; label: string; icon: typeof Users }> = {
-  primary: { bg: "bg-primary/15 border-primary/30", text: "text-primary", label: "プライマリ", icon: Users },
-  secondary: { bg: "bg-amber-500/15 border-amber-500/30", text: "text-amber-400", label: "セカンダリ", icon: UserCheck },
-  external_system: { bg: "bg-purple-500/15 border-purple-500/30", text: "text-purple-400", label: "外部システム", icon: Network },
+const ACTOR_TYPE_STYLE: Record<string, { tone: "accent" | "warning" | "default"; accent: string; label: string; icon: typeof Users }> = {
+  primary: { tone: "accent", accent: "text-primary", label: "プライマリ", icon: Users },
+  secondary: { tone: "warning", accent: "text-[color:var(--planning-warning-strong)]", label: "セカンダリ", icon: UserCheck },
+  external_system: { tone: "default", accent: "text-[color:var(--planning-text-soft)]", label: "外部システム", icon: Network },
 };
 
 const PHASE_LABELS: Record<JourneyPhase, string> = {
@@ -94,16 +120,62 @@ const PHASE_COLORS: Record<JourneyPhase, string> = {
   advocacy: "bg-pink-500/20 border-pink-500/40",
 };
 
-const JTBD_COLORS: Record<JobStory["priority"], { badge: string; border: string }> = {
-  core: { badge: "bg-destructive/20 text-destructive", border: "border-destructive/30 bg-destructive/5" },
-  supporting: { badge: "bg-primary/20 text-primary", border: "border-primary/30 bg-primary/5" },
-  aspirational: { badge: "bg-success/20 text-success", border: "border-success/30 bg-success/5" },
+const JTBD_COLORS: Record<JobStory["priority"], { tone: "danger" | "accent" | "success" }> = {
+  core: { tone: "danger" },
+  supporting: { tone: "accent" },
+  aspirational: { tone: "success" },
 };
 
-const IA_PRIORITY_COLORS: Record<IANode["priority"], string> = {
-  primary: "bg-primary/20 text-primary border-primary/40",
-  secondary: "bg-amber-500/20 text-amber-500 border-amber-500/40",
-  utility: "bg-muted text-muted-foreground border-border",
+const RISK_SEVERITY_STYLE: Record<string, { badge: string; card: string; label: string }> = {
+  critical: {
+    badge: planningChipVariants({ tone: "danger" }),
+    card: planningSurfaceVariants({ tone: "danger", padding: "md" }),
+    label: "重大",
+  },
+  high: {
+    badge: planningChipVariants({ tone: "warning" }),
+    card: planningSurfaceVariants({ tone: "warning", padding: "md" }),
+    label: "高",
+  },
+  medium: {
+    badge: planningChipVariants({ tone: "accent" }),
+    card: planningSurfaceVariants({ tone: "accent", padding: "md" }),
+    label: "中",
+  },
+  low: {
+    badge: planningChipVariants({ tone: "default" }),
+    card: planningSurfaceVariants({ tone: "inset", padding: "md" }),
+    label: "低",
+  },
+};
+
+const RECOMMENDATION_PRIORITY_STYLE: Record<string, { badge: string; card: string; label: string }> = {
+  critical: {
+    badge: planningChipVariants({ tone: "danger" }),
+    card: planningSurfaceVariants({ tone: "danger", padding: "md" }),
+    label: "最優先",
+  },
+  high: {
+    badge: planningChipVariants({ tone: "accent" }),
+    card: planningSurfaceVariants({ tone: "accent", padding: "md" }),
+    label: "高",
+  },
+  medium: {
+    badge: planningChipVariants({ tone: "warning" }),
+    card: planningSurfaceVariants({ tone: "warning", padding: "md" }),
+    label: "中",
+  },
+  low: {
+    badge: planningChipVariants({ tone: "default" }),
+    card: planningSurfaceVariants({ tone: "inset", padding: "md" }),
+    label: "低",
+  },
+};
+
+const IA_PRIORITY_STYLE: Record<IANode["priority"], { label: string; tone: "accent" | "warning" | "default" }> = {
+  primary: { label: "主要", tone: "accent" },
+  secondary: { label: "補助", tone: "warning" },
+  utility: { label: "補助線", tone: "default" },
 };
 const NAV_MODEL_LABELS: Record<IAAnalysis["navigation_model"], string> = {
   hierarchical: "階層型",
@@ -114,12 +186,16 @@ const NAV_MODEL_LABELS: Record<IAAnalysis["navigation_model"], string> = {
 
 function KanoBubbleChart({
   features,
-  hoveredIdx,
+  activeIdx,
+  tooltipIdx,
   onHover,
+  onSelect,
 }: {
   features: KanoFeature[];
-  hoveredIdx: number | null;
+  activeIdx: number | null;
+  tooltipIdx: number | null;
   onHover: (i: number | null) => void;
+  onSelect: (i: number) => void;
 }) {
   const W = KANO_CHART_WIDTH;
   const H = KANO_CHART_HEIGHT;
@@ -161,8 +237,8 @@ function KanoBubbleChart({
   ];
 
   return (
-    <div className="rounded-xl border border-border bg-card p-5">
-      <h3 className="mb-4 text-sm font-medium text-foreground">KANO バブルチャート</h3>
+    <div className={planningSurfaceVariants({ tone: "default", padding: "md" })}>
+      <h3 className={cn("mb-4", planningSectionTitleClassName)}>KANO バブルチャート</h3>
       <div className="flex justify-center">
         <svg viewBox={`0 0 ${W} ${H}`} className="w-full max-w-3xl" style={{ aspectRatio: `${W}/${H}` }}>
           <defs>
@@ -220,28 +296,45 @@ function KanoBubbleChart({
           {features.map((f, i) => {
             const pos = positions[i];
             const style = KANO_CAT_STYLE[f.category] ?? KANO_CAT_STYLE.indifferent;
-            const isHovered = hoveredIdx === i;
-            const r = isHovered ? 24 : 18;
+            const isActive = activeIdx === i;
+            const r = isActive ? 24 : 18;
             return (
-              <g key={i} onMouseEnter={() => onHover(i)} onMouseLeave={() => onHover(null)} style={{ cursor: "pointer", transition: "transform 0.15s ease" }}>
-                {isHovered && (
+              <g
+                key={i}
+                tabIndex={0}
+                role="button"
+                aria-label={`${f.feature} の詳細を表示`}
+                onMouseEnter={() => onHover(i)}
+                onMouseLeave={() => onHover(null)}
+                onFocus={() => onSelect(i)}
+                onBlur={() => onHover(null)}
+                onClick={() => onSelect(i)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    onSelect(i);
+                  }
+                }}
+                style={{ cursor: "pointer", transition: "transform 0.15s ease" }}
+              >
+                {isActive && (
                   <circle cx={pos.x} cy={pos.y} r={r + 8} fill={style.fill} opacity={0.4}>
                     <animate attributeName="r" from={String(r + 4)} to={String(r + 10)} dur="0.8s" repeatCount="indefinite" />
                     <animate attributeName="opacity" from="0.4" to="0.1" dur="0.8s" repeatCount="indefinite" />
                   </circle>
                 )}
-                <circle cx={pos.x} cy={pos.y} r={r} fill={style.fill} stroke={style.stroke} strokeWidth={isHovered ? 2.5 : 1.5} style={{ transition: "r 0.15s ease, stroke-width 0.15s ease" }} />
-                <text x={pos.x} y={pos.y + 1} textAnchor="middle" dominantBaseline="central" fill={style.text} fontSize={isHovered ? 13 : 11} fontWeight={600}>
+                <circle cx={pos.x} cy={pos.y} r={r} fill={style.fill} stroke={style.stroke} strokeWidth={isActive ? 2.5 : 1.5} style={{ transition: "r 0.15s ease, stroke-width 0.15s ease" }} />
+                <text x={pos.x} y={pos.y + 1} textAnchor="middle" dominantBaseline="central" fill={style.text} fontSize={isActive ? 13 : 11} fontWeight={600}>
                   {i + 1}
                 </text>
               </g>
             );
           })}
 
-          {hoveredIdx !== null &&
+          {tooltipIdx !== null &&
             (() => {
-              const f = features[hoveredIdx];
-              const pos = positions[hoveredIdx];
+              const f = features[tooltipIdx];
+              const pos = positions[tooltipIdx];
               const style = KANO_CAT_STYLE[f.category] ?? KANO_CAT_STYLE.indifferent;
               const hasRationale = f.rationale && f.rationale.length > 0;
               const tooltipW = 240;
@@ -283,11 +376,41 @@ function KanoBubbleChart({
   );
 }
 
-export function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
+export function ReviewContent({
+  analysis,
+  handoffNotice = null,
+  planningGuardrails = [],
+  onContinue,
+  continueLabel = "デザイン比較へ",
+  requiresDecisionConfirmation = false,
+  decisionConfirmed = true,
+  onDecisionConfirmedChange,
+}: {
+  analysis: AnalysisResult;
+  handoffNotice?: string | null;
+  planningGuardrails?: string[];
+  onContinue?: (() => void) | undefined;
+  continueLabel?: string;
+  requiresDecisionConfirmation?: boolean;
+  decisionConfirmed?: boolean;
+  onDecisionConfirmedChange?: ((confirmed: boolean) => void) | undefined;
+}) {
   const reviewVm = selectPlanningReviewViewModel(analysis);
   const [tab, setTab] = useState<PlanningReviewTab>("overview");
   const [kanoHovered, setKanoHovered] = useState<number | null>(null);
+  const [kanoSelected, setKanoSelected] = useState<number | null>(
+    analysis.kano_features.length > 0 ? 0 : null,
+  );
   const [kanoSort, setKanoSort] = useState<{ key: KanoSortKey; dir: SortDir }>({ key: "index", dir: "asc" });
+  const riskSectionRef = useRef<HTMLDivElement | null>(null);
+  const recommendationSectionRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    setKanoSelected((prev) => {
+      if (analysis.kano_features.length === 0) return null;
+      return prev !== null && prev < analysis.kano_features.length ? prev : 0;
+    });
+  }, [analysis.kano_features.length]);
 
   const toggleKanoSort = useCallback((key: KanoSortKey) => {
     setKanoSort((prev) => (prev.key === key ? { key, dir: prev.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" }));
@@ -320,38 +443,429 @@ export function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
     return items;
   }, [analysis.kano_features, kanoSort]);
 
+  const jumpToOverviewSection = useCallback((section: "risk" | "recommendation") => {
+    setTab("overview");
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        const target = section === "risk" ? riskSectionRef.current : recommendationSectionRef.current;
+        target?.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+    });
+  }, []);
+
+  const topRisk = reviewVm.riskHighlights[0] ?? null;
+  const topRecommendation = reviewVm.structuredRecommendations[0] ?? null;
+  const decisionSummary = reviewVm.decisionSummary;
+  const detailPrimaryLabel = topRisk ? "最優先リスク" : decisionSummary?.label ?? "主要フォーカス";
+  const detailPrimaryTitle = topRisk?.title ?? decisionSummary?.title ?? "大きな阻害要因はありません";
+  const detailPrimaryMeta = topRisk?.mustResolveBefore ?? decisionSummary?.due ?? null;
+  const topRiskStyle = topRisk
+    ? (RISK_SEVERITY_STYLE[topRisk.severity] ?? RISK_SEVERITY_STYLE.medium)
+    : null;
+  const activeKanoIdx = kanoHovered ?? kanoSelected;
+  const activeKanoFeature = activeKanoIdx !== null ? analysis.kano_features[activeKanoIdx] ?? null : null;
+  const continueDisabled = requiresDecisionConfirmation && !decisionConfirmed;
+  const [handoffCopyState, setHandoffCopyState] = useState<"idle" | "copied" | "error">("idle");
+  const handoffCopyText = useMemo(() => {
+    const lines = [
+      reviewVm.handoffBrief.headline,
+      reviewVm.handoffBrief.summary,
+      "",
+      ...reviewVm.handoffBrief.bullets.map((item) => `- ${item}`),
+    ];
+    if (planningGuardrails.length > 0) {
+      lines.push("", "持ち込む前提:");
+      planningGuardrails.forEach((item) => lines.push(`- ${item}`));
+    }
+    return lines.join("\n");
+  }, [planningGuardrails, reviewVm.handoffBrief]);
+
+  useEffect(() => {
+    if (handoffCopyState === "idle") return;
+    const timeoutId = window.setTimeout(() => setHandoffCopyState("idle"), 2200);
+    return () => window.clearTimeout(timeoutId);
+  }, [handoffCopyState]);
+
+  const handleCouncilAction = useCallback((targetTab?: PlanningReviewTab, targetSection?: "risk" | "recommendation") => {
+    if (targetSection) {
+      jumpToOverviewSection(targetSection);
+      return;
+    }
+    if (targetTab) {
+      setTab(targetTab);
+    }
+  }, [jumpToOverviewSection]);
+
+  const copyHandoffBrief = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(handoffCopyText);
+      setHandoffCopyState("copied");
+    } catch {
+      setHandoffCopyState("error");
+    }
+  }, [handoffCopyText]);
+
+  const councilCardStyle = (tone?: string) => {
+    if (tone && tone in RISK_SEVERITY_STYLE) {
+      return RISK_SEVERITY_STYLE[tone];
+    }
+    if (tone && tone in RECOMMENDATION_PRIORITY_STYLE) {
+      return RECOMMENDATION_PRIORITY_STYLE[tone];
+    }
+    return RECOMMENDATION_PRIORITY_STYLE.medium;
+  };
+  const isOverview = tab === "overview";
+  const detailTabCopy: Record<Exclude<PlanningReviewTab, "overview">, { title: string; description: string }> = {
+    persona: {
+      title: "主要ユーザー像を揃える",
+      description: "誰の判断を支える企画なのかを短く確認し、以降の比較軸をぶらさないためのタブです。",
+    },
+    journey: {
+      title: "行動の流れを確認する",
+      description: "導入前から継続利用までの接点を見て、どこで価値が立ち上がるかを把握します。",
+    },
+    jtbd: {
+      title: "片づけたい仕事を確認する",
+      description: "ジョブストーリーの文脈で、機能ではなくユーザーが得たい成果を確認します。",
+    },
+    kano: {
+      title: "価値の重みを確認する",
+      description: "KANO の観点で、必須品質と魅力品質の釣り合いを見直します。",
+    },
+    stories: {
+      title: "ストーリーを整列する",
+      description: "誰が何をしたいかを受け入れ条件つきで並べ、スコープを判断可能にします。",
+    },
+    actors: {
+      title: "関係者と役割を揃える",
+      description: "ユーザーだけでなく運用者や外部システムまで含めて責務の境界を確認します。",
+    },
+    usecases: {
+      title: "ユースケースで操作を固める",
+      description: "主要フローと分岐を見て、デザイン比較で崩してはいけない導線を明確にします。",
+    },
+    ia: {
+      title: "情報構造を確認する",
+      description: "情報のまとまりと遷移経路を見て、迷わないナビゲーションの骨格を確認します。",
+    },
+    "design-tokens": {
+      title: "表現ルールを確認する",
+      description: "色、文字、動きの方針をまとめ、デザインが判断面から逸れないようにします。",
+    },
+  };
+  const activeDetailTab = !isOverview ? detailTabCopy[tab] : null;
+  const activeTabLabel = reviewVm.reviewTabs.find((item) => item.key === tab)?.label ?? "概要";
+  const heroStatLabel: Record<string, string> = {
+    "重要リスク": "重要リスク",
+    "高優先アクション": "優先アクション",
+    "中止基準": "中止基準",
+    "持ち込む前提": "前提数",
+  };
+
   return (
     <div className="mx-auto max-w-5xl">
-      <div className="mb-4 rounded-2xl border border-border bg-card p-4 sm:p-5">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-          <div className="space-y-2">
-            <div className="inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/5 px-3 py-1 text-[11px] font-medium text-primary">
-              <Sparkles className="h-3.5 w-3.5" />
-              企画統合
+      {isOverview ? (
+        <div className={cn(planningSurfaceVariants({ tone: "strong", padding: "md" }), "mb-4")}>
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+            <div className="space-y-2">
+              <div className={planningChipVariants({ tone: "accent" })}>
+                <Sparkles className="h-3.5 w-3.5" />
+                企画統合
+              </div>
+              <div>
+                <h2 className="text-lg font-semibold text-foreground">いま固めるべき企画判断を先に出す</h2>
+                <p className={cn("mt-1", planningMutedCopyClassName)}>
+                  量より順序を優先し、次のデザインフェーズに渡す前に処理すべき論点と前提だけを先頭に集約します。
+                </p>
+              </div>
             </div>
-            <div>
-              <h2 className="text-lg font-semibold text-foreground">調査結果を実装可能な企画に圧縮</h2>
-              <p className="mt-1 text-sm text-muted-foreground">
-                ペルソナ、ユースケース、KANO、IA を横断して、次のデザインフェーズに渡すスコープと判断材料を揃えます。
-              </p>
+            <div className="grid grid-cols-2 gap-2 lg:w-[22rem] xl:w-[30rem] xl:grid-cols-4">
+              {reviewVm.heroStats.map((item) => (
+                <div
+                  key={item.label}
+                  className={cn(
+                    planningMetricTileVariants({
+                      tone:
+                        item.label === "重要リスク"
+                          ? "warning"
+                          : item.label === "高優先アクション"
+                            ? "accent"
+                            : "default",
+                    }),
+                    "text-center",
+                  )}
+                >
+                  <p className="text-lg font-semibold text-foreground">{item.value}</p>
+                  <p className={cn(planningMicroLabelClassName, "mt-1 leading-4 [word-break:keep-all]")}>
+                    {heroStatLabel[item.label] ?? item.label}
+                  </p>
+                </div>
+              ))}
             </div>
           </div>
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:w-[26rem]">
-            {reviewVm.heroStats.map((item) => (
-              <div key={item.label} className="rounded-xl border border-border bg-background px-3 py-3 text-center">
-                <p className="text-lg font-semibold text-foreground">{item.value}</p>
-                <p className="text-[11px] text-muted-foreground">{item.label}</p>
+          {(decisionSummary || handoffNotice || planningGuardrails.length > 0 || onContinue) && (
+            <div className="mt-4 grid gap-4 lg:grid-cols-[minmax(0,1.35fr)_minmax(17rem,0.9fr)]">
+              <div className={planningSurfaceVariants({ tone: "accent", padding: "md" })}>
+                <div className="flex flex-wrap items-center gap-2">
+                  {handoffNotice && (
+                    <Badge variant="outline" className={planningChipVariants({ tone: "accent" })}>
+                      調査から前提つきで引き継ぎ
+                    </Badge>
+                  )}
+                  {decisionSummary?.label && (
+                    <Badge variant="outline" className={planningChipVariants({ tone: "default" })}>
+                      {decisionSummary.label}
+                    </Badge>
+                  )}
+                  {topRisk && topRiskStyle && (
+                    <Badge variant="outline" className={topRiskStyle.badge}>
+                      {topRiskStyle.label}
+                    </Badge>
+                  )}
+                </div>
+                <div className="mt-3 grid gap-4 lg:grid-cols-[minmax(0,1.1fr)_minmax(16rem,0.9fr)]">
+                  <div className="space-y-3">
+                    {decisionSummary && (
+                      <div className="space-y-2">
+                        <h3 className="text-base font-semibold text-foreground">{decisionSummary.title}</h3>
+                        <p className={cn("leading-6", planningMutedCopyClassName)}>{decisionSummary.description}</p>
+                      </div>
+                    )}
+                    <div className="flex flex-wrap gap-2 text-[11px] text-[color:var(--planning-text-soft)]">
+                      {decisionSummary?.owner && (
+                        <span className={planningChipVariants({ tone: "default" })}>
+                          担当: {decisionSummary.owner}
+                        </span>
+                      )}
+                      {decisionSummary?.due && (
+                        <span className={planningChipVariants({ tone: "default" })}>
+                          {topRisk ? "解消期限" : "対象"}: {decisionSummary.due}
+                        </span>
+                      )}
+                    </div>
+                    {handoffNotice && (
+                      <p className="text-xs leading-5 text-[color:var(--planning-text-soft)]">{handoffNotice}</p>
+                    )}
+                  </div>
+
+                  <div className={cn(planningSurfaceVariants({ tone: "inset", padding: "sm" }), "space-y-3")}>
+                    <div>
+                      <p className={planningEyebrowClassName}>持ち込む前提</p>
+                      <p className="mt-2 text-sm font-medium text-foreground">
+                        {planningGuardrails[0] ?? "主要導線と停止条件を先に崩さない"}
+                      </p>
+                    </div>
+                    {planningGuardrails.length > 1 && (
+                      <div className="space-y-1.5">
+                        {planningGuardrails.slice(1, 3).map((item) => (
+                          <p key={item} className="text-xs leading-5 text-[color:var(--planning-text-soft)]">
+                            • {item}
+                          </p>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
               </div>
-            ))}
+
+              <div className={planningSurfaceVariants({ tone: "inset", padding: "md" })}>
+                <p className={planningEyebrowClassName}>進行チェック</p>
+                <div className="mt-3 flex flex-col gap-2">
+                  {topRisk && (
+                    <button
+                      onClick={() => jumpToOverviewSection("risk")}
+                      className={planningActionVariants({ tone: "primary" })}
+                    >
+                      主要リスクを確認
+                      <ChevronRight className="h-4 w-4" />
+                    </button>
+                  )}
+                  {topRecommendation && (
+                    <button
+                      onClick={() => jumpToOverviewSection("recommendation")}
+                      className={planningActionVariants({ tone: "secondary" })}
+                    >
+                      推奨アクションを見る
+                      <ChevronRight className="h-4 w-4" />
+                    </button>
+                  )}
+                  {requiresDecisionConfirmation && onDecisionConfirmedChange && (
+                    <button
+                      type="button"
+                      onClick={() => onDecisionConfirmedChange(!decisionConfirmed)}
+                      className={cn(
+                        "rounded-xl border px-3 py-3 text-left transition-colors",
+                        decisionConfirmed
+                          ? "border-[color:var(--planning-success-border)] bg-[var(--planning-success-soft)] text-foreground"
+                          : "border-[color:var(--planning-border)] bg-[var(--planning-surface)] text-foreground hover:bg-[var(--planning-surface-strong)]",
+                      )}
+                    >
+                      <div className="flex items-start gap-3">
+                        <span className={cn(
+                          "mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border",
+                          decisionConfirmed
+                            ? "border-[color:var(--planning-success-border)] bg-[var(--planning-success-soft)] text-[color:var(--planning-success-strong)]"
+                            : "border-[color:var(--planning-border)] bg-[var(--planning-inset)] text-transparent",
+                        )}>
+                          <Check className="h-3.5 w-3.5" />
+                        </span>
+                        <span className="space-y-1">
+                          <span className="block text-sm font-medium">主要リスクと前提を確認した</span>
+                          <span className="block text-xs leading-5 text-[color:var(--planning-text-soft)]">
+                            未解決の前提を理解した上で、次のデザイン比較へ進める状態を明示します。
+                          </span>
+                        </span>
+                      </div>
+                    </button>
+                  )}
+                </div>
+                {continueDisabled && (
+                  <p className="mt-3 text-xs leading-5 text-[color:var(--planning-text-soft)]">
+                    進行前に、主要リスクと持ち込む前提の確認を完了してください。
+                  </p>
+                )}
+                {!continueDisabled && onContinue && (
+                  <p className="mt-3 text-xs leading-5 text-[color:var(--planning-text-soft)]">
+                    確認が済んだら、上部ヘッダーの「{continueLabel}」から次へ進めます。
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className={cn(planningSurfaceVariants({ tone: "subtle", padding: "md" }), "mb-4")}>
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+            <div className="space-y-2">
+              <div className={planningChipVariants({ tone: "default" })}>
+                <CircleDot className="h-3.5 w-3.5 text-primary" />
+                分析結果 / {activeTabLabel}
+              </div>
+              <div>
+                <h2 className="text-lg font-semibold text-foreground">{activeDetailTab?.title}</h2>
+                <p className={cn("mt-1", planningMutedCopyClassName)}>{activeDetailTab?.description}</p>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => setTab("overview")}
+                className={planningActionVariants({ tone: "secondary" })}
+              >
+                概要に戻る
+              </button>
+              {topRisk && (
+                <button
+                  type="button"
+                  onClick={() => jumpToOverviewSection("risk")}
+                  className={planningActionVariants({ tone: "tonal" })}
+                >
+                  主要リスク
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={copyHandoffBrief}
+                className={planningActionVariants({ tone: "secondary" })}
+              >
+                {handoffCopyState === "copied" ? "要約をコピー済み" : "要約をコピー"}
+              </button>
+            </div>
+          </div>
+          <div className="mt-4 grid gap-3 sm:grid-cols-3">
+            <div className={planningMetricTileVariants({ tone: "warning" })}>
+              <p className={planningEyebrowClassName}>{detailPrimaryLabel}</p>
+              <p className="mt-2 text-sm font-medium text-foreground">{detailPrimaryTitle}</p>
+              {detailPrimaryMeta && <p className="mt-1 text-xs text-[color:var(--planning-text-soft)]">期限: {detailPrimaryMeta}</p>}
+            </div>
+            <div className={planningMetricTileVariants({ tone: "accent" })}>
+              <p className={planningEyebrowClassName}>次の判断</p>
+              <p className="mt-2 text-sm font-medium text-foreground">{topRecommendation?.action ?? "主要仮説を保ちながら詳細を確認します"}</p>
+            </div>
+            <div className={planningMetricTileVariants({ tone: "default" })}>
+              <p className={planningEyebrowClassName}>持ち込む前提</p>
+              <p className="mt-2 text-sm font-medium text-foreground">{planningGuardrails[0] ?? "主要導線と停止条件を先に崩さない"}</p>
+            </div>
           </div>
         </div>
-        {reviewVm.focusSummary && (
-          <div className="mt-4 rounded-xl border border-primary/20 bg-primary/5 px-4 py-3">
-            <p className="text-[11px] font-medium uppercase tracking-[0.16em] text-primary/80">推奨フォーカス</p>
-            <p className="mt-1 text-sm text-foreground">{reviewVm.focusSummary}</p>
+      )}
+      {isOverview && (
+        <div className="mb-4 grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(18rem,0.9fr)]">
+          <div className={planningSurfaceVariants({ tone: "default", padding: "md" })}>
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className={planningEyebrowClassName}>判断を支える視点</p>
+                <h3 className="mt-1 text-base font-semibold text-foreground">補助メモだけを短く並べる</h3>
+              </div>
+              <Badge variant="outline" className={planningChipVariants({ tone: "accent" })}>
+                4視点レビュー
+              </Badge>
+            </div>
+            <div className="mt-4 space-y-3">
+              {reviewVm.councilCards.map((card) => {
+                const style = councilCardStyle(card.tone);
+                return (
+                  <div key={card.id} className={cn(style.card, "space-y-2")}>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="space-y-1">
+                        <p className={planningMicroLabelClassName}>{card.agent}</p>
+                        <p className="text-sm font-semibold text-foreground">{card.title}</p>
+                      </div>
+                      <Badge variant="outline" className={style.badge}>
+                        {card.lens}
+                      </Badge>
+                    </div>
+                    <p className="text-xs leading-5 text-muted-foreground">{card.summary}</p>
+                    <button
+                      type="button"
+                      onClick={() => handleCouncilAction(card.targetTab, card.targetSection)}
+                      className="inline-flex items-center gap-1.5 text-xs font-medium text-[color:var(--planning-accent-strong)] hover:text-white"
+                    >
+                      {card.actionLabel}
+                      <ChevronRight className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
           </div>
-        )}
-      </div>
+
+          <div className={planningSurfaceVariants({ tone: "accent", padding: "md" })}>
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className={planningEyebrowClassName}>デザイン引き継ぎ</p>
+                <h3 className="mt-1 text-base font-semibold text-foreground">そのまま渡せる要約</h3>
+              </div>
+              <button
+                type="button"
+                onClick={copyHandoffBrief}
+                className={cn(
+                  "px-3 py-1",
+                  handoffCopyState === "copied"
+                    ? planningActionVariants({ tone: "secondary" }).replace("px-4 py-2", "")
+                    : handoffCopyState === "error"
+                      ? planningActionVariants({ tone: "danger" }).replace("px-4 py-2", "")
+                      : planningActionVariants({ tone: "secondary" }).replace("px-4 py-2", ""),
+                )}
+              >
+                {handoffCopyState === "copied" ? "コピー済み" : handoffCopyState === "error" ? "コピー失敗" : "要約をコピー"}
+              </button>
+            </div>
+            <div className={cn(planningSurfaceVariants({ tone: "inset", padding: "md" }), "mt-4")}>
+              <p className="text-sm font-semibold text-foreground">{reviewVm.handoffBrief.headline}</p>
+              <p className={cn("mt-2 leading-6", planningMutedCopyClassName)}>{reviewVm.handoffBrief.summary}</p>
+              <div className="mt-4 space-y-2">
+                {reviewVm.handoffBrief.bullets.slice(0, 4).map((item) => (
+                  <p key={item} className="flex items-start gap-2 text-xs leading-5 text-foreground">
+                    <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-primary" />
+                    <span>{item}</span>
+                  </p>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="mb-4 -mx-1 flex gap-1 overflow-x-auto px-1 pb-1">
         {reviewVm.reviewTabs.filter((item) => !item.hidden).map((item) => {
@@ -360,10 +874,7 @@ export function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
             <button
               key={item.key}
               onClick={() => setTab(item.key)}
-              className={cn(
-                "shrink-0 flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
-                tab === item.key ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground",
-              )}
+              className={planningTabVariants({ active: tab === item.key })}
             >
               <Icon className="h-3.5 w-3.5" />
               {item.label}
@@ -376,47 +887,127 @@ export function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
         <div className="space-y-4">
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-6">
             {reviewVm.overviewStats.map((item) => (
-              <div key={item.label} className="rounded-xl border border-border bg-card p-4 text-center">
+              <div key={item.label} className={cn(planningMetricTileVariants({ tone: "default" }), "text-center")}>
                 <p className="text-2xl font-bold text-foreground">{item.value}</p>
-                <p className="text-xs text-muted-foreground">{item.label}</p>
+                <p className={planningEyebrowClassName}>{item.label}</p>
               </div>
             ))}
           </div>
-          <div className="rounded-xl border border-border bg-card p-4">
+          {reviewVm.coverageSummary && (
+            <div className={planningSurfaceVariants({ tone: "accent", padding: "md" })}>
+              <div className="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+                <div>
+                  <p className={planningEyebrowClassName}>計画カバレッジ</p>
+                  <h3 className="mt-1 text-sm font-semibold text-foreground">この企画がどこまで作り切れる粒度になっているか</h3>
+                </div>
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                  {reviewVm.coverageSummary.tiles.map((item) => (
+                    <div key={item.label} className={cn(planningMetricTileVariants({ tone: "default" }), "min-w-[6rem] text-center")}>
+                      <p className="text-lg font-semibold text-foreground">{item.value}</p>
+                      <p className={planningMicroLabelClassName}>{item.label}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="mt-4 grid gap-2 lg:grid-cols-2">
+                {reviewVm.coverageSummary.notes.map((note, index) => (
+                  <div key={`${note}-${index}`} className={cn(planningSurfaceVariants({ tone: index === 0 ? "subtle" : "inset", padding: "sm" }), "text-xs leading-5 text-foreground")}>
+                    {note}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          <div className={planningSurfaceVariants({ tone: "default", padding: "md" })}>
             <h3 className="mb-3 text-sm font-medium text-foreground">KANO分布</h3>
             <div className="grid gap-3 sm:grid-cols-3">
               {reviewVm.kanoDistribution.map((item) => (
-                <div key={item.label} className={cn("flex-1 rounded-lg p-3 text-center", item.color)}>
+                <div key={item.label} className={cn(planningMetricTileVariants({ tone: "default" }), "text-center", item.color)}>
                   <p className="text-lg font-bold">{item.count}</p>
                   <p className="text-xs">{item.label}</p>
                 </div>
               ))}
             </div>
           </div>
-          <div className="space-y-2">
-            {analysis.recommendations.map((r, i) => {
-              const isQuick = r.includes("Quick Win");
-              const isStrategic = r.includes("Strategic");
-              return (
-                <div
-                  key={i}
-                  className={cn(
-                    "rounded-lg border-2 p-3 text-sm text-foreground",
-                    isQuick ? "border-success/30 bg-success/5" : isStrategic ? "border-primary/30 bg-primary/5" : "border-border",
-                  )}
-                >
-                  {r}
+          {!!reviewVm.riskHighlights.length && (
+            <div ref={riskSectionRef} className={planningSurfaceVariants({ tone: "default", padding: "md" })}>
+              <div className="mb-3 flex items-center gap-2">
+                <AlertTriangle className="h-4 w-4 text-amber-400" />
+                <h3 className="text-sm font-medium text-foreground">主要リスク</h3>
+              </div>
+              <div className="grid gap-3 lg:grid-cols-2">
+                {reviewVm.riskHighlights.map((risk) => {
+                  const style = RISK_SEVERITY_STYLE[risk.severity] ?? RISK_SEVERITY_STYLE.medium;
+                  return (
+                    <div key={risk.id} className={style.card}>
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="space-y-1">
+                          <p className="text-sm font-medium text-foreground">{risk.title}</p>
+                          <div className="flex flex-wrap gap-2 text-[11px] text-[color:var(--planning-text-soft)]">
+                            {risk.owner && <span>担当: {risk.owner}</span>}
+                            {risk.mustResolveBefore && <span>期限: {risk.mustResolveBefore}</span>}
+                          </div>
+                        </div>
+                        <Badge variant="outline" className={style.badge}>
+                          {style.label}
+                        </Badge>
+                      </div>
+                      <p className="mt-3 text-xs leading-5 text-[color:var(--planning-text-soft)]">{risk.description}</p>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {!!reviewVm.structuredRecommendations.length && (
+            <div ref={recommendationSectionRef} className={planningSurfaceVariants({ tone: "default", padding: "md" })}>
+              <div className="mb-3 flex items-center gap-2">
+                <Sparkles className="h-4 w-4 text-primary" />
+                <h3 className="text-sm font-medium text-foreground">推奨アクション</h3>
+              </div>
+              <div className="space-y-3">
+                {reviewVm.structuredRecommendations.map((item) => {
+                  const style = RECOMMENDATION_PRIORITY_STYLE[item.priority] ?? RECOMMENDATION_PRIORITY_STYLE.medium;
+                  return (
+                    <div key={item.id} className={style.card}>
+                      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                        <div className="space-y-1">
+                          <p className="text-sm font-medium text-foreground">{item.action}</p>
+                          {item.target && (
+                            <p className="text-[11px] text-[color:var(--planning-text-soft)]">対象: {item.target}</p>
+                          )}
+                        </div>
+                        <Badge variant="outline" className={style.badge}>
+                          {style.label}
+                        </Badge>
+                      </div>
+                      {item.rationale && (
+                        <p className="mt-3 text-xs leading-5 text-[color:var(--planning-text-soft)]">{item.rationale}</p>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {!!reviewVm.recommendationNotes.length && (
+            <div className="space-y-2">
+              {reviewVm.recommendationNotes.map((note, index) => (
+                <div key={`${note}-${index}`} className={cn(planningSurfaceVariants({ tone: "inset", padding: "sm" }), "text-sm text-foreground")}>
+                  {note}
                 </div>
-              );
-            })}
-          </div>
+              ))}
+            </div>
+          )}
 
           <div className="grid gap-4 lg:grid-cols-2">
-            <div className="rounded-xl border border-border bg-card p-4">
+            <div className={planningSurfaceVariants({ tone: "default", padding: "md" })}>
               <h3 className="mb-3 text-sm font-medium text-foreground">判定テーブル</h3>
               <div className="space-y-2">
                 {(analysis.feature_decisions ?? []).map((decision) => (
-                  <div key={decision.feature} className="rounded-lg border border-border/80 bg-background px-3 py-2">
+                  <div key={decision.feature} className={planningSurfaceVariants({ tone: "inset", padding: "sm" })}>
                     <div className="flex items-center justify-between gap-2">
                       <p className="text-xs font-medium text-foreground">{decision.feature}</p>
                       <Badge variant={decision.selected ? "default" : "secondary"} className="text-[10px]">
@@ -432,17 +1023,17 @@ export function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
                 ))}
               </div>
             </div>
-            <div className="rounded-xl border border-border bg-card p-4">
+            <div className={planningSurfaceVariants({ tone: "default", padding: "md" })}>
               <h3 className="mb-3 text-sm font-medium text-foreground">仮説とレッドチームの発見</h3>
               <div className="space-y-2">
                 {(analysis.assumptions ?? []).map((assumption) => (
-                  <div key={assumption.id} className="rounded-lg border border-border/80 bg-background px-3 py-2">
+                  <div key={assumption.id} className={planningSurfaceVariants({ tone: "inset", padding: "sm" })}>
                     <p className="text-xs font-medium text-foreground">{assumption.statement}</p>
-                    <p className="mt-1 text-[11px] text-muted-foreground">{assumption.severity}</p>
+                    <p className="mt-1 text-[11px] text-muted-foreground">{SEVERITY_TEXT_LABELS[assumption.severity] ?? assumption.severity}</p>
                   </div>
                 ))}
                 {(analysis.red_team_findings ?? []).map((finding) => (
-                  <div key={finding.id} className="rounded-lg border border-destructive/20 bg-destructive/5 px-3 py-2">
+                  <div key={finding.id} className={planningSurfaceVariants({ tone: "danger", padding: "sm" })}>
                     <p className="text-xs font-medium text-foreground">{finding.title}</p>
                     <p className="mt-1 text-[11px] text-muted-foreground">{finding.recommendation}</p>
                   </div>
@@ -452,11 +1043,11 @@ export function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
           </div>
 
           <div className="grid gap-4 lg:grid-cols-2">
-            <div className="rounded-xl border border-border bg-card p-4">
+            <div className={planningSurfaceVariants({ tone: "default", padding: "md" })}>
               <h3 className="mb-3 text-sm font-medium text-foreground">トレーサビリティ</h3>
               <div className="space-y-2">
                 {(analysis.traceability ?? []).map((item, index) => (
-                  <div key={`${item.feature}-${index}`} className="rounded-lg border border-border/80 bg-background px-3 py-2 text-xs text-foreground">
+                  <div key={`${item.feature}-${index}`} className={cn(planningSurfaceVariants({ tone: "inset", padding: "sm" }), "text-xs text-foreground")}>
                     <p>{item.feature}</p>
                     <p className="mt-1 text-[11px] text-muted-foreground">
                       主張 {item.claim_id || "n/a"} → ユースケース {item.use_case_id || "n/a"} → マイルストーン {item.milestone_id || "n/a"}
@@ -465,17 +1056,17 @@ export function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
                 ))}
               </div>
             </div>
-            <div className="rounded-xl border border-border bg-card p-4">
+            <div className={planningSurfaceVariants({ tone: "default", padding: "md" })}>
               <h3 className="mb-3 text-sm font-medium text-foreground">ネガティブペルソナと中止基準</h3>
               <div className="space-y-2">
                 {(analysis.negative_personas ?? []).map((persona) => (
-                  <div key={persona.id} className="rounded-lg border border-border/80 bg-background px-3 py-2">
+                  <div key={persona.id} className={planningSurfaceVariants({ tone: "inset", padding: "sm" })}>
                     <p className="text-xs font-medium text-foreground">{persona.name}</p>
                     <p className="mt-1 text-[11px] text-muted-foreground">{persona.mitigation}</p>
                   </div>
                 ))}
                 {(analysis.kill_criteria ?? []).map((criterion) => (
-                  <div key={criterion.id} className="rounded-lg border border-border/80 bg-background px-3 py-2">
+                  <div key={criterion.id} className={planningSurfaceVariants({ tone: "inset", padding: "sm" })}>
                     <p className="text-xs font-medium text-foreground">{criterion.condition}</p>
                     <p className="mt-1 text-[11px] text-muted-foreground">{criterion.rationale}</p>
                   </div>
@@ -489,26 +1080,27 @@ export function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
       {tab === "persona" && (
         <div className="grid gap-4 lg:grid-cols-3">
           {analysis.personas.map((p, i) => (
-            <div key={i} className="space-y-3 rounded-xl border border-border bg-card p-5">
+            <div key={i} className={cn(planningDetailCardVariants({ tone: "default", padding: "lg" }), "space-y-3")}>
               <div className="flex items-center gap-3">
-                <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary/20 font-bold text-primary">{p.name.charAt(0)}</div>
+                <div className="flex h-10 w-10 items-center justify-center rounded-full border border-[color:var(--planning-border-strong)] bg-[var(--planning-accent-soft)] font-bold text-primary">{p.name.charAt(0)}</div>
                 <div>
                   <p className="font-medium text-foreground">{p.name}</p>
-                  <p className="text-xs text-muted-foreground">
+                  <p className={planningBodyLabelClassName}>
                     {p.role} · {p.age_range}
+                    {p.tech_proficiency ? ` · 熟練度 ${PROFICIENCY_LABELS[p.tech_proficiency] ?? p.tech_proficiency}` : ""}
                   </p>
                 </div>
               </div>
-              <p className="text-xs text-muted-foreground">{p.context}</p>
+              <p className={planningBodyLabelClassName}>{p.context}</p>
               {p.goals.map((g, j) => (
                 <p key={j} className="flex items-start gap-1.5 text-xs text-foreground">
-                  <Check className="mt-0.5 h-3 w-3 shrink-0 text-success" />
+                  <Check className="mt-0.5 h-3 w-3 shrink-0 text-[color:var(--planning-success-strong)]" />
                   {g}
                 </p>
               ))}
               {p.frustrations.map((f, j) => (
                 <p key={j} className="flex items-start gap-1.5 text-xs text-foreground">
-                  <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0 text-destructive" />
+                  <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0 text-[color:var(--planning-danger-strong)]" />
                   {f}
                 </p>
               ))}
@@ -519,11 +1111,56 @@ export function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
 
       {tab === "kano" && (
         <div className="space-y-4">
-          <KanoBubbleChart features={analysis.kano_features} hoveredIdx={kanoHovered} onHover={setKanoHovered} />
-          <div className="overflow-x-auto rounded-xl border border-border bg-card">
+          <KanoBubbleChart
+            features={analysis.kano_features}
+            activeIdx={activeKanoIdx}
+            tooltipIdx={kanoHovered}
+            onHover={setKanoHovered}
+            onSelect={setKanoSelected}
+          />
+          {activeKanoFeature && (
+            <div className={planningSurfaceVariants({ tone: "default", padding: "md" })}>
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div className="space-y-2">
+                  <p className={planningMicroLabelClassName}>
+                    タップ / クリックで固定
+                  </p>
+                  <div>
+                    <h3 className="text-base font-semibold text-foreground">{activeKanoFeature.feature}</h3>
+                    <p className={cn("mt-1", planningMutedCopyClassName)}>
+                      {KANO_CATEGORY_HELP[activeKanoFeature.category] ?? "価値仮説の扱いを見直すポイントです。"}
+                    </p>
+                  </div>
+                </div>
+                <span className={planningSoftBadgeVariants({ tone: activeKanoFeature.category === "must-be" ? "danger" : activeKanoFeature.category === "attractive" ? "success" : activeKanoFeature.category === "one-dimensional" ? "accent" : "default" })}>
+                  {(KANO_CAT_STYLE[activeKanoFeature.category] ?? KANO_CAT_STYLE.indifferent).label}
+                </span>
+              </div>
+              <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                <div className={planningDetailCardVariants({ tone: "default", padding: "md" })}>
+                  <p className={planningEyebrowClassName}>満足度</p>
+                  <p className="mt-1 text-lg font-semibold text-foreground">{activeKanoFeature.user_delight.toFixed(1)}</p>
+                </div>
+                <div className={planningDetailCardVariants({ tone: "default", padding: "md" })}>
+                  <p className={planningEyebrowClassName}>実装コスト</p>
+                  <p className="mt-1 text-lg font-semibold text-foreground">{KANO_COST_LABELS[activeKanoFeature.implementation_cost] ?? activeKanoFeature.implementation_cost}</p>
+                </div>
+                <div className={planningDetailCardVariants({ tone: "default", padding: "md" })}>
+                  <p className={planningEyebrowClassName}>カテゴリ</p>
+                  <p className="mt-1 text-lg font-semibold text-foreground">
+                    {(KANO_CAT_STYLE[activeKanoFeature.category] ?? KANO_CAT_STYLE.indifferent).label}
+                  </p>
+                </div>
+              </div>
+              {activeKanoFeature.rationale && (
+                <p className={cn("mt-4 leading-6", planningMutedCopyClassName)}>{activeKanoFeature.rationale}</p>
+              )}
+            </div>
+          )}
+          <div className={cn(planningSurfaceVariants({ tone: "default" }), "overflow-x-auto")}>
             <table className="min-w-[40rem] w-full text-sm">
               <thead>
-                <tr className="border-b border-border bg-muted/30">
+                <tr className="border-b border-border bg-[rgba(119,182,234,0.05)]">
                   {([
                     { key: "index" as KanoSortKey, label: "#", w: "w-10" },
                     { key: "feature" as KanoSortKey, label: "機能", w: "" },
@@ -531,7 +1168,7 @@ export function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
                     { key: "delight" as KanoSortKey, label: "満足度", w: "w-32" },
                     { key: "cost" as KanoSortKey, label: "コスト", w: "w-24" },
                   ]).map((col) => (
-                    <th key={col.key} className={cn("select-none px-3 py-2.5 text-left text-xs font-medium text-muted-foreground", col.w)}>
+                    <th key={col.key} className={cn("select-none px-3 py-3 text-left text-xs font-medium text-[color:var(--planning-text-soft)]", col.w)}>
                       <button onClick={() => toggleKanoSort(col.key)} className="flex cursor-pointer items-center gap-1 transition-colors hover:text-foreground">
                         {col.label}
                         <ChevronsUpDown className={cn("h-3 w-3", kanoSort.key === col.key ? "text-primary" : "text-muted-foreground/40")} />
@@ -546,23 +1183,42 @@ export function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
                     "must-be": "text-destructive",
                     "one-dimensional": "text-primary",
                     attractive: "text-success",
-                    indifferent: "text-muted-foreground",
-                    reverse: "text-purple-400",
+                    indifferent: "text-[color:var(--planning-text-soft)]",
+                    reverse: "text-[color:var(--planning-text-muted)]",
                   };
-                  const isHovered = kanoHovered === f._origIdx;
+                  const isHovered = activeKanoIdx === f._origIdx;
                   return (
-                    <tr key={f._origIdx} onMouseEnter={() => setKanoHovered(f._origIdx)} onMouseLeave={() => setKanoHovered(null)} className={cn("cursor-default transition-colors", isHovered ? "bg-accent/50" : "hover:bg-muted/20")}>
+                    <tr
+                      key={f._origIdx}
+                      tabIndex={0}
+                      role="button"
+                      aria-pressed={kanoSelected === f._origIdx}
+                      onMouseEnter={() => setKanoHovered(f._origIdx)}
+                      onMouseLeave={() => setKanoHovered(null)}
+                      onFocus={() => setKanoSelected(f._origIdx)}
+                      onBlur={() => setKanoHovered(null)}
+                      onClick={() => setKanoSelected(f._origIdx)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          setKanoSelected(f._origIdx);
+                        }
+                      }}
+                      className={cn("cursor-pointer transition-colors outline-none", isHovered ? "bg-[rgba(119,182,234,0.12)]" : "hover:bg-[rgba(119,182,234,0.05)]")}
+                    >
                       <td className="px-3 py-2.5 font-mono text-xs text-muted-foreground">{f._origIdx + 1}</td>
                       <td className="px-3 py-2.5">
                         <p className="font-medium text-foreground">{f.feature}</p>
                         {f.rationale && <p className="mt-0.5 line-clamp-1 text-[11px] text-muted-foreground">{f.rationale}</p>}
                       </td>
-                      <td className={cn("px-3 py-2.5 text-xs font-medium capitalize", catColor[f.category])}>{f.category.replace("-", " ")}</td>
+                      <td className={cn("px-3 py-2.5 text-xs font-medium", catColor[f.category])}>
+                        {(KANO_CAT_STYLE[f.category] ?? KANO_CAT_STYLE.indifferent).label}
+                      </td>
                       <td className="px-3 py-2.5">
                         <div className="flex items-center gap-2">
-                          <div className="h-1.5 w-14 overflow-hidden rounded-full bg-muted">
+                          <div className="h-1.5 w-14 overflow-hidden rounded-full bg-[rgba(127,147,169,0.22)]">
                             <div
-                              className={cn("h-full rounded-full transition-all", f.user_delight > 0.7 ? "bg-success" : f.user_delight > 0.4 ? "bg-primary" : "bg-amber-500")}
+                              className={cn("h-full rounded-full transition-all", f.user_delight > 0.7 ? "bg-[color:var(--planning-success-strong)]" : f.user_delight > 0.4 ? "bg-[color:var(--planning-accent)]" : "bg-[color:var(--planning-warning-strong)]")}
                               style={{ width: `${Math.max(f.user_delight * 100, 5)}%` }}
                             />
                           </div>
@@ -570,9 +1226,9 @@ export function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
                         </div>
                       </td>
                       <td className="px-3 py-2.5">
-                        <Badge variant="outline" className={cn("text-[10px] capitalize", f.implementation_cost === "high" ? "border-destructive/40 text-destructive" : f.implementation_cost === "low" ? "border-success/40 text-success" : "")}>
-                          {f.implementation_cost}
-                        </Badge>
+                        <span className={planningSoftBadgeVariants({ tone: f.implementation_cost === "high" ? "danger" : f.implementation_cost === "low" ? "success" : "default" })}>
+                          {KANO_COST_LABELS[f.implementation_cost] ?? f.implementation_cost}
+                        </span>
                       </td>
                     </tr>
                   );
@@ -586,20 +1242,14 @@ export function ReviewContent({ analysis }: { analysis: AnalysisResult }) {
       {tab === "stories" && (
         <div className="max-w-3xl space-y-2">
           {analysis.user_stories.map((s, i) => {
-            const color: Record<string, string> = {
-              must: "bg-destructive/20 text-destructive",
-              should: "bg-warning/20 text-warning",
-              could: "bg-primary/20 text-primary",
-              wont: "bg-muted text-muted-foreground",
-            };
             return (
-              <div key={i} className="flex items-start gap-2 rounded-lg border border-border bg-card p-3">
-                <Badge className={cn("mt-0.5 shrink-0 border-0 text-[10px] uppercase", color[s.priority])}>{s.priority}</Badge>
+              <div key={i} className={cn(planningDetailCardVariants({ tone: "default", padding: "md" }), "flex items-start gap-2")}>
+                <span className={cn(planningSoftBadgeVariants({ tone: s.priority === "must" ? "danger" : s.priority === "should" ? "warning" : s.priority === "could" ? "accent" : "default" }), "mt-0.5 shrink-0")}>{s.priority}</span>
                 <div>
                   <p className="text-sm text-foreground">
                     {s.role} として、{s.action} したい
                   </p>
-                  <p className="mt-0.5 text-xs text-muted-foreground">それにより {s.benefit}</p>
+                  <p className={cn("mt-0.5", planningBodyLabelClassName)}>それにより {s.benefit}</p>
                 </div>
               </div>
             );
@@ -630,66 +1280,64 @@ function DesignTokenContent({ tokens }: { tokens: DesignTokenAnalysis }) {
 
   return (
     <div className="space-y-6">
-      <div className="rounded-lg border border-border/40 bg-card/60 p-4">
-        <p className="text-sm leading-relaxed text-muted-foreground">{rationale}</p>
+      <div className={planningDetailCardVariants({ tone: "default", padding: "md" })}>
+        <p className={cn("leading-relaxed", planningMutedCopyClassName)}>{rationale}</p>
       </div>
 
-      <div className="space-y-3 rounded-lg border border-border/40 bg-card/60 p-4">
-        <h4 className="flex items-center gap-2 text-sm font-semibold">
-          <Palette className="h-4 w-4 text-violet-400" />
+      <div className={cn(planningDetailCardVariants({ tone: "default", padding: "md" }), "space-y-3")}>
+        <h4 className={cn(planningSectionTitleClassName, "flex items-center gap-2")}>
+          <Palette className="h-4 w-4 text-primary" />
           スタイル
         </h4>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="text-base font-medium">{style.name}</span>
+          <span className="text-base font-medium text-foreground">{style.name}</span>
           {style.keywords.map((kw) => (
-            <Badge key={kw} variant="secondary" className="text-[10px]">
-              {kw}
-            </Badge>
+            <span key={kw} className={planningSoftBadgeVariants({ tone: "default" })}>{kw}</span>
           ))}
         </div>
-        <div className="grid grid-cols-1 gap-3 text-xs text-muted-foreground sm:grid-cols-3">
+        <div className="grid grid-cols-1 gap-3 text-xs text-[color:var(--planning-text-soft)] sm:grid-cols-3">
           <div>
-            <span className="block font-medium text-foreground/70">適用先</span>
+            <span className={cn("block", planningEyebrowClassName)}>適用先</span>
             {style.best_for || "—"}
           </div>
           <div>
-            <span className="block font-medium text-foreground/70">パフォーマンス</span>
+            <span className={cn("block", planningEyebrowClassName)}>パフォーマンス</span>
             {style.performance || "—"}
           </div>
           <div>
-            <span className="block font-medium text-foreground/70">アクセシビリティ</span>
+            <span className={cn("block", planningEyebrowClassName)}>アクセシビリティ</span>
             {style.accessibility || "—"}
           </div>
         </div>
       </div>
 
-      <div className="space-y-3 rounded-lg border border-border/40 bg-card/60 p-4">
-        <h4 className="text-sm font-semibold">カラーパレット</h4>
+      <div className={cn(planningDetailCardVariants({ tone: "default", padding: "md" }), "space-y-3")}>
+        <h4 className={planningSectionTitleClassName}>カラーパレット</h4>
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
           {colorEntries.map(([key, hex]) => (
             <div key={key} className="space-y-1.5">
-              <div className="h-16 cursor-pointer rounded-lg border border-border/30 transition-transform hover:scale-105" style={{ backgroundColor: hex }} title={hex} />
+              <div className="h-16 cursor-pointer rounded-[1rem] border border-[color:var(--planning-border)] transition-transform hover:scale-[1.02]" style={{ backgroundColor: hex }} title={hex} />
               <div className="text-center text-[10px]">
                 <div className="font-medium text-foreground/80">{colorLabels[key] ?? key}</div>
-                <div className="font-mono text-muted-foreground">{hex}</div>
+                <div className="font-mono text-[color:var(--planning-text-soft)]">{hex}</div>
               </div>
             </div>
           ))}
         </div>
-        {colors.notes && <p className="mt-2 text-xs text-muted-foreground">{colors.notes}</p>}
+        {colors.notes && <p className={cn("mt-2", planningBodyLabelClassName)}>{colors.notes}</p>}
       </div>
 
-      <div className="space-y-3 rounded-lg border border-border/40 bg-card/60 p-4">
-        <h4 className="text-sm font-semibold">タイポグラフィ</h4>
+      <div className={cn(planningDetailCardVariants({ tone: "default", padding: "md" }), "space-y-3")}>
+        <h4 className={planningSectionTitleClassName}>タイポグラフィ</h4>
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div>
-            <span className="mb-1 block text-[10px] text-muted-foreground">見出し</span>
+            <span className={cn("mb-1 block", planningEyebrowClassName)}>見出し</span>
             <span className="text-lg font-semibold" style={{ fontFamily: typography.heading }}>
               {typography.heading}
             </span>
           </div>
           <div>
-            <span className="mb-1 block text-[10px] text-muted-foreground">本文</span>
+            <span className={cn("mb-1 block", planningEyebrowClassName)}>本文</span>
             <span className="text-lg" style={{ fontFamily: typography.body }}>
               {typography.body}
             </span>
@@ -698,43 +1346,41 @@ function DesignTokenContent({ tokens }: { tokens: DesignTokenAnalysis }) {
         {typography.mood.length > 0 && (
           <div className="flex flex-wrap gap-1.5">
             {typography.mood.map((m) => (
-              <Badge key={m} variant="outline" className="text-[10px]">
-                {m}
-              </Badge>
+              <span key={m} className={planningSoftBadgeVariants({ tone: "default" })}>{m}</span>
             ))}
           </div>
         )}
         {typography.google_fonts_url && (
-          <a href={typography.google_fonts_url} target="_blank" rel="noopener noreferrer" className="text-[10px] text-blue-400 hover:underline">
+          <a href={typography.google_fonts_url} target="_blank" rel="noopener noreferrer" className="text-xs text-[color:var(--planning-accent-strong)] hover:text-white hover:underline">
             Google Fonts で表示
           </a>
         )}
       </div>
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <div className="space-y-2 rounded-lg border border-border/40 bg-card/60 p-4">
-          <h4 className="flex items-center gap-1.5 text-sm font-semibold">
-            <Sparkles className="h-3.5 w-3.5 text-amber-400" />
+        <div className={cn(planningDetailCardVariants({ tone: "accent", padding: "md" }), "space-y-2")}>
+          <h4 className={cn(planningSectionTitleClassName, "flex items-center gap-1.5")}>
+            <Sparkles className="h-3.5 w-3.5 text-[color:var(--planning-warning-strong)]" />
             エフェクト
           </h4>
           <ul className="space-y-1">
             {effects.map((e, i) => (
-              <li key={i} className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                <Check className="h-3 w-3 shrink-0 text-green-400" />
+              <li key={i} className="flex items-center gap-1.5 text-xs text-[color:var(--planning-text-soft)]">
+                <Check className="h-3 w-3 shrink-0 text-[color:var(--planning-success-strong)]" />
                 {e}
               </li>
             ))}
           </ul>
         </div>
-        <div className="space-y-2 rounded-lg border border-border/40 bg-card/60 p-4">
-          <h4 className="flex items-center gap-1.5 text-sm font-semibold">
-            <AlertTriangle className="h-3.5 w-3.5 text-red-400" />
+        <div className={cn(planningDetailCardVariants({ tone: "danger", padding: "md" }), "space-y-2")}>
+          <h4 className={cn(planningSectionTitleClassName, "flex items-center gap-1.5")}>
+            <AlertTriangle className="h-3.5 w-3.5 text-[color:var(--planning-danger-strong)]" />
             アンチパターン
           </h4>
           <ul className="space-y-1">
             {anti_patterns.map((a, i) => (
-              <li key={i} className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                <AlertCircle className="h-3 w-3 shrink-0 text-red-400" />
+              <li key={i} className="flex items-center gap-1.5 text-xs text-[color:var(--planning-text-soft)]">
+                <AlertCircle className="h-3 w-3 shrink-0 text-[color:var(--planning-danger-strong)]" />
                 {a}
               </li>
             ))}
@@ -758,14 +1404,11 @@ function ActorRoleContent({ actors, roles }: { actors: Actor[]; roles: Role[] })
           <button
             key={t.key}
             onClick={() => setActiveTab(t.key)}
-            className={cn(
-              "flex cursor-pointer items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium transition-colors",
-              activeTab === t.key ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground",
-            )}
+            className={planningTabVariants({ active: activeTab === t.key })}
           >
             <t.icon className="h-3.5 w-3.5" />
             {t.label}
-            <span className={cn("ml-1 rounded-full px-1.5 py-0.5 text-[10px]", activeTab === t.key ? "bg-primary/20 text-primary" : "bg-muted text-muted-foreground")}>{t.count}</span>
+            <span className={cn(planningSoftBadgeVariants({ tone: activeTab === t.key ? "accent" : "default" }), "ml-1 px-1.5 py-0.5 text-[10px]")}>{t.count}</span>
           </button>
         ))}
       </div>
@@ -775,28 +1418,26 @@ function ActorRoleContent({ actors, roles }: { actors: Actor[]; roles: Role[] })
           {actors.map((a, i) => {
             const style = ACTOR_TYPE_STYLE[a.type] ?? ACTOR_TYPE_STYLE.primary;
             return (
-              <div key={i} className={cn("space-y-3 rounded-xl border p-5", style.bg)}>
+              <div key={i} className={cn(planningDetailCardVariants({ tone: style.tone, padding: "lg" }), "space-y-3")}>
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-3">
-                    <div className={cn("flex h-10 w-10 items-center justify-center rounded-full", style.bg)}>
-                      <style.icon className={cn("h-5 w-5", style.text)} />
+                    <div className={cn("flex h-10 w-10 items-center justify-center rounded-full border", style.tone === "accent" ? "border-[color:var(--planning-border-strong)] bg-[var(--planning-accent-soft)]" : style.tone === "warning" ? "border-[color:var(--planning-warning-border)] bg-[var(--planning-warning-soft)]" : "border-[color:var(--planning-border)] bg-[var(--planning-inset)]")}>
+                      <style.icon className={cn("h-5 w-5", style.accent)} />
                     </div>
                     <div>
                       <p className="font-medium text-foreground">{a.name}</p>
-                      <p className="text-xs text-muted-foreground">{a.description}</p>
+                      <p className={planningBodyLabelClassName}>{a.description}</p>
                     </div>
                   </div>
-                  <Badge variant="outline" className={cn("text-[10px]", style.text)}>
-                    {style.label}
-                  </Badge>
+                  <span className={planningSoftBadgeVariants({ tone: style.tone })}>{style.label}</span>
                 </div>
                 {a.goals.length > 0 && (
                   <div>
-                    <p className="mb-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">ゴール</p>
+                    <p className={cn("mb-1.5", planningEyebrowClassName)}>ゴール</p>
                     <div className="space-y-1">
                       {a.goals.map((g, j) => (
                         <p key={j} className="flex items-start gap-1.5 text-xs text-foreground">
-                          <Target className="mt-0.5 h-3 w-3 shrink-0 text-success" />
+                          <Target className="mt-0.5 h-3 w-3 shrink-0 text-[color:var(--planning-success-strong)]" />
                           {g}
                         </p>
                       ))}
@@ -805,12 +1446,10 @@ function ActorRoleContent({ actors, roles }: { actors: Actor[]; roles: Role[] })
                 )}
                 {a.interactions.length > 0 && (
                   <div>
-                    <p className="mb-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">インタラクション</p>
+                    <p className={cn("mb-1.5", planningEyebrowClassName)}>インタラクション</p>
                     <div className="flex flex-wrap gap-1">
                       {a.interactions.map((interaction, j) => (
-                        <Badge key={j} variant="outline" className="bg-muted/30 text-[10px]">
-                          {interaction}
-                        </Badge>
+                        <span key={j} className={planningSoftBadgeVariants({ tone: "default" })}>{interaction}</span>
                       ))}
                     </div>
                   </div>
@@ -824,34 +1463,34 @@ function ActorRoleContent({ actors, roles }: { actors: Actor[]; roles: Role[] })
       {activeTab === "roles" && (
         <div className="space-y-3">
           {roles.map((r, i) => (
-            <div key={i} className="space-y-3 rounded-xl border border-border bg-card p-5">
+            <div key={i} className={cn(planningDetailCardVariants({ tone: "default", padding: "lg" }), "space-y-3")}>
               <div className="flex items-center gap-3">
-                <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary/20">
+                <div className="flex h-10 w-10 items-center justify-center rounded-full border border-[color:var(--planning-border-strong)] bg-[var(--planning-accent-soft)]">
                   <Shield className="h-5 w-5 text-primary" />
                 </div>
                 <div>
                   <p className="font-medium text-foreground">{r.name}</p>
-                  {r.related_actors.length > 0 && <p className="text-xs text-muted-foreground">関連アクター: {r.related_actors.join(", ")}</p>}
+                  {r.related_actors.length > 0 && <p className={planningBodyLabelClassName}>関連アクター: {r.related_actors.join(", ")}</p>}
                 </div>
               </div>
               <div className="grid gap-3 sm:grid-cols-2">
                 <div>
-                  <p className="mb-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">責務</p>
+                  <p className={cn("mb-1.5", planningEyebrowClassName)}>責務</p>
                   <div className="space-y-1">
                     {r.responsibilities.map((resp, j) => (
                       <p key={j} className="flex items-start gap-1.5 text-xs text-foreground">
-                        <Check className="mt-0.5 h-3 w-3 shrink-0 text-success" />
+                        <Check className="mt-0.5 h-3 w-3 shrink-0 text-[color:var(--planning-success-strong)]" />
                         {resp}
                       </p>
                     ))}
                   </div>
                 </div>
                 <div>
-                  <p className="mb-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">権限</p>
+                  <p className={cn("mb-1.5", planningEyebrowClassName)}>権限</p>
                   <div className="space-y-1">
                     {r.permissions.map((perm, j) => (
                       <p key={j} className="flex items-start gap-1.5 text-xs text-foreground">
-                        <Shield className="mt-0.5 h-3 w-3 shrink-0 text-amber-400" />
+                        <Shield className="mt-0.5 h-3 w-3 shrink-0 text-[color:var(--planning-warning-strong)]" />
                         {perm}
                       </p>
                     ))}
@@ -877,9 +1516,9 @@ function UseCaseContent({ useCases }: { useCases: UseCase[] }) {
     });
 
   const priorityStyle: Record<string, string> = {
-    must: "bg-destructive/20 text-destructive",
-    should: "bg-amber-500/20 text-amber-400",
-    could: "bg-primary/20 text-primary",
+    must: planningSoftBadgeVariants({ tone: "danger" }),
+    should: planningSoftBadgeVariants({ tone: "warning" }),
+    could: planningSoftBadgeVariants({ tone: "accent" }),
   };
 
   const grouped = useMemo(() => {
@@ -898,30 +1537,30 @@ function UseCaseContent({ useCases }: { useCases: UseCase[] }) {
   const renderUseCase = (uc: UseCase) => {
     const isOpen = expanded.has(uc.id);
     return (
-      <div key={uc.id} className="overflow-hidden rounded-xl border border-border bg-card">
-        <button onClick={() => toggle(uc.id)} className="flex w-full cursor-pointer items-center gap-3 p-4 text-left transition-colors hover:bg-muted/20">
+      <div key={uc.id} className={cn(planningDetailCardVariants({ tone: "default", padding: "none" }), "overflow-hidden")}>
+        <button onClick={() => toggle(uc.id)} className="flex w-full cursor-pointer items-center gap-3 p-4 text-left transition-colors hover:bg-[rgba(119,182,234,0.06)]">
           <ChevronRight className={cn("h-4 w-4 shrink-0 text-muted-foreground transition-transform", isOpen && "rotate-90")} />
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <span className="font-mono text-xs text-muted-foreground">{uc.id}</span>
               <p className="truncate font-medium text-foreground">{uc.title}</p>
             </div>
-            <p className="mt-0.5 text-xs text-muted-foreground">
+            <p className={cn("mt-0.5", planningBodyLabelClassName)}>
               <Users className="mr-1 inline h-3 w-3" />
               {uc.actor}
             </p>
           </div>
-          <Badge className={cn("shrink-0 border-0 text-[10px] uppercase", priorityStyle[uc.priority])}>{uc.priority}</Badge>
+          <span className={cn(priorityStyle[uc.priority], "shrink-0")}>{USE_CASE_PRIORITY_LABELS[uc.priority] ?? uc.priority}</span>
         </button>
         {isOpen && (
-          <div className="space-y-4 border-t border-border bg-muted/5 px-4 py-4">
+          <div className="space-y-4 border-t border-border bg-[rgba(119,182,234,0.04)] px-4 py-4">
             {uc.preconditions.length > 0 && (
               <div>
-                <p className="mb-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">事前条件</p>
+                <p className={cn("mb-1.5", planningEyebrowClassName)}>事前条件</p>
                 <div className="space-y-1">
                   {uc.preconditions.map((pre, j) => (
                     <p key={j} className="flex items-start gap-1.5 text-xs text-foreground">
-                      <CircleDot className="mt-0.5 h-3 w-3 shrink-0 text-amber-400" />
+                      <CircleDot className="mt-0.5 h-3 w-3 shrink-0 text-[color:var(--planning-warning-strong)]" />
                       {pre}
                     </p>
                   ))}
@@ -929,7 +1568,7 @@ function UseCaseContent({ useCases }: { useCases: UseCase[] }) {
               </div>
             )}
             <div>
-              <p className="mb-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">メインフロー</p>
+              <p className={cn("mb-1.5", planningEyebrowClassName)}>メインフロー</p>
               <div className="space-y-1.5">
                 {uc.main_flow.map((step, j) => (
                   <div key={j} className="flex items-start gap-2 text-xs text-foreground">
@@ -941,16 +1580,16 @@ function UseCaseContent({ useCases }: { useCases: UseCase[] }) {
             </div>
             {uc.alternative_flows?.length ? (
               <div>
-                <p className="mb-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">代替フロー</p>
+                <p className={cn("mb-1.5", planningEyebrowClassName)}>代替フロー</p>
                 {uc.alternative_flows.map((af, j) => (
-                  <div key={j} className="mb-2 rounded-lg border border-border bg-card p-3">
-                    <p className="mb-1.5 text-xs font-medium text-amber-400">
+                  <div key={j} className={cn(planningDetailCardVariants({ tone: "warning", padding: "sm" }), "mb-2")}>
+                    <p className="mb-1.5 text-xs font-medium text-[color:var(--planning-warning-strong)]">
                       <AlertTriangle className="mr-1 inline h-3 w-3" />
                       {af.condition}
                     </p>
                     <div className="ml-4 space-y-1">
                       {af.steps.map((step, k) => (
-                        <p key={k} className="text-xs text-muted-foreground">
+                        <p key={k} className="text-xs text-[color:var(--planning-text-soft)]">
                           {k + 1}. {step}
                         </p>
                       ))}
@@ -961,11 +1600,11 @@ function UseCaseContent({ useCases }: { useCases: UseCase[] }) {
             ) : null}
             {uc.postconditions.length > 0 && (
               <div>
-                <p className="mb-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">事後条件</p>
+                <p className={cn("mb-1.5", planningEyebrowClassName)}>事後条件</p>
                 <div className="space-y-1">
                   {uc.postconditions.map((post, j) => (
                     <p key={j} className="flex items-start gap-1.5 text-xs text-foreground">
-                      <Check className="mt-0.5 h-3 w-3 shrink-0 text-success" />
+                      <Check className="mt-0.5 h-3 w-3 shrink-0 text-[color:var(--planning-success-strong)]" />
                       {post}
                     </p>
                   ))}
@@ -974,11 +1613,9 @@ function UseCaseContent({ useCases }: { useCases: UseCase[] }) {
             )}
             {uc.related_stories?.length ? (
               <div className="flex flex-wrap gap-1">
-                <span className="mr-1 text-[10px] text-muted-foreground">関連ストーリー:</span>
+                <span className={cn("mr-1", planningEyebrowClassName)}>関連ストーリー:</span>
                 {uc.related_stories.map((story, j) => (
-                  <Badge key={j} variant="outline" className="text-[10px]">
-                    {story}
-                  </Badge>
+                  <span key={j} className={planningSoftBadgeVariants({ tone: "default" })}>{story}</span>
                 ))}
               </div>
             ) : null}
@@ -993,11 +1630,10 @@ function UseCaseContent({ useCases }: { useCases: UseCase[] }) {
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
         {(["must", "should", "could"] as const).map((priority) => {
           const count = useCases.filter((uc) => uc.priority === priority).length;
-          const labels: Record<string, string> = { must: "Must", should: "Should", could: "Could" };
           return (
-            <div key={priority} className={cn("flex-1 rounded-lg border p-3 text-center", priorityStyle[priority])}>
+            <div key={priority} className={cn(planningDetailCardVariants({ tone: priority === "must" ? "danger" : priority === "should" ? "warning" : "accent", padding: "md" }), "flex-1 text-center")}>
               <p className="text-lg font-bold">{count}</p>
-              <p className="text-xs">{labels[priority]}</p>
+              <p className="text-xs">{USE_CASE_PRIORITY_LABELS[priority]}</p>
             </div>
           );
         })}
@@ -1007,15 +1643,15 @@ function UseCaseContent({ useCases }: { useCases: UseCase[] }) {
         <div key={category} className="space-y-3">
           <div className="flex items-center gap-2 pt-2">
             <FolderOpen className="h-4 w-4 text-primary" />
-            <h3 className="text-sm font-bold text-foreground">{category}</h3>
-            <span className="text-[10px] text-muted-foreground">({Array.from(subMap.values()).flat().length})</span>
+            <h3 className={planningSectionTitleClassName}>{category}</h3>
+            <span className={cn(planningEyebrowClassName, "normal-case tracking-normal")}>({Array.from(subMap.values()).flat().length})</span>
           </div>
           {Array.from(subMap.entries()).map(([sub, cases]) => (
             <div key={sub} className="ml-4 space-y-2">
               <div className="flex items-center gap-1.5">
                 <div className="h-px max-w-3 flex-1 bg-border" />
-                <span className="text-[11px] font-medium text-muted-foreground">{sub}</span>
-                <span className="text-[10px] text-muted-foreground/60">({cases.length})</span>
+                <span className="text-[12px] font-medium text-[color:var(--planning-text-soft)]">{sub}</span>
+                <span className="text-[11px] text-[color:var(--planning-text-muted)]">({cases.length})</span>
                 <div className="h-px flex-1 bg-border" />
               </div>
               {cases.map(renderUseCase)}
@@ -1028,9 +1664,9 @@ function UseCaseContent({ useCases }: { useCases: UseCase[] }) {
 }
 
 const EmotionIcon = ({ emotion }: { emotion: JourneyTouchpoint["emotion"] }) => {
-  if (emotion === "positive") return <Smile className="h-4 w-4 text-green-500" />;
-  if (emotion === "negative") return <Frown className="h-4 w-4 text-red-500" />;
-  return <Meh className="h-4 w-4 text-amber-500" />;
+  if (emotion === "positive") return <Smile className="h-4 w-4 text-[color:var(--planning-success-strong)]" />;
+  if (emotion === "negative") return <Frown className="h-4 w-4 text-[color:var(--planning-danger-strong)]" />;
+  return <Meh className="h-4 w-4 text-[color:var(--planning-warning-strong)]" />;
 };
 
 function JourneyContent({ journeys }: { journeys: UserJourneyMap[] }) {
@@ -1047,19 +1683,16 @@ function JourneyContent({ journeys }: { journeys: UserJourneyMap[] }) {
             <button
               key={i}
               onClick={() => setActivePersona(i)}
-              className={cn(
-                "flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-xs font-medium transition-colors",
-                i === activePersona ? "border-primary bg-primary/10 text-primary" : "border-border text-muted-foreground hover:text-foreground",
-              )}
+              className={planningTabVariants({ active: i === activePersona })}
             >
-              <div className="flex h-6 w-6 items-center justify-center rounded-full bg-primary/20 text-[10px] font-bold text-primary">{j.persona_name.charAt(0)}</div>
+              <div className="flex h-6 w-6 items-center justify-center rounded-full border border-[color:var(--planning-border)] bg-[var(--planning-inset)] text-[10px] font-bold text-primary">{j.persona_name.charAt(0)}</div>
               {j.persona_name}
             </button>
           ))}
         </div>
       )}
 
-      <div className="overflow-x-auto rounded-xl border border-border bg-card">
+      <div className={cn(planningSurfaceVariants({ tone: "default" }), "overflow-x-auto")}>
         <div className="min-w-[48rem] overflow-hidden">
           <div className="grid grid-cols-5 border-b border-border">
             {phases.map((phase) => (
@@ -1085,8 +1718,8 @@ function JourneyContent({ journeys }: { journeys: UserJourneyMap[] }) {
               const tp = journey.touchpoints.find((t) => t.phase === phase);
               return (
                 <div key={phase} className="border-r border-border px-3 py-3 last:border-r-0">
-                  <p className="mb-1 text-[10px] font-medium text-muted-foreground">行動</p>
-                  <p className="text-xs text-foreground">{tp?.action || "—"}</p>
+                  <p className={cn("mb-1", planningEyebrowClassName)}>行動</p>
+                  <p className={planningDataValueClassName}>{tp?.action || "—"}</p>
                 </div>
               );
             })}
@@ -1097,7 +1730,7 @@ function JourneyContent({ journeys }: { journeys: UserJourneyMap[] }) {
               const tp = journey.touchpoints.find((t) => t.phase === phase);
               return (
                 <div key={phase} className="border-r border-border px-3 py-3 last:border-r-0">
-                  <p className="mb-1 text-[10px] font-medium text-muted-foreground">タッチポイント</p>
+                  <p className={cn("mb-1", planningEyebrowClassName)}>タッチポイント</p>
                   <p className="flex items-start gap-1 text-xs text-foreground">
                     <MapPin className="mt-0.5 h-3 w-3 shrink-0 text-primary" />
                     {tp?.touchpoint || "—"}
@@ -1114,8 +1747,8 @@ function JourneyContent({ journeys }: { journeys: UserJourneyMap[] }) {
                 <div key={phase} className="border-r border-border px-3 py-3 last:border-r-0">
                   {tp?.pain_point && (
                     <>
-                      <p className="mb-1 text-[10px] font-medium text-destructive/80">ペインポイント</p>
-                      <p className="text-xs text-destructive/90">{tp.pain_point}</p>
+                      <p className={cn("mb-1", planningEyebrowClassName, "text-[color:var(--planning-danger-strong)]")}>ペインポイント</p>
+                      <p className="text-xs text-[color:var(--planning-danger-strong)]">{tp.pain_point}</p>
                     </>
                   )}
                 </div>
@@ -1130,8 +1763,8 @@ function JourneyContent({ journeys }: { journeys: UserJourneyMap[] }) {
                 <div key={phase} className="border-r border-border px-3 py-3 last:border-r-0">
                   {tp?.opportunity && (
                     <>
-                      <p className="mb-1 text-[10px] font-medium text-green-500/80">機会</p>
-                      <p className="text-xs text-green-500/90">{tp.opportunity}</p>
+                      <p className={cn("mb-1", planningEyebrowClassName, "text-[color:var(--planning-success-strong)]")}>機会</p>
+                      <p className="text-xs text-[color:var(--planning-success-strong)]">{tp.opportunity}</p>
                     </>
                   )}
                 </div>
@@ -1151,18 +1784,18 @@ function JTBDContent({ stories }: { stories: JobStory[] }) {
     aspirational: stories.filter((s) => s.priority === "aspirational"),
   };
   const sections: { key: JobStory["priority"]; label: string; desc: string }[] = [
-    { key: "core", label: "Core Jobs", desc: "プロダクトの存在理由となる中核的ジョブ" },
-    { key: "supporting", label: "Supporting Jobs", desc: "コアジョブを補助する関連ジョブ" },
-    { key: "aspirational", label: "Aspirational Jobs", desc: "差別化につながる願望的ジョブ" },
+    { key: "core", label: "中核ジョブ", desc: "プロダクトの存在理由となる中核的ジョブ" },
+    { key: "supporting", label: "補助ジョブ", desc: "コアジョブを補助する関連ジョブ" },
+    { key: "aspirational", label: "拡張ジョブ", desc: "差別化につながる願望的ジョブ" },
   ];
 
   return (
     <div className="mx-auto max-w-4xl space-y-6">
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
         {sections.map((section) => (
-          <div key={section.key} className={cn("rounded-xl border p-4 text-center", JTBD_COLORS[section.key].border)}>
+          <div key={section.key} className={cn(planningDetailCardVariants({ tone: JTBD_COLORS[section.key].tone, padding: "md" }), "text-center")}>
             <p className="text-2xl font-bold text-foreground">{grouped[section.key].length}</p>
-            <p className="text-xs text-muted-foreground">{section.label}</p>
+            <p className={planningBodyLabelClassName}>{section.label}</p>
           </div>
         ))}
       </div>
@@ -1172,28 +1805,26 @@ function JTBDContent({ stories }: { stories: JobStory[] }) {
         if (items.length === 0) return null;
         return (
           <div key={section.key}>
-            <h3 className="mb-1 text-sm font-bold text-foreground">{section.label}</h3>
-            <p className="mb-3 text-xs text-muted-foreground">{section.desc}</p>
+            <h3 className={cn("mb-1", planningSectionTitleClassName)}>{section.label}</h3>
+            <p className={cn("mb-3", planningBodyLabelClassName)}>{section.desc}</p>
             <div className="space-y-3">
               {items.map((story, i) => (
-                <div key={i} className={cn("space-y-2 rounded-lg border p-4", JTBD_COLORS[section.key].border)}>
+                <div key={i} className={cn(planningDetailCardVariants({ tone: JTBD_COLORS[section.key].tone, padding: "md" }), "space-y-2")}>
                   <div className="space-y-1">
                     <p className="text-sm text-foreground">
-                      <span className="font-medium text-muted-foreground">When</span> {story.situation}
+                      <span className="font-medium text-[color:var(--planning-text-soft)]">状況</span> {story.situation}
                     </p>
                     <p className="text-sm text-foreground">
-                      <span className="font-medium text-muted-foreground">I want to</span> {story.motivation}
+                      <span className="font-medium text-[color:var(--planning-text-soft)]">したいこと</span> {story.motivation}
                     </p>
                     <p className="text-sm text-foreground">
-                      <span className="font-medium text-muted-foreground">So I can</span> {story.outcome}
+                      <span className="font-medium text-[color:var(--planning-text-soft)]">得たい結果</span> {story.outcome}
                     </p>
                   </div>
                   {story.related_features.length > 0 && (
                     <div className="flex flex-wrap gap-1 pt-1">
                       {story.related_features.map((feature, j) => (
-                        <Badge key={j} variant="outline" className="text-[10px]">
-                          {feature}
-                        </Badge>
+                        <span key={j} className={planningSoftBadgeVariants({ tone: "default" })}>{feature}</span>
                       ))}
                     </div>
                   )}
@@ -1208,12 +1839,13 @@ function JTBDContent({ stories }: { stories: JobStory[] }) {
 }
 
 function IANodeTree({ node, depth = 0 }: { node: IANode; depth?: number }) {
+  const style = IA_PRIORITY_STYLE[node.priority];
   return (
     <div className={cn("border-l-2 pl-3", depth === 0 ? "border-primary/40" : "border-border/50")} style={{ marginLeft: depth > 0 ? 12 : 0 }}>
       <div className="flex items-center gap-2 py-1.5">
-        <Badge className={cn("shrink-0 border text-[10px]", IA_PRIORITY_COLORS[node.priority])}>{node.priority}</Badge>
+        <span className={cn(planningSoftBadgeVariants({ tone: style.tone }), "shrink-0")}>{style.label}</span>
         <span className="text-sm font-medium text-foreground">{node.label}</span>
-        {node.description && <span className="truncate text-xs text-muted-foreground">— {node.description}</span>}
+        {node.description && <span className="truncate text-xs text-[color:var(--planning-text-soft)]">— {node.description}</span>}
       </div>
       {node.children?.map((child) => (
         <IANodeTree key={child.id} node={child} depth={depth + 1} />
@@ -1226,24 +1858,24 @@ function IAContent({ ia }: { ia: IAAnalysis }) {
   return (
     <div className="mx-auto max-w-4xl space-y-6">
       <div className="flex flex-wrap items-center gap-3">
-        <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-3">
+        <div className={cn(planningDetailCardVariants({ tone: "default", padding: "md" }), "flex items-center gap-2")}>
           <Network className="h-4 w-4 text-primary" />
           <div>
-            <p className="text-[10px] text-muted-foreground">ナビゲーションモデル</p>
+            <p className={planningEyebrowClassName}>ナビゲーションモデル</p>
             <p className="text-sm font-bold text-foreground">{NAV_MODEL_LABELS[ia.navigation_model]}</p>
           </div>
         </div>
-        <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-3">
+        <div className={cn(planningDetailCardVariants({ tone: "default", padding: "md" }), "flex items-center gap-2")}>
           <Route className="h-4 w-4 text-primary" />
           <div>
-            <p className="text-[10px] text-muted-foreground">主要パス</p>
+            <p className={planningEyebrowClassName}>主要パス</p>
             <p className="text-sm font-bold text-foreground">{ia.key_paths.length} フロー</p>
           </div>
         </div>
       </div>
 
-      <div className="rounded-xl border border-border bg-card p-5">
-        <h3 className="mb-4 flex items-center gap-2 text-sm font-bold text-foreground">
+      <div className={planningSurfaceVariants({ tone: "default", padding: "md" })}>
+        <h3 className={cn("mb-4 flex items-center gap-2", planningSectionTitleClassName)}>
           <Network className="h-4 w-4 text-primary" />
           サイトマップ
         </h3>
@@ -1254,19 +1886,19 @@ function IAContent({ ia }: { ia: IAAnalysis }) {
         </div>
       </div>
 
-      <div className="rounded-xl border border-border bg-card p-5">
-        <h3 className="mb-4 flex items-center gap-2 text-sm font-bold text-foreground">
+      <div className={planningSurfaceVariants({ tone: "default", padding: "md" })}>
+        <h3 className={cn("mb-4 flex items-center gap-2", planningSectionTitleClassName)}>
           <Route className="h-4 w-4 text-primary" />
           主要ユーザーフロー
         </h3>
         <div className="space-y-4">
           {ia.key_paths.map((path, i) => (
             <div key={i}>
-              <p className="mb-2 text-xs font-medium text-foreground">{path.name}</p>
+              <p className="mb-2 text-sm font-medium text-foreground">{path.name}</p>
               <div className="flex flex-wrap items-center gap-1">
                 {path.steps.map((step, j) => (
                   <div key={j} className="flex items-center gap-1">
-                    <span className="rounded-md border border-primary/30 bg-primary/10 px-2.5 py-1 text-xs font-medium text-primary">{step}</span>
+                    <span className={planningSoftBadgeVariants({ tone: "accent" })}>{step}</span>
                     {j < path.steps.length - 1 && <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground" />}
                   </div>
                 ))}

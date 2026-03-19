@@ -5,8 +5,10 @@ import { EmptyState } from "@/components/EmptyState";
 import { PageSkeleton } from "@/components/PageSkeleton";
 import { queryKeys } from "@/lib/queryKeys";
 import { workflowsApi } from "@/api/workflows";
+import { useI18n } from "@/contexts/I18nContext";
 
 export function Workflows() {
+  const { t } = useI18n();
   const query = useQuery({
     queryKey: queryKeys.workflows.list(),
     queryFn: () => workflowsApi.list(),
@@ -19,18 +21,18 @@ export function Workflows() {
   return (
     <div className="space-y-6 p-6">
       <div>
-        <h1 className="text-2xl font-bold tracking-tight">Workflows</h1>
+        <h1 className="text-2xl font-bold tracking-tight">{t("workflows.title")}</h1>
         <p className="text-sm text-muted-foreground">
-          {workflows.length} workflows defined
+          {t("workflows.definedCount", { count: workflows.length })}
         </p>
       </div>
 
       {workflows.length === 0 ? (
         <EmptyState
           icon={GitBranch}
-          title="No workflows yet"
-          description="Define your first workflow using pylon.yaml or the API."
-          action={{ label: "ワークフローを表示", onClick: () => window.location.reload() }}
+          title={t("workflows.empty.title")}
+          description={t("workflows.empty.description")}
+          action={{ label: t("workflows.empty.action"), onClick: () => window.location.reload() }}
         />
       ) : (
         <div className="space-y-2">
@@ -42,7 +44,7 @@ export function Workflows() {
               <div>
                 <p className="font-medium">{wf.project_name}</p>
                 <p className="text-xs text-muted-foreground">
-                  {wf.agent_count} agents · {wf.node_count} nodes
+                  {t("workflows.agentNodeCount", { agents: wf.agent_count, nodes: wf.node_count })}
                 </p>
               </div>
               <StatusBadge status={wf.goal_enabled ? "active" : "ready"} />

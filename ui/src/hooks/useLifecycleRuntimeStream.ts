@@ -35,6 +35,7 @@ export function useLifecycleRuntimeStream(
     let active = true;
     let reconnectTimer: number | null = null;
     let controller: AbortController | null = null;
+    let terminalReached = false;
 
     const connect = async () => {
       while (active) {
@@ -62,6 +63,7 @@ export function useLifecycleRuntimeStream(
                   terminalKeyRef.current = key;
                   setTerminalEvent(payload);
                 }
+                terminalReached = true;
               }
             },
           });
@@ -69,7 +71,7 @@ export function useLifecycleRuntimeStream(
           if (!active || controller.signal.aborted) break;
           console.debug("Lifecycle runtime stream disconnected", error);
         }
-        if (!active) break;
+        if (!active || terminalReached) break;
         await new Promise<void>((resolve) => {
           reconnectTimer = window.setTimeout(() => resolve(), RECONNECT_DELAY_MS);
         });

@@ -75,6 +75,21 @@ const AUTONOMOUS_REMEDIATION_STATUS_LABELS: Record<string, string> = {
   blocked: "自動補完の上限に到達",
 };
 
+const RESEARCH_RECOVERY_MODE_LABELS: Record<string, string> = {
+  auto: "自動判断",
+  deepen_evidence: "根拠を深掘り",
+  reframe_research: "観点を切り替えて再調査",
+};
+
+const RESEARCH_OPERATOR_ACTION_LABELS: Record<string, string> = {
+  wait_for_autonomous_recovery: "AI の自動回復を待つ",
+  deepen_evidence: "根拠を深掘りして再実行",
+  reframe_research: "観点を変えて再調査",
+  conditional_handoff: "条件付きで企画へ進む",
+  clarify_scope: "問いを絞ってから再調査",
+  advance_to_planning: "企画へ進む",
+};
+
 const DEGRADATION_REASON_LABELS: Record<string, string> = {
   llm_json_parse_failed: "LLM 応答を構造化できませんでした",
   llm_response_repaired: "LLM 応答を JSON として修復しました",
@@ -98,6 +113,7 @@ function stripSourceLead(text: string): string {
   if (next.includes("**")) {
     next = next.split("**").slice(-1)[0]?.trim() ?? next;
   }
+  next = next.replace(/^[^。]{0,60}(記事|ブログ|ガイド|ドキュメント|レポート|資料|docs|guide)より[:：]?\s*/iu, "");
   const japaneseIndex = next.search(/[ぁ-んァ-ヶ一-龠]/u);
   if (japaneseIndex > 16) {
     const prefix = next.slice(0, japaneseIndex);
@@ -109,7 +125,7 @@ function stripSourceLead(text: string): string {
 }
 
 export function polishResearchCopy(value: string): string {
-  return stripSourceLead(value)
+  let next = stripSourceLead(value)
     .replace(/\s+/g, " ")
     .replace(
       "外部 URL に grounded された evidence が不足しています。",
@@ -120,28 +136,98 @@ export function polishResearchCopy(value: string): string {
       "主要仮説に対する反証は確保できています。",
     )
     .replace("external url evidence is missing", "外部 URL の根拠が不足しています")
+    .replace("external url evidence is present", "外部 URL の根拠があります")
+    .replace("Autonomous remediation budget is exhausted.", "自動補完の回数上限に達しました。")
+    .replace("The current research blockers need operator guidance.", "現在の調査の詰まりはオペレーターの判断が必要です。")
+    .replace("Proceed with planning under explicit research assumptions.", "未解決の前提を明示したうえで企画へ進みます。")
+    .replace(
+      /Planning outputs are not yet sufficient for design and approval\./gi,
+      "企画の成果がまだ十分ではなく、デザインと承認へ進める状態ではありません。",
+    )
+    .replace(
+      /Close the remaining research gaps so 企画 can continue without operator intervention\./gi,
+      "残っている調査ギャップを埋め、オペレーターの介入なしで企画へ進める状態にします。",
+    )
+    .replace(
+      /Can the team defend this thesis with enough grounded evidence to plan against it:/gi,
+      "この仮説は、企画に進めるだけの公開根拠で支えられているか:",
+    )
+    .replace(
+      /この仮説を、企画に使える grounded evidence で防御できるか:/gi,
+      "この仮説は、企画に進めるだけの公開根拠で支えられているか:",
+    )
+    .replace(
+      /Define the observable evidence that would falsify this claim in the first milestone\./gi,
+      "最初のマイルストーンで、この主張を否定できる観測可能な根拠を定義してください。",
+    )
+    .replace(/grounded evidence/gi, "公開根拠")
+    .replace(/kill criteria/gi, "除外条件")
+    .replace(/\bopen question\b/gi, "未解決の論点")
+    .replace(/\bassumption\b/gi, "前提条件")
+    .replace(/\bprimary scope\b/gi, "主計画")
+    .replace(/\balpha scope\b/gi, "アルファ範囲")
+    .replace(/\bclaim\b/gi, "主張")
+    .replace(/\bcritical node\b/gi, "重要ノード")
+    .replace(/\bUX\b/g, "UX")
     .replace("低下したノード", "要再確認ノード")
     .replace(/Research needs rework/gi, "調査結果の見直しが必要です")
+    .replace(/strict gate/gi, "品質ゲート")
+    .replace(/guarded handoff/gi, "条件付き引き継ぎ")
     .replace(/confidence floor/gi, "信頼度下限")
     .replace(/winning theses?/gi, "有力仮説")
     .replace(/\bthesis\b/gi, "仮説")
     .replace(/critical dissent/gi, "重大な反証")
     .replace(/\bdissent\b/gi, "反証")
     .replace(/\bevidence\b/gi, "根拠")
-    .replace(/\bgrounded\b/gi, "紐づいた")
+    .replace(/\bgrounded\b/gi, "裏づいた")
+    .replace(/公開根拠/g, "公開根拠")
     .replace(/\bplanning\b/gi, "企画")
     .replace(/\bdegraded\b/gi, "要再確認")
     .replace(/\bblocked\b/gi, "未達")
     .replace(/\bpass\b/gi, "通過")
+    .replace(/winning\s*仮説\s*数/gi, "有力仮説数")
     .replace(/有力仮説 数/g, "有力仮説数")
+    .replace(/接地した根拠/g, "公開根拠")
+    .replace(/外部 URL に\s*紐づいた\s*された\s*根拠\s*が\s*あります。?/gi, "外部 URL の根拠があります。")
+    .replace(/外部 URL に\s*紐づいた\s*された\s*根拠\s*が\s*不足しています。?/gi, "外部 URL の根拠が不足しています。")
+    .replace(/外部 URL に\s*裏づいた\s*された\s*根拠\s*が\s*あります。?/gi, "外部 URL の根拠があります。")
+    .replace(/外部 URL に\s*裏づいた\s*された\s*根拠\s*が\s*不足しています。?/gi, "外部 URL の根拠が不足しています。")
     .replace(/どの論文も/g, "どの仮説も")
     .replace(/論文/g, "仮説")
     .replace(/ゼロの解決が記録された/g, "解決がまだ記録されていない")
+    .replace(/Not publicly listed/gi, "非公開")
+    .replace(/feature breadth/gi, "機能の広さ")
+    .replace(/traceability/gi, "追跡可能性")
+    .replace(/(^|[。\s])は\s*企画\s*の閾値を満たしています。?/g, "$1信頼度下限は企画の閾値を満たしています。")
+    .replace(/operator/gi, "オペレーター")
+    .replace(/blocker/gi, "阻害要因")
+    .replace(/brief/gi, "要約")
+    .replace(/no unresolved 重大な反証/gi, "未解決の重大な反証はありません")
     .trim();
+  for (const [nodeId, label] of Object.entries(RESEARCH_NODE_LABELS)) {
+    next = next.replace(new RegExp(`\\b${nodeId.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\b`, "gi"), label);
+  }
+  return next;
 }
 
 export function polishConsoleCopy(value: string): string {
   return polishResearchCopy(value)
+    .replace(
+      /Development is approval-gated and must not auto-run until approval is granted\./gi,
+      "開発は承認後にのみ開始されます。まず承認フェーズで判断を確定してください。",
+    )
+    .replace(
+      /Deploy checks have passed and a release record can be created\./gi,
+      "デプロイチェックは通過しています。リリース記録を作成できます。",
+    )
+    .replace(
+      /The release exists, but no iteration feedback has been captured yet\./gi,
+      "リリースは作成済みですが、改善に回すフィードバックがまだ記録されていません。",
+    )
+    .replace(
+      /A release and feedback loop already exist; continue iterating within the backlog\./gi,
+      "リリースと改善ループは揃っています。バックログを起点に次の改善を進めてください。",
+    )
     .replace(
       "Phase outputs did not satisfy readiness checks.",
       "品質ゲートを満たせなかったため、見直しが必要です。",
@@ -158,7 +244,7 @@ export function polishConsoleCopy(value: string): string {
     )
     .replace(
       /call out where the result is based on public web evidence versus the project brief\./gi,
-      "公開 Web 根拠と project brief 由来の内容を明確に分けてください。",
+      "公開 Web 根拠とプロジェクト要約由来の内容を明確に分けてください。",
     )
     .replace(
       /prefer source diversity over adding more snippets from the same domain\./gi,
@@ -192,6 +278,54 @@ export function polishConsoleCopy(value: string): string {
     .replace(/persona-research/gi, "ペルソナ分析")
     .replace(/local/gi, "ローカル")
     .replace(/task:/gi, "タスク:");
+}
+
+export function presentLifecycleGateReason(params: {
+  currentPhase: LifecyclePhase;
+  recommendedPhase: LifecyclePhase | null;
+  reason: string | null | undefined;
+}): string | null {
+  const { currentPhase, recommendedPhase, reason } = params;
+  if (typeof reason !== "string" || reason.trim().length === 0) {
+    return null;
+  }
+
+  if (
+    recommendedPhase === "approval"
+    && currentPhase !== "approval"
+    && /Development is approval-gated and must not auto-run until approval is granted\./i.test(reason)
+  ) {
+    if (currentPhase === "development") {
+      return polishConsoleCopy(reason);
+    }
+    return `${formatPhaseLabel(currentPhase)} は承認の判断が完了するまで開けません。まず承認フェーズで判断を確定してください。`;
+  }
+
+  if (
+    recommendedPhase === "development"
+    && currentPhase !== "development"
+    && (
+      /phase workflow API/i.test(reason)
+      || /ready for implementation/i.test(reason)
+      || /Run development mesh/i.test(reason)
+    )
+  ) {
+    return `${formatPhaseLabel(currentPhase)} は開発フェーズの実行が完了するまで開けません。まず開発フェーズを開始して build を生成してください。`;
+  }
+
+  if (
+    recommendedPhase === "deploy"
+    && currentPhase !== "deploy"
+    && (
+      /release record/i.test(reason)
+      || /deploy checks/i.test(reason)
+      || /release exists/i.test(reason)
+    )
+  ) {
+    return `${formatPhaseLabel(currentPhase)} はデプロイ判断が完了するまで開けません。まずデプロイフェーズでチェックとリリース記録を確定してください。`;
+  }
+
+  return polishConsoleCopy(reason);
 }
 
 export function formatPhaseLabel(phase: LifecyclePhase): string {
@@ -228,6 +362,14 @@ export function formatDissentSeverity(severity: string): string {
 
 export function formatAutonomousRemediationStatus(status: string): string {
   return AUTONOMOUS_REMEDIATION_STATUS_LABELS[status] ?? status;
+}
+
+export function formatResearchRecoveryMode(mode: string): string {
+  return RESEARCH_RECOVERY_MODE_LABELS[mode] ?? polishResearchCopy(mode.replaceAll("_", " "));
+}
+
+export function formatResearchOperatorAction(action: string): string {
+  return RESEARCH_OPERATOR_ACTION_LABELS[action] ?? polishResearchCopy(action.replaceAll("_", " "));
 }
 
 export function formatResearchDegradationReason(reason: string): string {
@@ -285,4 +427,32 @@ export function formatPhaseStatus(status: string): string {
     locked: "未解放",
   };
   return labels[status] ?? polishConsoleCopy(status);
+}
+
+export function formatEARSPattern(pattern: string): string {
+  const labels: Record<string, string> = {
+    ubiquitous: "普遍的要件",
+    "event-driven": "イベント駆動",
+    unwanted: "例外処理",
+    "state-driven": "状態駆動",
+    optional: "オプション",
+    complex: "複合要件",
+  };
+  return labels[pattern] ?? pattern;
+}
+
+export function formatConfidenceBadge(confidence: number): { label: string; level: string } {
+  if (confidence >= 0.8) return { label: "高信頼度", level: "high" };
+  if (confidence >= 0.5) return { label: "中信頼度", level: "medium" };
+  return { label: "低信頼度", level: "low" };
+}
+
+export function formatTaskPriority(priority: string): string {
+  const labels: Record<string, string> = { must: "必須", should: "推奨", could: "任意" };
+  return labels[priority] ?? priority;
+}
+
+export function formatRiskSeverity(severity: string): string {
+  const labels: Record<string, string> = { critical: "致命的", high: "高", medium: "中", low: "低" };
+  return labels[severity] ?? severity;
 }

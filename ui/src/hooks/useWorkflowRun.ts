@@ -23,10 +23,39 @@ export interface WorkflowRunState {
 interface UseWorkflowRunOptions {
   enabled?: boolean;
   observeOnly?: boolean;
+  knownRunExists?: boolean;
 }
 
 const RUN_RECONCILE_INTERVAL_MS = 5000;
 const START_GRACE_PERIOD_MS = 10000;
+
+function executionSummaryRecord(
+  run: WorkflowRun | null | undefined,
+): Record<string, unknown> {
+  return run?.execution_summary && typeof run.execution_summary === "object"
+    ? run.execution_summary as Record<string, unknown>
+    : {};
+}
+
+function executionSummaryStringList(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((item) => String(item ?? "").trim())
+    .filter((item) => item.length > 0);
+}
+
+function executionSummaryNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : null;
+}
+
+function runNodeSequence(run: WorkflowRun | null | undefined): string[] {
+  const summary = executionSummaryRecord(run);
+  return executionSummaryStringList(summary.node_sequence ?? summary.nodeSequence);
+}
 
 function extractAgentProgress(data: WorkflowRun): AgentProgress[] {
   const nodeMap = new Map<string, AgentProgress>();
@@ -64,6 +93,16 @@ function extractAgentProgress(data: WorkflowRun): AgentProgress[] {
       } else {
         nodeMap.get(nodeId)!.status = mapped;
       }
+    }
+  }
+
+  for (const nodeId of runNodeSequence(data)) {
+    if (!nodeMap.has(nodeId)) {
+      nodeMap.set(nodeId, {
+        nodeId,
+        agent: nodeId,
+        status: "completed",
+      });
     }
   }
 
@@ -109,21 +148,91 @@ function isNewerRun(candidate: WorkflowRun, current: WorkflowRun | null): boolea
   return candidate.id !== current.id;
 }
 
+function shouldAdoptLatestRun(
+  candidate: WorkflowRun,
+  current: WorkflowRun | null,
+  hookStatus: WorkflowRunState["status"],
+): boolean {
+  if (!current) {
+    return true;
+  }
+  if (!isNewerRun(candidate, current)) {
+    return false;
+  }
+  if (hookStatus === "running" || hookStatus === "starting") {
+    return true;
+  }
+  if (candidate.status === "running") {
+    return true;
+  }
+  return isTerminal(candidate.status);
+}
+
+function runSignature(run: WorkflowRun | null | undefined): string {
+  if (!run) return "";
+  const execution = (run.state?.execution as Record<string, unknown> | undefined) ?? {};
+  const summary = executionSummaryRecord(run);
+  return JSON.stringify({
+    status: run.status,
+    completedAt: run.completed_at ?? null,
+    error: extractRunError(run),
+    eventCount:
+      run.event_log?.length
+      ?? executionSummaryNumber(summary.eventCount)
+      ?? executionSummaryNumber(summary.total_events)
+      ?? 0,
+    lastEventSeq:
+      executionSummaryNumber(summary.lastEventSeq)
+      ?? executionSummaryNumber(summary.eventCount)
+      ?? executionSummaryNumber(summary.total_events)
+      ?? null,
+    lastNode: String(summary.lastNodeId ?? summary.last_node ?? ""),
+    nodeStatus:
+      run.node_status
+      ?? (execution.node_status as Record<string, unknown> | undefined)
+      ?? {},
+  });
+}
+
+function hasMeaningfulRunUpdate(
+  candidate: WorkflowRun,
+  current: WorkflowRun | null,
+): boolean {
+  if (!current) return true;
+  return runSignature(candidate) !== runSignature(current);
+}
+
 function toLiveTelemetry(run: WorkflowRun | null, agentProgress: AgentProgress[]): WorkflowRunLiveTelemetry {
+  const summary = executionSummaryRecord(run);
+  const nodeSequence = runNodeSequence(run);
+  const fallbackRecentNodeIds = executionSummaryStringList(summary.recentNodeIds);
   const lastEventSeq = run?.event_log && run.event_log.length > 0
     ? run.event_log[run.event_log.length - 1]?.seq ?? null
-    : null;
-  const recentNodeIds = Array.from(new Set(
-    [...(run?.event_log ?? [])]
-      .reverse()
-      .map((event) => event.node_id)
-      .filter(Boolean),
-  )).slice(0, 3);
+    : executionSummaryNumber(summary.lastEventSeq)
+      ?? executionSummaryNumber(summary.eventCount)
+      ?? executionSummaryNumber(summary.total_events);
+  const recentNodeIds = run?.event_log && run.event_log.length > 0
+    ? Array.from(new Set(
+        [...run.event_log]
+          .reverse()
+          .map((event) => event.node_id)
+          .filter(Boolean),
+      )).slice(0, 3)
+    : fallbackRecentNodeIds.length > 0
+      ? fallbackRecentNodeIds
+      : Array.from(new Set([...nodeSequence].reverse())).slice(0, 3);
   const lastEvent = run?.event_log && run.event_log.length > 0
     ? run.event_log[run.event_log.length - 1]
     : null;
+  const summaryLastNodeId = String(
+    summary.lastNodeId
+      ?? summary.last_node
+      ?? nodeSequence.at(-1)
+      ?? "",
+  ).trim() || undefined;
   const activeFocusNodeId = agentProgress.find((item) => item.status === "running")?.nodeId
-    ?? lastEvent?.node_id;
+    ?? lastEvent?.node_id
+    ?? summaryLastNodeId;
   const recentEvents: WorkflowRunLiveEvent[] = [...(run?.event_log ?? [])]
     .slice(-5)
     .reverse()
@@ -139,6 +248,32 @@ function toLiveTelemetry(run: WorkflowRun | null, agentProgress: AgentProgress[]
         ? `${event.agent} finished ${event.node_id}`
         : `${event.node_id} finished`,
     }));
+  const fallbackRecentEvents = recentEvents.length > 0
+    ? recentEvents
+    : [...nodeSequence]
+      .reverse()
+      .reduce<WorkflowRunLiveEvent[]>((events, nodeId, index) => {
+        if (!nodeId || events.some((event) => event.nodeId === nodeId)) {
+          return events;
+        }
+        events.push({
+          seq: lastEventSeq !== null ? Math.max(lastEventSeq - index, 1) : null,
+          nodeId,
+          status:
+            agentProgress.find((item) => item.nodeId === nodeId)?.status
+            ?? "completed",
+          summary: `${nodeId} finished ${nodeId}`,
+        });
+        return events;
+      }, [])
+      .slice(0, 5);
+  const completedNodeCount = agentProgress.filter((item) => item.status === "completed").length
+    || executionSummaryNumber(summary.completedNodeCount)
+    || new Set(nodeSequence).size;
+  const eventCount = run?.event_log?.length
+    ?? executionSummaryNumber(summary.eventCount)
+    ?? executionSummaryNumber(summary.total_events)
+    ?? nodeSequence.length;
   return {
     run: run
       ? {
@@ -149,16 +284,16 @@ function toLiveTelemetry(run: WorkflowRun | null, agentProgress: AgentProgress[]
           error: run.error,
         }
       : null,
-    eventCount: run?.event_log?.length ?? 0,
-    completedNodeCount: agentProgress.filter((item) => item.status === "completed").length,
+    eventCount,
+    completedNodeCount,
     runningNodeIds: agentProgress.filter((item) => item.status === "running").map((item) => item.nodeId),
     failedNodeIds: agentProgress.filter((item) => item.status === "failed").map((item) => item.nodeId),
     lastEventSeq,
     activeFocusNodeId,
-    lastNodeId: lastEvent?.node_id,
+    lastNodeId: lastEvent?.node_id ?? summaryLastNodeId,
     lastAgent: lastEvent?.agent,
     recentNodeIds,
-    recentEvents,
+    recentEvents: fallbackRecentEvents,
   };
 }
 
@@ -170,6 +305,7 @@ export function useWorkflowRun(
   const workflowId = lifecycleWorkflowId(phase, projectSlug);
   const enabled = options.enabled ?? true;
   const observeOnly = options.observeOnly ?? false;
+  const knownRunExists = options.knownRunExists ?? true;
   const [runId, setRunId] = useState<string | null>(null);
   const [hookStatus, setHookStatus] = useState<WorkflowRunState["status"]>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -215,7 +351,13 @@ export function useWorkflowRun(
   }, []);
 
   useEffect(() => {
-    if (restoredRef.current || !projectSlug || !enabled) return;
+    const shouldRestoreLatestRun =
+      knownRunExists
+      || observeOnly
+      || runId !== null
+      || hookStatus === "starting"
+      || hookStatus === "running";
+    if (restoredRef.current || !projectSlug || !enabled || !shouldRestoreLatestRun) return;
     restoredRef.current = true;
     let cancelled = false;
 
@@ -227,7 +369,7 @@ export function useWorkflowRun(
     return () => {
       cancelled = true;
     };
-  }, [applyRunSnapshot, enabled, projectSlug, workflowId]);
+  }, [applyRunSnapshot, enabled, hookStatus, knownRunExists, observeOnly, projectSlug, runId, workflowId]);
 
   useEffect(() => {
     if (hookStatus !== "running") {
@@ -291,6 +433,13 @@ export function useWorkflowRun(
 
   useEffect(() => {
     if (!enabled || !projectSlug) return;
+    const shouldLookupLatestRun =
+      knownRunExists
+      || observeOnly
+      || runId !== null
+      || hookStatus === "starting"
+      || hookStatus === "running";
+    if (!shouldLookupLatestRun) return;
     let cancelled = false;
 
     const reconcile = async () => {
@@ -309,15 +458,12 @@ export function useWorkflowRun(
         return;
       }
       if (latestRun.id === runId) {
-        if (!liveRun || latestRun.status !== liveRun.status) {
+        if (!liveRun || hasMeaningfulRunUpdate(latestRun, liveRun)) {
           applyRunSnapshot(latestRun);
         }
         return;
       }
-      if (!isNewerRun(latestRun, liveRun)) {
-        return;
-      }
-      if (hookStatus === "running" || hookStatus === "starting" || isTerminal(latestRun.status)) {
+      if (shouldAdoptLatestRun(latestRun, liveRun, hookStatus)) {
         applyRunSnapshot(latestRun);
       }
     };
@@ -330,7 +476,7 @@ export function useWorkflowRun(
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [applyRunSnapshot, enabled, hookStatus, liveRun, projectSlug, runId, workflowId]);
+  }, [applyRunSnapshot, enabled, hookStatus, knownRunExists, liveRun, observeOnly, projectSlug, runId, workflowId]);
 
   const agentProgress = liveRun ? extractAgentProgress(liveRun) : [];
   const state = (liveRun?.state ?? {}) as Record<string, unknown>;

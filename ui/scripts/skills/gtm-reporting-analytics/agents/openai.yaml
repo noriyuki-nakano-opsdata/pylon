@@ -1,0 +1,6 @@
+interface:
+  display_name: "GTM Reporting Analytics"
+  short_description: "Executive KPI summaries and funnel diagnostics"
+  default_prompt: "Use $gtm-reporting-analytics to turn sales and marketing performance data into an executive summary, funnel diagnosis, and next actions."
+policy:
+  allow_implicit_invocation: true

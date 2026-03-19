@@ -2,8 +2,9 @@ import { createContext, useContext, useState, useCallback, useEffect, type React
 import { useNavigate, useLocation } from "react-router-dom";
 import { setTenantId } from "@/api/client";
 import { lifecycleApi } from "@/api/lifecycle";
-import { createUniqueProjectSlug } from "@/lib/projectSlug";
-import type { LifecycleProject } from "@/types/lifecycle";
+import { generateProjectId } from "@/lib/projectId";
+import { normalizeProductIdentity } from "@/lifecycle/productIdentity";
+import type { LifecycleProductIdentity, LifecycleProject } from "@/types/lifecycle";
 
 export interface Tenant {
   id: string;
@@ -25,6 +26,7 @@ export interface CreateProjectInput {
   name: string;
   brief?: string;
   githubRepo?: string;
+  productIdentity?: Partial<LifecycleProductIdentity>;
 }
 
 interface TenantProjectState {
@@ -36,6 +38,7 @@ interface TenantProjectState {
   setCurrentTenant: (tenant: Tenant) => void;
   setCurrentProject: (project: Project) => void;
   createProject: (input: CreateProjectInput) => Promise<Project>;
+  deleteProject: (projectSlug: string) => Promise<void>;
   refreshProjects: () => Promise<void>;
 }
 
@@ -165,25 +168,63 @@ export function TenantProjectProvider({ children }: { children: ReactNode }) {
     if (!name) {
       throw new Error("Project name is required");
     }
-    const projectId = createUniqueProjectSlug(name, projects.map((project) => project.slug));
-    if (projects.some((project) => project.id === projectId)) {
-      throw new Error(`Project already exists: ${projectId}`);
-    }
+    const projectId = generateProjectId();
 
     const brief = input.brief?.trim() || "";
+    const productIdentity = normalizeProductIdentity(input.productIdentity, {
+      fallbackProductName: name,
+    });
 
     const response = await lifecycleApi.saveProject(projectId, {
       name,
       description: brief,
       spec: brief,
       githubRepo: input.githubRepo?.trim() || null,
+      productIdentity,
     });
-    const project = mapLifecycleProject(response.project, currentTenant.id);
+    const initialLifecycleProject = {
+      ...response.project,
+      productIdentity: normalizeProductIdentity(response.project.productIdentity ?? productIdentity, {
+        fallbackProductName: name,
+      }),
+      spec: response.project.spec?.trim() || brief,
+    } satisfies LifecycleProject;
+    const project = mapLifecycleProject(initialLifecycleProject, currentTenant.id);
     setProjects((prev) => upsertProjects(prev, project));
     setCurrentProjectState(project);
-    navigate(`/p/${project.slug}/lifecycle/research`);
+    navigate(`/p/${project.slug}/lifecycle/research`, {
+      state: {
+        initialLifecycleProject,
+      },
+    });
     return project;
-  }, [currentTenant.id, navigate, projects]);
+  }, [currentTenant.id, navigate]);
+
+  const deleteProject = useCallback(async (projectSlug: string) => {
+    const deletedProject = projects.find((project) => project.slug === projectSlug);
+    if (!deletedProject) {
+      return;
+    }
+
+    await lifecycleApi.deleteProject(projectSlug);
+    const tenantProjects = await fetchProjects(currentTenant.id);
+    const remainingProjects = tenantProjects.filter((project) => project.slug !== projectSlug);
+    setProjects(remainingProjects);
+
+    if (currentProject?.slug !== projectSlug) {
+      return;
+    }
+
+    const subPath = location.pathname.replace(/^\/p\/[^/]+/, "");
+    const fallbackPath = subPath || "/lifecycle";
+    const nextProject = remainingProjects[0] ?? null;
+    setCurrentProjectState(nextProject);
+    if (nextProject) {
+      navigate(`/p/${nextProject.slug}${fallbackPath}`);
+      return;
+    }
+    navigate("/dashboard");
+  }, [currentProject?.slug, currentTenant.id, fetchProjects, location.pathname, navigate, projects]);
 
   return (
     <TenantProjectContext.Provider
@@ -196,6 +237,7 @@ export function TenantProjectProvider({ children }: { children: ReactNode }) {
         setCurrentTenant,
         setCurrentProject,
         createProject,
+        deleteProject,
         refreshProjects,
       }}
     >

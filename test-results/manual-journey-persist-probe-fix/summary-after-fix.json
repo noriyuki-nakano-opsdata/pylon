@@ -1,0 +1,19 @@
+{
+  "url": "http://127.0.0.1:5173/p/persist-probe-manual/lifecycle/design",
+  "designLockedAfterReload": false,
+  "hasGeneratedDesigns": true,
+  "selectedDesign": true,
+  "approvalEnabled": true,
+  "events": [
+    "console:debug:[vite] connecting...",
+    "console:debug:[vite] connected.",
+    "console:info:%cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold",
+    "console:debug:Lifecycle runtime stream disconnected TypeError: network error",
+    "console:debug:[vite] connecting...",
+    "console:debug:[vite] connected.",
+    "console:info:%cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold",
+    "console:warning:An iframe which has both allow-scripts and allow-same-origin for its sandbox attribute can escape its sandboxing.",
+    "console:warning:An iframe which has both allow-scripts and allow-same-origin for its sandbox attribute can escape its sandboxing.",
+    "console:warning:An iframe which has both allow-scripts and allow-same-origin for its sandbox attribute can escape its sandboxing."
+  ]
+}

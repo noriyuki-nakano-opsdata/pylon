@@ -13,15 +13,19 @@ from pathlib import Path
 project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root / "src"))
 
-# Load .env
-env_file = project_root / ".env"
-if env_file.exists():
-    with open(env_file) as f:
+def _load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    with open(path) as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, _, v = line.partition("=")
                 os.environ.setdefault(k.strip(), v.strip())
+
+
+for env_file in (Path.home() / ".config" / "pylon" / "env", project_root / ".env"):
+    _load_env_file(env_file)
 
 from pylon.sdk import PylonClient
 

@@ -9,21 +9,33 @@ import type {
   LifecycleArtifact,
   LifecycleAutonomyLevel,
   LifecycleAutonomyState,
+  LifecycleDecisionContext,
   LifecycleDecision,
+  LifecycleDevelopmentHandoff,
+  LifecycleDeliveryPlan,
   LifecycleDelegation,
+  LifecycleGovernanceMode,
   LifecycleNextAction,
+  LifecycleOutcomeTelemetryContract,
   LifecycleOrchestrationMode,
   LifecyclePhase,
   LifecyclePhaseRuntimeSummary,
   LifecyclePhaseRun,
+  LifecycleProductIdentity,
   LifecycleProject,
   LifecycleResearchConfig,
   LifecycleRecommendation,
   LifecycleSkillInvocation,
+  LifecycleValueContract,
   MarketResearch,
   Milestone,
   MilestoneResult,
   PhaseBlueprint,
+  RequirementsBundle,
+  ReverseEngineeringResult,
+  TaskDecomposition,
+  DCSAnalysis,
+  TechnicalDesignBundle,
   PhaseStatus,
   PlanEstimate,
   PlanPreset,
@@ -33,8 +45,12 @@ import type {
 
 export interface LifecycleWorkspaceView {
   spec: string;
+  githubRepo?: string | null;
   orchestrationMode: LifecycleOrchestrationMode;
+  governanceMode?: LifecycleGovernanceMode;
   autonomyLevel: LifecycleAutonomyLevel;
+  decisionContext?: LifecycleDecisionContext | null;
+  productIdentity: LifecycleProductIdentity;
   researchConfig: LifecycleResearchConfig;
   research: MarketResearch | null;
   analysis: AnalysisResult | null;
@@ -48,6 +64,10 @@ export interface LifecycleWorkspaceView {
   buildCost: number;
   buildIteration: number;
   milestoneResults: MilestoneResult[];
+  deliveryPlan?: LifecycleDeliveryPlan | null;
+  valueContract?: LifecycleValueContract | null;
+  outcomeTelemetryContract?: LifecycleOutcomeTelemetryContract | null;
+  developmentHandoff?: LifecycleDevelopmentHandoff | null;
   planEstimates: PlanEstimate[];
   selectedPreset: PlanPreset;
   phaseStatuses: PhaseStatus[];
@@ -69,11 +89,19 @@ export interface LifecycleWorkspaceView {
   runtimeLiveTelemetry: WorkflowRunLiveTelemetry | null;
   runtimeConnectionState: "inactive" | "connecting" | "live" | "reconnecting";
   blueprints: Record<LifecyclePhase, PhaseBlueprint>;
+  requirements?: RequirementsBundle | null;
+  requirementsConfig?: { earsEnabled: boolean; interactiveClarification: boolean; confidenceFloor: number };
+  reverseEngineering?: ReverseEngineeringResult | null;
+  taskDecomposition?: TaskDecomposition | null;
+  dcsAnalysis?: DCSAnalysis | null;
+  technicalDesign?: TechnicalDesignBundle | null;
   isHydrating: boolean;
 }
 
 export interface LifecycleActions {
   editSpec: (s: string) => void;
+  selectGovernanceMode: (mode: LifecycleGovernanceMode) => void;
+  updateProductIdentity: (identity: LifecycleProductIdentity) => void;
   updateResearchConfig: (config: LifecycleResearchConfig) => void;
   replaceFeatures: (f: FeatureSelection[]) => void;
   replaceMilestones: (m: Milestone[]) => void;

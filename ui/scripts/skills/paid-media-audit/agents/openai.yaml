@@ -1,0 +1,6 @@
+interface:
+  display_name: "Paid Media Audit"
+  short_description: "Google, Meta, tracking, and budget audits"
+  default_prompt: "Use $paid-media-audit to review campaign structure, measurement health, and budget efficiency for this ad account."
+policy:
+  allow_implicit_invocation: true

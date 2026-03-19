@@ -1,10 +1,11 @@
 import { lazy, Suspense } from "react";
-import { Navigate, Route, Routes } from "react-router-dom";
+import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { Loader2 } from "lucide-react";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { FeatureUnavailable } from "@/components/FeatureUnavailable";
 import { Layout } from "@/components/Layout";
 import { useFeatureFlags } from "@/contexts/FeatureFlagsContext";
+import { useI18n } from "@/contexts/I18nContext";
 import { LifecycleLayout } from "@/pages/lifecycle/LifecycleLayout";
 
 const Dashboard = lazy(() => import("@/pages/Dashboard").then(m => ({ default: m.Dashboard })));
@@ -14,6 +15,7 @@ const AgentNew = lazy(() => import("@/pages/AgentNew").then(m => ({ default: m.A
 const Workflows = lazy(() => import("@/pages/Workflows").then(m => ({ default: m.Workflows })));
 const Runs = lazy(() => import("@/pages/Runs").then(m => ({ default: m.Runs })));
 const Approvals = lazy(() => import("@/pages/Approvals").then(m => ({ default: m.Approvals })));
+const Experiments = lazy(() => import("@/pages/Experiments").then(m => ({ default: m.Experiments })));
 const Costs = lazy(() => import("@/pages/Costs").then(m => ({ default: m.Costs })));
 const Providers = lazy(() => import("@/pages/Providers").then(m => ({ default: m.Providers })));
 const Studio = lazy(() => import("@/pages/Studio").then(m => ({ default: m.Studio })));
@@ -22,6 +24,7 @@ const TeamStructure = lazy(() => import("@/pages/TeamStructure").then(m => ({ de
 const Memory = lazy(() => import("@/pages/Memory").then(m => ({ default: m.Memory })));
 const Calendar = lazy(() => import("@/pages/Calendar").then(m => ({ default: m.Calendar })));
 const ContentPipeline = lazy(() => import("@/pages/ContentPipeline").then(m => ({ default: m.ContentPipeline })));
+const GtmControlTower = lazy(() => import("@/pages/GtmControlTower").then(m => ({ default: m.GtmControlTower })));
 const Issues = lazy(() => import("@/pages/Issues").then(m => ({ default: m.Issues })));
 const IssueDetail = lazy(() => import("@/pages/IssueDetail").then(m => ({ default: m.IssueDetail })));
 const PullRequests = lazy(() => import("@/pages/PullRequests").then(m => ({ default: m.PullRequests })));
@@ -45,10 +48,12 @@ const DeployPhase = lazy(() => import("@/pages/lifecycle/DeployPhase").then(m =>
 const IteratePhase = lazy(() => import("@/pages/lifecycle/IteratePhase").then(m => ({ default: m.IteratePhase })));
 
 export function App() {
+  const { t } = useI18n();
   const { isEnabled } = useFeatureFlags();
+  const location = useLocation();
 
   return (
-    <ErrorBoundary>
+    <ErrorBoundary resetKey={`${location.pathname}${location.search}${location.hash}`}>
     <Suspense fallback={<div className="flex h-screen items-center justify-center"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>}>
       <Routes>
         <Route element={<Layout />}>
@@ -62,71 +67,83 @@ export function App() {
               path="studio"
               element={isEnabled("project", "studio")
                 ? <Studio />
-                : <FeatureUnavailable title="Quick Build is disabled" description="This backend only exposes the stable orchestration surfaces." />}
+                : <FeatureUnavailable title={t("feature.quickBuild.title")} description={t("feature.quickBuild.description")} />}
+            />
+            <Route
+              path="gtm"
+              element={isEnabled("project", "gtm")
+                ? <GtmControlTower />
+                : <FeatureUnavailable title={t("feature.gtm.title")} description={t("feature.gtm.description")} />}
             />
             <Route
               path="tasks"
               element={isEnabled("project", "tasks")
                 ? <TasksBoard />
-                : <FeatureUnavailable title="Task Board is disabled" description="Mission-control surfaces are not enabled in the current backend." />}
+                : <FeatureUnavailable title={t("feature.tasks.title")} description={t("feature.tasks.description")} />}
             />
             <Route
               path="team"
               element={isEnabled("project", "team")
                 ? <TeamStructure />
-                : <FeatureUnavailable title="Agent Monitoring is disabled" description="Mission-control surfaces are not enabled in the current backend." />}
+                : <FeatureUnavailable title={t("feature.team.title")} description={t("feature.team.description")} />}
             />
             <Route
               path="memory"
               element={isEnabled("project", "memory")
                 ? <Memory />
-                : <FeatureUnavailable title="Memory is disabled" description="Mission-control surfaces are not enabled in the current backend." />}
+                : <FeatureUnavailable title={t("feature.memory.title")} description={t("feature.memory.description")} />}
             />
             <Route
               path="calendar"
               element={isEnabled("project", "calendar")
                 ? <Calendar />
-                : <FeatureUnavailable title="Calendar is disabled" description="Mission-control surfaces are not enabled in the current backend." />}
+                : <FeatureUnavailable title={t("feature.calendar.title")} description={t("feature.calendar.description")} />}
             />
             <Route
               path="content"
               element={isEnabled("project", "content")
                 ? <ContentPipeline />
-                : <FeatureUnavailable title="Content Pipeline is disabled" description="Mission-control surfaces are not enabled in the current backend." />}
+                : <FeatureUnavailable title={t("feature.content.title")} description={t("feature.content.description")} />}
             />
             <Route
               path="issues"
               element={isEnabled("project", "issues")
                 ? <Issues />
-                : <FeatureUnavailable title="Issues are disabled" description="GitHub mock surfaces are hidden until a real integration is enabled." />}
+                : <FeatureUnavailable title={t("feature.issues.title")} description={t("feature.issues.description")} />}
             />
             <Route
               path="issues/:issueNumber"
               element={isEnabled("project", "issues")
                 ? <IssueDetail />
-                : <FeatureUnavailable title="Issues are disabled" description="GitHub mock surfaces are hidden until a real integration is enabled." />}
+                : <FeatureUnavailable title={t("feature.issues.title")} description={t("feature.issues.description")} />}
             />
             <Route
               path="pulls"
               element={isEnabled("project", "pulls")
                 ? <PullRequests />
-                : <FeatureUnavailable title="Pull Requests are disabled" description="GitHub mock surfaces are hidden until a real integration is enabled." />}
+                : <FeatureUnavailable title={t("feature.pulls.title")} description={t("feature.pulls.description")} />}
             />
             <Route
               path="pulls/:prNumber"
               element={isEnabled("project", "pulls")
                 ? <PullRequestDetail />
-                : <FeatureUnavailable title="Pull Requests are disabled" description="GitHub mock surfaces are hidden until a real integration is enabled." />}
+                : <FeatureUnavailable title={t("feature.pulls.title")} description={t("feature.pulls.description")} />}
             />
             <Route path="runs" element={<Runs />} />
             <Route path="approvals" element={<Approvals />} />
+            <Route
+              path="experiments"
+              element={isEnabled("project", "experiments")
+                ? <Experiments />
+                : <FeatureUnavailable title={t("feature.experiments.title")} description={t("feature.experiments.description")} />}
+            />
 
             {/* Ads Audit */}
             <Route
               path="ads"
               element={isEnabled("project", "ads")
                 ? <AdsLayout />
-                : <FeatureUnavailable title="Ads Audit is disabled" description="This backend does not expose the ads analysis contract yet." />}
+                : <FeatureUnavailable title={t("feature.ads.title")} description={t("feature.ads.description")} />}
             >
               <Route index element={<Navigate to="dashboard" replace />} />
               <Route path="dashboard" element={<AdsDashboard />} />
@@ -142,7 +159,7 @@ export function App() {
               path="lifecycle"
               element={isEnabled("project", "lifecycle")
                 ? <LifecycleLayout />
-                : <FeatureUnavailable title="Lifecycle is disabled" description="The current backend is focused on the stable orchestration control plane." />}
+                : <FeatureUnavailable title={t("feature.lifecycle.title")} description={t("feature.lifecycle.description")} />}
             >
               <Route index element={<Navigate to="research" replace />} />
               <Route path="research" element={<ResearchPhase />} />
@@ -157,16 +174,16 @@ export function App() {
 
           {/* Admin routes (not project-scoped) */}
           <Route path="dashboard" element={<Dashboard />} />
-          <Route path="workflows" element={isEnabled("admin", "workflows") ? <Workflows /> : <FeatureUnavailable title="Workflows are disabled" description="This surface is not enabled in the current backend." />} />
-          <Route path="agents" element={isEnabled("admin", "agents") ? <Agents /> : <FeatureUnavailable title="Agents are disabled" description="This surface is not enabled in the current backend." />} />
-          <Route path="agents/new" element={isEnabled("admin", "agents") ? <AgentNew /> : <FeatureUnavailable title="Agents are disabled" description="This surface is not enabled in the current backend." />} />
-          <Route path="agents/:agentId" element={isEnabled("admin", "agents") ? <AgentDetail /> : <FeatureUnavailable title="Agents are disabled" description="This surface is not enabled in the current backend." />} />
-          <Route path="costs" element={isEnabled("admin", "costs") ? <Costs /> : <FeatureUnavailable title="Costs are disabled" description="This surface is not enabled in the current backend." />} />
-          <Route path="providers" element={isEnabled("admin", "providers") ? <Providers /> : <FeatureUnavailable title="Providers are disabled" description="This surface is not enabled in the current backend." />} />
-          <Route path="models" element={isEnabled("admin", "models") ? <Models /> : <FeatureUnavailable title="Models are disabled" description="This surface is not enabled in the current backend." />} />
-          <Route path="skills" element={isEnabled("admin", "skills") ? <Skills /> : <FeatureUnavailable title="Skills are disabled" description="This surface is not enabled in the current backend." />} />
+          <Route path="workflows" element={isEnabled("admin", "workflows") ? <Workflows /> : <FeatureUnavailable title={t("feature.workflows.title")} description={t("feature.workflows.description")} />} />
+          <Route path="agents" element={isEnabled("admin", "agents") ? <Agents /> : <FeatureUnavailable title={t("feature.agents.title")} description={t("feature.agents.description")} />} />
+          <Route path="agents/new" element={isEnabled("admin", "agents") ? <AgentNew /> : <FeatureUnavailable title={t("feature.agents.title")} description={t("feature.agents.description")} />} />
+          <Route path="agents/:agentId" element={isEnabled("admin", "agents") ? <AgentDetail /> : <FeatureUnavailable title={t("feature.agents.title")} description={t("feature.agents.description")} />} />
+          <Route path="costs" element={isEnabled("admin", "costs") ? <Costs /> : <FeatureUnavailable title={t("feature.costs.title")} description={t("feature.costs.description")} />} />
+          <Route path="providers" element={isEnabled("admin", "providers") ? <Providers /> : <FeatureUnavailable title={t("feature.providers.title")} description={t("feature.providers.description")} />} />
+          <Route path="models" element={isEnabled("admin", "models") ? <Models /> : <FeatureUnavailable title={t("feature.models.title")} description={t("feature.models.description")} />} />
+          <Route path="skills" element={isEnabled("admin", "skills") ? <Skills /> : <FeatureUnavailable title={t("feature.skills.title")} description={t("feature.skills.description")} />} />
           <Route path="projects/new" element={<ProjectNew />} />
-          <Route path="settings" element={isEnabled("admin", "settings") ? <Settings /> : <FeatureUnavailable title="Settings are disabled" description="This surface is not enabled in the current backend." />} />
+          <Route path="settings" element={isEnabled("admin", "settings") ? <Settings /> : <FeatureUnavailable title={t("feature.settings.title")} description={t("feature.settings.description")} />} />
 
           {/* Legacy redirects */}
           <Route path="studio" element={<Navigate to="/p/todo-app-builder/studio" replace />} />

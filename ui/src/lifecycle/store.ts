@@ -8,29 +8,46 @@ import type {
   LifecycleArtifact,
   LifecycleAutonomyLevel,
   LifecycleAutonomyState,
+  LifecycleDecisionContext,
   LifecycleDecision,
   LifecycleDelegation,
   LifecycleNextAction,
+  LifecycleGovernanceMode,
+  LifecycleOutcomeTelemetryContract,
   LifecycleOrchestrationMode,
   LifecyclePhase,
+  LifecycleProductIdentity,
   LifecycleProject,
   LifecycleResearchConfig,
   LifecycleRecommendation,
   LifecycleSkillInvocation,
+  LifecycleValueContract,
   MarketResearch,
   Milestone,
   MilestoneResult,
   PhaseBlueprint,
   PhaseStatus,
+  RequirementsBundle,
+  ReverseEngineeringResult,
+  TaskDecomposition,
+  DCSAnalysis,
+  TechnicalDesignBundle,
   PlanEstimate,
   PlanPreset,
   ReleaseRecord,
 } from "@/types/lifecycle";
+import {
+  defaultProductIdentity,
+  normalizeProductIdentity,
+} from "@/lifecycle/productIdentity";
+import { completePhaseStatuses } from "@/lifecycle/phaseStatus";
 
 export type EditableProjectPatch = {
   spec: string;
   orchestrationMode: LifecycleOrchestrationMode;
+  governanceMode: LifecycleGovernanceMode;
   autonomyLevel: LifecycleAutonomyLevel;
+  productIdentity: LifecycleProductIdentity;
   researchConfig: LifecycleResearchConfig;
   features: FeatureSelection[];
   milestones: Milestone[];
@@ -53,6 +70,7 @@ export function defaultResearchConfig(): LifecycleResearchConfig {
     competitorUrls: [],
     depth: "standard",
     outputLanguage: "ja",
+    recoveryMode: "auto",
   };
 }
 
@@ -100,7 +118,9 @@ export function defaultEditableProjectPatch(): EditableProjectPatch {
   return {
     spec: "",
     orchestrationMode: "workflow",
+    governanceMode: "governed",
     autonomyLevel: "A3",
+    productIdentity: defaultProductIdentity(),
     researchConfig: defaultResearchConfig(),
     features: [],
     milestones: [],
@@ -115,7 +135,9 @@ export function toEditableProjectPatch(
   return {
     spec: state.spec,
     orchestrationMode: state.orchestrationMode,
+    governanceMode: state.governanceMode,
     autonomyLevel: state.autonomyLevel,
+    productIdentity: normalizeProductIdentity(state.productIdentity),
     researchConfig: state.researchConfig,
     features: state.features,
     milestones: state.milestones,
@@ -129,6 +151,7 @@ export function editableProjectPayload(
 ): Partial<LifecycleProject> {
   return {
     ...state,
+    productIdentity: normalizeProductIdentity(state.productIdentity),
     selectedDesignId: state.selectedDesignId ?? undefined,
   };
 }
@@ -139,8 +162,15 @@ export function editableProjectFromProject(
   return {
     spec: project.spec || project.description || "",
     orchestrationMode: project.orchestrationMode ?? "workflow",
+    governanceMode: project.governanceMode ?? "governed",
     autonomyLevel: project.autonomyLevel ?? "A3",
-    researchConfig: project.researchConfig ?? defaultResearchConfig(),
+    productIdentity: normalizeProductIdentity(project.productIdentity, {
+      fallbackProductName: project.name,
+    }),
+    researchConfig: {
+      ...defaultResearchConfig(),
+      ...(project.researchConfig ?? {}),
+    },
     features: project.features ?? [],
     milestones: project.milestones ?? [],
     selectedDesignId: project.selectedDesignId ?? null,
@@ -170,7 +200,13 @@ export function mergeEditableProjectPatch(
 } {
   const specChanged = editableFieldChanged("spec", local, saved);
   const modeChanged = editableFieldChanged("orchestrationMode", local, saved);
+  const governanceChanged = editableFieldChanged("governanceMode", local, saved);
   const autonomyChanged = editableFieldChanged("autonomyLevel", local, saved);
+  const productIdentityChanged = editableFieldChanged(
+    "productIdentity",
+    local,
+    saved,
+  );
   const researchConfigChanged = editableFieldChanged(
     "researchConfig",
     local,
@@ -187,7 +223,13 @@ export function mergeEditableProjectPatch(
       orchestrationMode: modeChanged
         ? local.orchestrationMode
         : server.orchestrationMode,
+      governanceMode: governanceChanged
+        ? local.governanceMode
+        : server.governanceMode,
       autonomyLevel: autonomyChanged ? local.autonomyLevel : server.autonomyLevel,
+      productIdentity: productIdentityChanged
+        ? local.productIdentity
+        : server.productIdentity,
       researchConfig: researchConfigChanged
         ? local.researchConfig
         : server.researchConfig,
@@ -203,7 +245,13 @@ export function mergeEditableProjectPatch(
       orchestrationMode: modeChanged
         ? saved.orchestrationMode
         : server.orchestrationMode,
+      governanceMode: governanceChanged
+        ? saved.governanceMode
+        : server.governanceMode,
       autonomyLevel: autonomyChanged ? saved.autonomyLevel : server.autonomyLevel,
+      productIdentity: productIdentityChanged
+        ? saved.productIdentity
+        : server.productIdentity,
       researchConfig: researchConfigChanged
         ? saved.researchConfig
         : server.researchConfig,
@@ -219,8 +267,12 @@ export function mergeEditableProjectPatch(
 
 export interface LifecycleWorkspaceProjectState {
   spec: string;
+  githubRepo: string | null;
   orchestrationMode: LifecycleOrchestrationMode;
+  governanceMode: LifecycleGovernanceMode;
   autonomyLevel: LifecycleAutonomyLevel;
+  decisionContext?: LifecycleDecisionContext | null;
+  productIdentity: LifecycleProductIdentity;
   researchConfig: LifecycleResearchConfig;
   research: MarketResearch | null;
   analysis: AnalysisResult | null;
@@ -234,6 +286,10 @@ export interface LifecycleWorkspaceProjectState {
   buildCost: number;
   buildIteration: number;
   milestoneResults: MilestoneResult[];
+  deliveryPlan: LifecycleProject["deliveryPlan"] | null;
+  valueContract: LifecycleValueContract | null;
+  outcomeTelemetryContract: LifecycleOutcomeTelemetryContract | null;
+  developmentHandoff: LifecycleProject["developmentHandoff"] | null;
   planEstimates: PlanEstimate[];
   selectedPreset: PlanPreset;
   phaseStatuses: PhaseStatus[];
@@ -249,6 +305,12 @@ export interface LifecycleWorkspaceProjectState {
   nextAction: LifecycleNextAction | null;
   autonomyState: LifecycleAutonomyState | null;
   blueprints: Record<LifecyclePhase, PhaseBlueprint>;
+  requirements: RequirementsBundle | null;
+  requirementsConfig: { earsEnabled: boolean; interactiveClarification: boolean; confidenceFloor: number };
+  reverseEngineering: ReverseEngineeringResult | null;
+  taskDecomposition: TaskDecomposition | null;
+  dcsAnalysis: DCSAnalysis | null;
+  technicalDesign: TechnicalDesignBundle | null;
   lastSavedAt: string | null;
   editableBaseline: EditableProjectPatch;
   hydrationState: "idle" | "loading" | "ready" | "error";
@@ -260,8 +322,12 @@ export interface LifecycleWorkspaceProjectState {
 export function createWorkspaceProjectState(): LifecycleWorkspaceProjectState {
   return {
     spec: "",
+    githubRepo: null,
     orchestrationMode: "workflow",
+    governanceMode: "governed",
     autonomyLevel: "A3",
+    decisionContext: null,
+    productIdentity: defaultProductIdentity(),
     researchConfig: defaultResearchConfig(),
     research: null,
     analysis: null,
@@ -275,6 +341,10 @@ export function createWorkspaceProjectState(): LifecycleWorkspaceProjectState {
     buildCost: 0,
     buildIteration: 0,
     milestoneResults: [],
+    deliveryPlan: null,
+    valueContract: null,
+    outcomeTelemetryContract: null,
+    developmentHandoff: null,
     planEstimates: [],
     selectedPreset: "standard",
     phaseStatuses: defaultStatuses(),
@@ -290,6 +360,12 @@ export function createWorkspaceProjectState(): LifecycleWorkspaceProjectState {
     nextAction: null,
     autonomyState: null,
     blueprints: defaultBlueprints(),
+    requirements: null,
+    requirementsConfig: { earsEnabled: true, interactiveClarification: true, confidenceFloor: 0.6 },
+    reverseEngineering: null,
+    taskDecomposition: null,
+    dcsAnalysis: null,
+    technicalDesign: null,
     lastSavedAt: null,
     editableBaseline: defaultEditableProjectPatch(),
     hydrationState: "idle",
@@ -320,8 +396,12 @@ function applyServerProject(
   return {
     ...state,
     spec: editablePatch.spec,
+    githubRepo: project.githubRepo ?? null,
     orchestrationMode: editablePatch.orchestrationMode,
+    governanceMode: editablePatch.governanceMode,
     autonomyLevel: editablePatch.autonomyLevel,
+    decisionContext: project.decisionContext ?? project.decision_context ?? null,
+    productIdentity: editablePatch.productIdentity,
     researchConfig: editablePatch.researchConfig,
     research: project.research ?? null,
     analysis: project.analysis ?? null,
@@ -335,6 +415,10 @@ function applyServerProject(
     buildCost: project.buildCost ?? 0,
     buildIteration: project.buildIteration ?? 0,
     milestoneResults: project.milestoneResults ?? [],
+    deliveryPlan: project.deliveryPlan ?? null,
+    valueContract: project.valueContract ?? project.deliveryPlan?.value_contract ?? null,
+    outcomeTelemetryContract: project.outcomeTelemetryContract ?? project.deliveryPlan?.outcome_telemetry_contract ?? null,
+    developmentHandoff: project.developmentHandoff ?? null,
     planEstimates: project.planEstimates ?? [],
     selectedPreset: editablePatch.selectedPreset,
     phaseStatuses: project.phaseStatuses ?? defaultStatuses(),
@@ -350,6 +434,12 @@ function applyServerProject(
     nextAction: project.nextAction ?? null,
     autonomyState: project.autonomyState ?? null,
     blueprints: normalizeBlueprints(project.blueprints),
+    requirements: project.requirements ?? null,
+    requirementsConfig: project.requirementsConfig ?? state.requirementsConfig,
+    reverseEngineering: (project as any).reverseEngineering ?? null,
+    taskDecomposition: project.taskDecomposition ?? null,
+    dcsAnalysis: project.dcsAnalysis ?? null,
+    technicalDesign: project.technicalDesign ?? null,
     lastSavedAt: project.savedAt ?? null,
     editableBaseline,
     hydrationState: "ready",
@@ -393,8 +483,16 @@ export type LifecycleWorkspaceAction =
       value: string;
     }
   | {
+      type: "update_governance_mode";
+      value: LifecycleGovernanceMode;
+    }
+  | {
       type: "update_research_config";
       value: LifecycleResearchConfig;
+    }
+  | {
+      type: "update_product_identity";
+      value: LifecycleProductIdentity;
     }
   | {
       type: "replace_features";
@@ -519,10 +617,24 @@ export function lifecycleWorkspaceReducer(
     };
   }
 
+  if (action.type === "update_governance_mode") {
+    return {
+      ...state,
+      governanceMode: action.value,
+    };
+  }
+
   if (action.type === "update_research_config") {
     return {
       ...state,
       researchConfig: action.value,
+    };
+  }
+
+  if (action.type === "update_product_identity") {
+    return {
+      ...state,
+      productIdentity: normalizeProductIdentity(action.value),
     };
   }
 
@@ -613,24 +725,9 @@ export function lifecycleWorkspaceReducer(
   }
 
   if (action.type === "complete_phase") {
-    const phaseStatuses = state.phaseStatuses.map((entry) => ({ ...entry }));
-    const index = PHASE_ORDER.indexOf(action.phase);
-    const current = phaseStatuses.find((item) => item.phase === action.phase);
-    if (current) {
-      current.status = "completed";
-      current.completedAt = new Date().toISOString();
-    }
-    if (index + 1 < PHASE_ORDER.length) {
-      const nextEntry = phaseStatuses.find(
-        (item) => item.phase === PHASE_ORDER[index + 1],
-      );
-      if (nextEntry && nextEntry.status === "locked") {
-        nextEntry.status = "available";
-      }
-    }
     return {
       ...state,
-      phaseStatuses,
+      phaseStatuses: completePhaseStatuses(state.phaseStatuses, action.phase),
     };
   }
 
@@ -643,7 +740,9 @@ export function selectEditableProjectPatch(
   return toEditableProjectPatch({
     spec: state.spec,
     orchestrationMode: state.orchestrationMode,
+    governanceMode: state.governanceMode,
     autonomyLevel: state.autonomyLevel,
+    productIdentity: state.productIdentity,
     researchConfig: state.researchConfig,
     features: state.features,
     milestones: state.milestones,

@@ -6,8 +6,10 @@ import { EmptyState } from "@/components/EmptyState";
 import { PageSkeleton } from "@/components/PageSkeleton";
 import { queryKeys } from "@/lib/queryKeys";
 import { healthApi, type HealthCheck } from "@/api/health";
+import { useI18n } from "@/contexts/I18nContext";
 
 export function Providers() {
+  const { t } = useI18n();
   const query = useQuery({
     queryKey: queryKeys.providers.health(),
     queryFn: () => healthApi.get(),
@@ -21,17 +23,17 @@ export function Providers() {
   return (
     <div className="space-y-6 p-6">
       <div>
-        <h1 className="text-2xl font-bold tracking-tight">Providers</h1>
+        <h1 className="text-2xl font-bold tracking-tight">{t("providers.title")}</h1>
         <p className="text-sm text-muted-foreground">
-          System health: {query.data?.status ?? "unknown"}
+          {t("providers.systemHealth", { status: query.data?.status ?? t("common.status.unknown") })}
         </p>
       </div>
 
       {checks.length === 0 ? (
         <EmptyState
           icon={Server}
-          title="No health checks"
-          description="Configure LLM providers in your pylon.yaml to get started."
+          title={t("providers.empty.title")}
+          description={t("providers.empty.description")}
         />
       ) : (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">

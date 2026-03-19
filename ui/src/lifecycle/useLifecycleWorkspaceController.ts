@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { lifecycleApi } from "@/api/lifecycle";
+import { ApiError } from "@/api/client";
+import { lifecycleApi, normalizeLifecycleProject } from "@/api/lifecycle";
 import { useLifecycleRuntimeStream } from "@/hooks/useLifecycleRuntimeStream";
+import { deriveVisiblePhaseStatuses } from "@/lifecycle/phaseStatus";
+import { mergeProductIdentityFallback } from "@/lifecycle/productIdentity";
 import {
   createWorkspaceProjectState,
   defaultEditableProjectPatch,
@@ -13,7 +16,6 @@ import {
 } from "@/lifecycle/store";
 import type {
   EditableProjectPatch,
-  LifecycleWorkspaceProjectState,
 } from "@/lifecycle/store";
 import type {
   LifecycleActions,
@@ -22,24 +24,27 @@ import type {
 } from "@/pages/lifecycle/LifecycleContext";
 import type {
   LifecycleAutonomyState,
+  LifecycleGovernanceMode,
   LifecycleNextAction,
   LifecyclePhase,
   LifecycleProject,
   PhaseStatus,
 } from "@/types/lifecycle";
 
-const PHASE_ORDER: LifecyclePhase[] = [
-  "research",
-  "planning",
-  "design",
-  "approval",
-  "development",
-  "deploy",
-  "iterate",
-];
-
 const lifecycleProjectCache = new Map<string, LifecycleProject>();
 const LIFECYCLE_CACHE_PREFIX = "pylon:lifecycle-project:";
+const LIFECYCLE_CACHE_VERSION = 6;
+
+type LifecycleProjectCacheRecord = {
+  version: number;
+  project: LifecycleProject;
+};
+
+function normalizeCachedProject(
+  project: LifecycleProject,
+): LifecycleProject {
+  return normalizeLifecycleProject(project);
+}
 
 function readLifecycleProjectCache(projectSlug: string): LifecycleProject | null {
   const inMemory = lifecycleProjectCache.get(projectSlug);
@@ -49,22 +54,41 @@ function readLifecycleProjectCache(projectSlug: string): LifecycleProject | null
     const raw = window.sessionStorage.getItem(`${LIFECYCLE_CACHE_PREFIX}${projectSlug}`);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed as LifecycleProject : null;
+    if (!parsed || typeof parsed !== "object") return null;
+    const cacheRecord = "version" in parsed && "project" in parsed
+      ? parsed as LifecycleProjectCacheRecord
+      : null;
+    if (!cacheRecord || cacheRecord.version !== LIFECYCLE_CACHE_VERSION) return null;
+    return normalizeCachedProject(cacheRecord.project);
   } catch {
     return null;
   }
 }
 
 function writeLifecycleProjectCache(projectSlug: string, project: LifecycleProject): void {
-  lifecycleProjectCache.set(projectSlug, project);
+  const normalized = normalizeCachedProject(project);
+  lifecycleProjectCache.set(projectSlug, normalized);
   if (typeof window === "undefined") return;
   try {
     window.sessionStorage.setItem(
       `${LIFECYCLE_CACHE_PREFIX}${projectSlug}`,
-      JSON.stringify(project),
+      JSON.stringify({
+        version: LIFECYCLE_CACHE_VERSION,
+        project: normalized,
+      } satisfies LifecycleProjectCacheRecord),
     );
   } catch {
     // Ignore cache persistence failures.
+  }
+}
+
+function clearLifecycleProjectCache(projectSlug: string): void {
+  lifecycleProjectCache.delete(projectSlug);
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.removeItem(`${LIFECYCLE_CACHE_PREFIX}${projectSlug}`);
+  } catch {
+    // Ignore cache cleanup failures.
   }
 }
 
@@ -72,8 +96,14 @@ export function useLifecycleWorkspaceController(params: {
   projectSlug: string;
   basePath: string;
   currentPhase: LifecyclePhase | null;
+  initialProject?: LifecycleProject | null;
 }) {
-  const { basePath, currentPhase, projectSlug } = params;
+  const {
+    basePath,
+    currentPhase,
+    projectSlug,
+    initialProject = null,
+  } = params;
   const navigate = useNavigate();
   const [workspace, dispatch] = useReducer(
     lifecycleWorkspaceReducer,
@@ -90,7 +120,10 @@ export function useLifecycleWorkspaceController(params: {
   const {
     spec,
     orchestrationMode,
+    governanceMode,
     autonomyLevel,
+    decisionContext,
+    productIdentity,
     researchConfig,
     research,
     analysis,
@@ -104,6 +137,10 @@ export function useLifecycleWorkspaceController(params: {
     buildCost,
     buildIteration,
     milestoneResults,
+    deliveryPlan,
+    valueContract,
+    outcomeTelemetryContract,
+    developmentHandoff,
     planEstimates,
     selectedPreset,
     phaseStatuses,
@@ -119,6 +156,12 @@ export function useLifecycleWorkspaceController(params: {
     nextAction,
     autonomyState,
     blueprints,
+    requirements,
+    requirementsConfig,
+    reverseEngineering,
+    taskDecomposition,
+    dcsAnalysis,
+    technicalDesign,
     lastSavedAt,
     editableBaseline,
     hydrationState,
@@ -132,23 +175,35 @@ export function useLifecycleWorkspaceController(params: {
   const editableBaselineSnapshot = stableProjectSnapshot(editableBaseline);
   editableDraftRef.current = editableDraft;
   const isHydrating = hydrationState === "loading";
+  const visiblePhaseStatuses = deriveVisiblePhaseStatuses(phaseStatuses, nextAction);
+  const fallbackProductIdentity = initialProject?.productIdentity ?? null;
 
   const applyProject = useCallback((
     project: LifecycleProject,
     options: { preserveDirtyEditable?: boolean } = {},
   ) => {
+    const normalizedProject = {
+      ...normalizeCachedProject(project),
+      productIdentity: mergeProductIdentityFallback(
+        project.productIdentity,
+        editableDraftRef.current.productIdentity ?? fallbackProductIdentity,
+        {
+          fallbackProductName: project.name?.trim() || project.projectId,
+        },
+      ),
+    } satisfies LifecycleProject;
     applyingRemoteRef.current = true;
-    writeLifecycleProjectCache(projectSlug, project);
+    writeLifecycleProjectCache(projectSlug, normalizedProject);
     dispatch({
       type: "apply_project",
-      project,
+      project: normalizedProject,
       preserveDirtyEditable: options.preserveDirtyEditable,
     });
     setHasHydratedContent(true);
     queueMicrotask(() => {
       applyingRemoteRef.current = false;
     });
-  }, [projectSlug]);
+  }, [fallbackProductIdentity, projectSlug]);
 
   const applyRuntimeProject = useCallback((payload: {
     phaseStatuses?: PhaseStatus[];
@@ -164,6 +219,29 @@ export function useLifecycleWorkspaceController(params: {
     });
   }, []);
 
+  const applyCachedProject = useCallback((project: LifecycleProject) => {
+    const normalizedProject = {
+      ...normalizeCachedProject(project),
+      productIdentity: mergeProductIdentityFallback(
+        project.productIdentity,
+        editableDraftRef.current.productIdentity ?? fallbackProductIdentity,
+        {
+          fallbackProductName: project.name?.trim() || project.projectId,
+        },
+      ),
+    } satisfies LifecycleProject;
+    applyingRemoteRef.current = true;
+    writeLifecycleProjectCache(projectSlug, normalizedProject);
+    dispatch({
+      type: "hydrate_from_cache",
+      project: normalizedProject,
+    });
+    setHasHydratedContent(true);
+    queueMicrotask(() => {
+      applyingRemoteRef.current = false;
+    });
+  }, [fallbackProductIdentity, projectSlug]);
+
   useEffect(() => {
     let cancelled = false;
     if (!projectSlug) {
@@ -174,11 +252,9 @@ export function useLifecycleWorkspaceController(params: {
     setHasHydratedContent(false);
     applyingRemoteRef.current = true;
 
-    const cachedProject = readLifecycleProjectCache(projectSlug);
+    const cachedProject = readLifecycleProjectCache(projectSlug) ?? initialProject;
     if (cachedProject) {
-      dispatch({ type: "hydrate_from_cache", project: cachedProject });
-      setHasHydratedContent(true);
-      applyingRemoteRef.current = false;
+      applyCachedProject(cachedProject);
     }
 
     lifecycleApi.getProject(projectSlug)
@@ -186,14 +262,20 @@ export function useLifecycleWorkspaceController(params: {
         if (cancelled) return;
         applyProject(project, { preserveDirtyEditable: Boolean(cachedProject) });
       })
-      .catch(() => {
+      .catch((error) => {
         if (cancelled) return;
-        setHasHydratedContent(Boolean(cachedProject));
+        const isNotFound = error instanceof ApiError && error.status === 404;
+        if (isNotFound) {
+          clearLifecycleProjectCache(projectSlug);
+          setHasHydratedContent(false);
+        } else {
+          setHasHydratedContent(Boolean(cachedProject));
+        }
         applyingRemoteRef.current = false;
         dispatch({
           type: "hydrate_failed",
           error: "Lifecycle state を読み込めませんでした。もう一度読み込むと復旧できる場合があります。",
-          hasCachedProject: Boolean(cachedProject),
+          hasCachedProject: Boolean(cachedProject) && !isNotFound,
         });
       });
 
@@ -201,10 +283,18 @@ export function useLifecycleWorkspaceController(params: {
       cancelled = true;
       clearTimeout(saveTimer.current);
     };
-  }, [applyProject, projectSlug]);
+  }, [applyCachedProject, applyProject, initialProject, projectSlug]);
 
   useEffect(() => {
-    if (!projectSlug || !hasHydratedContent || applyingRemoteRef.current) return;
+    if (
+      !projectSlug
+      || !hasHydratedContent
+      || applyingRemoteRef.current
+      || hydrationState !== "ready"
+      || isRefreshingProject
+    ) {
+      return;
+    }
     if (editableDraftSnapshot === editableBaselineSnapshot) return;
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
@@ -216,13 +306,24 @@ export function useLifecycleWorkspaceController(params: {
         { autoRun: false },
       )
         .then((response) => {
-          const savedEditable = editableProjectFromProject(response.project);
+          const normalizedProject = {
+            ...response.project,
+            productIdentity: mergeProductIdentityFallback(
+              response.project.productIdentity,
+              currentEditable.productIdentity,
+              {
+                fallbackProductName: response.project.name?.trim() || response.project.projectId,
+              },
+            ),
+          } satisfies LifecycleProject;
+          writeLifecycleProjectCache(projectSlug, normalizedProject);
+          const savedEditable = editableProjectFromProject(normalizedProject);
           dispatch({
             type: "mark_saved",
             editableBaseline: savedEditable,
-            savedAt: response.project.savedAt ?? new Date().toISOString(),
+            savedAt: normalizedProject.savedAt ?? new Date().toISOString(),
           });
-          applyRuntimeProject(response.project);
+          applyRuntimeProject(normalizedProject);
         })
         .catch(() => {
           dispatch({ type: "save_failed" });
@@ -234,6 +335,8 @@ export function useLifecycleWorkspaceController(params: {
     editableBaselineSnapshot,
     editableDraftSnapshot,
     hasHydratedContent,
+    hydrationState,
+    isRefreshingProject,
     projectSlug,
   ]);
 
@@ -249,24 +352,6 @@ export function useLifecycleWorkspaceController(params: {
     currentPhase,
     shouldStreamRuntime,
   );
-
-  useEffect(() => {
-    if (isHydrating || !currentPhase) return;
-    const currentStatus = phaseStatuses.find((item) => item.phase === currentPhase);
-    if (!currentStatus || currentStatus.status === "locked") {
-      let fallbackPhase: LifecyclePhase | null = null;
-      for (let index = PHASE_ORDER.length - 1; index >= 0; index -= 1) {
-        const status = phaseStatuses.find((item) => item.phase === PHASE_ORDER[index]);
-        if (status && (status.status === "in_progress" || status.status === "completed" || status.status === "available")) {
-          fallbackPhase = PHASE_ORDER[index];
-          break;
-        }
-      }
-      if (fallbackPhase) {
-        navigate(`${basePath}/lifecycle/${fallbackPhase}`, { replace: true });
-      }
-    }
-  }, [basePath, currentPhase, isHydrating, navigate, phaseStatuses]);
 
   useEffect(() => {
     if (!runtimeStream.runtime) return;
@@ -342,7 +427,10 @@ export function useLifecycleWorkspaceController(params: {
   const state: LifecycleWorkspaceView = {
     spec,
     orchestrationMode,
+    governanceMode,
     autonomyLevel,
+    decisionContext,
+    productIdentity,
     researchConfig,
     research,
     analysis,
@@ -356,9 +444,13 @@ export function useLifecycleWorkspaceController(params: {
     buildCost,
     buildIteration,
     milestoneResults,
+    deliveryPlan,
+    valueContract,
+    outcomeTelemetryContract,
+    developmentHandoff,
     planEstimates,
     selectedPreset,
-    phaseStatuses,
+    phaseStatuses: visiblePhaseStatuses,
     deployChecks,
     releases,
     feedbackItems,
@@ -377,11 +469,19 @@ export function useLifecycleWorkspaceController(params: {
     runtimeLiveTelemetry: runtimeStream.liveTelemetry,
     runtimeConnectionState: runtimeStream.connectionState,
     blueprints,
+    requirements,
+    requirementsConfig,
+    reverseEngineering,
+    taskDecomposition,
+    dcsAnalysis,
+    technicalDesign,
     isHydrating,
   };
 
   const actions: LifecycleActions = {
     editSpec: (value) => dispatch({ type: "edit_spec", value }),
+    selectGovernanceMode: (value: LifecycleGovernanceMode) => dispatch({ type: "update_governance_mode", value }),
+    updateProductIdentity: (value) => dispatch({ type: "update_product_identity", value }),
     updateResearchConfig: (value) => dispatch({ type: "update_research_config", value }),
     replaceFeatures: (value) => dispatch({ type: "replace_features", value }),
     replaceMilestones: (value) => dispatch({ type: "replace_milestones", value }),

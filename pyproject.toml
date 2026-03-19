@@ -49,6 +49,8 @@ opentelemetry = [
 
 [project.scripts]
 pylon = "pylon.cli.main:cli"
+pylon-firecracker-runner = "pylon.sandbox.firecracker_runner:main"
+pylon-firecracker-executor = "pylon.sandbox.firecracker_executor:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pylon"]

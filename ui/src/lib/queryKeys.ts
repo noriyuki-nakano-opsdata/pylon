@@ -19,6 +19,11 @@ export const queryKeys = {
     list: (filter?: string) => ["approvals", filter ?? "all"] as const,
     detail: (id: string) => ["approvals", id] as const,
   },
+  experiments: {
+    list: (projectSlug?: string) => ["experiments", projectSlug ?? "all"] as const,
+    detail: (id: string) => ["experiments", id] as const,
+    iterations: (id: string) => ["experiments", id, "iterations"] as const,
+  },
   costs: {
     summary: (period: string) => ["costs", "summary", period] as const,
     breakdown: (period: string) => ["costs", "breakdown", period] as const,

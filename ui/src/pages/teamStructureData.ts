@@ -23,6 +23,12 @@ const CORE_TEAM_DEFS: ApiTeamDef[] = [
   { id: "data", name: "Data & Evaluation", nameJa: "データ / 評価", icon: "Zap", color: "text-cyan-400", bg: "bg-cyan-600" },
   { id: "security", name: "Security & Governance", nameJa: "セキュリティ / ガバナンス", icon: "Shield", color: "text-red-400", bg: "bg-red-600" },
   { id: "operations", name: "Operations & Release", nameJa: "運用 / リリース", icon: "Bot", color: "text-amber-400", bg: "bg-amber-600" },
+  { id: "marketing", name: "Marketing", nameJa: "マーケティング", icon: "TrendingUp", color: "text-fuchsia-300", bg: "bg-fuchsia-700" },
+  { id: "sales", name: "Sales", nameJa: "セールス", icon: "Target", color: "text-lime-400", bg: "bg-lime-600" },
+  { id: "customer-success", name: "Customer Success", nameJa: "カスタマーサクセス", icon: "Users", color: "text-teal-300", bg: "bg-teal-700" },
+  { id: "partnerships", name: "Partnerships", nameJa: "パートナーシップ", icon: "Handshake", color: "text-indigo-300", bg: "bg-indigo-700" },
+  { id: "people", name: "People & Talent", nameJa: "人事 / タレント", icon: "BriefcaseBusiness", color: "text-rose-400", bg: "bg-rose-600" },
+  { id: "finance", name: "Finance & Legal", nameJa: "財務 / 法務", icon: "Landmark", color: "text-yellow-300", bg: "bg-yellow-700" },
 ];
 
 const KNOWN_DYNAMIC_TEAM_DEFS: Record<string, ApiTeamDef> = {
@@ -77,10 +83,40 @@ const TEAM_META: Record<string, TeamMeta> = {
     emptyState: "運用 / リリース担当が未配備です。",
     recommendedRoles: ["Release Operator"],
   },
+  marketing: {
+    description: "需要創出、ポジショニング、コンテンツ流通を束ねて市場認知を伸ばすチーム。",
+    emptyState: "マーケティング担当が不足しています。",
+    recommendedRoles: ["Product Marketer", "Lifecycle Marketer"],
+  },
+  sales: {
+    description: "商談創出、提案、契約前の技術折衝を担当し、売上化を前進させるチーム。",
+    emptyState: "セールス担当が未配備です。",
+    recommendedRoles: ["Account Executive", "Solutions Consultant"],
+  },
+  "customer-success": {
+    description: "導入、定着、更新、拡張提案を通じて顧客価値の実現を担うチーム。",
+    emptyState: "カスタマーサクセス担当が不足しています。",
+    recommendedRoles: ["Customer Success Manager", "Technical Account Manager"],
+  },
+  partnerships: {
+    description: "アライアンス、紹介チャネル、共同施策を設計し、外部成長レバーを作るチーム。",
+    emptyState: "パートナーシップ担当がまだ配備されていません。",
+    recommendedRoles: ["Partner Manager", "Channel Operations Lead"],
+  },
   advertising: {
     description: "媒体運用、配信最適化、クリエイティブ監査を担うチーム。",
     emptyState: "広告運用担当がまだ配備されていません。",
     recommendedRoles: ["Campaign Strategist", "Compliance Reviewer"],
+  },
+  people: {
+    description: "採用、オンボーディング、育成を通じて、組織の密度と持続性を高めるチーム。",
+    emptyState: "採用 / 人材開発担当が未配備です。",
+    recommendedRoles: ["Recruiter", "People Partner"],
+  },
+  finance: {
+    description: "予算、契約、支払い統制を握り、事業の意思決定を健全に保つチーム。",
+    emptyState: "財務 / 法務の統制役が未配備です。",
+    recommendedRoles: ["Finance Controller", "Legal Operations Manager"],
   },
 };
 

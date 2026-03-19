@@ -1,0 +1,6 @@
+interface:
+  display_name: "People Ops Hiring"
+  short_description: "Hiring, calibration, and onboarding ops"
+  default_prompt: "Use $people-ops-hiring to tighten the role scorecard, interview loop, and onboarding plan for this hiring motion."
+policy:
+  allow_implicit_invocation: true

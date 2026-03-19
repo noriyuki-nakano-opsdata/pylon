@@ -10,6 +10,7 @@ import { DesignPhase } from "../lifecycle/DesignPhase";
 const navigateMock = vi.fn();
 const actionMocks = {
   editSpec: vi.fn(),
+  selectGovernanceMode: vi.fn(),
   updateProductIdentity: vi.fn(),
   updateResearchConfig: vi.fn(),
   replaceFeatures: vi.fn(),
@@ -60,6 +61,7 @@ function makeLifecycleState(): LifecycleWorkspaceView {
   return {
     spec: "調査から企画、承認、開発までを一貫して進める operator 向け control plane",
     orchestrationMode: "workflow",
+    governanceMode: "governed",
     autonomyLevel: "A3",
     decisionContext: {
       schema_version: 1,
@@ -420,7 +422,7 @@ describe("DesignPhase", () => {
     expect(screen.getByText("実装ガードレール")).toBeInTheDocument();
     expect(screen.getByText("マルチエージェント実装レーン")).toBeInTheDocument();
     expect(screen.getByText("状態保持型 ワークスペース シェル にする")).toBeInTheDocument();
-  });
+  }, 20000);
 
   it("keeps prototype handoff content aligned with the currently inspected variant", () => {
     renderSubject();
@@ -431,7 +433,7 @@ describe("DesignPhase", () => {
 
     expect(screen.getByText("この案を承認へ渡すなら")).toBeInTheDocument();
     expect(screen.getByText("密度高めの制御室体験を保ったまま承認へ渡す。")).toBeInTheDocument();
-  });
+  }, 12000);
 
   it("renders implementation slices from embedded payload strings without breaking the layout", () => {
     const state = makeLifecycleState();

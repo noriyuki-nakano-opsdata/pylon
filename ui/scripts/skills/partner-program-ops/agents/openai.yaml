@@ -1,0 +1,6 @@
+interface:
+  display_name: "Partner Program Ops"
+  short_description: "Channel, referral, and alliance operations"
+  default_prompt: "Use $partner-program-ops to design the operating model, attribution rules, and activation plan for this partner motion."
+policy:
+  allow_implicit_invocation: true

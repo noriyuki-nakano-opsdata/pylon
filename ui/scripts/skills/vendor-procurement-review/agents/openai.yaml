@@ -1,0 +1,6 @@
+interface:
+  display_name: "Vendor Procurement Review"
+  short_description: "Supplier, renewal, and approval discipline"
+  default_prompt: "Use $vendor-procurement-review to assess vendor fit, renewal risk, and required approval conditions for this purchase."
+policy:
+  allow_implicit_invocation: true

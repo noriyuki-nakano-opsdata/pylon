@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="pylon-fg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f8fafc"/>
+      <stop offset="100%" stop-color="#dbeafe"/>
+    </linearGradient>
+    <linearGradient id="pylon-bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#1d4ed8"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="16" fill="url(#pylon-bg)"/>
+  <path d="M18 18h18c9.94 0 18 8.06 18 18s-8.06 18-18 18H18z" fill="url(#pylon-fg)" opacity="0.16"/>
+  <path d="M22 16h14c10.493 0 19 8.507 19 19S46.493 54 36 54H22zm8 8v22h6c6.627 0 12-5.373 12-12s-5.373-12-12-12z" fill="url(#pylon-fg)"/>

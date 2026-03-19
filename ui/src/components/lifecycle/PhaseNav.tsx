@@ -45,15 +45,27 @@ export function PhaseNav({
 
   return (
     <nav className={cn(
-      "flex h-full flex-col gap-0.5 border-r border-border bg-card/70 py-3",
-      collapsed ? "w-14 px-1" : "w-56 px-2",
+      "flex h-full flex-col gap-0.5 border-r border-border bg-card/60 py-3 backdrop-blur",
+      collapsed ? "w-16 px-1.5" : "w-72 px-2.5",
       className,
     )}>
-      {!collapsed && (
-        <p className="px-3 pb-2 pt-1 text-[10px] font-semibold uppercase tracking-widest text-muted-foreground/60">
-          プロダクトライフサイクル
-        </p>
-      )}
+      <div className={cn("border-b border-border/80 pb-3", collapsed ? "px-1" : "px-2.5")}>
+        {!collapsed ? (
+          <>
+            <p className="px-2 pb-1 pt-1 text-[10px] font-semibold uppercase tracking-[0.24em] text-muted-foreground">
+              Explorer
+            </p>
+            <div className="rounded-[1.1rem] border border-border bg-background/70 px-3 py-3">
+              <p className="font-mono text-[11px] text-foreground">workflow://lifecycle</p>
+              <p className="mt-1 text-xs text-muted-foreground">phases/{PHASES.length} modules</p>
+            </div>
+          </>
+        ) : (
+          <div className="flex justify-center pt-1">
+            <div className="h-9 w-9 rounded-2xl border border-border bg-background/80" />
+          </div>
+        )}
+      </div>
       {PHASES.map((phase, i) => {
         const ps = phaseStatuses.find((s) => s.phase === phase.key);
         const status = ps?.status ?? (i === 0 ? "available" : "locked");
@@ -63,11 +75,10 @@ export function PhaseNav({
 
         return (
           <div key={phase.key} className="relative">
-            {/* connector line */}
             {i > 0 && (
               <div className={cn(
-                "absolute left-5 -top-0.5 h-0.5 w-px",
-                collapsed ? "left-[1.35rem]" : "left-5",
+                "absolute w-px",
+                collapsed ? "left-7 top-[-2px] h-2.5" : "left-7 top-[-6px] h-4",
                 status === "locked" ? "bg-border" : "bg-primary/30",
               )} />
             )}
@@ -86,14 +97,13 @@ export function PhaseNav({
         );
       })}
 
-      {/* Version indicator */}
       {!collapsed && (
-        <div className="mt-auto border-t border-border px-3 pt-3">
-          <div className="flex items-center justify-between text-[10px] text-muted-foreground">
-            <span>バージョン</span>
-            <span className="font-mono">v{phaseStatuses.filter((s) => s.status === "completed").length + 1}.0</span>
+        <div className="mt-auto border-t border-border px-3 pt-4">
+          <div className="flex items-center justify-between text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+            <span>release</span>
+            <span className="font-mono normal-case">v{phaseStatuses.filter((s) => s.status === "completed").length + 1}.0</span>
           </div>
-          <div className="mt-1.5 flex gap-0.5">
+          <div className="mt-2 flex gap-1">
             {PHASES.map((phase) => {
               const ps = phaseStatuses.find((s) => s.phase === phase.key);
               const status = ps?.status ?? "locked";
@@ -101,7 +111,7 @@ export function PhaseNav({
                 <div
                   key={phase.key}
                   className={cn(
-                    "h-1 flex-1 rounded-full",
+                    "h-1.5 flex-1 rounded-full",
                     status === "completed" ? "bg-success" :
                     status === "in_progress" ? "bg-primary animate-pulse" :
                     status === "review" ? "bg-warning" :
@@ -143,11 +153,11 @@ function PhaseNavItem({
   const inner = (
     <>
       <div className={cn(
-        "relative flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition-colors",
-        isActive ? "bg-primary text-primary-foreground" :
-        status === "completed" ? "bg-success/10 text-success" :
-        status === "in_progress" ? "bg-primary/10 text-primary" :
-        "bg-muted text-muted-foreground",
+        "relative flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl border transition-colors",
+        isActive ? "border-primary/30 bg-primary/15 text-primary" :
+        status === "completed" ? "border-success/20 bg-success/10 text-success" :
+        status === "in_progress" ? "border-primary/20 bg-primary/10 text-primary" :
+        "border-border/70 bg-background/70 text-muted-foreground",
       )}>
         <Icon className="h-4 w-4" />
         {status !== "available" && (
@@ -159,12 +169,12 @@ function PhaseNavItem({
       {!collapsed && (
         <div className="min-w-0 flex-1">
           <p className={cn(
-            "truncate",
+            "truncate font-medium",
             isActive ? "text-foreground" : "text-muted-foreground group-hover:text-foreground",
           )}>
             {label}
           </p>
-          <p className="truncate text-[10px] text-muted-foreground/70">
+          <p className="truncate font-mono text-[10px] text-muted-foreground/70">
             {description}
           </p>
         </div>
@@ -176,13 +186,13 @@ function PhaseNavItem({
   );
 
   const baseClassName = cn(
-    "group flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-all",
-    collapsed && "justify-center px-2",
+    "group flex items-center gap-3 rounded-[1rem] border px-3 py-2.5 text-sm font-medium transition-all",
+    collapsed && "justify-center px-2.5",
   );
 
   if (isLocked) {
     return (
-      <div className={cn(baseClassName, "opacity-40 cursor-not-allowed")} aria-disabled="true" tabIndex={-1}>
+      <div className={cn(baseClassName, "cursor-not-allowed border-transparent opacity-45")} aria-disabled="true" tabIndex={-1}>
         {inner}
       </div>
     );
@@ -194,7 +204,9 @@ function PhaseNavItem({
       onClick={onClick}
       className={cn(
         baseClassName,
-        isActive ? "bg-accent shadow-sm" : "hover:bg-accent/50",
+        isActive
+          ? "border-primary/25 bg-primary/8 shadow-[0_14px_30px_rgba(2,6,23,0.28)]"
+          : "border-transparent bg-transparent hover:border-border/70 hover:bg-accent/55",
       )}
     >
       {inner}
