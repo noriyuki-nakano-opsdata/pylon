@@ -1,5 +1,7 @@
 """Tests for workflow graph executor."""
 
+import asyncio
+
 import pytest
 
 from pylon.approval import ApprovalManager, ApprovalStore
@@ -133,6 +135,51 @@ class TestGraphExecutor:
         assert [cp.event_log[0]["node_id"] for cp in checkpoints] == ["step1", "step2"]
         assert all(cp.state_version > 0 for cp in checkpoints)
         assert all(cp.state_hash for cp in checkpoints)
+
+    @pytest.mark.asyncio
+    async def test_progress_observer_persists_running_nodes_before_superstep_completes(self):
+        repo = CheckpointRepository()
+        snapshots: list[dict[str, object]] = []
+        release = asyncio.Event()
+
+        async def progress_observer(run: WorkflowRun, checkpoints) -> None:
+            execution = run.state.get("execution", {})
+            node_status = execution.get("node_status", {}) if isinstance(execution, dict) else {}
+            snapshots.append(
+                {
+                    "status": run.status,
+                    "node_status": dict(node_status) if isinstance(node_status, dict) else {},
+                    "checkpoint_count": len(checkpoints),
+                    "event_count": len(run.event_log),
+                },
+            )
+
+        executor = GraphExecutor(checkpoint_repo=repo, progress_observer=progress_observer)
+        g = WorkflowGraph(name="progress-running")
+        g.add_node("step1", "agent", next_nodes=[ConditionalEdge(target="step2")])
+        g.add_node("step2", "agent", next_nodes=[ConditionalEdge(target=END)])
+
+        async def blocking_handler(node_id: str, state: dict) -> dict:
+            if node_id == "step1":
+                await release.wait()
+            return {f"{node_id}_done": True}
+
+        run = WorkflowRun(workflow_id="wf-progress")
+        task = asyncio.create_task(executor.execute(g, run, blocking_handler))
+        await asyncio.sleep(0)
+
+        assert snapshots, "expected a progress snapshot while the first node is running"
+        first = snapshots[0]
+        assert first["status"] == RunStatus.RUNNING
+        assert first["event_count"] == 0
+        assert first["checkpoint_count"] == 0
+        assert first["node_status"] == {"step1": "running", "step2": "pending"}
+
+        release.set()
+        result = await task
+
+        assert result.status == RunStatus.COMPLETED
+        assert snapshots[-1]["node_status"] == {"step1": "succeeded", "step2": "succeeded"}
 
     @pytest.mark.asyncio
     async def test_max_steps_limit(self, executor):

@@ -64,8 +64,13 @@ def research_context(
     *,
     segment_from_spec: Callable[[str], str],
 ) -> dict[str, Any]:
-    research = dict(state.get("research")) if isinstance(state.get("research"), dict) else {}
-    raw_user_research = research.get("user_research")
+    research_record = dict(state.get("research")) if isinstance(state.get("research"), dict) else {}
+    canonical_research = (
+        dict(research_record.get("canonical"))
+        if isinstance(research_record.get("canonical"), dict)
+        else research_record
+    )
+    raw_user_research = canonical_research.get("user_research")
     if isinstance(raw_user_research, dict):
         user_research = dict(raw_user_research)
     elif isinstance(state.get("user_research"), dict):
@@ -74,11 +79,11 @@ def research_context(
         user_research = {}
 
     return {
-        "research": research,
+        "research": canonical_research,
         "user_signals": normalized_research_strings(user_research.get("signals"), limit=4),
         "pain_points": normalized_research_strings(user_research.get("pain_points"), limit=4),
-        "opportunities": normalized_research_strings(research.get("opportunities"), limit=4),
-        "threats": normalized_research_strings(research.get("threats"), limit=4),
+        "opportunities": normalized_research_strings(canonical_research.get("opportunities"), limit=4),
+        "threats": normalized_research_strings(canonical_research.get("threats"), limit=4),
         "segment": first_research_text(
             user_research.get("segment"),
             default=segment_from_spec(str(state.get("spec", ""))),

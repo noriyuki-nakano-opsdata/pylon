@@ -1,0 +1,4 @@
+interface:
+  display_name: "Japan Finance Ops"
+  short_description: "Japanese finance, tax, and procurement ops"
+  default_prompt: "Use $japan-finance-ops to review this Japanese finance or procurement workflow for compliance gates, financial impact, and next actions."

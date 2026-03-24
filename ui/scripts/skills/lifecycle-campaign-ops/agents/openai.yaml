@@ -1,0 +1,6 @@
+interface:
+  display_name: "Lifecycle Campaign Ops"
+  short_description: "Launch plans, nurture flows, and handoff discipline"
+  default_prompt: "Use $lifecycle-campaign-ops to design a campaign brief, sequence map, launch plan, and performance review loop."
+policy:
+  allow_implicit_invocation: true

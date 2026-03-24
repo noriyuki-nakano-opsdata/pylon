@@ -12,7 +12,9 @@ import { agentsApi } from "../agents";
 import { approvalsApi } from "../approvals";
 import { adsApi } from "../ads";
 import { costsApi } from "../costs";
+import { experimentsApi } from "../experiments";
 import { featuresApi } from "../features";
+import { gtmApi } from "../gtm";
 import { lifecycleApi } from "../lifecycle";
 import {
   createContent,
@@ -81,6 +83,57 @@ describe("stable API contract", () => {
       workflowsApi.startRun("wf-1", { task: "ship" }),
       "/v1/workflows/wf-1/runs",
       { method: "POST", body: JSON.stringify({ input: { task: "ship" } }) },
+    );
+  });
+
+  it("keeps experiment campaign routes on the canonical v1 surface", async () => {
+    apiFetch.mockResolvedValueOnce({ campaigns: [], count: 0 });
+    await expectApiCall(experimentsApi.list("pylon"), "/v1/experiments?project_slug=pylon");
+
+    apiFetch.mockResolvedValueOnce({ campaign: { id: "exp-1" }, iterations: [], count: 0 });
+    await expectApiCall(
+      experimentsApi.create({
+        objective: "Reduce benchmark latency",
+        repo_path: "/tmp/repo",
+        benchmark_command: "make bench",
+        planner_command: "make optimize",
+        metric_name: "latency",
+        metric_direction: "minimize",
+        max_iterations: 3,
+      }),
+      "/v1/experiments",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          objective: "Reduce benchmark latency",
+          repo_path: "/tmp/repo",
+          benchmark_command: "make bench",
+          planner_command: "make optimize",
+          metric_name: "latency",
+          metric_direction: "minimize",
+          max_iterations: 3,
+        }),
+      },
+    );
+
+    apiFetch.mockResolvedValueOnce({ campaign: { id: "exp-1" }, iterations: [], count: 0 });
+    await expectApiCall(experimentsApi.get("exp-1"), "/v1/experiments/exp-1");
+
+    apiFetch.mockResolvedValueOnce({ campaign: { id: "exp-1" }, iterations: [], count: 0 });
+    await expectApiCall(
+      experimentsApi.start("exp-1"),
+      "/v1/experiments/exp-1/start",
+      { method: "POST" },
+    );
+
+    apiFetch.mockResolvedValueOnce({ campaign: { id: "exp-1" }, iterations: [], count: 0 });
+    await expectApiCall(
+      experimentsApi.promote("exp-1", "pylon/experiments/promoted/exp-1"),
+      "/v1/experiments/exp-1/promote",
+      {
+        method: "POST",
+        body: JSON.stringify({ branch_name: "pylon/experiments/promoted/exp-1" }),
+      },
     );
   });
 
@@ -221,6 +274,9 @@ describe("stable API contract", () => {
 
     apiFetch.mockResolvedValueOnce({});
     await expectApiCall(featuresApi.get(), "/v1/features");
+
+    apiFetch.mockResolvedValueOnce({});
+    await expectApiCall(gtmApi.getOverview(), "/v1/gtm/overview");
   });
 
   it("keeps mission-control routes on the canonical v1 surface", async () => {
@@ -458,6 +514,13 @@ describe("stable API contract", () => {
 
     apiFetch.mockResolvedValueOnce({});
     await expectApiCall(
+      lifecycleApi.deleteProject("orbit"),
+      "/v1/lifecycle/projects/orbit",
+      { method: "DELETE" },
+    );
+
+    apiFetch.mockResolvedValueOnce({});
+    await expectApiCall(
       lifecycleApi.saveProject("orbit", { spec: "Autonomous lifecycle cockpit" }),
       "/v1/lifecycle/projects/orbit",
       { method: "PATCH", body: JSON.stringify({ spec: "Autonomous lifecycle cockpit" }) },
@@ -546,5 +609,124 @@ describe("stable API contract", () => {
       lifecycleApi.getRecommendations("orbit"),
       "/v1/lifecycle/projects/orbit/recommendations",
     );
+  });
+
+  it("normalizes native lifecycle artifacts from mixed backend payloads", async () => {
+    apiFetch.mockResolvedValueOnce({
+      id: "orbit",
+      projectId: "orbit",
+      spec: "Autonomous lifecycle cockpit",
+      orchestrationMode: "workflow",
+      autonomyLevel: "A3",
+      researchConfig: { competitorUrls: [], depth: "standard", outputLanguage: "ja", recoveryMode: "auto" },
+      features: [],
+      milestones: [],
+      designVariants: [],
+      approvalStatus: "pending",
+      approvalComments: [],
+      buildCost: 0,
+      buildIteration: 0,
+      milestoneResults: [],
+      planEstimates: [],
+      selectedPreset: "standard",
+      phaseStatuses: [],
+      deployChecks: [],
+      releases: [],
+      feedbackItems: [],
+      recommendations: [],
+      artifacts: [],
+      decisionLog: [],
+      skillInvocations: [],
+      delegations: [],
+      phaseRuns: [],
+      createdAt: "2026-03-17T00:00:00Z",
+      updatedAt: "2026-03-17T00:00:00Z",
+      savedAt: "2026-03-17T00:00:00Z",
+      requirements: {
+        requirements: [
+          {
+            id: "REQ-0001",
+            pattern: "event-driven",
+            statement: "When release approval is requested, the system shall record the decision.",
+            confidence: 0.9,
+            source_claim_ids: ["claim-1"],
+            user_story_ids: ["US-0001"],
+            acceptance_criteria: ["AC-0001"],
+          },
+        ],
+        user_stories: [{ id: "US-0001", persona: "operator", action: "record the decision", text: "As operator, I want to record the decision." }],
+        acceptance_criteria: [{ id: "AC-0001", requirement_id: "REQ-0001", text: "Given a request, when approved, then the decision is stored." }],
+        confidence_distribution: { high: 1, medium: 0, low: 0 },
+        completeness_score: 0.9,
+        traceability_index: { "claim-1": ["REQ-0001"] },
+      },
+      taskDecomposition: {
+        tasks: [{ id: "TASK-0001", title: "Implement approval log", description: "", phase: "Phase 1", milestone_id: "ms-1", depends_on: [], effort_hours: 8, priority: "must", feature_id: "feat-1", requirement_id: "REQ-0001" }],
+        dag_edges: [],
+        phase_milestones: [{ phase: "Phase 1", milestone_ids: ["ms-1"], task_count: 1, total_hours: 8, duration_days: 20 }],
+        total_effort_hours: 8,
+        critical_path: ["TASK-0001"],
+        effort_by_phase: { "Phase 1": 8 },
+        has_cycles: false,
+      },
+      dcsAnalysis: {
+        rubber_duck_prd: {
+          problem_statement: "Approval latency blocks delivery.",
+          target_users: ["operator"],
+          success_metrics: [],
+          scope_boundaries: { in_scope: ["approval"], out_of_scope: ["billing"] },
+          key_decisions: [],
+        },
+        edge_case_analysis: {
+          edge_cases: [{ id: "EC-1", scenario: "Double submit", severity: "high", mitigation: "dedupe", feature_id: "feat-1" }],
+          risk_matrix: { high: 1 },
+          coverage_score: 1,
+        },
+        impact_analysis: {
+          layers: [{ layer: "api", impacts: [{ component: "approval route", description: "changes request handling" }] }],
+          blast_radius: 2,
+          critical_paths_affected: ["TASK-0001"],
+        },
+        sequence_diagrams: {
+          diagrams: [{ id: "seq-1", title: "Approval", mermaid_code: "sequenceDiagram\nUser->>API: approve", flow_type: "success" }],
+        },
+        state_transitions: {
+          states: [{ id: "pending", name: "pending", description: "" }],
+          transitions: [{ from_state: "pending", to_state: "approved", trigger: "approve", guard: "", risk_level: "low" }],
+          risk_states: [],
+          mermaid_code: "stateDiagram-v2\npending --> approved: approve",
+        },
+      },
+      technicalDesign: {
+        architecture: { system_overview: "Approval service", architectural_pattern: "SPA + API" },
+        dataflow_mermaid: "flowchart LR\nUser-->API",
+        api_specification: [{ method: "POST", path: "/api/v1/approvals", description: "Create approval", auth_required: true }],
+        database_schema: [{ name: "approvals", columns: [{ name: "id", type: "uuid", primary_key: true }], indexes: [] }],
+        interface_definitions: [{ name: "ApprovalRecord", properties: [{ name: "id", type: "string" }], extends: [] }],
+        component_dependency_graph: { UI: ["API"] },
+      },
+      reverseEngineering: {
+        extracted_requirements: [{ id: "REQ-R-0001", statement: "The system shall expose approval endpoints.", source_file: "server/routes/items.ts" }],
+        architecture_doc: { endpoint_count: 2 },
+        dataflow_mermaid: "graph LR\nClient-->API",
+        api_endpoints: [{ method: "GET", path: "/api/items", handler: "listItems", file_path: "server/routes/items.ts" }],
+        database_schema: [{ name: "items", columns: [], source: "raw_sql" }],
+        interfaces: [{ name: "ItemRecord", kind: "interface", properties: [], file_path: "src/types.ts" }],
+        task_structure: [{ id: "TASK-R-0001" }],
+        test_specs: [{ id: "SPEC-R-0001" }],
+        coverage_score: 0.86,
+        languages_detected: ["typescript"],
+        source_type: "prototype_app",
+      },
+    });
+
+    const project = await lifecycleApi.getProject("orbit");
+
+    expect(project.requirements?.requirements[0].sourceClaimIds).toEqual(["claim-1"]);
+    expect(project.requirements?.requirements[0].acceptanceCriteria[0]).toContain("Given");
+    expect(project.taskDecomposition?.tasks[0].effortHours).toBe(8);
+    expect(project.dcsAnalysis?.impactAnalysis?.blastRadius).toBe(2);
+    expect(project.technicalDesign?.apiSpecification[0].authRequired).toBe(true);
+    expect(project.reverseEngineering?.apiEndpoints[0].filePath).toBe("server/routes/items.ts");
   });
 });

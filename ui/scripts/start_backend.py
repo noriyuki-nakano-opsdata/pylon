@@ -14,10 +14,10 @@ from pathlib import Path
 project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root / "src"))
 
-# Load .env file
-env_file = project_root / ".env"
-if env_file.exists():
-    with open(env_file) as f:
+def _load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    with open(path) as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
@@ -27,6 +27,10 @@ if env_file.exists():
                 # Override empty env vars too (Claude Code sets empty strings)
                 if v and not os.environ.get(k):
                     os.environ[k] = v
+
+
+for env_file in (Path.home() / ".config" / "pylon" / "env", project_root / ".env"):
+    _load_env_file(env_file)
 
 import anthropic
 try:
@@ -492,83 +496,266 @@ http_server, route_store = build_http_api_server(
 import uuid
 
 _agents_to_register = [
-    # ── Engineering ──
-    {"name": "planner",          "model": f"anthropic/{MODEL}",          "role": "Analyze spec and create implementation plan",            "autonomy": "A2", "tools": [],                              "sandbox": "gvisor"},
-    {"name": "architect",        "model": f"anthropic/{MODEL}",          "role": "System architecture design and API contracts",           "autonomy": "A2", "tools": [],                              "sandbox": "gvisor"},
-    {"name": "frontend-coder",   "model": f"anthropic/{MODEL}",          "role": "React/TypeScript frontend implementation",               "autonomy": "A2", "tools": ["file-write", "shell"],          "sandbox": "docker"},
-    {"name": "backend-coder",    "model": "openai/gpt-5-mini",           "role": "Python/Node.js backend API implementation",              "autonomy": "A2", "tools": ["file-write", "shell"],          "sandbox": "docker"},
-    {"name": "fullstack-builder","model": f"anthropic/{MODEL}",          "role": "Full-stack developer building complete products",         "autonomy": "A2", "tools": ["file-write", "shell"],          "sandbox": "docker"},
-    {"name": "reviewer",         "model": f"anthropic/{HAIKU_MODEL}",    "role": "Code review, quality checks and standards enforcement",   "autonomy": "A2", "tools": [],                              "sandbox": "gvisor"},
-    {"name": "tester",           "model": "openai/gpt-5-mini",           "role": "Test planning, writing and execution",                    "autonomy": "A2", "tools": ["file-write", "shell"],          "sandbox": "docker"},
-    {"name": "devops-engineer",  "model": "openai/gpt-5-mini",           "role": "CI/CD pipelines, Docker, Kubernetes and IaC",             "autonomy": "A3", "tools": ["shell"],                        "sandbox": "docker"},
+    # ── Product ──
+    {"name": "product-manager", "team": "product", "model": f"anthropic/{MODEL}", "role": "PRD writing, feature prioritization and roadmap ownership", "autonomy": "A2", "tools": [], "sandbox": "gvisor"},
+    {"name": "scrum-master", "team": "product", "model": f"anthropic/{HAIKU_MODEL}", "role": "Sprint planning, standup facilitation and delivery flow management", "autonomy": "A2", "tools": [], "sandbox": "gvisor"},
+    {"name": "product-ops-manager", "team": "product", "model": "openai/gpt-5-mini", "role": "Portfolio hygiene, intake governance and cross-team cadencing", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
+    {"name": "business-analyst", "team": "product", "model": "openai/gpt-5-mini", "role": "Business case modeling, KPI definition and requirement decomposition", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
+    {"name": "program-manager", "team": "product", "model": f"anthropic/{HAIKU_MODEL}", "role": "Cross-functional dependency management and milestone orchestration", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
+    # ── Research ──
+    {"name": "researcher", "team": "research", "model": f"anthropic/{MODEL}", "role": "Market research, competitive analysis and trend reports", "autonomy": "A2", "tools": ["http", "browser"], "sandbox": "gvisor"},
+    {"name": "tech-writer", "team": "research", "model": f"anthropic/{HAIKU_MODEL}", "role": "Technical documentation, API docs and runbooks", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
+    {"name": "content-writer", "team": "research", "model": "moonshot/kimi-k2.5", "role": "Long-form thought leadership, launch assets and editorial drafting", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
+    {"name": "user-researcher", "team": "research", "model": f"anthropic/{MODEL}", "role": "Interview synthesis, diary-study analysis and JTBD discovery", "autonomy": "A2", "tools": ["http", "browser"], "sandbox": "gvisor"},
+    {"name": "competitor-analyst", "team": "research", "model": "openai/gpt-5-mini", "role": "Competitor teardowns, pricing intelligence and battlecard updates", "autonomy": "A2", "tools": ["http", "browser"], "sandbox": "gvisor"},
+    {"name": "market-analyst", "team": "research", "model": "openai/gpt-5-mini", "role": "TAM sizing, segment analysis and category trend monitoring", "autonomy": "A2", "tools": ["http", "browser"], "sandbox": "gvisor"},
     # ── Design ──
-    {"name": "ui-designer",      "model": f"anthropic/{MODEL}",          "role": "UI component design and design system management",        "autonomy": "A2", "tools": ["file-write"],                   "sandbox": "gvisor"},
-    {"name": "ux-analyst",       "model": f"anthropic/{MODEL}",          "role": "UX research, personas, user journey mapping",             "autonomy": "A2", "tools": [],                              "sandbox": "gvisor"},
-    {"name": "design-reviewer",  "model": "moonshot/kimi-k2.5",          "role": "Design critique, accessibility and usability audit",      "autonomy": "A2", "tools": [],                              "sandbox": "gvisor"},
-    # ── Research & Writing ──
-    {"name": "researcher",       "model": "openai/gpt-5-mini",           "role": "Market research, competitive analysis and trend reports", "autonomy": "A2", "tools": ["http", "browser"],              "sandbox": "gvisor"},
-    {"name": "tech-writer",      "model": f"anthropic/{HAIKU_MODEL}",    "role": "Technical documentation, API docs and runbooks",          "autonomy": "A2", "tools": ["file-write"],                   "sandbox": "gvisor"},
-    {"name": "content-writer",   "model": "moonshot/kimi-k2.5",          "role": "Blog posts, marketing copy and release notes",            "autonomy": "A2", "tools": ["file-write"],                   "sandbox": "gvisor"},
-    # ── Data & AI ──
-    {"name": "data-analyst",     "model": f"gemini/{GEMINI_MODEL}",      "role": "Data analysis, SQL queries and visualization",            "autonomy": "A2", "tools": ["shell"],                        "sandbox": "docker"},
-    {"name": "ml-engineer",      "model": f"anthropic/{MODEL}",          "role": "ML model development, training and evaluation",           "autonomy": "A3", "tools": ["file-write", "shell"],          "sandbox": "docker"},
-    {"name": "data-engineer",    "model": f"gemini/{GEMINI_MODEL}",      "role": "Data pipelines, ETL, BigQuery and schema design",         "autonomy": "A2", "tools": ["shell"],                        "sandbox": "docker"},
+    {"name": "ui-designer", "team": "design", "model": f"anthropic/{MODEL}", "role": "UI component design and design system management", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
+    {"name": "design-integration-engineer", "team": "design", "model": "openai/gpt-5-mini", "role": "Figma, Canva, and Stitch workflows, design token/API workflows, and design-to-code handoff automation", "autonomy": "A2", "tools": ["shell", "file-write", "browser"], "sandbox": "docker"},
+    {"name": "ux-analyst", "team": "design", "model": f"anthropic/{MODEL}", "role": "UX research, personas, user journey mapping", "autonomy": "A2", "tools": [], "sandbox": "gvisor"},
+    {"name": "design-reviewer", "team": "design", "model": f"anthropic/{MODEL}", "role": "Design critique, accessibility and usability audit", "autonomy": "A2", "tools": [], "sandbox": "gvisor"},
+    {"name": "brand-designer", "team": "design", "model": f"anthropic/{HAIKU_MODEL}", "role": "Brand system evolution, visual campaigns and identity governance", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
+    {"name": "motion-designer", "team": "design", "model": "moonshot/kimi-k2.5", "role": "Motion language, product storytelling and launch animation concepts", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
+    # ── Development ──
+    {"name": "planner", "team": "development", "model": f"anthropic/{MODEL}", "role": "Analyze spec and create implementation plan", "autonomy": "A2", "tools": [], "sandbox": "gvisor"},
+    {"name": "architect", "team": "development", "model": f"anthropic/{MODEL}", "role": "System architecture design and API contracts", "autonomy": "A2", "tools": [], "sandbox": "gvisor"},
+    {"name": "frontend-coder", "team": "development", "model": f"anthropic/{MODEL}", "role": "React/TypeScript frontend implementation", "autonomy": "A2", "tools": ["file-write", "shell"], "sandbox": "docker"},
+    {"name": "backend-coder", "team": "development", "model": "openai/gpt-5-mini", "role": "Python/Node.js backend API implementation", "autonomy": "A2", "tools": ["file-write", "shell"], "sandbox": "docker"},
+    {"name": "fullstack-builder", "team": "development", "model": f"anthropic/{MODEL}", "role": "Full-stack developer building complete products", "autonomy": "A2", "tools": ["file-write", "shell"], "sandbox": "docker"},
+    {"name": "reviewer", "team": "development", "model": f"anthropic/{MODEL}", "role": "Code review, quality checks and standards enforcement", "autonomy": "A2", "tools": [], "sandbox": "gvisor"},
+    {"name": "tester", "team": "development", "model": "openai/gpt-5-mini", "role": "Test planning, writing and execution", "autonomy": "A2", "tools": ["file-write", "shell"], "sandbox": "docker"},
+    {"name": "mobile-engineer", "team": "development", "model": f"anthropic/{MODEL}", "role": "Mobile client architecture and native feature implementation", "autonomy": "A2", "tools": ["file-write", "shell"], "sandbox": "docker"},
+    {"name": "api-engineer", "team": "development", "model": "openai/gpt-5-mini", "role": "Public API design, SDK compatibility and integration ergonomics", "autonomy": "A2", "tools": ["file-write", "shell"], "sandbox": "docker"},
+    {"name": "integration-engineer", "team": "development", "model": "openai/gpt-5-mini", "role": "Third-party integrations, webhook contracts and partner connectors", "autonomy": "A2", "tools": ["file-write", "shell"], "sandbox": "docker"},
+    {"name": "automation-engineer", "team": "development", "model": "openai/gpt-5-mini", "role": "Internal workflow automation, tooling glue and QA scripting", "autonomy": "A2", "tools": ["file-write", "shell"], "sandbox": "docker"},
+    {"name": "workspace-automation-engineer", "team": "operations", "model": "openai/gpt-5-mini", "role": "Google Workspace automation, mailbox and Drive workflows, and calendar-centric ops scripting", "autonomy": "A2", "tools": ["shell", "file-write"], "sandbox": "docker"},
+    {"name": "staff-engineer", "team": "development", "model": f"anthropic/{MODEL}", "role": "Technical direction, complex system simplification and review escalation", "autonomy": "A3", "tools": ["file-write", "shell"], "sandbox": "docker"},
+    {"name": "cms-engineer", "team": "development", "model": f"anthropic/{HAIKU_MODEL}", "role": "Content model implementation, headless CMS integration and publishing workflows", "autonomy": "A2", "tools": ["file-write", "shell"], "sandbox": "docker"},
+    {"name": "sdk-engineer", "team": "development", "model": "openai/gpt-5-mini", "role": "Developer SDK generation, examples and API adoption tooling", "autonomy": "A2", "tools": ["file-write", "shell"], "sandbox": "docker"},
+    # ── Platform ──
+    {"name": "devops-engineer", "team": "platform", "model": "openai/gpt-5-mini", "role": "CI/CD pipelines, Docker, Kubernetes and infrastructure as code", "autonomy": "A3", "tools": ["shell"], "sandbox": "docker"},
+    {"name": "infra-ops", "team": "platform", "model": "openai/gpt-5-mini", "role": "Infrastructure provisioning, cost optimization and environment hygiene", "autonomy": "A3", "tools": ["shell"], "sandbox": "docker"},
+    {"name": "platform-engineer", "team": "platform", "model": f"anthropic/{MODEL}", "role": "Internal developer platform design and runtime enablement", "autonomy": "A3", "tools": ["shell"], "sandbox": "docker"},
+    {"name": "dbre", "team": "platform", "model": "openai/gpt-5-mini", "role": "Database reliability, capacity planning and backup recovery", "autonomy": "A3", "tools": ["shell"], "sandbox": "docker"},
+    {"name": "observability-engineer", "team": "platform", "model": f"gemini/{GEMINI_MODEL}", "role": "Tracing, metrics design and production telemetry quality", "autonomy": "A2", "tools": ["shell"], "sandbox": "docker"},
+    {"name": "cloud-architect", "team": "platform", "model": f"anthropic/{MODEL}", "role": "Cloud topology, tenancy boundaries and cost-aware environment design", "autonomy": "A3", "tools": ["shell"], "sandbox": "docker"},
+    {"name": "network-engineer", "team": "platform", "model": "openai/gpt-5-mini", "role": "Network routing, ingress policy, zero-trust edge and connectivity diagnostics", "autonomy": "A3", "tools": ["shell"], "sandbox": "docker"},
+    {"name": "endpoint-engineer", "team": "platform", "model": f"anthropic/{HAIKU_MODEL}", "role": "Workstation fleet standards, device hardening and internal access setup", "autonomy": "A2", "tools": ["shell"], "sandbox": "docker"},
+    {"name": "platform-analyst", "team": "platform", "model": f"gemini/{GEMINI_MODEL}", "role": "Platform capacity dashboards, SLA scorecards and efficiency reporting", "autonomy": "A2", "tools": ["shell"], "sandbox": "docker"},
+    # ── Data ──
+    {"name": "data-analyst", "team": "data", "model": f"gemini/{GEMINI_MODEL}", "role": "Data analysis, SQL queries and visualization", "autonomy": "A2", "tools": ["shell"], "sandbox": "docker"},
+    {"name": "ml-engineer", "team": "data", "model": f"anthropic/{MODEL}", "role": "ML model development, training and evaluation", "autonomy": "A3", "tools": ["file-write", "shell"], "sandbox": "docker"},
+    {"name": "data-engineer", "team": "data", "model": f"gemini/{GEMINI_MODEL}", "role": "Data pipelines, ETL, warehouse modeling and schema design", "autonomy": "A2", "tools": ["shell"], "sandbox": "docker"},
+    {"name": "analytics-engineer", "team": "data", "model": "openai/gpt-5-mini", "role": "Metrics modeling, semantic layer design and dashboard quality", "autonomy": "A2", "tools": ["shell"], "sandbox": "docker"},
+    {"name": "experimentation-lead", "team": "data", "model": "openai/gpt-5-mini", "role": "Experiment design, holdout strategy and causal inference review", "autonomy": "A2", "tools": ["shell"], "sandbox": "docker"},
+    {"name": "data-scientist", "team": "data", "model": f"anthropic/{MODEL}", "role": "Predictive modeling, retention analysis and opportunity scoring", "autonomy": "A2", "tools": ["shell"], "sandbox": "docker"},
+    {"name": "insight-analyst", "team": "data", "model": "openai/gpt-5-mini", "role": "Executive KPI narrative, funnel diagnosis and cohort interpretation", "autonomy": "A2", "tools": ["shell"], "sandbox": "docker"},
+    {"name": "mlops-engineer", "team": "data", "model": f"gemini/{GEMINI_MODEL}", "role": "Model serving pipelines, evaluation automation and feature-store operations", "autonomy": "A3", "tools": ["shell"], "sandbox": "docker"},
     # ── Security ──
-    {"name": "security-auditor", "model": f"anthropic/{MODEL}",          "role": "Security scanning, OWASP review and vulnerability triage","autonomy": "A2", "tools": ["shell"],                        "sandbox": "gvisor"},
-    {"name": "security-reviewer","model": "openai/gpt-5-mini",           "role": "Dependency audit, secrets detection and policy check",    "autonomy": "A2", "tools": ["shell"],                        "sandbox": "gvisor"},
-    # ── Product & Operations ──
-    {"name": "product-manager",  "model": f"anthropic/{MODEL}",          "role": "PRD writing, feature prioritization and roadmap",         "autonomy": "A2", "tools": [],                              "sandbox": "gvisor"},
-    {"name": "scrum-master",     "model": f"anthropic/{HAIKU_MODEL}",    "role": "Sprint planning, standup facilitation and velocity tracking","autonomy": "A2", "tools": [],                            "sandbox": "gvisor"},
-    {"name": "sre-engineer",     "model": "openai/gpt-5-mini",           "role": "Monitoring, alerting, incident response and SLA management","autonomy": "A3", "tools": ["shell"],                      "sandbox": "docker"},
-    {"name": "infra-ops",        "model": f"anthropic/{HAIKU_MODEL}",    "role": "Infrastructure provisioning, cost optimization",          "autonomy": "A3", "tools": ["shell"],                        "sandbox": "docker"},
-    {"name": "qa-lead",          "model": f"gemini/{GEMINI_MODEL}",      "role": "QA strategy, test coverage analysis and release readiness","autonomy": "A2", "tools": [],                              "sandbox": "gvisor"},
-    {"name": "perf-engineer",    "model": f"gemini/{GEMINI_MODEL}",      "role": "Performance profiling, load testing and optimization",    "autonomy": "A2", "tools": ["shell"],                        "sandbox": "docker"},
+    {"name": "security-auditor", "team": "security", "model": f"anthropic/{MODEL}", "role": "Security scanning, OWASP review and vulnerability triage", "autonomy": "A2", "tools": ["shell"], "sandbox": "gvisor"},
+    {"name": "security-reviewer", "team": "security", "model": "openai/gpt-5-mini", "role": "Dependency audit, secrets detection and policy check", "autonomy": "A2", "tools": ["shell"], "sandbox": "gvisor"},
+    {"name": "compliance-manager", "team": "security", "model": "openai/gpt-5-mini", "role": "Policy controls, audit readiness and vendor risk governance", "autonomy": "A2", "tools": ["shell"], "sandbox": "gvisor"},
+    {"name": "iam-engineer", "team": "security", "model": "openai/gpt-5-mini", "role": "Identity lifecycle, access reviews and role model hardening", "autonomy": "A2", "tools": ["shell"], "sandbox": "gvisor"},
+    {"name": "security-ops-analyst", "team": "security", "model": f"anthropic/{HAIKU_MODEL}", "role": "Detection tuning, incident enrichment and alert hygiene operations", "autonomy": "A2", "tools": ["shell"], "sandbox": "gvisor"},
+    {"name": "privacy-engineer", "team": "security", "model": f"anthropic/{MODEL}", "role": "Data retention controls, privacy-by-design review and sensitive flow mapping", "autonomy": "A2", "tools": ["shell"], "sandbox": "gvisor"},
+    # ── Operations ──
+    {"name": "sre-engineer", "team": "operations", "model": "openai/gpt-5-mini", "role": "Monitoring, alerting, incident response and SLA management", "autonomy": "A3", "tools": ["shell"], "sandbox": "docker"},
+    {"name": "qa-lead", "team": "operations", "model": "openai/gpt-5-mini", "role": "QA strategy, test coverage analysis and release readiness", "autonomy": "A2", "tools": [], "sandbox": "gvisor"},
+    {"name": "perf-engineer", "team": "operations", "model": f"gemini/{GEMINI_MODEL}", "role": "Performance profiling, load testing and optimization", "autonomy": "A2", "tools": ["shell"], "sandbox": "docker"},
+    {"name": "release-manager", "team": "operations", "model": "openai/gpt-5-mini", "role": "Release train coordination, change windows and rollback plans", "autonomy": "A2", "tools": ["shell"], "sandbox": "docker"},
+    {"name": "incident-commander", "team": "operations", "model": "openai/gpt-5-mini", "role": "Incident triage, escalation flow and postmortem facilitation", "autonomy": "A3", "tools": ["shell"], "sandbox": "docker"},
+    {"name": "support-ops", "team": "operations", "model": f"anthropic/{HAIKU_MODEL}", "role": "Ticket triage, escalation routing and knowledge-base upkeep", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
+    {"name": "knowledge-manager", "team": "operations", "model": f"anthropic/{HAIKU_MODEL}", "role": "Runbook quality, internal wiki curation and support content governance", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
+    {"name": "service-delivery-manager", "team": "operations", "model": "openai/gpt-5-mini", "role": "Escalation governance, premium support coordination and service health reviews", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
+    # ── Marketing ──
+    {"name": "brand-marketer", "team": "marketing", "model": "moonshot/kimi-k2.5", "role": "Narrative development, campaign themes and brand consistency across channels", "autonomy": "A2", "tools": ["file-write", "browser"], "sandbox": "gvisor"},
+    {"name": "content-marketer", "team": "marketing", "model": "moonshot/kimi-k2.5", "role": "Editorial planning, landing-page messaging and conversion-focused content production", "autonomy": "A2", "tools": ["file-write", "browser"], "sandbox": "gvisor"},
+    {"name": "seo-strategist", "team": "marketing", "model": "openai/gpt-5-mini", "role": "Organic growth strategy, search intent mapping and technical SEO recommendations", "autonomy": "A2", "tools": ["browser"], "sandbox": "gvisor"},
+    {"name": "lifecycle-marketer", "team": "marketing", "model": "openai/gpt-5-mini", "role": "Email journeys, retention nudges and onboarding lifecycle experimentation", "autonomy": "A2", "tools": ["file-write", "browser"], "sandbox": "gvisor"},
+    {"name": "product-marketer", "team": "marketing", "model": f"anthropic/{MODEL}", "role": "Positioning, launch briefs, persona messaging and sales enablement assets", "autonomy": "A2", "tools": ["file-write", "browser"], "sandbox": "gvisor"},
+    {"name": "marketing-ops", "team": "marketing", "model": "openai/gpt-5-mini", "role": "Attribution plumbing, lead routing logic and campaign operations hygiene", "autonomy": "A2", "tools": ["file-write", "browser"], "sandbox": "gvisor"},
+    {"name": "campaign-manager", "team": "marketing", "model": "openai/gpt-5-mini", "role": "Campaign launch orchestration, content sequencing and nurture readiness", "autonomy": "A2", "tools": ["file-write", "browser"], "sandbox": "gvisor"},
+    {"name": "pr-manager", "team": "marketing", "model": "moonshot/kimi-k2.5", "role": "Press narrative, analyst relations and executive thought-leadership coordination", "autonomy": "A2", "tools": ["file-write", "browser"], "sandbox": "gvisor"},
+    {"name": "event-marketer", "team": "marketing", "model": "openai/gpt-5-mini", "role": "Webinar, field event and community campaign planning with follow-up orchestration", "autonomy": "A2", "tools": ["file-write", "browser"], "sandbox": "gvisor"},
+    {"name": "field-marketer", "team": "marketing", "model": "moonshot/kimi-k2.5", "role": "Field event execution, webinar attendance follow-up and booth readiness", "autonomy": "A2", "tools": ["file-write", "browser"], "sandbox": "gvisor"},
+    {"name": "creative-automation-producer", "team": "marketing", "model": "openai/gpt-5-mini", "role": "Canva, Stitch, Google Stitch, and Kling AI asset generation, download handling, and creative handoff automation", "autonomy": "A2", "tools": ["shell", "file-write", "browser"], "sandbox": "docker"},
+    # ── Sales ──
+    {"name": "account-executive", "team": "sales", "model": f"anthropic/{MODEL}", "role": "Pipeline qualification, discovery synthesis and deal strategy execution", "autonomy": "A2", "tools": ["browser"], "sandbox": "gvisor"},
+    {"name": "sales-ops", "team": "sales", "model": f"anthropic/{HAIKU_MODEL}", "role": "CRM hygiene, forecast operations and territory planning", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
+    {"name": "revops-manager", "team": "sales", "model": "openai/gpt-5-mini", "role": "Pipeline definitions, funnel instrumentation and GTM operating cadence", "autonomy": "A2", "tools": ["file-write", "browser"], "sandbox": "gvisor"},
+    {"name": "crm-ops-manager", "team": "sales", "model": "openai/gpt-5-mini", "role": "Lead dedupe rules, enrichment policy, routing logic and CRM hygiene programs", "autonomy": "A2", "tools": ["file-write", "browser"], "sandbox": "gvisor"},
+    {"name": "solutions-consultant", "team": "sales", "model": f"anthropic/{MODEL}", "role": "Pre-sales discovery, technical scoping and solution proposal shaping", "autonomy": "A2", "tools": ["browser", "file-write"], "sandbox": "gvisor"},
+    {"name": "outbound-sdr", "team": "sales", "model": f"anthropic/{HAIKU_MODEL}", "role": "Outbound sequencing, account research and meeting generation motions", "autonomy": "A2", "tools": ["browser", "file-write"], "sandbox": "gvisor"},
+    {"name": "sales-enablement-manager", "team": "sales", "model": f"anthropic/{MODEL}", "role": "Pitch decks, objection handling assets and rep readiness programs", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
+    {"name": "account-manager", "team": "sales", "model": f"anthropic/{MODEL}", "role": "Expansion pipeline, commercial negotiations and strategic account planning", "autonomy": "A2", "tools": ["browser", "file-write"], "sandbox": "gvisor"},
+    # ── Customer Success ──
+    {"name": "customer-success-manager", "team": "customer-success", "model": f"anthropic/{MODEL}", "role": "Renewal readiness, adoption monitoring and executive business reviews", "autonomy": "A2", "tools": ["browser"], "sandbox": "gvisor"},
+    {"name": "onboarding-specialist", "team": "customer-success", "model": "openai/gpt-5-mini", "role": "Implementation kickoff, rollout checklists and training path coordination", "autonomy": "A2", "tools": ["browser", "file-write"], "sandbox": "gvisor"},
+    {"name": "technical-account-manager", "team": "customer-success", "model": f"anthropic/{MODEL}", "role": "Technical health reviews, architecture guidance and escalated account support", "autonomy": "A2", "tools": ["browser", "file-write"], "sandbox": "gvisor"},
+    {"name": "renewal-manager", "team": "customer-success", "model": f"anthropic/{HAIKU_MODEL}", "role": "Renewal forecasting, risk mitigation planning and commercial close coordination", "autonomy": "A2", "tools": ["browser", "file-write"], "sandbox": "gvisor"},
+    {"name": "community-manager", "team": "customer-success", "model": "moonshot/kimi-k2.5", "role": "User community programs, advocacy loops and feedback amplification", "autonomy": "A2", "tools": ["browser", "file-write"], "sandbox": "gvisor"},
+    # ── Partnerships ──
+    {"name": "partner-manager", "team": "partnerships", "model": f"anthropic/{MODEL}", "role": "Partner sourcing, co-sell motion design and joint business planning", "autonomy": "A2", "tools": ["browser", "file-write"], "sandbox": "gvisor"},
+    {"name": "alliances-manager", "team": "partnerships", "model": f"anthropic/{MODEL}", "role": "Strategic alliance execution, executive updates and shared roadmap alignment", "autonomy": "A2", "tools": ["browser", "file-write"], "sandbox": "gvisor"},
+    {"name": "channel-ops", "team": "partnerships", "model": "openai/gpt-5-mini", "role": "Partner onboarding, MDF tracking and referral pipeline operations", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
+    # ── People ──
+    {"name": "recruiter", "team": "people", "model": "openai/gpt-5-mini", "role": "Hiring pipeline management, scorecard synthesis and outreach", "autonomy": "A2", "tools": ["browser", "file-write"], "sandbox": "gvisor"},
+    {"name": "people-ops-manager", "team": "people", "model": "openai/gpt-5-mini", "role": "Onboarding design, policy upkeep and manager enablement", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
+    {"name": "talent-enablement-partner", "team": "people", "model": f"anthropic/{MODEL}", "role": "Career ladder stewardship, learning plans and capability mapping", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
+    {"name": "hr-business-partner", "team": "people", "model": f"anthropic/{MODEL}", "role": "Manager coaching, org health reviews and employee relations triage", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
+    {"name": "employer-brand-manager", "team": "people", "model": "moonshot/kimi-k2.5", "role": "Talent brand narrative, recruiting campaigns and candidate experience content", "autonomy": "A2", "tools": ["file-write", "browser"], "sandbox": "gvisor"},
+    # ── Finance & Legal ──
+    {"name": "finance-controller", "team": "finance", "model": "openai/gpt-5-mini", "role": "Budget governance, vendor approvals, contract controls and spend reviews", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
+    {"name": "fp-and-a-manager", "team": "finance", "model": "openai/gpt-5-mini", "role": "Revenue forecasting, operating plan analysis and scenario planning", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
+    {"name": "procurement-manager", "team": "finance", "model": "openai/gpt-5-mini", "role": "Vendor evaluation, purchase controls and renewal negotiation prep", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
+    {"name": "legal-counsel", "team": "finance", "model": f"anthropic/{MODEL}", "role": "Contract review, policy wording and commercial risk advisory", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
+    {"name": "deal-desk-manager", "team": "finance", "model": f"anthropic/{MODEL}", "role": "Quote approval, commercial packaging, renewal guardrails and escalation routing", "autonomy": "A2", "tools": ["file-write"], "sandbox": "gvisor"},
     # ── Advertising ──
-    {"name": "audit-google",     "model": f"anthropic/{MODEL}",          "role": "Google Ads audit (Search, PMax, YouTube) - 74 checks",    "autonomy": "A2", "tools": [],                              "sandbox": "gvisor"},
-    {"name": "audit-meta",       "model": f"anthropic/{MODEL}",          "role": "Meta Ads audit (FB, IG, Advantage+) - 46 checks",         "autonomy": "A2", "tools": [],                              "sandbox": "gvisor"},
-    {"name": "audit-creative",   "model": f"anthropic/{HAIKU_MODEL}",    "role": "Creative quality and fatigue assessment across platforms", "autonomy": "A2", "tools": [],                              "sandbox": "gvisor"},
-    {"name": "audit-tracking",   "model": f"anthropic/{HAIKU_MODEL}",    "role": "Conversion tracking health (Pixel, CAPI, UET)",           "autonomy": "A2", "tools": [],                              "sandbox": "gvisor"},
-    {"name": "audit-budget",     "model": f"anthropic/{HAIKU_MODEL}",    "role": "Budget allocation and bidding strategy analysis",          "autonomy": "A2", "tools": [],                              "sandbox": "gvisor"},
-    {"name": "audit-compliance", "model": f"anthropic/{HAIKU_MODEL}",    "role": "Ad compliance and privacy verification",                  "autonomy": "A2", "tools": [],                              "sandbox": "gvisor"},
+    {"name": "audit-google", "team": "advertising", "model": f"anthropic/{MODEL}", "role": "Google Ads audit (Search, PMax, YouTube) - 74 checks", "autonomy": "A2", "tools": [], "sandbox": "gvisor"},
+    {"name": "audit-meta", "team": "advertising", "model": f"anthropic/{MODEL}", "role": "Meta Ads audit (FB, IG, Advantage+) - 46 checks", "autonomy": "A2", "tools": [], "sandbox": "gvisor"},
+    {"name": "audit-creative", "team": "advertising", "model": "moonshot/kimi-k2.5", "role": "Creative quality and fatigue assessment across platforms", "autonomy": "A2", "tools": [], "sandbox": "gvisor"},
+    {"name": "audit-tracking", "team": "advertising", "model": "openai/gpt-5-mini", "role": "Conversion tracking health (Pixel, CAPI, UET)", "autonomy": "A2", "tools": [], "sandbox": "gvisor"},
+    {"name": "audit-budget", "team": "advertising", "model": "openai/gpt-5-mini", "role": "Budget allocation and bidding strategy analysis", "autonomy": "A2", "tools": [], "sandbox": "gvisor"},
+    {"name": "audit-compliance", "team": "advertising", "model": f"anthropic/{MODEL}", "role": "Ad compliance and privacy verification", "autonomy": "A2", "tools": [], "sandbox": "gvisor"},
 ]
 
 _AGENT_DEFAULT_SKILLS: dict[str, list[str]] = {
-    "planner": [],
-    "architect": ["api-designer"],
-    "frontend-coder": ["code-review"],
+    "product-manager": ["product-manager-skill", "market-researcher-skill"],
+    "scrum-master": ["scrum-master-skill", "project-manager-skill"],
+    "product-ops-manager": ["business-analyst-skill", "project-manager-skill"],
+    "business-analyst": ["business-analyst-skill", "product-manager-skill"],
+    "program-manager": ["project-manager-skill", "business-analyst-skill"],
+    "researcher": ["market-researcher-skill", "competitive-analyst-skill"],
+    "tech-writer": ["technical-writer-skill", "doc-generator"],
+    "content-writer": ["content-marketer-skill", "technical-writer-skill"],
+    "user-researcher": ["ux-researcher-skill", "market-researcher-skill"],
+    "competitor-analyst": ["competitive-analyst-skill", "market-researcher-skill"],
+    "market-analyst": ["market-researcher-skill", "data-analyst-skill"],
+    "ui-designer": ["ui-designer-skill", "frontend-design", "ux-researcher-skill", "figma-design-ops", "canva-design-ops", "stitch-design-ops", "google-stitch-browser"],
+    "design-integration-engineer": ["frontend-design", "figma-design-ops", "canva-design-ops", "stitch-design-ops", "google-stitch-browser", "technical-writer-skill"],
+    "ux-analyst": ["ux-researcher-skill", "ui-designer-skill"],
+    "design-reviewer": ["ui-designer-skill", "frontend-design"],
+    "brand-designer": ["ui-designer-skill", "frontend-design", "canva-design-ops", "stitch-design-ops", "content-marketer-skill"],
+    "motion-designer": ["ui-designer-skill", "content-marketer-skill"],
+    "planner": ["business-analyst-skill", "project-manager-skill"],
+    "architect": ["solution-architect-skill", "api-designer"],
+    "frontend-coder": ["code-review", "ui-designer-skill", "frontend-design"],
     "backend-coder": ["code-review", "api-designer"],
-    "fullstack-builder": ["code-review", "api-designer"],
-    "reviewer": ["code-review", "security-scan"],
-    AUTONOMOUS_REVIEWER_NAME: ["code-review", "security-scan"],
-    "tester": ["test-generator"],
-    "devops-engineer": ["deployment-helper"],
-    "ui-designer": [],
-    "ux-analyst": [],
-    "design-reviewer": [],
-    "researcher": [],
-    "tech-writer": ["doc-generator"],
-    "content-writer": ["doc-generator"],
-    "data-analyst": ["performance-profiler"],
-    "ml-engineer": [],
-    "data-engineer": [],
-    "security-auditor": ["security-scan"],
-    "security-reviewer": ["security-scan"],
-    "product-manager": [],
-    "scrum-master": [],
-    "sre-engineer": ["performance-profiler", "deployment-helper"],
-    "infra-ops": ["deployment-helper"],
-    "qa-lead": ["test-generator"],
-    "perf-engineer": ["performance-profiler"],
+    "fullstack-builder": ["code-review", "api-designer", "solution-architect-skill"],
+    "reviewer": ["code-review", "security-scan", "qa-expert-skill"],
+    AUTONOMOUS_REVIEWER_NAME: ["code-review", "security-scan", "qa-expert-skill"],
+    "tester": ["test-generator", "qa-expert-skill"],
+    "mobile-engineer": ["code-review", "ui-designer-skill", "frontend-design"],
+    "api-engineer": ["code-review", "api-designer", "technical-writer-skill"],
+    "integration-engineer": ["google-workspace-cli", "figma-design-ops", "canva-design-ops", "stitch-design-ops", "code-review", "api-designer", "solution-architect-skill"],
+    "automation-engineer": ["google-workspace-cli", "canva-design-ops", "stitch-design-ops", "google-stitch-browser", "kling-ai-browser", "code-review", "test-generator"],
+    "workspace-automation-engineer": ["google-workspace-cli", "technical-writer-skill"],
+    "staff-engineer": ["solution-architect-skill", "code-review", "refactor-advisor"],
+    "cms-engineer": ["code-review", "technical-writer-skill"],
+    "sdk-engineer": ["code-review", "api-designer", "technical-writer-skill"],
+    "devops-engineer": ["devops-engineer-skill", "deployment-helper"],
+    "infra-ops": ["platform-engineer-skill", "deployment-helper"],
+    "platform-engineer": ["platform-engineer-skill", "devops-engineer-skill"],
+    "dbre": ["platform-engineer-skill", "performance-profiler"],
+    "observability-engineer": ["performance-engineer-skill", "performance-profiler"],
+    "cloud-architect": ["solution-architect-skill", "platform-engineer-skill"],
+    "network-engineer": ["network-engineer-skill", "deployment-helper"],
+    "endpoint-engineer": ["platform-engineer-skill", "security-engineer-skill"],
+    "platform-analyst": ["data-analyst-skill", "performance-profiler"],
+    "data-analyst": ["data-analyst-skill", "performance-profiler"],
+    "ml-engineer": ["machine-learning-engineer-skill", "data-scientist-skill"],
+    "data-engineer": ["data-engineer-skill", "performance-profiler"],
+    "analytics-engineer": ["data-analyst-skill", "performance-profiler"],
+    "experimentation-lead": ["data-analyst-skill", "performance-profiler"],
+    "data-scientist": ["data-scientist-skill", "data-analyst-skill"],
+    "insight-analyst": ["data-analyst-skill", "market-researcher-skill"],
+    "mlops-engineer": ["mlops-engineer-skill", "deployment-helper", "performance-profiler"],
+    "security-auditor": ["security-scan", "security-engineer-skill", "compliance-auditor-skill"],
+    "security-reviewer": ["security-scan", "security-engineer-skill"],
+    "compliance-manager": ["japan-finance-ops", "compliance-auditor-skill", "vendor-procurement-review"],
+    "iam-engineer": ["security-engineer-skill", "security-scan"],
+    "security-ops-analyst": ["incident-responder-skill", "security-scan"],
+    "privacy-engineer": ["legal-advisor-skill", "compliance-auditor-skill", "vendor-procurement-review"],
+    "sre-engineer": ["incident-responder-skill", "performance-profiler", "deployment-helper"],
+    "qa-lead": ["qa-expert-skill", "test-generator"],
+    "perf-engineer": ["performance-engineer-skill", "performance-profiler"],
+    "release-manager": ["project-manager-skill", "deployment-helper", "qa-expert-skill"],
+    "incident-commander": ["incident-responder-skill", "project-manager-skill"],
+    "support-ops": ["customer-onboarding-playbooks", "technical-writer-skill"],
+    "knowledge-manager": ["technical-writer-skill", "customer-onboarding-playbooks"],
+    "service-delivery-manager": ["customer-onboarding-playbooks", "project-manager-skill"],
+    "brand-marketer": ["content-marketer-skill", "frontend-design", "canva-design-ops", "stitch-design-ops", "google-stitch-browser", "kling-ai-browser"],
+    "content-marketer": ["content-marketer-skill", "seo-specialist-skill", "frontend-design", "canva-design-ops", "stitch-design-ops", "google-stitch-browser"],
+    "seo-strategist": ["seo-specialist-skill", "content-marketer-skill"],
+    "lifecycle-marketer": ["content-marketer-skill", "customer-success-manager-skill"],
+    "product-marketer": ["product-manager-skill", "content-marketer-skill", "competitive-analyst-skill"],
+    "marketing-ops": ["revops-forecasting", "gtm-reporting-analytics", "data-analyst-skill"],
+    "campaign-manager": ["lifecycle-campaign-ops", "content-marketer-skill", "gtm-reporting-analytics"],
+    "pr-manager": ["content-marketer-skill", "competitive-analyst-skill"],
+    "event-marketer": ["webinar-field-marketing", "content-marketer-skill", "project-manager-skill"],
+    "field-marketer": ["webinar-field-marketing", "content-marketer-skill", "project-manager-skill"],
+    "creative-automation-producer": ["canva-design-ops", "stitch-design-ops", "google-stitch-browser", "kling-ai-browser", "content-marketer-skill"],
+    "account-executive": ["business-analyst-skill", "revops-forecasting", "deal-desk-commercial-review"],
+    "sales-ops": ["crm-lead-ops", "revops-forecasting", "business-analyst-skill"],
+    "revops-manager": ["revops-forecasting", "data-analyst-skill", "business-analyst-skill"],
+    "crm-ops-manager": ["crm-lead-ops", "revops-forecasting", "business-analyst-skill"],
+    "solutions-consultant": ["sales-engineer-skill", "solution-architect-skill"],
+    "outbound-sdr": ["crm-lead-ops", "content-marketer-skill", "revops-forecasting"],
+    "sales-enablement-manager": ["sales-engineer-skill", "content-marketer-skill"],
+    "account-manager": ["customer-success-manager-skill", "revops-forecasting"],
+    "customer-success-manager": ["customer-success-manager-skill", "customer-onboarding-playbooks"],
+    "onboarding-specialist": ["customer-onboarding-playbooks", "customer-success-manager-skill"],
+    "technical-account-manager": ["sales-engineer-skill", "customer-success-manager-skill", "customer-onboarding-playbooks"],
+    "renewal-manager": ["customer-success-manager-skill", "revops-forecasting"],
+    "community-manager": ["content-marketer-skill", "customer-success-manager-skill"],
+    "partner-manager": ["partner-program-ops", "sales-engineer-skill"],
+    "alliances-manager": ["partner-program-ops", "project-manager-skill"],
+    "channel-ops": ["partner-program-ops", "revops-forecasting"],
+    "recruiter": ["people-ops-hiring"],
+    "people-ops-manager": ["people-ops-hiring", "project-manager-skill"],
+    "talent-enablement-partner": ["people-ops-hiring", "customer-onboarding-playbooks"],
+    "hr-business-partner": ["people-ops-hiring", "project-manager-skill"],
+    "employer-brand-manager": ["people-ops-hiring", "content-marketer-skill"],
+    "finance-controller": ["japan-finance-ops", "vendor-procurement-review", "business-analyst-skill"],
+    "fp-and-a-manager": ["japan-finance-ops", "revops-forecasting", "data-analyst-skill"],
+    "procurement-manager": ["japan-finance-ops", "vendor-procurement-review", "legal-advisor-skill"],
+    "legal-counsel": ["japan-finance-ops", "legal-advisor-skill", "vendor-procurement-review", "compliance-auditor-skill"],
+    "deal-desk-manager": ["deal-desk-commercial-review", "vendor-procurement-review", "legal-advisor-skill"],
+    "audit-google": ["paid-media-audit", "data-analyst-skill"],
+    "audit-meta": ["paid-media-audit", "data-analyst-skill"],
+    "audit-creative": ["paid-media-audit", "content-marketer-skill"],
+    "audit-tracking": ["paid-media-audit", "data-analyst-skill"],
+    "audit-budget": ["paid-media-audit", "revops-forecasting"],
+    "audit-compliance": ["paid-media-audit", "compliance-auditor-skill", "legal-advisor-skill"],
+}
+
+_SEEDED_AGENT_TEAMS = {
+    str(agent["name"]): str(agent["team"])
+    for agent in _agents_to_register
+    if agent.get("team")
 }
 
 def _agent_team(name: str) -> str:
+    explicit_team = _SEEDED_AGENT_TEAMS.get(name)
+    if explicit_team:
+        return explicit_team
     n = name.lower()
-    if any(k in n for k in ["audit-google","audit-meta","audit-creative","audit-tracking","audit-budget","audit-compliance"]): return "advertising"
-    if any(k in n for k in ["planner","architect","frontend","backend","fullstack","builder","reviewer","tester","devops","qa","perf"]): return "development"
-    if any(k in n for k in ["ui-design","ux","design"]): return "design"
-    if any(k in n for k in ["researcher","research","tech-writer","content-writer"]): return "research"
-    if any(k in n for k in ["data","ml"]): return "data"
-    if "security" in n: return "security"
+    if any(k in n for k in ["audit-google", "audit-meta", "audit-creative", "audit-tracking", "audit-budget", "audit-compliance"]): return "advertising"
+    if any(k in n for k in ["brand-marketer", "content-marketer", "seo", "lifecycle-marketer", "product-marketer", "marketing-ops", "pr-manager", "event-marketer"]): return "marketing"
+    if any(k in n for k in ["account-executive", "sales-ops", "revops", "solutions-consultant", "outbound-sdr", "sales-enablement", "account-manager"]): return "sales"
+    if any(k in n for k in ["customer-success", "onboarding", "technical-account-manager", "renewal-manager", "community-manager"]): return "customer-success"
+    if any(k in n for k in ["partner-manager", "alliances-manager", "channel-ops"]): return "partnerships"
+    if any(k in n for k in ["recruit", "people-ops", "talent-enablement"]): return "people"
+    if any(k in n for k in ["hr-business-partner", "employer-brand-manager"]): return "people"
+    if any(k in n for k in ["finance", "legal", "fp-and-a", "procurement"]): return "finance"
+    if any(k in n for k in ["release", "incident", "support-ops", "sre"]): return "operations"
+    if any(k in n for k in ["knowledge-manager", "service-delivery-manager", "qa-lead", "perf"]): return "operations"
+    if any(k in n for k in ["platform", "infra", "devops", "dbre", "observability", "cloud-architect", "network-engineer", "endpoint-engineer"]): return "platform"
+    if any(k in n for k in ["planner", "architect", "frontend", "backend", "fullstack", "builder", "reviewer", "tester", "mobile", "api-engineer", "integration-engineer", "automation-engineer", "staff-engineer", "cms-engineer", "sdk-engineer"]): return "development"
+    if any(k in n for k in ["ui-design", "ux", "design"]): return "design"
+    if any(k in n for k in ["researcher", "research", "tech-writer", "content-writer", "competitor-analyst", "market-analyst"]): return "research"
+    if any(k in n for k in ["data", "ml", "analytics", "experimentation", "insight"]) : return "data"
+    if "security" in n or "compliance" in n: return "security"
     return "product"
 
 seed_summary = reconcile_seeded_agents(
@@ -913,12 +1100,7 @@ def autonomous_plan_handler(node_id: str, state: dict) -> dict:
 
     _track_task(task_id=f"wf_{node_id}", title="自律計画", description="マイルストーン対応の実装計画策定", status="in_progress", assignee="architect", priority="high", phase="autonomous-build", node_id=node_id)
     print(f"[auto-plan] Iteration {iteration}, planning {len(selected_features)} features, {len(milestones)} milestones...")
-    response = client_anthropic.messages.create(
-        model=MODEL, max_tokens=4096,
-        messages=[{"role": "user", "content": "\n\n".join(context_parts)}],
-    )
-    plan_text = response.content[0].text
-    usage = response.usage
+    plan_text, tin, tout = _agent_call_llm("architect", MODEL, "\n\n".join(context_parts))
     try:
         text = plan_text
         if "```json" in text:
@@ -929,12 +1111,12 @@ def autonomous_plan_handler(node_id: str, state: dict) -> dict:
     except Exception:
         build_plan = {"raw_plan": plan_text}
 
-    print(f"[auto-plan] Done. Tokens: {usage.input_tokens}in/{usage.output_tokens}out")
+    print(f"[auto-plan] Done. Tokens: {tin}in/{tout}out")
     _track_task(task_id=f"wf_{node_id}", title="自律計画", description="", status="done", assignee="architect")
     return {
         "build_plan": build_plan,
-        "plan_tokens_in": usage.input_tokens,
-        "plan_tokens_out": usage.output_tokens,
+        "plan_tokens_in": tin,
+        "plan_tokens_out": tout,
         "_build_iteration": iteration,
     }
 
@@ -971,12 +1153,7 @@ def autonomous_build_handler(node_id: str, state: dict) -> dict:
 
     _track_task(task_id=f"wf_{node_id}", title="自律ビルド", description="マイルストーン実装のコード生成", status="in_progress", assignee="fullstack-builder", priority="high", phase="autonomous-build", node_id=node_id)
     print(f"[auto-build] Iteration {iteration}, building...")
-    response = client_anthropic.messages.create(
-        model=MODEL, max_tokens=8192,
-        messages=[{"role": "user", "content": "\n\n".join(prompt_parts)}],
-    )
-    code = response.content[0].text
-    usage = response.usage
+    code, tin, tout = _agent_call_llm("builder", MODEL, "\n\n".join(prompt_parts), max_tokens=8192)
     if "```html" in code:
         code = code.split("```html", 1)[1].rsplit("```", 1)[0]
     elif "```" in code:
@@ -991,8 +1168,8 @@ def autonomous_build_handler(node_id: str, state: dict) -> dict:
     _track_task(task_id=f"wf_{node_id}", title="自律ビルド", description="", status="review", assignee="fullstack-builder")
     return {
         "code": code,
-        "build_tokens_in": usage.input_tokens,
-        "build_tokens_out": usage.output_tokens,
+        "build_tokens_in": tin,
+        "build_tokens_out": tout,
         "generated_file": str(output_path),
     }
 
@@ -1006,29 +1183,26 @@ def autonomous_review_handler(node_id: str, state: dict) -> dict:
 
     _track_task(task_id=f"wf_{node_id}", title="自律レビュー", description="マイルストーン達成度とコード品質の評価", status="in_progress", assignee=AUTONOMOUS_REVIEWER_NAME, priority="high", phase="autonomous-build", node_id=node_id)
     print(f"[auto-review] Iteration {iteration}, reviewing against {len(milestones)} milestones...")
-    response = client_anthropic.messages.create(
-        model=MODEL, max_tokens=4096,
-        messages=[{
-            "role": "user",
-            "content": (
-                "You are a senior code reviewer and QA engineer. Review this HTML application "
-                "against the milestones and features.\n\n"
-                "For each milestone, evaluate if it is SATISFIED or NOT_SATISFIED.\n"
-                "Output JSON with keys:\n"
-                "- milestone_results: [{id, name, status:'satisfied'|'not_satisfied', reason}]\n"
-                "- all_milestones_met: boolean\n"
-                "- quality_score: 0.0-1.0 (overall quality)\n"
-                "- feedback: string (specific improvements needed if not all met)\n"
-                "- feature_coverage: [{feature, implemented: boolean}]\n\n"
-                "Output ONLY valid JSON.\n\n"
-                f"Milestones:\n{_json.dumps(milestones, ensure_ascii=False)}\n\n"
-                f"Selected Features:\n{_json.dumps(selected_features, ensure_ascii=False)}\n\n"
-                f"Code ({len(code)} chars):\n{code[:6000]}"
-            ),
-        }],
+    review_text, tin, tout = _agent_call_llm(
+        AUTONOMOUS_REVIEWER_NAME,
+        MODEL,
+        (
+            "You are a senior code reviewer and QA engineer. Review this HTML application "
+            "against the milestones and features.\n\n"
+            "For each milestone, evaluate if it is SATISFIED or NOT_SATISFIED.\n"
+            "Output JSON with keys:\n"
+            "- milestone_results: [{id, name, status:'satisfied'|'not_satisfied', reason}]\n"
+            "- all_milestones_met: boolean\n"
+            "- quality_score: 0.0-1.0 (overall quality)\n"
+            "- feedback: string (specific improvements needed if not all met)\n"
+            "- feature_coverage: [{feature, implemented: boolean}]\n\n"
+            "Output ONLY valid JSON.\n\n"
+            f"Milestones:\n{_json.dumps(milestones, ensure_ascii=False)}\n\n"
+            f"Selected Features:\n{_json.dumps(selected_features, ensure_ascii=False)}\n\n"
+            f"Code ({len(code)} chars):\n{code[:6000]}"
+        ),
+        max_tokens=4096,
     )
-    review_text = response.content[0].text
-    usage = response.usage
     try:
         text = review_text
         if "```json" in text:
@@ -1048,13 +1222,13 @@ def autonomous_review_handler(node_id: str, state: dict) -> dict:
         state.get("analysis_tokens_in", 0)
         + state.get("plan_tokens_in", 0)
         + state.get("build_tokens_in", 0)
-        + usage.input_tokens
+        + tin
     )
     total_out = (
         state.get("analysis_tokens_out", 0)
         + state.get("plan_tokens_out", 0)
         + state.get("build_tokens_out", 0)
-        + usage.output_tokens
+        + tout
     )
     cost = (total_in * 3 / 1_000_000) + (total_out * 15 / 1_000_000)
 
@@ -1066,8 +1240,8 @@ def autonomous_review_handler(node_id: str, state: dict) -> dict:
         "all_milestones_met": all_met,
         "quality_score": quality,
         "_build_iteration": iteration + 1,
-        "review_tokens_in": usage.input_tokens,
-        "review_tokens_out": usage.output_tokens,
+        "review_tokens_in": tin,
+        "review_tokens_out": tout,
         "estimated_cost_usd": cost,
     }
 
@@ -1367,13 +1541,43 @@ def _call_llm(model: str, prompt: str, max_tokens: int = 4096, *, provider: str 
     raise RuntimeError(f"All providers failed. Last error: {last_error}")
 
 
+_AGENT_RUNTIME_ALIASES = {
+    "builder": "fullstack-builder",
+    "backend-builder": "backend-coder",
+    "integrator": "integration-engineer",
+}
+
+
+def _canonical_agent_name(agent_name: str) -> str:
+    return _AGENT_RUNTIME_ALIASES.get(agent_name, agent_name)
+
+
+def _get_agent_record(agent_name: str) -> dict | None:
+    canonical_name = _canonical_agent_name(agent_name)
+    for agent in route_store.agents.values():
+        if agent.get("name") == canonical_name:
+            return agent
+    return None
+
+
+def _resolve_agent_llm_target(agent_name: str, default_model: str, default_provider: str) -> tuple[str, str]:
+    agent = _get_agent_record(agent_name)
+    if not agent:
+        return default_model, default_provider
+
+    model_ref = str(agent.get("model", default_model))
+    if "/" not in model_ref:
+        return model_ref, default_provider
+
+    provider_name, model_name = model_ref.split("/", 1)
+    if provider_name not in DEFAULT_MODELS:
+        return model_name, default_provider
+    return model_name, provider_name
+
+
 def _build_skill_augmented_prompt(agent_name: str, base_prompt: str) -> str:
     """Prepend relevant skill instructions to the agent's prompt based on assigned skills."""
-    agent = None
-    for a in route_store.agents.values():
-        if a["name"] == agent_name:
-            agent = a
-            break
+    agent = _get_agent_record(agent_name)
     if not agent or not agent.get("skills"):
         return base_prompt
 
@@ -1404,7 +1608,8 @@ def _agent_call_llm(
 ) -> tuple[str, int, int]:
     """Call LLM with skill-augmented prompt based on agent's assigned skills."""
     augmented = _build_skill_augmented_prompt(agent_name, prompt)
-    return _call_llm(model, augmented, max_tokens, provider=provider, fallback=fallback)
+    use_model, use_provider = _resolve_agent_llm_target(agent_name, model, provider)
+    return _call_llm(use_model, augmented, max_tokens, provider=use_provider, fallback=fallback)
 
 
 # ── Research Phase Handlers ──
@@ -2842,12 +3047,20 @@ print("API: /api/v1/agents/{agent_id}/skills registered (2 endpoints)")
 # -- Teams CRUD --
 
 _teams: dict[str, dict] = {
-    "development": {"id": "development", "name": "Engineering", "nameJa": "エンジニアリング", "icon": "Code2", "color": "text-blue-400", "bg": "bg-blue-600"},
-    "design": {"id": "design", "name": "Design", "nameJa": "デザイン", "icon": "Palette", "color": "text-purple-400", "bg": "bg-pink-600"},
-    "research": {"id": "research", "name": "Research & Writing", "nameJa": "リサーチ & ライティング", "icon": "PenTool", "color": "text-emerald-400", "bg": "bg-violet-600"},
-    "data": {"id": "data", "name": "Data & AI", "nameJa": "データ & AI", "icon": "Zap", "color": "text-cyan-400", "bg": "bg-cyan-600"},
-    "security": {"id": "security", "name": "Security", "nameJa": "セキュリティ", "icon": "Shield", "color": "text-red-400", "bg": "bg-red-600"},
-    "product": {"id": "product", "name": "Product & Ops", "nameJa": "プロダクト & 運用", "icon": "Network", "color": "text-orange-400", "bg": "bg-orange-600"},
+    "product": {"id": "product", "name": "Product Strategy", "nameJa": "プロダクト戦略", "icon": "Network", "color": "text-orange-400", "bg": "bg-orange-600"},
+    "research": {"id": "research", "name": "Research Intelligence", "nameJa": "リサーチ", "icon": "PenTool", "color": "text-emerald-400", "bg": "bg-emerald-600"},
+    "design": {"id": "design", "name": "UX & Design Systems", "nameJa": "UX / デザインシステム", "icon": "Palette", "color": "text-purple-400", "bg": "bg-pink-600"},
+    "development": {"id": "development", "name": "Application Engineering", "nameJa": "アプリケーション開発", "icon": "Code2", "color": "text-blue-400", "bg": "bg-blue-600"},
+    "platform": {"id": "platform", "name": "Platform & Infra", "nameJa": "プラットフォーム / 基盤", "icon": "Monitor", "color": "text-sky-400", "bg": "bg-sky-600"},
+    "data": {"id": "data", "name": "Data & Evaluation", "nameJa": "データ / 評価", "icon": "Zap", "color": "text-cyan-400", "bg": "bg-cyan-600"},
+    "security": {"id": "security", "name": "Security & Governance", "nameJa": "セキュリティ / ガバナンス", "icon": "Shield", "color": "text-red-400", "bg": "bg-red-600"},
+    "operations": {"id": "operations", "name": "Operations & Release", "nameJa": "運用 / リリース", "icon": "Bot", "color": "text-amber-400", "bg": "bg-amber-600"},
+    "marketing": {"id": "marketing", "name": "Marketing", "nameJa": "マーケティング", "icon": "TrendingUp", "color": "text-fuchsia-300", "bg": "bg-fuchsia-700"},
+    "sales": {"id": "sales", "name": "Sales", "nameJa": "セールス", "icon": "Target", "color": "text-lime-400", "bg": "bg-lime-600"},
+    "customer-success": {"id": "customer-success", "name": "Customer Success", "nameJa": "カスタマーサクセス", "icon": "Users", "color": "text-teal-300", "bg": "bg-teal-700"},
+    "partnerships": {"id": "partnerships", "name": "Partnerships", "nameJa": "パートナーシップ", "icon": "Handshake", "color": "text-indigo-300", "bg": "bg-indigo-700"},
+    "people": {"id": "people", "name": "People & Talent", "nameJa": "人事 / タレント", "icon": "BriefcaseBusiness", "color": "text-rose-400", "bg": "bg-rose-600"},
+    "finance": {"id": "finance", "name": "Finance & Legal", "nameJa": "財務 / 法務", "icon": "Landmark", "color": "text-yellow-300", "bg": "bg-yellow-700"},
     "advertising": {"id": "advertising", "name": "Advertising", "nameJa": "広告運用", "icon": "Megaphone", "color": "text-amber-400", "bg": "bg-amber-600"},
 }
 
@@ -3033,6 +3246,292 @@ http_server.api_server.add_route("PUT", "/api/v1/content/{content_id}", _update_
 http_server.api_server.add_route("PATCH", "/api/v1/content/{content_id}", _update_content)
 http_server.api_server.add_route("DELETE", "/api/v1/content/{content_id}", _delete_content)
 print("API: /api/v1/content CRUD registered")
+
+# -- GTM Control Tower -------------------------------------------------------
+
+_GTM_TEAM_LABELS = {
+    "marketing": "Marketing",
+    "sales": "Sales",
+    "customer-success": "Customer Success",
+    "partnerships": "Partnerships",
+    "advertising": "Advertising",
+    "finance": "Finance & Legal",
+}
+_GTM_TEAM_ORDER = ("marketing", "sales", "customer-success", "partnerships", "advertising", "finance")
+_GTM_CAPABILITY_DEFS = (
+    {
+        "id": "crm-lead-ops",
+        "label": "CRM Lead Ops",
+        "summary": "Lead hygiene, enrichment, routing, and follow-up readiness.",
+        "skill_ids": ("crm-lead-ops", "revops-forecasting"),
+    },
+    {
+        "id": "campaign-lifecycle",
+        "label": "Campaign Lifecycle",
+        "summary": "Campaign sequencing, nurture design, content staging, and launch readiness.",
+        "skill_ids": ("lifecycle-campaign-ops", "content-marketer-skill"),
+    },
+    {
+        "id": "webinar-field-marketing",
+        "label": "Webinar & Field Marketing",
+        "summary": "Event planning, attendance follow-up, and field execution checklists.",
+        "skill_ids": ("webinar-field-marketing",),
+    },
+    {
+        "id": "paid-media",
+        "label": "Paid Media Operations",
+        "summary": "Audit, measurement, creative, and budget discipline for paid acquisition.",
+        "skill_ids": ("paid-media-audit",),
+    },
+    {
+        "id": "onboarding-renewal",
+        "label": "Onboarding & Renewal",
+        "summary": "Kickoff, activation, QBR, health tracking, and renewal preparation.",
+        "skill_ids": ("customer-onboarding-playbooks", "customer-success-manager-skill"),
+    },
+    {
+        "id": "partner-ops",
+        "label": "Partner Operations",
+        "summary": "Partner tiering, referral operations, and joint business planning.",
+        "skill_ids": ("partner-program-ops",),
+    },
+    {
+        "id": "deal-desk",
+        "label": "Deal Desk & Commercial Review",
+        "summary": "Quote packaging, approval gates, and commercial risk checks.",
+        "skill_ids": ("deal-desk-commercial-review", "vendor-procurement-review"),
+    },
+    {
+        "id": "gtm-analytics",
+        "label": "GTM Reporting & Analytics",
+        "summary": "Executive KPI rollups, channel analysis, and action-oriented reporting.",
+        "skill_ids": ("gtm-reporting-analytics", "data-analyst-skill"),
+    },
+)
+
+def _resolve_gtm_team(actor: str, by_id: dict[str, str], by_name: dict[str, str]) -> str:
+    trimmed = str(actor or "").strip()
+    if not trimmed:
+        return ""
+    return by_id.get(trimmed, by_name.get(trimmed, ""))
+
+def _gtm_status(agent_count: int, skill_count: int) -> str:
+    if agent_count >= 3 and skill_count >= 3:
+        return "strong"
+    if agent_count >= 1:
+        return "watch"
+    return "thin"
+
+def _get_gtm_overview(request: Request) -> Response:
+    now = _datetime.datetime.now(_datetime.timezone.utc)
+    upcoming_cutoff = now + _datetime.timedelta(days=14)
+
+    agents = [
+        dict(agent)
+        for agent in route_store.agents.values()
+        if str(agent.get("team", "")) in _GTM_TEAM_ORDER
+    ]
+    tasks = list(_tasks_store.values())
+    events = list(_scheduled_events.values())
+    content_items = [item for item in _content_items.values() if str(item.get("stage", "")) != "published"]
+    recent_ads_reports = []
+    for report in _ads_reports.values():
+        created_at = str(report.get("created_at", "")).strip()
+        if not created_at:
+            continue
+        try:
+            parsed = _datetime.datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed >= (now - _datetime.timedelta(days=30)):
+            recent_ads_reports.append(report)
+
+    available_skill_ids = set(_skill_registry)
+    team_skill_ids: dict[str, set[str]] = {team_id: set() for team_id in _GTM_TEAM_ORDER}
+    by_id: dict[str, str] = {}
+    by_name: dict[str, str] = {}
+    for agent in agents:
+        team_id = str(agent.get("team", ""))
+        agent_id = str(agent.get("id", "")).strip()
+        agent_name = str(agent.get("name", "")).strip()
+        if agent_id:
+            by_id[agent_id] = team_id
+        if agent_name:
+            by_name[agent_name] = team_id
+        for skill_id in agent.get("skills", []) if isinstance(agent.get("skills"), list) else []:
+            if isinstance(skill_id, str) and skill_id.strip():
+                team_skill_ids.setdefault(team_id, set()).add(skill_id.strip())
+
+    upcoming_events = []
+    for event in events:
+        start = str(event.get("start", "")).strip()
+        if not start:
+            continue
+        try:
+            parsed = _datetime.datetime.fromisoformat(start.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if now <= parsed <= upcoming_cutoff:
+            upcoming_events.append(event)
+
+    teams = []
+    for team_id in _GTM_TEAM_ORDER:
+        team_agents = [agent for agent in agents if str(agent.get("team", "")) == team_id]
+        open_tasks = sum(1 for task in tasks if _resolve_gtm_team(task.get("assignee", ""), by_id, by_name) == team_id and str(task.get("status", "")) != "done")
+        team_events = sum(1 for event in upcoming_events if _resolve_gtm_team(event.get("agentId", ""), by_id, by_name) == team_id)
+        team_content = sum(1 for item in content_items if _resolve_gtm_team(item.get("assignee", ""), by_id, by_name) == team_id)
+        teams.append({
+            "id": team_id,
+            "label": _GTM_TEAM_LABELS[team_id],
+            "agent_count": len(team_agents),
+            "open_tasks": open_tasks,
+            "upcoming_events": team_events,
+            "active_content": team_content,
+            "status": _gtm_status(len(team_agents), len(team_skill_ids.get(team_id, set()))),
+            "core_skills": sorted(team_skill_ids.get(team_id, set())),
+        })
+
+    motions = [
+        {
+            "id": "lead-engine",
+            "label": "Lead Engine",
+            "owner_team": "Sales",
+            "status": "strong" if {"crm-lead-ops", "revops-forecasting"} & available_skill_ids else "watch",
+            "summary": "Lead routing, CRM hygiene, and meeting generation coverage.",
+            "signals": [
+                {"label": "sales agents", "value": str(sum(1 for agent in agents if str(agent.get("team", "")) == "sales"))},
+                {"label": "open sales tasks", "value": str(sum(1 for task in tasks if _resolve_gtm_team(task.get("assignee", ""), by_id, by_name) == "sales" and str(task.get("status", "")) != "done"))},
+                {"label": "crm skills", "value": str(sum(1 for skill_id in ("crm-lead-ops", "revops-forecasting") if skill_id in available_skill_ids))},
+            ],
+        },
+        {
+            "id": "campaign-engine",
+            "label": "Campaign Engine",
+            "owner_team": "Marketing",
+            "status": "strong" if {"lifecycle-campaign-ops", "gtm-reporting-analytics"} & available_skill_ids else "watch",
+            "summary": "Campaign sequencing, content throughput, and reporting loop readiness.",
+            "signals": [
+                {"label": "marketing agents", "value": str(sum(1 for agent in agents if str(agent.get("team", "")) == "marketing"))},
+                {"label": "active content", "value": str(sum(1 for item in content_items if _resolve_gtm_team(item.get("assignee", ""), by_id, by_name) == "marketing"))},
+                {"label": "upcoming marketing events", "value": str(sum(1 for event in upcoming_events if _resolve_gtm_team(event.get("agentId", ""), by_id, by_name) == "marketing"))},
+            ],
+        },
+        {
+            "id": "customer-loop",
+            "label": "Customer Expansion Loop",
+            "owner_team": "Customer Success",
+            "status": "strong" if "customer-onboarding-playbooks" in available_skill_ids else "watch",
+            "summary": "Onboarding, adoption, renewal, and expansion orchestration.",
+            "signals": [
+                {"label": "cs agents", "value": str(sum(1 for agent in agents if str(agent.get("team", "")) == "customer-success"))},
+                {"label": "open cs tasks", "value": str(sum(1 for task in tasks if _resolve_gtm_team(task.get("assignee", ""), by_id, by_name) == "customer-success" and str(task.get("status", "")) != "done"))},
+                {"label": "renewal skills", "value": str(sum(1 for skill_id in ("customer-onboarding-playbooks", "customer-success-manager-skill") if skill_id in available_skill_ids))},
+            ],
+        },
+        {
+            "id": "paid-media-loop",
+            "label": "Paid Media Loop",
+            "owner_team": "Advertising",
+            "status": "strong" if "paid-media-audit" in available_skill_ids and recent_ads_reports else "watch",
+            "summary": "Audit, creative review, tracking QA, and budget discipline.",
+            "signals": [
+                {"label": "ads agents", "value": str(sum(1 for agent in agents if str(agent.get("team", "")) == "advertising"))},
+                {"label": "recent ads reports", "value": str(len(recent_ads_reports))},
+                {"label": "ads skill", "value": "1" if "paid-media-audit" in available_skill_ids else "0"},
+            ],
+        },
+    ]
+
+    capabilities = []
+    covered = 0.0
+    for capability in _GTM_CAPABILITY_DEFS:
+        present = [skill_id for skill_id in capability["skill_ids"] if skill_id in available_skill_ids]
+        if len(present) == len(capability["skill_ids"]):
+            status = "covered"
+            covered += 1.0
+        elif present:
+            status = "partial"
+            covered += 0.5
+        else:
+            status = "missing"
+        capabilities.append({
+            "id": capability["id"],
+            "label": capability["label"],
+            "status": status,
+            "summary": capability["summary"],
+            "skill_ids": list(capability["skill_ids"]),
+        })
+
+    recommendations = []
+    if not recent_ads_reports:
+        recommendations.append({
+            "title": "Restart the paid media inspection cadence",
+            "priority": "high",
+            "owner_team": "advertising",
+            "rationale": "No ads report exists in the last 30 days, so performance drift may be invisible.",
+            "action": "Run fresh Google and Meta audits, then create remediation tasks from the findings.",
+        })
+    if not any(item.get("stage") in {"draft", "review", "ready"} for item in content_items):
+        recommendations.append({
+            "title": "Rebuild the campaign content queue",
+            "priority": "high",
+            "owner_team": "marketing",
+            "rationale": "The content pipeline has no near-launch work staged for delivery.",
+            "action": "Create one research item, one draft, and one ready-to-launch asset tied to the next GTM motion.",
+        })
+    if not any(_resolve_gtm_team(event.get("agentId", ""), by_id, by_name) in {"sales", "marketing", "customer-success"} for event in upcoming_events):
+        recommendations.append({
+            "title": "Restore GTM operating cadence",
+            "priority": "medium",
+            "owner_team": "sales",
+            "rationale": "There are no upcoming pipeline, campaign, or customer events in the next two weeks.",
+            "action": "Schedule a forecast review, a campaign checkpoint, and a customer health review within 14 days.",
+        })
+    if "crm-lead-ops" not in available_skill_ids:
+        recommendations.append({
+            "title": "Add a dedicated CRM lead ops playbook",
+            "priority": "high",
+            "owner_team": "sales",
+            "rationale": "Lead hygiene and speed-to-lead are still under-specified without a local CRM operations skill.",
+            "action": "Install or author the CRM lead ops skill and assign it to sales ops, outbound SDR, and marketing ops roles.",
+        })
+    if "gtm-reporting-analytics" not in available_skill_ids:
+        recommendations.append({
+            "title": "Strengthen GTM reporting coverage",
+            "priority": "medium",
+            "owner_team": "marketing",
+            "rationale": "Executive KPI and channel-level analysis still rely on generic analytics skills.",
+            "action": "Add the GTM reporting skill to marketing ops and revops roles, then use it for the weekly business review.",
+        })
+    if not recommendations:
+        recommendations.append({
+            "title": "Keep the GTM loop tight",
+            "priority": "low",
+            "owner_team": "marketing",
+            "rationale": "The current environment has coverage across the main GTM operating lanes.",
+            "action": "Use this overview weekly to convert stale signals into tasks, content, and scheduled reviews.",
+        })
+
+    coverage_score = round(covered / len(_GTM_CAPABILITY_DEFS), 2) if _GTM_CAPABILITY_DEFS else 0.0
+    return Response(body={
+        "generated_at": now.isoformat(),
+        "summary": {
+            "total_gtm_agents": len(agents),
+            "open_tasks": sum(1 for task in tasks if str(task.get("status", "")) != "done"),
+            "upcoming_events": len(upcoming_events),
+            "active_content_items": len(content_items),
+            "recent_ads_reports": len(recent_ads_reports),
+            "coverage_score": coverage_score,
+        },
+        "teams": teams,
+        "motions": motions,
+        "capabilities": capabilities,
+        "recommendations": recommendations,
+    })
+
+http_server.api_server.add_route("GET", "/v1/gtm/overview", _get_gtm_overview)
+http_server.api_server.add_route("GET", "/api/v1/gtm/overview", _get_gtm_overview)
+print("API: /api/v1/gtm/overview registered")
 
 # ── Ads Audit API ──────────────────────────────────
 import threading as _threading
@@ -3425,6 +3924,7 @@ print("API: /api/v1/models/* registered (4 endpoints)")
 # ── Skills Management System ──────────────────────────
 
 SKILL_DIRS = [
+    Path.home() / ".codex" / "skills",
     Path.home() / ".claude" / "skills",
     Path(__file__).parent / "skills",
 ]
@@ -3568,6 +4068,14 @@ def _parse_skill_md(skill_dir: Path) -> dict | None:
 
     # Parse YAML frontmatter between --- markers
     fm_match = _re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)", text, _re.DOTALL)
+    def _infer_skill_source() -> str:
+        resolved_skill_dir = skill_dir.resolve()
+        repo_skill_base = (Path(__file__).parent / "skills").resolve()
+        try:
+            resolved_skill_dir.relative_to(repo_skill_base)
+            return "local"
+        except ValueError:
+            return "community"
     if not fm_match:
         # No frontmatter; treat entire file as content with minimal metadata
         return {
@@ -3576,7 +4084,7 @@ def _parse_skill_md(skill_dir: Path) -> dict | None:
             "description": "",
             "category": "other",
             "risk": "unknown",
-            "source": "local" if "skills" in str(skill_dir) else "community",
+            "source": _infer_skill_source(),
             "tags": [],
             "path": str(skill_dir),
             "has_scripts": any(skill_dir.glob("*.sh")) or any(skill_dir.glob("*.py")),
@@ -3592,6 +4100,13 @@ def _parse_skill_md(skill_dir: Path) -> dict | None:
     # Simple regex-based YAML parser (no pyyaml dependency)
     def _yaml_val(key: str, default=""):
         m = _re.search(rf"^{key}\s*:\s*(.+)$", yaml_text, _re.MULTILINE)
+        return m.group(1).strip().strip("\"'") if m else default
+
+    metadata_match = _re.search(r"^metadata\s*:\s*$\n((?:^[ \t]+.*$\n?)*)", yaml_text, _re.MULTILINE)
+    metadata_text = metadata_match.group(1) if metadata_match else ""
+
+    def _yaml_meta_val(key: str, default=""):
+        m = _re.search(rf"^\s+{key}\s*:\s*(.+)$", metadata_text, _re.MULTILINE)
         return m.group(1).strip().strip("\"'") if m else default
 
     def _yaml_list(key: str) -> list[str]:
@@ -3613,15 +4128,33 @@ def _parse_skill_md(skill_dir: Path) -> dict | None:
                     break
         return items
 
+    def _yaml_meta_list(key: str) -> list[str]:
+        m = _re.search(rf"^\s+{key}\s*:\s*\[(.+?)\]", metadata_text, _re.MULTILINE)
+        if m:
+            return [t.strip().strip("\"'") for t in m.group(1).split(",")]
+        items: list[str] = []
+        in_list = False
+        for line in metadata_text.splitlines():
+            if _re.match(rf"^\s+{key}\s*:\s*$", line):
+                in_list = True
+                continue
+            if in_list:
+                lm = _re.match(r"^\s+-\s+(.+)$", line)
+                if lm:
+                    items.append(lm.group(1).strip().strip("\"'"))
+                else:
+                    break
+        return items
+
     skill_id = _yaml_val("id", skill_dir.name)
     return {
         "id": skill_id,
         "name": _yaml_val("name", skill_id),
         "description": _yaml_val("description"),
-        "category": _yaml_val("category", "other"),
-        "risk": _yaml_val("risk", "unknown"),
-        "source": _yaml_val("source", "community"),
-        "tags": _yaml_list("tags"),
+        "category": _yaml_val("category", _yaml_meta_val("category", "other")),
+        "risk": _yaml_val("risk", _yaml_meta_val("risk", "unknown")),
+        "source": _yaml_val("source", _yaml_meta_val("source", _infer_skill_source())),
+        "tags": _yaml_list("tags") or _yaml_meta_list("tags"),
         "path": str(skill_dir),
         "has_scripts": any(skill_dir.glob("*.sh")) or any(skill_dir.glob("*.py")),
         "content_preview": content_text[:200].strip(),
@@ -3663,6 +4196,21 @@ def _scan_skills() -> dict[str, dict]:
 # Initialize skill registry at startup
 _skill_registry = _scan_skills()
 print(f"Skills: {len(_skill_registry)} discovered ({sum(1 for s in _skill_registry.values() if s['source'] == 'builtin')} builtin)")
+_unknown_seed_skills = sorted({
+    skill_id
+    for assigned in _AGENT_DEFAULT_SKILLS.values()
+    for skill_id in assigned
+    if skill_id not in _skill_registry
+})
+if _unknown_seed_skills:
+    print(f"Warning: {len(_unknown_seed_skills)} assigned skills are missing from registry: {_unknown_seed_skills}")
+
+
+def _strip_skill_frontmatter(text: str) -> str:
+    fm_match = _re.match(r"^---\s*\n.*?\n---\s*\n?(.*)", text, _re.DOTALL)
+    if fm_match:
+        return fm_match.group(1).strip()
+    return text.strip()
 
 
 def _get_skill_content(skill: dict) -> str:
@@ -3675,7 +4223,7 @@ def _get_skill_content(skill: dict) -> str:
     skill_file = Path(skill_path) / "SKILL.md"
     if skill_file.exists():
         try:
-            return skill_file.read_text(encoding="utf-8")
+            return _strip_skill_frontmatter(skill_file.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError):
             return skill["description"]
     return skill["description"]
@@ -4062,6 +4610,7 @@ def _get_features(request):
                 "approvals": True,
                 "studio": False,
                 "lifecycle": True,
+                "gtm": True,
                 "tasks": True,
                 "team": True,
                 "memory": True,

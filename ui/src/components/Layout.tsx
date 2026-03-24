@@ -1,9 +1,11 @@
 import { useState, useEffect } from "react";
 import { Outlet, useLocation } from "react-router-dom";
 import { Sidebar } from "@/components/Sidebar";
+import { useI18n } from "@/contexts/I18nContext";
 import { cn } from "@/lib/utils";
 
 export function Layout() {
+  const { t } = useI18n();
   const location = useLocation();
   const [collapsed, setCollapsed] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
@@ -65,6 +67,7 @@ export function Layout() {
           <div className="flex h-14 shrink-0 items-center border-b border-border px-4">
             <button
               onClick={() => setMobileOpen(true)}
+              aria-label={t("layout.mobileMenu")}
               className="rounded-md p-2 text-muted-foreground hover:text-foreground"
             >
               <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">

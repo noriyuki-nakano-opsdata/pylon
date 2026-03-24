@@ -7,6 +7,7 @@ Routes project API concerns over a pluggable workflow control-plane backend.
 from __future__ import annotations
 
 import asyncio
+import ast
 import json
 import logging
 import os
@@ -57,8 +58,11 @@ from pylon.control_plane.adapters import (
 from pylon.control_plane.workflow_service import WorkflowRunService
 from pylon.di import ServiceContainer
 from pylon.dsl.parser import PylonProject
+from pylon.experiments import ExperimentCampaignManager
 from pylon.lifecycle import (
     PHASE_ORDER,
+    backfill_planning_artifacts,
+    backfill_native_artifacts,
     build_deploy_checks,
     build_lifecycle_approval_binding,
     build_lifecycle_autonomy_projection,
@@ -76,8 +80,10 @@ from pylon.lifecycle import (
     lifecycle_phase_input,
     merge_lifecycle_project_record,
     merge_operator_records,
+    rebuild_lifecycle_phase_statuses,
     refresh_lifecycle_recommendations,
     resolve_lifecycle_autonomy_level,
+    resolve_lifecycle_governance_mode,
     resolve_lifecycle_orchestration_mode,
     sync_lifecycle_project_with_run,
 )
@@ -85,9 +91,38 @@ from pylon.lifecycle.runtime_projection import (
     lifecycle_runtime_payload,
     runtime_active_phase,
 )
+from pylon.lifecycle.services.planning_localization import (
+    backfill_planning_localization,
+)
+from pylon.lifecycle.services.design_localization import (
+    backfill_design_localization,
+)
+from pylon.lifecycle.services.decision_context import (
+    build_lifecycle_decision_context,
+)
+from pylon.lifecycle.services.research_localization import (
+    backfill_research_localization,
+)
+from pylon.lifecycle.services.research_view_model import (
+    build_research_view_model,
+)
+from pylon.lifecycle.orchestrator import (
+    _DESIGN_TEMPLATE_PREVIEW_VERSION,
+    _apply_design_judge_enrichment,
+    _build_preview_html,
+    _build_design_implementation_brief,
+    _design_preview_meta,
+    _enrich_design_variant_contract,
+    _preview_style_class,
+    _preview_title,
+)
+from pylon.prototyping import (
+    build_nextjs_prototype_app,
+    build_prototype_spec,
+)
 from pylon.providers.base import Message, TokenUsage
 from pylon.repository.audit import default_hmac_key
-from pylon.runtime.llm import ProviderRegistry
+from pylon.runtime.llm import ProviderRegistry, estimate_cost_from_usage, parse_model_ref
 from pylon.skills.compat import (
     SkillCompatibilityLayer,
     get_default_skill_compatibility_layer,
@@ -103,6 +138,27 @@ from pylon.errors import ConcurrencyError
 
 logger = logging.getLogger(__name__)
 
+_LIFECYCLE_DERIVED_STORAGE_FIELDS = frozenset(
+    {
+        "decision_context",
+        "blueprints",
+        "recommendations",
+        "approvalRequest",
+        "activeApproval",
+        "phaseContracts",
+        "phaseReadiness",
+        "nextAction",
+        "autonomyState",
+    }
+)
+_LIFECYCLE_HISTORY_LIMITS: dict[str, int] = {
+    "artifacts": 80,
+    "decisionLog": 80,
+    "skillInvocations": 80,
+    "delegations": 80,
+    "phaseRuns": 40,
+}
+
 
 MISSION_TASK_STATUSES = {"backlog", "in_progress", "review", "done"}
 MISSION_TASK_PRIORITIES = {"low", "medium", "high", "critical"}
@@ -117,6 +173,78 @@ MISSION_CONTENT_STAGES = {
     "ready",
     "published",
 }
+GTM_TEAM_LABELS = {
+    "marketing": "Marketing",
+    "sales": "Sales",
+    "customer-success": "Customer Success",
+    "partnerships": "Partnerships",
+    "advertising": "Advertising",
+    "finance": "Finance & Legal",
+}
+GTM_TEAM_ORDER = (
+    "marketing",
+    "sales",
+    "customer-success",
+    "partnerships",
+    "advertising",
+    "finance",
+)
+GTM_CAPABILITY_DEFS: tuple[dict[str, Any], ...] = (
+    {
+        "id": "crm-lead-ops",
+        "label": "CRM Lead Ops",
+        "summary": "Lead hygiene, routing discipline, enrichment, and follow-up readiness.",
+        "skill_ids": ("crm-lead-ops", "revops-forecasting"),
+    },
+    {
+        "id": "pipeline-forecasting",
+        "label": "Pipeline & Forecasting",
+        "summary": "Pipeline inspection, stage discipline, attribution health, and forecast cadence.",
+        "skill_ids": ("revops-forecasting",),
+    },
+    {
+        "id": "campaign-lifecycle",
+        "label": "Campaign Lifecycle",
+        "summary": "Campaign briefs, launch sequencing, nurture flows, and handoff planning.",
+        "skill_ids": ("lifecycle-campaign-ops", "content-marketer-skill"),
+    },
+    {
+        "id": "webinar-field-marketing",
+        "label": "Webinar & Field Marketing",
+        "summary": "Webinar planning, attendance follow-up, and field-event operating checklists.",
+        "skill_ids": ("webinar-field-marketing",),
+    },
+    {
+        "id": "onboarding-renewal",
+        "label": "Onboarding & Renewal",
+        "summary": "Kickoff, activation, health review, renewal risk, and handoff quality.",
+        "skill_ids": ("customer-onboarding-playbooks", "customer-success-manager-skill"),
+    },
+    {
+        "id": "partner-ops",
+        "label": "Partner Operations",
+        "summary": "Partner tiering, referral governance, co-sell motions, and joint plans.",
+        "skill_ids": ("partner-program-ops",),
+    },
+    {
+        "id": "paid-media",
+        "label": "Paid Media Operations",
+        "summary": "Account audit, tracking QA, creative fatigue review, and budget diagnostics.",
+        "skill_ids": ("paid-media-audit",),
+    },
+    {
+        "id": "deal-desk",
+        "label": "Deal Desk & Commercial Review",
+        "summary": "Quote packaging, approval routing, renewal controls, and commercial guardrails.",
+        "skill_ids": ("deal-desk-commercial-review", "vendor-procurement-review"),
+    },
+    {
+        "id": "gtm-analytics",
+        "label": "GTM Reporting & Analytics",
+        "summary": "Executive KPI summaries, channel analysis, and actionable performance narratives.",
+        "skill_ids": ("gtm-reporting-analytics", "data-analyst-skill"),
+    },
+)
 DEFAULT_AUDIT_AGENTS = (
     "audit-google",
     "audit-meta",
@@ -906,6 +1034,16 @@ def register_routes(
         provider_registry = container.resolve_optional(ProviderRegistry, provider_registry)
     else:
         workflow_service = WorkflowRunService(s, provider_registry=provider_registry)
+    experiment_manager = ExperimentCampaignManager(s.control_plane_store)
+    reconciled_experiment_campaigns = experiment_manager.reconcile_orphaned_campaigns()
+    if reconciled_experiment_campaigns:
+        logger.warning(
+            "experiment_campaign_reconciled recovered_campaigns=%s",
+            reconciled_experiment_campaigns,
+        )
+    cleanup_stats = experiment_manager.cleanup_stale_resources()
+    if any(cleanup_stats.values()):
+        logger.info("experiment_campaign_cleanup %s", cleanup_stats)
     skill_runtime = skill_runtime or get_default_skill_runtime()
     compatibility_layer = compatibility_layer or get_default_skill_compatibility_layer()
     skill_import_lock = threading.RLock()
@@ -1847,6 +1985,7 @@ def register_routes(
 
     _start_skill_import_worker()
     if hasattr(server, "add_shutdown_hook"):
+        server.add_shutdown_hook(experiment_manager.shutdown)
         server.add_shutdown_hook(lambda: skill_import_worker_stop.set())
         server.add_shutdown_hook(_release_skill_import_leader)
     readiness_checker.register("skill_import_worker", _skill_import_readiness)
@@ -2020,36 +2159,67 @@ def register_routes(
                     break
 
     def _lifecycle_project_payload(project: dict[str, Any]) -> dict[str, Any]:
-        payload = dict(project)
+        stored_analysis_is_none = project.get("analysis") is None
+        payload = backfill_planning_artifacts(dict(project))
+        if stored_analysis_is_none:
+            payload["analysis"] = None
         payload.setdefault("orchestrationMode", "workflow")
+        payload.setdefault("governanceMode", "governed")
         payload.setdefault("autonomyLevel", "A3")
-        payload.setdefault("researchConfig", {"competitorUrls": [], "depth": "standard", "outputLanguage": "ja"})
+        payload.setdefault("researchConfig", {"competitorUrls": [], "depth": "standard", "outputLanguage": "ja", "recoveryMode": "auto"})
         if isinstance(payload.get("researchConfig"), dict):
             payload["researchConfig"].setdefault("outputLanguage", "ja")
+            payload["researchConfig"].setdefault("recoveryMode", "auto")
+        if isinstance(payload.get("research"), dict):
+            payload["research"] = backfill_research_localization(
+                dict(payload["research"]),
+                target_language=str(payload["researchConfig"].get("outputLanguage", "ja") or "ja"),
+            )
+            payload["research"]["view_model"] = build_research_view_model(payload["research"])
+        if isinstance(payload.get("analysis"), dict):
+            payload["analysis"] = backfill_planning_localization(
+                dict(payload["analysis"]),
+                target_language=str(payload["researchConfig"].get("outputLanguage", "ja") or "ja"),
+            )
+        payload["designVariants"] = _hydrate_design_variants(payload)
+        payload = backfill_native_artifacts(
+            payload,
+            target_language=str(payload["researchConfig"].get("outputLanguage", "ja") or "ja"),
+        )
+        payload["decision_context"] = build_lifecycle_decision_context(
+            payload,
+            target_language=str(payload["researchConfig"].get("outputLanguage", "ja") or "ja"),
+            compact=False,
+        )
         payload["blueprints"] = build_lifecycle_phase_blueprints(str(project.get("id", "")))
         payload["recommendations"] = refresh_lifecycle_recommendations(payload)
         approval_request_id = str(payload.get("approvalRequestId") or "")
         approval_record = s.get_approval_record(approval_request_id) if approval_request_id else None
         if str(payload.get("approvalStatus", "pending") or "pending") == "approved":
-            if approval_record is None or approval_record.get("status") != "approved":
+            approval_record = _effective_lifecycle_approval(payload, dict(approval_record) if isinstance(approval_record, dict) else None)
+            if approval_record is None:
                 payload["approvalStatus"] = "pending"
                 payload["approvalRequestId"] = None
                 approval_record = None
-            else:
-                binding = build_lifecycle_approval_binding(payload)
-                manager = _lifecycle_approval_manager()
-                try:
-                    _run_coro(
-                        manager.validate_binding(
-                            approval_request_id,
-                            plan=binding["plan"],
-                            effect_envelope=binding["effect_envelope"],
-                        )
-                    )
-                except (ApprovalAlreadyDecidedError, ApprovalBindingMismatchError, ApprovalNotFoundError):
-                    payload["approvalStatus"] = "pending"
-                    payload["approvalRequestId"] = None
-                    approval_record = None
+        approval_phase_status = next(
+            (
+                str(item.get("status") or "")
+                for item in payload.get("phaseStatuses", [])
+                if isinstance(item, dict) and item.get("phase") == "approval"
+            ),
+            "",
+        )
+        if str(payload.get("approvalStatus", "pending") or "pending") != "approved" and approval_phase_status == "completed":
+            completed_until = (
+                "design"
+                if payload.get("selectedDesignId") or payload.get("designVariants")
+                else "planning"
+                if payload.get("analysis") or payload.get("features") or payload.get("milestones")
+                else "research"
+                if payload.get("research")
+                else None
+            )
+            payload["phaseStatuses"] = rebuild_lifecycle_phase_statuses(payload, completed_until=completed_until)
         payload["approvalRequest"] = dict(approval_record) if approval_record is not None else None
         payload["activeApproval"] = (
             dict(approval_record)
@@ -2062,12 +2232,421 @@ def register_routes(
         payload["nextAction"] = autonomy["nextAction"]
         payload["autonomyState"] = {
             "orchestrationMode": autonomy["orchestrationMode"],
+            "governanceMode": autonomy["governanceMode"],
             "completedExecutablePhases": autonomy["completedExecutablePhases"],
             "blockedPhases": autonomy["blockedPhases"],
             "approvalRequired": autonomy["approvalRequired"],
+            "humanDecisionRequired": autonomy["humanDecisionRequired"],
+            "requiredHumanDecisions": autonomy["requiredHumanDecisions"],
+            "phasePolicies": autonomy["phasePolicies"],
+            "humanOverrideAlwaysAllowed": autonomy["humanOverrideAlwaysAllowed"],
+            "continuousDeliveryMode": autonomy["continuousDeliveryMode"],
             "canAdvanceAutonomously": autonomy["canAdvanceAutonomously"],
         }
         return payload
+
+    def _lifecycle_selected_feature_names(
+        project: dict[str, Any],
+        variant: dict[str, Any],
+    ) -> list[str]:
+        decision_scope = variant.get("decision_scope")
+        if isinstance(decision_scope, dict):
+            selected = [
+                str(item).strip()
+                for item in decision_scope.get("selected_features", [])
+                if str(item).strip()
+            ]
+            if selected:
+                return selected
+        project_features = project.get("features")
+        if isinstance(project_features, list):
+            selected = [
+                str(item.get("feature") or item.get("name") or "").strip()
+                for item in project_features
+                if isinstance(item, dict)
+                and item.get("selected", True)
+                and str(item.get("feature") or item.get("name") or "").strip()
+            ]
+            if selected:
+                return selected
+        return [
+            item
+            for item in (
+                "Research workspace",
+                "Planning synthesis",
+                "Artifact lineage",
+                "Approval gate",
+            )
+            if item
+        ]
+
+    def _hydrate_design_variants(project: dict[str, Any]) -> list[dict[str, Any]]:
+        def _normalize_variant_text(value: Any) -> str:
+            return " ".join(str(value or "").split()).strip()
+
+        def _parse_loose_mapping(value: Any) -> dict[str, Any]:
+            if isinstance(value, dict):
+                return dict(value)
+            text = _normalize_variant_text(value)
+            if not text or text[0] not in "{[":
+                return {}
+            for parser in (json.loads, ast.literal_eval):
+                try:
+                    payload = parser(text)
+                except (ValueError, SyntaxError, TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(payload, dict):
+                    return dict(payload)
+            return {}
+
+        def _parse_loose_sequence(value: Any) -> list[str]:
+            if isinstance(value, list):
+                return [str(item).strip() for item in value if str(item).strip()]
+            text = _normalize_variant_text(value)
+            if not text or text[0] != "[":
+                return []
+            for parser in (json.loads, ast.literal_eval):
+                try:
+                    payload = parser(text)
+                except (ValueError, SyntaxError, TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(payload, list):
+                    return [str(item).strip() for item in payload if str(item).strip()]
+            return []
+
+        def _normalize_action_label(value: Any) -> str:
+            text = _normalize_variant_text(value)
+            if not text:
+                return ""
+            if text.startswith("Open {"):
+                return "Open primary workspace"
+            return text
+
+        def _normalize_prototype_kind(value: Any, *, variant_id: str) -> str:
+            text = _normalize_variant_text(value).lower()
+            if variant_id == "claude-designer":
+                return "control-center"
+            if variant_id == "gemini-designer":
+                return "decision-studio"
+            if any(marker in text for marker in ("control", "operator", "approval")):
+                return "control-center"
+            if any(marker in text for marker in ("decision", "studio", "gallery")):
+                return "decision-studio"
+            if any(marker in text for marker in ("workspace", "application", "shell")):
+                return "product-workspace"
+            if any(marker in text for marker in ("store", "catalog", "checkout")):
+                return "storefront"
+            return "product-workspace"
+
+        def _normalize_variant_model(variant: dict[str, Any]) -> str:
+            explicit_model = str(variant.get("model") or "").strip()
+            if explicit_model:
+                return explicit_model
+            node_id = str(variant.get("id") or "").strip()
+            if node_id == "claude-designer":
+                return "Claude Sonnet 4.6"
+            if node_id == "gemini-designer":
+                return "KIMI K2.5 / Direction B"
+            return explicit_model
+
+        def _variant_model_ref(variant: dict[str, Any]) -> str:
+            candidate = str(variant.get("model_ref") or variant.get("model") or "").strip()
+            provider_name, model_id = parse_model_ref(candidate)
+            if provider_name and model_id:
+                return f"{provider_name}/{model_id}"
+            lowered = candidate.lower()
+            if "claude sonnet 4.6" in lowered:
+                return "anthropic/claude-sonnet-4-6"
+            if "gemini 3 pro" in lowered:
+                return "google/gemini-3-pro-preview"
+            if "kimi" in lowered or "k2.5" in lowered:
+                return "moonshot/kimi-k2.5"
+            node_id = str(variant.get("id") or "").strip()
+            if node_id == "claude-designer":
+                return "anthropic/claude-sonnet-4-6"
+            if node_id == "gemini-designer":
+                return "moonshot/kimi-k2.5"
+            return ""
+
+        def _normalize_screen(screen: dict[str, Any]) -> dict[str, Any]:
+            normalized = dict(screen)
+            details = _parse_loose_mapping(screen.get("title"))
+            if details:
+                title = str(details.get("label") or details.get("title") or normalized.get("title") or "").strip()
+                if title:
+                    normalized["title"] = title
+                description = str(details.get("description") or "").strip()
+                if description and not str(normalized.get("purpose") or "").strip():
+                    normalized["purpose"] = description
+                layout = str(details.get("layout") or "").strip()
+                if layout:
+                    normalized["layout"] = layout
+                if not normalized.get("modules"):
+                    raw_components = details.get("components")
+                    if not isinstance(raw_components, list):
+                        raw_components = details.get("key_elements")
+                    if isinstance(raw_components, list):
+                        items = [str(item).strip() for item in raw_components if str(item).strip()]
+                        if items:
+                            normalized["modules"] = [
+                                {
+                                    "name": "主要構成",
+                                    "type": "structure",
+                                    "items": items[:4],
+                                }
+                            ]
+                accessibility_notes = str(details.get("accessibility") or details.get("accessibility_notes") or "").strip()
+                if accessibility_notes and not str(normalized.get("success_state") or "").strip():
+                    normalized["success_state"] = accessibility_notes
+            raw_actions = normalized.get("primary_actions")
+            if isinstance(raw_actions, list):
+                normalized["primary_actions"] = [
+                    action
+                    for action in (_normalize_action_label(item) for item in raw_actions)
+                    if action
+                ][:4]
+            success_state = _normalize_variant_text(normalized.get("success_state"))
+            sequence_state = _parse_loose_sequence(success_state)
+            if sequence_state:
+                normalized["success_state"] = " / ".join(sequence_state[:2])
+            normalized.setdefault("headline", "")
+            normalized.setdefault("supporting_text", "")
+            normalized.setdefault("primary_actions", [])
+            normalized.setdefault("modules", [])
+            normalized.setdefault("success_state", "")
+            return normalized
+
+        def _variant_dict(value: Any) -> dict[str, Any]:
+            return dict(value) if isinstance(value, MutableMapping) else {}
+
+        def _variant_list(value: Any) -> list[Any]:
+            return list(value) if isinstance(value, list) else []
+
+        variants = project.get("designVariants")
+        if not isinstance(variants, list):
+            return []
+        analysis = project.get("analysis")
+        design_tokens = analysis.get("design_tokens") if isinstance(analysis, dict) else None
+        milestones = project.get("milestones")
+        target_language = str(_variant_dict(project.get("researchConfig")).get("outputLanguage") or "ja")
+        current_decision_fingerprint = str(
+            _variant_dict(
+                build_lifecycle_decision_context(project, target_language=target_language, compact=True)
+            ).get("fingerprint")
+            or ""
+        )
+        selected_features = _lifecycle_selected_feature_names(project, {})
+        hydrated: list[dict[str, Any]] = []
+        for raw_variant in variants:
+            if not isinstance(raw_variant, dict):
+                continue
+            variant = dict(raw_variant)
+            variant["model"] = _normalize_variant_model(variant)
+            token_payload = variant.get("tokens")
+            if isinstance(token_payload, dict):
+                usage = TokenUsage(
+                    input_tokens=int(token_payload.get("in", 0) or 0),
+                    output_tokens=int(token_payload.get("out", 0) or 0),
+                )
+                model_ref = _variant_model_ref(variant)
+                provider_name, model_id = parse_model_ref(model_ref)
+                if provider_name and model_id and (usage.input_tokens > 0 or usage.output_tokens > 0):
+                    variant["cost_usd"] = round(estimate_cost_from_usage(provider_name, model_id, usage), 3)
+            prototype = variant.get("prototype")
+            if isinstance(prototype, dict):
+                normalized_prototype = dict(prototype)
+                normalized_prototype["kind"] = _normalize_prototype_kind(
+                    normalized_prototype.get("kind"),
+                    variant_id=str(variant.get("id") or ""),
+                )
+                raw_screens = normalized_prototype.get("screens")
+                if isinstance(raw_screens, list):
+                    normalized_prototype["screens"] = [
+                        _normalize_screen(screen)
+                        for screen in raw_screens
+                        if isinstance(screen, dict)
+                    ]
+                variant["prototype"] = normalized_prototype
+            if not isinstance(variant.get("implementation_brief"), dict):
+                variant["implementation_brief"] = _build_design_implementation_brief(
+                    spec=str(project.get("spec") or project.get("name") or ""),
+                    analysis=_variant_dict(project.get("analysis")),
+                    selected_features=_lifecycle_selected_feature_names(project, variant) or selected_features,
+                    prototype=_variant_dict(variant.get("prototype")),
+                    decision_scope=_variant_dict(variant.get("decision_scope")),
+                    plan_estimates=[dict(item) for item in _variant_list(project.get("planEstimates")) if isinstance(item, dict)],
+                    selected_preset=str(project.get("selectedPreset") or ""),
+                    quality_focus=[str(item) for item in _variant_list(variant.get("quality_focus")) if str(item).strip()],
+                )
+            existing_prototype_spec = variant.get("prototype_spec")
+            existing_prototype_app = variant.get("prototype_app")
+            stored_preview_html = str(variant.get("preview_html") or "")
+            stored_preview_meta = _variant_dict(variant.get("preview_meta"))
+            stored_preview_source = str(stored_preview_meta.get("source") or "").strip().lower()
+            stored_template_version = int(stored_preview_meta.get("template_version", 0) or 0)
+            variant = backfill_design_localization(variant, target_language=target_language)
+            if stored_preview_html:
+                variant["preview_html"] = stored_preview_html
+            if stored_preview_meta:
+                variant["preview_meta"] = stored_preview_meta
+            canonical_variant = _enrich_design_variant_contract(
+                variant,
+                current_decision_context_fingerprint=current_decision_fingerprint,
+            )
+            if isinstance(canonical_variant.get("prototype"), dict):
+                variant["prototype"] = _variant_dict(canonical_variant.get("prototype"))
+            variant_title = _preview_title(
+                str(project.get("spec") or project.get("name") or variant.get("pattern_name") or "Product workspace")
+            )
+            variant_subtitle = str(variant.get("description") or variant.get("rationale") or project.get("description") or "")
+            variant_features = _lifecycle_selected_feature_names(project, variant) or selected_features
+            if not isinstance(existing_prototype_spec, dict):
+                existing_prototype_spec = build_prototype_spec(
+                    title=variant_title,
+                    subtitle=variant_subtitle,
+                    primary=str(variant.get("primary_color") or "#2563eb"),
+                    accent=str(variant.get("accent_color") or "#f59e0b"),
+                    features=variant_features,
+                    prototype=_variant_dict(variant.get("prototype")),
+                    design_tokens=design_tokens,
+                    decision_scope=_variant_dict(variant.get("decision_scope")),
+                    quality_focus=[str(item) for item in _variant_list(variant.get("quality_focus")) if str(item).strip()],
+                )
+            variant["prototype_spec"] = existing_prototype_spec
+            if not isinstance(existing_prototype_app, dict):
+                existing_prototype_app = build_nextjs_prototype_app(
+                    title=variant_title,
+                    subtitle=variant_subtitle,
+                    primary=str(variant.get("primary_color") or "#2563eb"),
+                    accent=str(variant.get("accent_color") or "#f59e0b"),
+                    prototype_spec=existing_prototype_spec,
+                )
+            variant["prototype_app"] = existing_prototype_app
+            evaluated_preview_meta = (
+                _design_preview_meta(
+                    stored_preview_html,
+                    source=stored_preview_source or "template",
+                    extraction_ok=bool(stored_preview_meta.get("extraction_ok")),
+                    fallback_reason=str(stored_preview_meta.get("fallback_reason") or ""),
+                    prototype=_variant_dict(variant.get("prototype")),
+                )
+                if stored_preview_html.strip()
+                else {}
+            )
+            expected_preview_style = _preview_style_class(
+                str(_variant_dict(_variant_dict(variant.get("prototype")).get("visual_direction")).get("visual_style") or "")
+            )
+            preview_style_matches_variant = (
+                not stored_preview_html.strip()
+                or f'preview-style-{expected_preview_style}' in stored_preview_html
+                or "preview-style-" not in stored_preview_html
+            )
+            preserve_preview = (
+                len(stored_preview_html.strip()) > 500
+                and "<html" in stored_preview_html.lower()
+                and "</html>" in stored_preview_html.lower()
+                and _variant_dict(evaluated_preview_meta).get("validation_ok") is True
+                and preview_style_matches_variant
+                and not (
+                    stored_preview_source in {"template", "repaired"}
+                    and stored_template_version != _DESIGN_TEMPLATE_PREVIEW_VERSION
+                )
+            )
+            if not preserve_preview:
+                variant["preview_html"] = _build_preview_html(
+                    title=variant_title,
+                    subtitle=variant_subtitle,
+                    primary=str(variant.get("primary_color") or "#2563eb"),
+                    accent=str(variant.get("accent_color") or "#f59e0b"),
+                    features=variant_features,
+                    prototype=variant.get("prototype"),
+                    design_tokens=design_tokens,
+                    milestones=milestones if isinstance(milestones, list) else None,
+                )
+                repaired_from_source = stored_preview_source or "missing"
+                fallback_reason = (
+                    "stored_preview_style_mismatch"
+                    if not preview_style_matches_variant
+                    else
+                    "stored_preview_stale_template"
+                    if stored_preview_source in {"template", "repaired"} and stored_template_version != _DESIGN_TEMPLATE_PREVIEW_VERSION
+                    else "stored_preview_invalid"
+                    if stored_preview_html.strip()
+                    else "stored_preview_missing"
+                )
+                variant["preview_meta"] = {
+                    **(_variant_dict(variant.get("preview_meta"))),
+                    "source": "repaired" if stored_preview_html.strip() else "template",
+                    "template_version": _DESIGN_TEMPLATE_PREVIEW_VERSION,
+                    "extraction_ok": bool(_variant_dict(variant.get("preview_meta")).get("extraction_ok")),
+                    "fallback_reason": fallback_reason,
+                    "repaired_from_source": repaired_from_source,
+                    "repair_actions": ["recompiled_from_canonical_spec"] if stored_preview_html.strip() else [],
+                    "candidate_validation_ok": bool(stored_preview_meta.get("validation_ok")),
+                    "candidate_validation_issues": _variant_list(stored_preview_meta.get("validation_issues")),
+                }
+            hydrated.append(
+                _enrich_design_variant_contract(
+                    variant,
+                    current_decision_context_fingerprint=current_decision_fingerprint,
+                )
+            )
+        selected_design_id = str(project.get("selectedDesignId") or "").strip()
+        if selected_design_id:
+            hydrated = _apply_design_judge_enrichment(
+                hydrated,
+                selected_design_id=selected_design_id,
+            )
+        return hydrated
+
+    def _compact_lifecycle_project_for_storage(project: dict[str, Any]) -> dict[str, Any]:
+        compacted = dict(project)
+        for field_name in _LIFECYCLE_DERIVED_STORAGE_FIELDS:
+            compacted.pop(field_name, None)
+        research_payload = compacted.get("research")
+        if isinstance(research_payload, dict):
+            compacted["research"] = {
+                key: value
+                for key, value in research_payload.items()
+                if key != "view_model"
+            }
+        variants = compacted.get("designVariants")
+        if isinstance(variants, list):
+            compacted["designVariants"] = [
+                dict(variant)
+                for variant in variants
+                if isinstance(variant, dict)
+            ]
+        for field_name, limit in _LIFECYCLE_HISTORY_LIMITS.items():
+            records = compacted.get(field_name)
+            if isinstance(records, list):
+                compacted[field_name] = [
+                    dict(item) if isinstance(item, dict) else item
+                    for item in records[:limit]
+                ]
+        return compacted
+
+    def _normalize_lifecycle_project_record(
+        project: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        payload = _lifecycle_project_payload(project)
+        return _compact_lifecycle_project_for_storage(payload), payload
+
+    def _reconcile_lifecycle_project_record(
+        tenant_id: str,
+        project_id: str,
+        project: dict[str, Any],
+        *,
+        persist: bool,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        normalized_storage, payload = _normalize_lifecycle_project_record(project)
+        if persist and normalized_storage != _compact_lifecycle_project_for_storage(project):
+            s.put_surface_record(
+                "lifecycle_projects",
+                _lifecycle_project_key(tenant_id, project_id),
+                normalized_storage,
+            )
+        return normalized_storage, payload
 
     def _seed_lifecycle_skills() -> None:
         for skill_id, skill_payload in build_lifecycle_skill_catalog().items():
@@ -2080,8 +2659,9 @@ def register_routes(
         project: dict[str, Any],
     ) -> dict[str, Any]:
         project["recommendations"] = refresh_lifecycle_recommendations(project)
-        s.put_surface_record("lifecycle_projects", _lifecycle_project_key(tenant_id, project_id), project)
-        return project
+        stored, _ = _normalize_lifecycle_project_record(project)
+        s.put_surface_record("lifecycle_projects", _lifecycle_project_key(tenant_id, project_id), stored)
+        return stored
 
     def _lifecycle_mutation_response(
         project: dict[str, Any],
@@ -2106,7 +2686,14 @@ def register_routes(
         if not isinstance(event_log, list):
             event_log = []
         if not isinstance(node_status, dict):
-            node_status = {}
+            # Fallback: completed runs store node_status inside state.execution
+            _state = run.get("state")
+            if isinstance(_state, dict):
+                _execution = _state.get("execution")
+                if isinstance(_execution, dict):
+                    node_status = _execution.get("node_status")
+            if not isinstance(node_status, dict):
+                node_status = {}
         completed_node_ids = {
             str(event.get("node_id", ""))
             for event in event_log
@@ -2322,6 +2909,41 @@ def register_routes(
         if not terminal_emitted and once:
             return
 
+    def _iter_experiment_campaign_events(
+        tenant_id: str,
+        campaign_id: str,
+        *,
+        once: bool = False,
+    ) -> Any:
+        emitted_signature: str | None = None
+        event_seq = 0
+        deadline = time.monotonic() + 45.0
+        while True:
+            detail = experiment_manager.get_campaign_detail(campaign_id, tenant_id=tenant_id)
+            if detail is None:
+                break
+            signature = _json_signature(detail)
+            if signature != emitted_signature:
+                event_name = "snapshot" if emitted_signature is None else "campaign"
+                yield _sse_event(event_name, detail, event_id=str(event_seq))
+                event_seq += 1
+                emitted_signature = signature
+            status = str(detail.get("campaign", {}).get("status", ""))
+            if status in {"paused", "completed", "failed", "cancelled"}:
+                yield _sse_event(
+                    "terminal",
+                    {
+                        "campaignId": campaign_id,
+                        "status": status,
+                    },
+                    event_id=str(event_seq),
+                )
+                break
+            if once or time.monotonic() >= deadline:
+                break
+            yield ": keep-alive\n\n"
+            time.sleep(0.75)
+
     def _run_coro(coro: Any) -> Any:
         loop = asyncio.new_event_loop()
         try:
@@ -2346,13 +2968,58 @@ def register_routes(
         approval = s.get_approval_record(approval_request_id)
         return dict(approval) if approval is not None else None
 
+    def _canonicalize_lifecycle_project_for_approval(project: dict[str, Any]) -> dict[str, Any]:
+        canonical = dict(project)
+        if isinstance(canonical.get("designVariants"), list):
+            canonical["designVariants"] = _hydrate_design_variants(canonical)
+        return canonical
+
+    def _lifecycle_approval_matches_project(
+        project: dict[str, Any],
+        approval: dict[str, Any] | None,
+    ) -> bool:
+        if not isinstance(approval, dict):
+            return False
+        approval_status = str(approval.get("status") or "")
+        if approval_status not in {"approved", "expired"}:
+            return False
+        binding = build_lifecycle_approval_binding(
+            _canonicalize_lifecycle_project_for_approval(project)
+        )
+        plan_hash = compute_approval_binding_hash(binding["plan"])
+        effect_hash = compute_approval_binding_hash(binding["effect_envelope"])
+        recorded_plan_hash = str(approval.get("plan_hash") or "")
+        recorded_effect_hash = str(approval.get("effect_hash") or "")
+        if recorded_plan_hash and recorded_plan_hash != plan_hash:
+            return False
+        if recorded_effect_hash and recorded_effect_hash != effect_hash:
+            return False
+        return True
+
+    def _effective_lifecycle_approval(
+        project: dict[str, Any],
+        approval: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not _lifecycle_approval_matches_project(project, approval):
+            return None
+        if not isinstance(approval, dict):
+            return None
+        if str(approval.get("status") or "") != "expired":
+            return dict(approval)
+        preserved = dict(approval)
+        preserved["status"] = "approved"
+        preserved["approval_status_source"] = "expired_record_preserved"
+        return preserved
+
     def _ensure_lifecycle_approval_request(
         tenant_id: str,
         project_id: str,
         *,
         project: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        binding = build_lifecycle_approval_binding(project)
+        binding = build_lifecycle_approval_binding(
+            _canonicalize_lifecycle_project_for_approval(project)
+        )
         plan_hash = compute_approval_binding_hash(binding["plan"])
         effect_hash = compute_approval_binding_hash(binding["effect_envelope"])
         current_approval = _current_lifecycle_approval(project)
@@ -2536,11 +3203,16 @@ def register_routes(
                 "buildCost",
                 "buildIteration",
                 "milestoneResults",
+                "deliveryPlan",
+                "developmentHandoff",
+                "valueContract",
+                "outcomeTelemetryContract",
                 "deployChecks",
                 "releases",
                 "feedbackItems",
                 "selectedPreset",
                 "orchestrationMode",
+                "governanceMode",
                 "autonomyLevel",
                 "researchConfig",
             }
@@ -2562,7 +3234,8 @@ def register_routes(
         if approval_status != "approved":
             return project, approval
 
-        if approval is None:
+        effective_approval = _effective_lifecycle_approval(project, approval)
+        if effective_approval is None:
             normalized = merge_lifecycle_project_record(
                 project,
                 {
@@ -2574,30 +3247,7 @@ def register_routes(
             if persist:
                 normalized = _persist_lifecycle_project(tenant_id, project_id, normalized)
             return normalized, None
-
-        binding = build_lifecycle_approval_binding(project)
-        manager = _lifecycle_approval_manager()
-        try:
-            _run_coro(
-                manager.validate_binding(
-                    str(approval.get("id", "")),
-                    plan=binding["plan"],
-                    effect_envelope=binding["effect_envelope"],
-                )
-            )
-        except (ApprovalAlreadyDecidedError, ApprovalBindingMismatchError, ApprovalNotFoundError):
-            normalized = merge_lifecycle_project_record(
-                project,
-                {
-                    "approvalStatus": "pending",
-                    "approvalRequestId": None,
-                },
-            )
-            _set_phase_status(normalized, "approval", "review")
-            if persist:
-                normalized = _persist_lifecycle_project(tenant_id, project_id, normalized)
-            return normalized, None
-        return project, approval
+        return project, effective_approval
 
     def _apply_lifecycle_approval_decision(
         tenant_id: str,
@@ -2635,7 +3285,9 @@ def register_routes(
                     project=current,
                 )
             approval_id = str(current.get("approvalRequestId") or approval.get("id", ""))
-            binding = build_lifecycle_approval_binding(current)
+            binding = build_lifecycle_approval_binding(
+                _canonicalize_lifecycle_project_for_approval(current)
+            )
             _run_coro(manager.approve(approval_id, "lifecycle-api", comment=note))
             _run_coro(
                 manager.validate_binding(
@@ -2700,7 +3352,11 @@ def register_routes(
         project_record: dict[str, Any] | None = None,
     ) -> tuple[str, PylonProject, dict[str, Any]]:
         _seed_lifecycle_skills()
-        definition = build_lifecycle_workflow_definition(project_id, phase)
+        definition = build_lifecycle_workflow_definition(
+            project_id,
+            phase,
+            project_record=project_record,
+        )
         phase_blueprint = build_lifecycle_phase_blueprints(project_id).get(phase, {})
         team_index = {
             str(item.get("id", "")).strip(): dict(item)
@@ -2760,16 +3416,18 @@ def register_routes(
             for skill_id, payload in s.skills.items()
         }
         if hasattr(raw_store, "set_handlers"):
+            phase_handlers = build_lifecycle_workflow_handlers(
+                phase,
+                provider_registry=provider_registry,
+                skill_runtime=get_default_skill_runtime(),
+                tenant_id=tenant_id,
+                agent_skill_lookup=_lifecycle_agent_skill_lookup,
+                control_plane_skills=control_plane_skills,
+            )
             raw_store.set_handlers(
                 workflow_id,
-                node_handlers=build_lifecycle_workflow_handlers(
-                    phase,
-                    provider_registry=provider_registry,
-                    skill_runtime=get_default_skill_runtime(),
-                    tenant_id=tenant_id,
-                    agent_skill_lookup=_lifecycle_agent_skill_lookup,
-                    control_plane_skills=control_plane_skills,
-                ),
+                node_handlers=phase_handlers,
+                agent_handlers=phase_handlers,
             )
         lifecycle_project = project_record or _get_lifecycle_project(tenant_id, project_id, create=True)
         if lifecycle_project is None:
@@ -2799,7 +3457,8 @@ def register_routes(
         *,
         project: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        checks_payload = build_deploy_checks(project)
+        enriched = backfill_planning_artifacts(dict(project))
+        checks_payload = build_deploy_checks(enriched)
         merged = merge_lifecycle_project_record(
             project,
             {
@@ -3012,8 +3671,156 @@ def register_routes(
         if not create:
             return None
         created = default_lifecycle_project_record(project_id, tenant_id=tenant_id)
-        s.put_surface_record("lifecycle_projects", key, created)
-        return created
+        return _persist_lifecycle_project(tenant_id, project_id, created)
+
+    def list_experiment_campaigns(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        project_slug = _query_string(request, "project_slug")
+        campaigns = experiment_manager.list_campaigns(
+            tenant_id=tenant_id,
+            project_slug=project_slug,
+        )
+        return Response(body={"campaigns": campaigns, "count": len(campaigns)})
+
+    def create_experiment_campaign(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        try:
+            detail = experiment_manager.create_campaign(request.body or {}, tenant_id=tenant_id)
+        except (FileNotFoundError, ValueError) as exc:
+            return Response(status_code=422, body={"errors": [str(exc)]})
+        campaign = detail["campaign"]
+        return Response(
+            status_code=201,
+            headers={"location": v1(f"/experiments/{campaign['id']}")},
+            body=detail,
+        )
+
+    def get_experiment_campaign(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        campaign_id = request.path_params.get("campaign_id", "")
+        detail = experiment_manager.get_campaign_detail(campaign_id, tenant_id=tenant_id)
+        if detail is None:
+            return Response(status_code=404, body={"error": f"Experiment campaign not found: {campaign_id}"})
+        return Response(body=detail)
+
+    def list_experiment_iterations(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        campaign_id = request.path_params.get("campaign_id", "")
+        detail = experiment_manager.get_campaign_detail(campaign_id, tenant_id=tenant_id)
+        if detail is None:
+            return Response(status_code=404, body={"error": f"Experiment campaign not found: {campaign_id}"})
+        return Response(body={"iterations": detail["iterations"], "count": detail["count"]})
+
+    def start_experiment_campaign(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        campaign_id = request.path_params.get("campaign_id", "")
+        try:
+            detail = experiment_manager.start_campaign(campaign_id, tenant_id=tenant_id)
+        except KeyError:
+            return Response(status_code=404, body={"error": f"Experiment campaign not found: {campaign_id}"})
+        except ValueError as exc:
+            return Response(status_code=409, body={"error": str(exc)})
+        status_code = 202 if detail["campaign"]["status"] == "waiting_approval" else 200
+        return Response(status_code=status_code, body=detail)
+
+    def pause_experiment_campaign(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        campaign_id = request.path_params.get("campaign_id", "")
+        try:
+            detail = experiment_manager.pause_campaign(campaign_id, tenant_id=tenant_id)
+        except KeyError:
+            return Response(status_code=404, body={"error": f"Experiment campaign not found: {campaign_id}"})
+        return Response(body=detail)
+
+    def resume_experiment_campaign(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        campaign_id = request.path_params.get("campaign_id", "")
+        try:
+            detail = experiment_manager.resume_campaign(campaign_id, tenant_id=tenant_id)
+        except KeyError:
+            return Response(status_code=404, body={"error": f"Experiment campaign not found: {campaign_id}"})
+        except ValueError as exc:
+            return Response(status_code=409, body={"error": str(exc)})
+        status_code = 202 if detail["campaign"]["status"] == "waiting_approval" else 200
+        return Response(status_code=status_code, body=detail)
+
+    def cancel_experiment_campaign(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        campaign_id = request.path_params.get("campaign_id", "")
+        try:
+            detail = experiment_manager.cancel_campaign(campaign_id, tenant_id=tenant_id)
+        except KeyError:
+            return Response(status_code=404, body={"error": f"Experiment campaign not found: {campaign_id}"})
+        return Response(body=detail)
+
+    def promote_experiment_campaign(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        body = request.body or {}
+        if body is not None and not isinstance(body, dict):
+            return Response(status_code=422, body={"errors": ["Request body must be a JSON object"]})
+        branch_name = (
+            str((body or {}).get("branch_name", "")).strip()
+            or str((body or {}).get("branch", "")).strip()
+        )
+        campaign_id = request.path_params.get("campaign_id", "")
+        try:
+            detail = experiment_manager.promote_campaign(
+                campaign_id,
+                tenant_id=tenant_id,
+                branch_name=branch_name,
+            )
+        except KeyError:
+            return Response(status_code=404, body={"error": f"Experiment campaign not found: {campaign_id}"})
+        except ValueError as exc:
+            return Response(status_code=409, body={"error": str(exc)})
+        status_code = (
+            202
+            if detail["campaign"].get("promotion", {}).get("status") == "approval_pending"
+            else 200
+        )
+        return Response(status_code=status_code, body=detail)
+
+    def stream_experiment_campaign_events(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        campaign_id = request.path_params.get("campaign_id", "")
+        detail = experiment_manager.get_campaign_detail(campaign_id, tenant_id=tenant_id)
+        if detail is None:
+            return Response(status_code=404, body={"error": f"Experiment campaign not found: {campaign_id}"})
+        once = _query_bool(request, "once", default=False)
+        return Response(
+            headers={
+                "content-type": "text/event-stream; charset=utf-8",
+                "cache-control": "no-cache",
+                "connection": "keep-alive",
+            },
+            body=StreamingBody(
+                _iter_experiment_campaign_events(
+                    tenant_id,
+                    campaign_id,
+                    once=once,
+                )
+            ),
+        )
 
     def list_lifecycle_projects(request: Request) -> Response:
         tenant_id = _require_tenant_id(request)
@@ -3021,7 +3828,17 @@ def register_routes(
             return _tenant_required_response()
         records = s.list_surface_records("lifecycle_projects", tenant_id=tenant_id)
         records.sort(key=lambda record: str(record.get("updatedAt", record.get("createdAt", ""))), reverse=True)
-        return Response(body={"projects": [_lifecycle_project_payload(record) for record in records], "count": len(records)})
+        projects = []
+        for record in records:
+            project_id = str(record.get("id") or record.get("projectId") or "")
+            _, payload = _reconcile_lifecycle_project_record(
+                tenant_id,
+                project_id,
+                record,
+                persist=bool(project_id),
+            )
+            projects.append(payload)
+        return Response(body={"projects": projects, "count": len(projects)})
 
     def get_lifecycle_project(request: Request) -> Response:
         tenant_id = _require_tenant_id(request)
@@ -3031,7 +3848,26 @@ def register_routes(
         project = _get_lifecycle_project(tenant_id, project_id, create=True)
         if project is None:
             return Response(status_code=404, body={"error": f"Lifecycle project not found: {project_id}"})
-        return Response(body=_lifecycle_project_payload(project))
+        _, payload = _reconcile_lifecycle_project_record(
+            tenant_id,
+            project_id,
+            project,
+            persist=True,
+        )
+        return Response(body=payload)
+
+    def delete_lifecycle_project(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+        project_id = request.path_params.get("project_id", "")
+        project = _get_lifecycle_project(tenant_id, project_id, create=False)
+        if project is None:
+            return Response(status_code=404, body={"error": f"Lifecycle project not found: {project_id}"})
+        s.delete_surface_record("lifecycle_projects", _lifecycle_project_key(tenant_id, project_id))
+        for phase in PHASE_ORDER:
+            s.remove_workflow_project(_lifecycle_workflow_id(project_id, phase), tenant_id=tenant_id)
+        return Response(status_code=204, body=None)
 
     def stream_lifecycle_project_events(request: Request) -> Response:
         tenant_id = _require_tenant_id(request)
@@ -3092,7 +3928,10 @@ def register_routes(
             field_name
             for field_name in {
                 "spec",
+                "githubRepo",
+                "productIdentity",
                 "researchConfig",
+                "requirementsConfig",
                 "research",
                 "analysis",
                 "features",
@@ -3116,6 +3955,7 @@ def register_routes(
         auto_run = bool(body.get("auto_run", True))
         try:
             mode = resolve_lifecycle_orchestration_mode(merged)
+            resolve_lifecycle_governance_mode(merged)
             resolve_lifecycle_autonomy_level(merged)
         except ValueError as exc:
             return Response(status_code=422, body={"errors": [str(exc)]})
@@ -3222,6 +4062,10 @@ def register_routes(
         project = _get_lifecycle_project(tenant_id, project_id, create=True)
         if project is None:
             return Response(status_code=404, body={"error": f"Lifecycle project not found: {project_id}"})
+        try:
+            resolve_lifecycle_governance_mode(project)
+        except ValueError as exc:
+            return Response(status_code=422, body={"errors": [str(exc)]})
         try:
             current, actions, next_action = _execute_lifecycle_progression(
                 tenant_id,
@@ -3439,7 +4283,7 @@ def register_routes(
         )
         _set_phase_status(merged, "iterate", "in_progress")
         merged["recommendations"] = refresh_lifecycle_recommendations(merged)
-        s.put_surface_record("lifecycle_projects", _lifecycle_project_key(tenant_id, project_id), merged)
+        merged = _persist_lifecycle_project(tenant_id, project_id, merged)
         return Response(status_code=201, body={"project": _lifecycle_project_payload(merged), "feedbackItems": feedbacks})
 
     def vote_lifecycle_feedback(request: Request) -> Response:
@@ -3486,7 +4330,7 @@ def register_routes(
             },
         )
         merged["recommendations"] = refresh_lifecycle_recommendations(merged)
-        s.put_surface_record("lifecycle_projects", _lifecycle_project_key(tenant_id, project_id), merged)
+        merged = _persist_lifecycle_project(tenant_id, project_id, merged)
         return Response(body={"project": _lifecycle_project_payload(merged), "feedbackItems": feedbacks})
 
     def get_lifecycle_recommendations(request: Request) -> Response:
@@ -3499,7 +4343,7 @@ def register_routes(
             return Response(status_code=404, body={"error": f"Lifecycle project not found: {project_id}"})
         recommendations = refresh_lifecycle_recommendations(project)
         merged = merge_lifecycle_project_record(project, {"recommendations": recommendations})
-        s.put_surface_record("lifecycle_projects", _lifecycle_project_key(tenant_id, project_id), merged)
+        merged = _persist_lifecycle_project(tenant_id, project_id, merged)
         return Response(body={"recommendations": recommendations})
 
     def _ensure_default_teams(tenant_id: str) -> list[dict[str, Any]]:
@@ -4187,6 +5031,256 @@ def register_routes(
             return Response(status_code=403, body={"error": "Forbidden"})
         del s.content_items[content_id]
         return Response(status_code=204, body=None)
+
+    def get_gtm_overview(request: Request) -> Response:
+        tenant_id = _require_tenant_id(request)
+        if tenant_id is None:
+            return _tenant_required_response()
+
+        now = datetime.now(UTC)
+        upcoming_cutoff = now + timedelta(days=14)
+        agents = [
+            dict(agent)
+            for agent in s.agents.values()
+            if str(agent.get("tenant_id", "")) == tenant_id
+            and str(agent.get("team", "")) in GTM_TEAM_ORDER
+        ]
+        tasks = [
+            dict(task)
+            for task in s.tasks.values()
+            if str(task.get("tenant_id", "")) == tenant_id
+            and str(task.get("status", "")) != "done"
+        ]
+        events = [
+            dict(event)
+            for event in s.events.values()
+            if str(event.get("tenant_id", "")) == tenant_id
+        ]
+        content_items = [
+            dict(item)
+            for item in s.content_items.values()
+            if str(item.get("tenant_id", "")) == tenant_id
+            and str(item.get("stage", "")) != "published"
+        ]
+        ads_reports = [
+            dict(report)
+            for report in s.ads_reports.values()
+            if str(report.get("tenant_id", "")) == tenant_id
+        ]
+        catalog = _effective_skill_catalog(tenant_id)
+        available_skill_ids = set(catalog)
+
+        agent_team_by_id: dict[str, str] = {}
+        agent_team_by_name: dict[str, str] = {}
+        team_skill_ids: dict[str, set[str]] = {team_id: set() for team_id in GTM_TEAM_ORDER}
+        for agent in agents:
+            team_id = str(agent.get("team", ""))
+            if not team_id:
+                continue
+            agent_id = str(agent.get("id", "")).strip()
+            agent_name = str(agent.get("name", "")).strip()
+            if agent_id:
+                agent_team_by_id[agent_id] = team_id
+            if agent_name:
+                agent_team_by_name[agent_name] = team_id
+            for skill_id in agent.get("skills", []) if isinstance(agent.get("skills"), list) else []:
+                if isinstance(skill_id, str) and skill_id.strip():
+                    team_skill_ids.setdefault(team_id, set()).add(skill_id.strip())
+
+        def _resolve_team_for_actor(actor: str) -> str:
+            trimmed = str(actor).strip()
+            if not trimmed:
+                return ""
+            return agent_team_by_id.get(trimmed, agent_team_by_name.get(trimmed, ""))
+
+        upcoming_events = []
+        for event in events:
+            start = str(event.get("start", "")).strip()
+            if not start:
+                continue
+            try:
+                parsed = _parse_iso_datetime(start)
+            except ValueError:
+                continue
+            if now <= parsed <= upcoming_cutoff:
+                upcoming_events.append(event)
+
+        recent_ads_reports = []
+        for report in ads_reports:
+            created_at = str(report.get("created_at", "")).strip()
+            if not created_at:
+                continue
+            try:
+                parsed = _parse_iso_datetime(created_at)
+            except ValueError:
+                continue
+            if parsed >= (now - timedelta(days=30)):
+                recent_ads_reports.append(report)
+
+        team_snapshots: list[dict[str, Any]] = []
+        for team_id in GTM_TEAM_ORDER:
+            team_agents = [agent for agent in agents if str(agent.get("team", "")) == team_id]
+            open_tasks = sum(1 for task in tasks if _resolve_team_for_actor(str(task.get("assignee", ""))) == team_id)
+            team_events = sum(1 for event in upcoming_events if _resolve_team_for_actor(str(event.get("agentId", ""))) == team_id)
+            team_content = sum(1 for item in content_items if _resolve_team_for_actor(str(item.get("assignee", ""))) == team_id)
+            skill_count = len(team_skill_ids.get(team_id, set()))
+            if len(team_agents) >= 3 and skill_count >= 3:
+                status = "strong"
+            elif len(team_agents) >= 1:
+                status = "watch"
+            else:
+                status = "thin"
+            team_snapshots.append({
+                "id": team_id,
+                "label": GTM_TEAM_LABELS[team_id],
+                "agent_count": len(team_agents),
+                "open_tasks": open_tasks,
+                "upcoming_events": team_events,
+                "active_content": team_content,
+                "status": status,
+                "core_skills": sorted(team_skill_ids.get(team_id, set())),
+            })
+
+        motions = [
+            {
+                "id": "lead-engine",
+                "label": "Lead Engine",
+                "owner_team": "Sales",
+                "status": "strong" if any(skill_id in available_skill_ids for skill_id in ("crm-lead-ops", "revops-forecasting")) else "watch",
+                "summary": "Lead intake, routing discipline, and pipeline hygiene across SDR, sales ops, and revops.",
+                "signals": [
+                    {"label": "sales agents", "value": str(sum(1 for agent in agents if str(agent.get("team", "")) == "sales"))},
+                    {"label": "open sales tasks", "value": str(sum(1 for task in tasks if _resolve_team_for_actor(str(task.get("assignee", ""))) == "sales"))},
+                    {"label": "crm skills", "value": str(sum(1 for skill_id in ("crm-lead-ops", "revops-forecasting") if skill_id in available_skill_ids))},
+                ],
+            },
+            {
+                "id": "campaign-engine",
+                "label": "Campaign Engine",
+                "owner_team": "Marketing",
+                "status": "strong" if any(skill_id in available_skill_ids for skill_id in ("lifecycle-campaign-ops", "gtm-reporting-analytics")) else "watch",
+                "summary": "Campaign brief, nurture, content pipeline, and measurement loops for launch execution.",
+                "signals": [
+                    {"label": "marketing agents", "value": str(sum(1 for agent in agents if str(agent.get("team", "")) == "marketing"))},
+                    {"label": "active content", "value": str(sum(1 for item in content_items if _resolve_team_for_actor(str(item.get("assignee", ""))) == "marketing"))},
+                    {"label": "upcoming events", "value": str(sum(1 for event in upcoming_events if _resolve_team_for_actor(str(event.get("agentId", ""))) == "marketing"))},
+                ],
+            },
+            {
+                "id": "customer-loop",
+                "label": "Customer Expansion Loop",
+                "owner_team": "Customer Success",
+                "status": "strong" if "customer-onboarding-playbooks" in available_skill_ids else "watch",
+                "summary": "Activation, adoption, renewal readiness, and commercial expansion coordination.",
+                "signals": [
+                    {"label": "cs agents", "value": str(sum(1 for agent in agents if str(agent.get("team", "")) == "customer-success"))},
+                    {"label": "open cs tasks", "value": str(sum(1 for task in tasks if _resolve_team_for_actor(str(task.get("assignee", ""))) == "customer-success"))},
+                    {"label": "renewal skills", "value": str(sum(1 for skill_id in ("customer-onboarding-playbooks", "customer-success-manager-skill") if skill_id in available_skill_ids))},
+                ],
+            },
+            {
+                "id": "paid-media-loop",
+                "label": "Paid Media Loop",
+                "owner_team": "Advertising",
+                "status": "strong" if "paid-media-audit" in available_skill_ids and recent_ads_reports else "watch",
+                "summary": "Audit, measurement, creative review, and budget optimization for paid acquisition.",
+                "signals": [
+                    {"label": "ads agents", "value": str(sum(1 for agent in agents if str(agent.get("team", "")) == "advertising"))},
+                    {"label": "recent ads reports", "value": str(len(recent_ads_reports))},
+                    {"label": "ads skill", "value": "1" if "paid-media-audit" in available_skill_ids else "0"},
+                ],
+            },
+        ]
+
+        capabilities: list[dict[str, Any]] = []
+        covered_capabilities = 0
+        for capability in GTM_CAPABILITY_DEFS:
+            present = [skill_id for skill_id in capability["skill_ids"] if skill_id in available_skill_ids]
+            if len(present) == len(capability["skill_ids"]):
+                status = "covered"
+                covered_capabilities += 1
+            elif present:
+                status = "partial"
+                covered_capabilities += 0.5
+            else:
+                status = "missing"
+            capabilities.append({
+                "id": capability["id"],
+                "label": capability["label"],
+                "status": status,
+                "summary": capability["summary"],
+                "skill_ids": list(capability["skill_ids"]),
+            })
+
+        recommendations: list[dict[str, Any]] = []
+        if not recent_ads_reports:
+            recommendations.append({
+                "title": "Restart the paid media inspection cadence",
+                "priority": "high",
+                "owner_team": "advertising",
+                "rationale": "No ads audit reports were recorded in the last 30 days, so budget and tracking drift may be invisible.",
+                "action": "Run a fresh audit across Google and Meta, then push the resulting fixes into the task board.",
+            })
+        if not any(item.get("stage") in {"draft", "review", "ready"} for item in content_items):
+            recommendations.append({
+                "title": "Rebuild the campaign delivery queue",
+                "priority": "high",
+                "owner_team": "marketing",
+                "rationale": "The content pipeline has no draft, review, or ready-stage work, which usually means launch throughput is too thin.",
+                "action": "Create at least one research item, one draft, and one launch-ready asset tied to the next GTM motion.",
+            })
+        if not any(_resolve_team_for_actor(str(event.get("agentId", ""))) in {"sales", "customer-success", "marketing"} for event in upcoming_events):
+            recommendations.append({
+                "title": "Restore customer and pipeline cadence",
+                "priority": "medium",
+                "owner_team": "sales",
+                "rationale": "There are no upcoming GTM events for pipeline review, webinar execution, or customer follow-up.",
+                "action": "Schedule one forecast review, one campaign or webinar checkpoint, and one customer health or renewal review in the next 14 days.",
+            })
+        if "crm-lead-ops" not in available_skill_ids:
+            recommendations.append({
+                "title": "Add a dedicated CRM lead operations playbook",
+                "priority": "high",
+                "owner_team": "sales",
+                "rationale": "Lead hygiene, dedupe rules, enrichment, and speed-to-lead are still under-specified without a dedicated local skill.",
+                "action": "Install or author the CRM lead ops skill and assign it to sales ops, outbound SDR, and marketing ops agents.",
+            })
+        if "gtm-reporting-analytics" not in available_skill_ids:
+            recommendations.append({
+                "title": "Strengthen GTM reporting coverage",
+                "priority": "medium",
+                "owner_team": "marketing",
+                "rationale": "Executive KPI and channel-level analysis are still dependent on generic analyst skills.",
+                "action": "Add a GTM reporting playbook and assign it to marketing ops, revops, and analytics roles.",
+            })
+        if not recommendations:
+            recommendations.append({
+                "title": "Keep the operating loop tight",
+                "priority": "low",
+                "owner_team": "marketing",
+                "rationale": "The current GTM environment has coverage across the main operating lanes.",
+                "action": "Use this overview weekly to convert stale signals into explicit tasks, events, and content work.",
+            })
+
+        coverage_score = 0.0
+        if capabilities:
+            coverage_score = round(covered_capabilities / len(capabilities), 2)
+
+        return Response(body={
+            "generated_at": now.isoformat(),
+            "summary": {
+                "total_gtm_agents": len(agents),
+                "open_tasks": len(tasks),
+                "upcoming_events": len(upcoming_events),
+                "active_content_items": len(content_items),
+                "recent_ads_reports": len(recent_ads_reports),
+                "coverage_score": coverage_score,
+            },
+            "teams": team_snapshots,
+            "motions": motions,
+            "capabilities": capabilities,
+            "recommendations": recommendations,
+        })
 
     def list_teams(request: Request) -> Response:
         tenant_id = _require_tenant_id(request)
@@ -5511,6 +6605,33 @@ def register_routes(
                 status_code=404,
                 body={"error": f"Approval request not found: {approval_id}"},
             )
+        approval_context = dict(approval.get("context") or {})
+        if str(approval_context.get("resource_type", "")) == "experiment_campaign":
+            approval_tenant_id = str(approval.get("tenant_id") or approval_context.get("tenant_id") or "default")
+            if approval_tenant_id != tenant_id:
+                return Response(status_code=403, body={"error": "Forbidden"})
+            if approval.get("status") != "pending":
+                return Response(
+                    status_code=409,
+                    body={"error": f"Approval request already decided: {approval_id}"},
+                )
+            body = request.body or {}
+            valid, errors = validate(body, APPROVAL_DECISION_SCHEMA)
+            if not valid:
+                return Response(status_code=422, body={"errors": errors})
+            reason = body.get("reason")
+            try:
+                detail = experiment_manager.approve_pending_approval(
+                    approval_id,
+                    tenant_id=tenant_id,
+                    actor="api",
+                    reason=reason,
+                )
+            except (ApprovalAlreadyDecidedError, ApprovalBindingMismatchError, ValueError) as exc:
+                return Response(status_code=409, body={"error": str(exc)})
+            except KeyError as exc:
+                return Response(status_code=404, body={"error": str(exc)})
+            return Response(body=detail)
         run_id = str(approval.get("run_id", ""))
         run = s.get_run_record(run_id)
         if run is None:
@@ -5558,6 +6679,33 @@ def register_routes(
                 status_code=404,
                 body={"error": f"Approval request not found: {approval_id}"},
             )
+        approval_context = dict(approval.get("context") or {})
+        if str(approval_context.get("resource_type", "")) == "experiment_campaign":
+            approval_tenant_id = str(approval.get("tenant_id") or approval_context.get("tenant_id") or "default")
+            if approval_tenant_id != tenant_id:
+                return Response(status_code=403, body={"error": "Forbidden"})
+            if approval.get("status") != "pending":
+                return Response(
+                    status_code=409,
+                    body={"error": f"Approval request already decided: {approval_id}"},
+                )
+            body = request.body or {}
+            valid, errors = validate(body, APPROVAL_DECISION_SCHEMA)
+            if not valid:
+                return Response(status_code=422, body={"errors": errors})
+            reason = body.get("reason")
+            try:
+                detail = experiment_manager.reject_pending_approval(
+                    approval_id,
+                    tenant_id=tenant_id,
+                    actor="api",
+                    reason=reason,
+                )
+            except (ApprovalAlreadyDecidedError, ApprovalBindingMismatchError, ValueError) as exc:
+                return Response(status_code=409, body={"error": str(exc)})
+            except KeyError as exc:
+                return Response(status_code=404, body={"error": str(exc)})
+            return Response(body=detail)
         run_id = str(approval.get("run_id", ""))
         run = s.get_run_record(run_id)
         if run is None:
@@ -5731,6 +6879,16 @@ def register_routes(
     _public("GET", v1("/runs/{run_id}/approvals"), list_run_approvals, aliases=("/api/v1/workflow-runs/{run_id}/approvals",), all_of=("approvals:read",))
     _public("GET", v1("/runs/{run_id}/checkpoints"), list_run_checkpoints, aliases=("/api/v1/workflow-runs/{run_id}/checkpoints",), all_of=("checkpoints:read",))
     _public("POST", v1("/runs/{run_id}/resume"), resume_workflow_run, aliases=("/api/v1/workflow-runs/{run_id}/resume",), all_of=("runs:write",))
+    _public("GET", v1("/experiments"), list_experiment_campaigns, all_of=("experiments:read",))
+    _public("POST", v1("/experiments"), create_experiment_campaign, all_of=("experiments:write",))
+    _public("GET", v1("/experiments/{campaign_id}"), get_experiment_campaign, all_of=("experiments:read",))
+    _public("GET", v1("/experiments/{campaign_id}/iterations"), list_experiment_iterations, all_of=("experiments:read",))
+    _public("GET", v1("/experiments/{campaign_id}/events"), stream_experiment_campaign_events, all_of=("experiments:read",))
+    _public("POST", v1("/experiments/{campaign_id}/start"), start_experiment_campaign, all_of=("experiments:write",))
+    _public("POST", v1("/experiments/{campaign_id}/pause"), pause_experiment_campaign, all_of=("experiments:stop",))
+    _public("POST", v1("/experiments/{campaign_id}/resume"), resume_experiment_campaign, all_of=("experiments:write",))
+    _public("POST", v1("/experiments/{campaign_id}/cancel"), cancel_experiment_campaign, all_of=("experiments:stop",))
+    _public("POST", v1("/experiments/{campaign_id}/promote"), promote_experiment_campaign, all_of=("experiments:promote",))
     _public("GET", v1("/approvals"), list_approvals, all_of=("approvals:read",))
     _public("POST", v1("/approvals/{approval_id}/approve"), approve_request, all_of=("approvals:write",))
     _public("POST", v1("/approvals/{approval_id}/reject"), reject_request, all_of=("approvals:write",))
@@ -5761,6 +6919,7 @@ def register_routes(
     _public("GET", v1("/lifecycle/projects/{project_id}"), get_lifecycle_project, all_of=("runs:read",))
     _public("GET", v1("/lifecycle/projects/{project_id}/events"), stream_lifecycle_project_events, all_of=("runs:read",))
     _public("PATCH", v1("/lifecycle/projects/{project_id}"), update_lifecycle_project, all_of=("runs:write",))
+    _public("DELETE", v1("/lifecycle/projects/{project_id}"), delete_lifecycle_project, all_of=("runs:write",))
     _public("GET", v1("/lifecycle/projects/{project_id}/blueprint"), get_lifecycle_blueprints, all_of=("runs:read",))
     _public("POST", v1("/lifecycle/projects/{project_id}/phases/{phase}/prepare"), prepare_lifecycle_phase, all_of=("runs:write",))
     _public("POST", v1("/lifecycle/projects/{project_id}/phases/{phase}/sync"), sync_lifecycle_phase_run, all_of=("runs:write",))
@@ -5788,6 +6947,7 @@ def register_routes(
     _public("POST", v1("/content"), create_content, all_of=("runs:write",))
     _public("PATCH", v1("/content/{content_id}"), update_content, all_of=("runs:write",))
     _public("DELETE", v1("/content/{content_id}"), delete_content, all_of=("runs:write",))
+    _public("GET", v1("/gtm/overview"), get_gtm_overview, all_of=("runs:read",))
     _public("GET", v1("/teams"), list_teams, all_of=("agents:read",))
     _public("POST", v1("/teams"), create_team, all_of=("agents:write",))
     _public("PATCH", v1("/teams/{id}"), update_team, all_of=("agents:write",))

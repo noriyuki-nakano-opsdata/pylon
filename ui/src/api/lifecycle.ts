@@ -28,6 +28,7 @@ import type {
   UseCase,
   RecommendedMilestone,
   PhaseBlueprint,
+  LifecycleDeliveryPlan,
   LifecycleProject,
   LifecycleOrchestrationMode,
   ApprovalComment,
@@ -37,6 +38,9 @@ import type {
   LifecycleRecommendation,
   LifecyclePhaseRuntimeSummary,
   PhaseStatus,
+  LifecycleGovernanceMode,
+  LifecycleValueContract,
+  LifecycleOutcomeTelemetryContract,
 } from "@/types/lifecycle";
 
 /* ── API Functions ── */
@@ -110,15 +114,27 @@ export function lifecycleWorkflowId(
 }
 
 export const lifecycleApi = {
-  listProjects(): Promise<LifecycleProjectListResponse> {
-    return apiFetch<LifecycleProjectListResponse>("/v1/lifecycle/projects");
+  async listProjects(): Promise<LifecycleProjectListResponse> {
+    const response = await apiFetch<LifecycleProjectListResponse>("/v1/lifecycle/projects");
+    return {
+      ...response,
+      projects: asArray<LifecycleProject>(response.projects).map((project) => normalizeLifecycleProject(project)),
+    };
   },
 
-  getProject(projectSlug: string): Promise<LifecycleProject> {
-    return apiFetch<LifecycleProject>(`/v1/lifecycle/projects/${projectSlug}`);
+  async getProject(projectSlug: string): Promise<LifecycleProject> {
+    return normalizeLifecycleProject(
+      await apiFetch<LifecycleProject>(`/v1/lifecycle/projects/${projectSlug}`),
+    );
   },
 
-  saveProject(
+  deleteProject(projectSlug: string): Promise<void> {
+    return apiFetch<void>(`/v1/lifecycle/projects/${projectSlug}`, {
+      method: "DELETE",
+    });
+  },
+
+  async saveProject(
     projectSlug: string,
     payload: Partial<LifecycleProject>,
     options: { autoRun?: boolean; maxSteps?: number } = {},
@@ -126,13 +142,13 @@ export const lifecycleApi = {
     const body: Record<string, unknown> = { ...payload };
     if (options.autoRun !== undefined) body.auto_run = options.autoRun;
     if (options.maxSteps !== undefined) body.max_steps = options.maxSteps;
-    return apiFetch<LifecycleMutationResponse>(`/v1/lifecycle/projects/${projectSlug}`, {
+    return normalizeLifecycleMutationResponse(await apiFetch<LifecycleMutationResponse>(`/v1/lifecycle/projects/${projectSlug}`, {
       method: "PATCH",
       body: JSON.stringify(body),
-    });
+    }));
   },
 
-  advanceProject(
+  async advanceProject(
     projectSlug: string,
     options: {
       orchestrationMode?: LifecycleOrchestrationMode;
@@ -142,10 +158,10 @@ export const lifecycleApi = {
     const body: Record<string, unknown> = {};
     if (options.orchestrationMode) body.orchestration_mode = options.orchestrationMode;
     if (options.maxSteps !== undefined) body.max_steps = options.maxSteps;
-    return apiFetch<LifecycleMutationResponse>(`/v1/lifecycle/projects/${projectSlug}/advance`, {
+    return normalizeLifecycleMutationResponse(await apiFetch<LifecycleMutationResponse>(`/v1/lifecycle/projects/${projectSlug}/advance`, {
       method: "POST",
       body: JSON.stringify(body),
-    });
+    }));
   },
 
   getBlueprints(projectSlug: string): Promise<LifecycleBlueprintResponse> {
@@ -184,15 +200,19 @@ export const lifecycleApi = {
     return { runId: res.id };
   },
 
-  syncPhaseRun(
+  async syncPhaseRun(
     projectSlug: string,
     phase: LifecyclePhase,
     runId: string,
   ): Promise<LifecyclePhaseSyncResponse> {
-    return apiFetch<LifecyclePhaseSyncResponse>(`/v1/lifecycle/projects/${projectSlug}/phases/${phase}/sync`, {
+    const response = await apiFetch<LifecyclePhaseSyncResponse>(`/v1/lifecycle/projects/${projectSlug}/phases/${phase}/sync`, {
       method: "POST",
       body: JSON.stringify({ run_id: runId }),
     });
+    return {
+      ...response,
+      project: normalizeLifecycleProject(response.project),
+    };
   },
 
   async getRun(runId: string): Promise<WorkflowRun> {
@@ -239,64 +259,71 @@ export const lifecycleApi = {
     }
   },
 
-  addApprovalComment(
+  async addApprovalComment(
     projectSlug: string,
     payload: Pick<ApprovalComment, "text" | "type">,
-  ): Promise<LifecycleProject> {
-    return apiFetch<LifecycleProject>(`/v1/lifecycle/projects/${projectSlug}/approval/comments`, {
+  ): Promise<LifecycleMutationResponse> {
+    return normalizeLifecycleMutationResponse(await apiFetch<LifecycleMutationResponse>(`/v1/lifecycle/projects/${projectSlug}/approval/comments`, {
       method: "POST",
       body: JSON.stringify(payload),
-    });
+    }));
   },
 
-  decideApproval(
+  async decideApproval(
     projectSlug: string,
     decision: LifecycleProject["approvalStatus"],
     comment = "",
-  ): Promise<LifecycleProject> {
-    return apiFetch<LifecycleProject>(`/v1/lifecycle/projects/${projectSlug}/approval/decision`, {
+  ): Promise<LifecycleMutationResponse> {
+    return normalizeLifecycleMutationResponse(await apiFetch<LifecycleMutationResponse>(`/v1/lifecycle/projects/${projectSlug}/approval/decision`, {
       method: "POST",
       body: JSON.stringify({ decision, comment }),
-    });
+    }));
   },
 
-  runDeployChecks(projectSlug: string, buildCode?: string): Promise<LifecycleDeployChecksResponse> {
-    return apiFetch<LifecycleDeployChecksResponse>(`/v1/lifecycle/projects/${projectSlug}/deploy/checks`, {
+  async runDeployChecks(projectSlug: string, buildCode?: string): Promise<LifecycleDeployChecksResponse> {
+    const response = await apiFetch<LifecycleDeployChecksResponse>(`/v1/lifecycle/projects/${projectSlug}/deploy/checks`, {
       method: "POST",
       body: JSON.stringify(buildCode ? { buildCode } : {}),
     });
+    return {
+      ...response,
+      project: normalizeLifecycleProject(response.project),
+    };
   },
 
-  createRelease(projectSlug: string, note = ""): Promise<{ project: LifecycleProject; release: ReleaseRecord }> {
-    return apiFetch<{ project: LifecycleProject; release: ReleaseRecord }>(`/v1/lifecycle/projects/${projectSlug}/releases`, {
+  async createRelease(projectSlug: string, note = ""): Promise<{ project: LifecycleProject; release: ReleaseRecord }> {
+    const response = await apiFetch<{ project: LifecycleProject; release: ReleaseRecord }>(`/v1/lifecycle/projects/${projectSlug}/releases`, {
       method: "POST",
       body: JSON.stringify({ note }),
     });
+    return { ...response, project: normalizeLifecycleProject(response.project) };
   },
 
   listFeedback(projectSlug: string): Promise<{ feedbackItems: FeedbackItem[]; recommendations: LifecycleRecommendation[] }> {
     return apiFetch<{ feedbackItems: FeedbackItem[]; recommendations: LifecycleRecommendation[] }>(`/v1/lifecycle/projects/${projectSlug}/feedback`);
   },
 
-  addFeedback(
+  async addFeedback(
     projectSlug: string,
     payload: Pick<FeedbackItem, "text" | "type" | "impact">,
   ): Promise<{ project: LifecycleProject; feedbackItems: FeedbackItem[] }> {
-    return apiFetch<{ project: LifecycleProject; feedbackItems: FeedbackItem[] }>(`/v1/lifecycle/projects/${projectSlug}/feedback`, {
+    const response = await apiFetch<{ project: LifecycleProject; feedbackItems: FeedbackItem[] }>(`/v1/lifecycle/projects/${projectSlug}/feedback`, {
       method: "POST",
       body: JSON.stringify(payload),
     });
+    return { ...response, project: normalizeLifecycleProject(response.project) };
   },
 
-  voteFeedback(
+  async voteFeedback(
     projectSlug: string,
     feedbackId: string,
     delta: number,
   ): Promise<{ project: LifecycleProject; feedbackItems: FeedbackItem[] }> {
-    return apiFetch<{ project: LifecycleProject; feedbackItems: FeedbackItem[] }>(`/v1/lifecycle/projects/${projectSlug}/feedback/${feedbackId}/vote`, {
+    const response = await apiFetch<{ project: LifecycleProject; feedbackItems: FeedbackItem[] }>(`/v1/lifecycle/projects/${projectSlug}/feedback/${feedbackId}/vote`, {
       method: "POST",
       body: JSON.stringify({ delta }),
     });
+    return { ...response, project: normalizeLifecycleProject(response.project) };
   },
 
   getRecommendations(projectSlug: string): Promise<{ recommendations: LifecycleRecommendation[] }> {
@@ -320,10 +347,522 @@ function asNumber(val: unknown, fallback = 0): number {
     : fallback;
 }
 
+function asBoolean(val: unknown, fallback = false): boolean {
+  return typeof val === "boolean" ? val : fallback;
+}
+
 function asRecord(val: unknown): Record<string, unknown> {
   return val != null && typeof val === "object" && !Array.isArray(val)
     ? (val as Record<string, unknown>)
     : {};
+}
+
+function parseRequirementsBundle(raw: unknown): LifecycleProject["requirements"] {
+  const source = asRecord(raw);
+  if (Object.keys(source).length === 0) return null;
+  const acceptanceCriteria = asArray(source.acceptanceCriteria ?? source.acceptance_criteria).map((item) => {
+    const record = asRecord(item);
+    return {
+      id: asString(record.id, ""),
+      requirementId: asString(record.requirementId ?? record.requirement_id, ""),
+      criterion: asString(record.criterion ?? record.text, ""),
+    };
+  }).filter((item) => item.id || item.requirementId || item.criterion);
+  const acceptanceByRequirement = new Map<string, string[]>();
+  for (const criterion of acceptanceCriteria) {
+    if (!criterion.requirementId || !criterion.criterion) continue;
+    const bucket = acceptanceByRequirement.get(criterion.requirementId) ?? [];
+    bucket.push(criterion.criterion);
+    acceptanceByRequirement.set(criterion.requirementId, bucket);
+  }
+  const requirements = asArray(source.requirements).map((item) => {
+    const record = asRecord(item);
+    const requirementId = asString(record.id, "");
+    const criteria = acceptanceByRequirement.get(requirementId)
+      ?? asArray<string>(record.acceptanceCriteria ?? record.acceptance_criteria);
+    return {
+      id: requirementId,
+      pattern: asString(record.pattern, "ubiquitous") as "ubiquitous" | "event-driven" | "unwanted" | "state-driven" | "optional" | "complex",
+      statement: asString(record.statement, ""),
+      confidence: asNumber(record.confidence, 0),
+      sourceClaimIds: asArray<string>(record.sourceClaimIds ?? record.source_claim_ids),
+      userStoryIds: asArray<string>(record.userStoryIds ?? record.user_story_ids),
+      acceptanceCriteria: criteria,
+    };
+  });
+  const userStories = asArray(source.userStories ?? source.user_stories).map((item) => {
+    const record = asRecord(item);
+    const description = asString(record.description ?? record.text, "");
+    const title = asString(
+      record.title,
+      `${asString(record.persona, "ユーザー")}: ${asString(record.action, asString(record.requirement_id ?? record.requirementId, ""))}`,
+    );
+    return {
+      id: asString(record.id, ""),
+      title,
+      description: description || title,
+    };
+  });
+  const distribution = asRecord(source.confidenceDistribution ?? source.confidence_distribution);
+  const traceabilityIndex = asRecord(source.traceabilityIndex ?? source.traceability_index);
+  return {
+    requirements,
+    userStories,
+    acceptanceCriteria,
+    confidenceDistribution: {
+      high: asNumber(distribution.high, 0),
+      medium: asNumber(distribution.medium, 0),
+      low: asNumber(distribution.low, 0),
+    },
+    completenessScore: asNumber(source.completenessScore ?? source.completeness_score, 0),
+    traceabilityIndex: Object.fromEntries(
+      Object.entries(traceabilityIndex).map(([key, value]) => [key, asArray<string>(value)]),
+    ),
+  };
+}
+
+function parseTaskDecomposition(raw: unknown): LifecycleProject["taskDecomposition"] {
+  const source = asRecord(raw);
+  if (Object.keys(source).length === 0) return null;
+  return {
+    tasks: asArray(source.tasks).map((item) => {
+      const record = asRecord(item);
+      return {
+        id: asString(record.id, ""),
+        title: asString(record.title, ""),
+        description: asString(record.description, ""),
+        phase: asString(record.phase, ""),
+        milestoneId: asString(record.milestoneId ?? record.milestone_id, "") || null,
+        dependsOn: asArray<string>(record.dependsOn ?? record.depends_on),
+        effortHours: asNumber(record.effortHours ?? record.effort_hours, 0),
+        priority: asString(record.priority, "should") as "must" | "should" | "could",
+        featureId: asString(record.featureId ?? record.feature_id, "") || null,
+        requirementId: asString(record.requirementId ?? record.requirement_id, "") || null,
+      };
+    }),
+    dagEdges: asArray(source.dagEdges ?? source.dag_edges)
+      .filter((entry): entry is [string, string] => Array.isArray(entry) && entry.length >= 2)
+      .map((entry) => [asString(entry[0], ""), asString(entry[1], "")]),
+    phaseMilestones: asArray(source.phaseMilestones ?? source.phase_milestones).map((item) => {
+      const record = asRecord(item);
+      return {
+        phase: asString(record.phase, ""),
+        milestoneIds: asArray<string>(record.milestoneIds ?? record.milestone_ids),
+        taskCount: asNumber(record.taskCount ?? record.task_count, 0),
+        totalHours: asNumber(record.totalHours ?? record.total_hours, 0),
+        durationDays: asNumber(record.durationDays ?? record.duration_days, 0),
+      };
+    }),
+    totalEffortHours: asNumber(source.totalEffortHours ?? source.total_effort_hours, 0),
+    criticalPath: asArray<string>(source.criticalPath ?? source.critical_path),
+    effortByPhase: Object.fromEntries(
+      Object.entries(asRecord(source.effortByPhase ?? source.effort_by_phase)).map(([key, value]) => [key, asNumber(value, 0)]),
+    ),
+    hasCycles: asBoolean(source.hasCycles ?? source.has_cycles, false),
+  };
+}
+
+function parseDCSAnalysis(raw: unknown): LifecycleProject["dcsAnalysis"] {
+  const source = asRecord(raw);
+  if (Object.keys(source).length === 0) return null;
+  const rubberDuck = asRecord(source.rubberDuckPrd ?? source.rubber_duck_prd);
+  const edgeCases = asRecord(source.edgeCases ?? source.edge_case_analysis);
+  const impactAnalysis = asRecord(source.impactAnalysis ?? source.impact_analysis);
+  const sequenceDiagrams = asRecord(source.sequenceDiagrams ?? source.sequence_diagrams);
+  const stateTransitions = asRecord(source.stateTransitions ?? source.state_transitions);
+  return {
+    rubberDuckPrd: Object.keys(rubberDuck).length > 0 ? {
+      problemStatement: asString(rubberDuck.problemStatement ?? rubberDuck.problem_statement, ""),
+      targetUsers: asArray<string>(rubberDuck.targetUsers ?? rubberDuck.target_users),
+      successMetrics: asArray(rubberDuck.successMetrics ?? rubberDuck.success_metrics).map((item) => asRecord(item)),
+      scopeBoundaries: (() => {
+        const scope = asRecord(rubberDuck.scopeBoundaries ?? rubberDuck.scope_boundaries);
+        return {
+          inScope: asArray<string>(scope.inScope ?? scope.in_scope),
+          outOfScope: asArray<string>(scope.outOfScope ?? scope.out_of_scope),
+        };
+      })(),
+      keyDecisions: asArray(rubberDuck.keyDecisions ?? rubberDuck.key_decisions).map((item) => asRecord(item)),
+    } : null,
+    edgeCases: Object.keys(edgeCases).length > 0 ? {
+      edgeCases: asArray(edgeCases.edgeCases ?? edgeCases.edge_cases).map((item) => {
+        const record = asRecord(item);
+        return {
+          id: asString(record.id, ""),
+          scenario: asString(record.scenario, ""),
+          severity: asString(record.severity, "low") as "critical" | "high" | "medium" | "low",
+          mitigation: asString(record.mitigation, ""),
+          featureId: asString(record.featureId ?? record.feature_id, ""),
+        };
+      }),
+      riskMatrix: Object.fromEntries(
+        Object.entries(asRecord(edgeCases.riskMatrix ?? edgeCases.risk_matrix)).map(([key, value]) => [key, asNumber(value, 0)]),
+      ),
+      coverageScore: asNumber(edgeCases.coverageScore ?? edgeCases.coverage_score, 0),
+    } : null,
+    impactAnalysis: Object.keys(impactAnalysis).length > 0 ? {
+      layers: asArray(impactAnalysis.layers).map((item) => {
+        const record = asRecord(item);
+        return {
+          layer: asString(record.layer, ""),
+          impacts: asArray(record.impacts).map((entry) => asRecord(entry)),
+        };
+      }),
+      blastRadius: asNumber(impactAnalysis.blastRadius ?? impactAnalysis.blast_radius, 0),
+      criticalPathsAffected: asArray<string>(impactAnalysis.criticalPathsAffected ?? impactAnalysis.critical_paths_affected),
+    } : null,
+    sequenceDiagrams: Object.keys(sequenceDiagrams).length > 0 ? {
+      diagrams: asArray(sequenceDiagrams.diagrams).map((item) => {
+        const record = asRecord(item);
+        return {
+          id: asString(record.id, ""),
+          title: asString(record.title, ""),
+          mermaidCode: asString(record.mermaidCode ?? record.mermaid_code, ""),
+          flowType: asString(record.flowType ?? record.flow_type, "success"),
+        };
+      }),
+    } : null,
+    stateTransitions: Object.keys(stateTransitions).length > 0 ? {
+      states: asArray(stateTransitions.states).map((item) => {
+        const record = asRecord(item);
+        return {
+          id: asString(record.id, ""),
+          name: asString(record.name, ""),
+          description: asString(record.description, ""),
+        };
+      }),
+      transitions: asArray(stateTransitions.transitions).map((item) => {
+        const record = asRecord(item);
+        return {
+          fromState: asString(record.fromState ?? record.from_state, ""),
+          toState: asString(record.toState ?? record.to_state, ""),
+          trigger: asString(record.trigger, ""),
+          guard: asString(record.guard, ""),
+          riskLevel: asString(record.riskLevel ?? record.risk_level, "low"),
+        };
+      }),
+      riskStates: asArray(stateTransitions.riskStates ?? stateTransitions.risk_states).map((item) => asRecord(item)),
+      mermaidCode: asString(stateTransitions.mermaidCode ?? stateTransitions.mermaid_code, ""),
+    } : null,
+  };
+}
+
+function parseTechnicalDesign(raw: unknown): LifecycleProject["technicalDesign"] {
+  const source = asRecord(raw);
+  if (Object.keys(source).length === 0) return null;
+  return {
+    architecture: asRecord(source.architecture),
+    dataflowMermaid: asString(source.dataflowMermaid ?? source.dataflow_mermaid, ""),
+    apiSpecification: asArray(source.apiSpecification ?? source.api_specification).map((item) => {
+      const record = asRecord(item);
+      return {
+        method: asString(record.method, "GET"),
+        path: asString(record.path, "/"),
+        description: asString(record.description, ""),
+        authRequired: asBoolean(record.authRequired ?? record.auth_required, true),
+      };
+    }),
+    databaseSchema: asArray(source.databaseSchema ?? source.database_schema).map((item) => {
+      const record = asRecord(item);
+      return {
+        name: asString(record.name, ""),
+        columns: asArray(record.columns).map((entry) => {
+          const column = asRecord(entry);
+          return {
+            name: asString(column.name, ""),
+            type: asString(column.type, "text"),
+            nullable: asBoolean(column.nullable, true),
+            primaryKey: asBoolean(column.primaryKey ?? column.primary_key, false),
+          };
+        }),
+        indexes: asArray<string>(record.indexes),
+      };
+    }),
+    interfaceDefinitions: asArray(source.interfaceDefinitions ?? source.interface_definitions).map((item) => {
+      const record = asRecord(item);
+      return {
+        name: asString(record.name, ""),
+        properties: asArray(record.properties).map((entry) => {
+          const property = asRecord(entry);
+          return {
+            name: asString(property.name, ""),
+            type: asString(property.type, "string"),
+            optional: asBoolean(property.optional, false),
+          };
+        }),
+        extends: asArray<string>(record.extends),
+      };
+    }),
+    componentDependencyGraph: Object.fromEntries(
+      Object.entries(asRecord(source.componentDependencyGraph ?? source.component_dependency_graph)).map(([key, value]) => [key, asArray<string>(value)]),
+    ),
+  };
+}
+
+function parseReverseEngineering(raw: unknown): LifecycleProject["reverseEngineering"] {
+  const source = asRecord(raw);
+  if (Object.keys(source).length === 0) return null;
+  return {
+    extractedRequirements: asArray(source.extractedRequirements ?? source.extracted_requirements).map((item) => asRecord(item)),
+    architectureDoc: asRecord(source.architectureDoc ?? source.architecture_doc),
+    dataflowMermaid: asString(source.dataflowMermaid ?? source.dataflow_mermaid, ""),
+    apiEndpoints: asArray(source.apiEndpoints ?? source.api_endpoints).map((item) => {
+      const record = asRecord(item);
+      return {
+        method: asString(record.method, "GET"),
+        path: asString(record.path, "/"),
+        handler: asString(record.handler, ""),
+        filePath: asString(record.filePath ?? record.file_path, ""),
+      };
+    }),
+    databaseSchema: asArray(source.databaseSchema ?? source.database_schema).map((item) => {
+      const record = asRecord(item);
+      return {
+        name: asString(record.name, ""),
+        columns: asArray(record.columns).map((entry) => asRecord(entry)),
+        source: asString(record.source, ""),
+      };
+    }),
+    interfaces: asArray(source.interfaces).map((item) => {
+      const record = asRecord(item);
+      return {
+        name: asString(record.name, ""),
+        kind: asString(record.kind, "interface"),
+        properties: asArray(record.properties).map((entry) => asRecord(entry)),
+        filePath: asString(record.filePath ?? record.file_path, ""),
+      };
+    }),
+    taskStructure: asArray(source.taskStructure ?? source.task_structure).map((item) => asRecord(item)),
+    testSpecs: asArray(source.testSpecs ?? source.test_specs).map((item) => asRecord(item)),
+    coverageScore: asNumber(source.coverageScore ?? source.coverage_score, 0),
+    languagesDetected: asArray<string>(source.languagesDetected ?? source.languages_detected),
+    sourceType: asString(source.sourceType ?? source.source_type, "") || undefined,
+  };
+}
+
+export function normalizeLifecycleProject(project: LifecycleProject | Record<string, unknown>): LifecycleProject {
+  const raw = asRecord(project);
+  const decisionContext = raw.decisionContext ?? raw.decision_context ?? undefined;
+  const parseValueContract = (value: unknown): LifecycleValueContract | undefined => {
+    const source = asRecord(value);
+    if (Object.keys(source).length === 0) return undefined;
+    return {
+      id: asString(source.id, "value-contract"),
+      schema_version: asNumber(source.schema_version ?? source.schemaVersion, 1),
+      summary: asString(source.summary, ""),
+      primary_personas: asArray(source.primary_personas ?? source.primaryPersonas).map((item) => {
+        const record = asRecord(item);
+        return {
+          name: asString(record.name, ""),
+          role: asString(record.role, undefined),
+          context: asString(record.context, undefined),
+          goals: asArray<string>(record.goals),
+          frustrations: asArray<string>(record.frustrations),
+        };
+      }),
+      selected_features: asArray(source.selected_features ?? source.selectedFeatures).map((item) => {
+        const record = asRecord(item);
+        return {
+          id: asString(record.id, ""),
+          name: asString(record.name, ""),
+          priority: asString(record.priority, undefined),
+          category: asString(record.category, undefined),
+          rationale: asString(record.rationale, undefined),
+        };
+      }),
+      required_use_cases: asArray(source.required_use_cases ?? source.requiredUseCases).map((item) => {
+        const record = asRecord(item);
+        return {
+          id: asString(record.id, ""),
+          title: asString(record.title, ""),
+          priority: asString(record.priority, undefined),
+          actor: asString(record.actor, undefined),
+          summary: asString(record.summary, undefined),
+          feature_names: asArray<string>(record.feature_names ?? record.featureNames),
+          milestone_names: asArray<string>(record.milestone_names ?? record.milestoneNames),
+        };
+      }),
+      job_stories: asArray(source.job_stories ?? source.jobStories).map((item) => {
+        const record = asRecord(item);
+        return {
+          id: asString(record.id, ""),
+          title: asString(record.title, ""),
+          situation: asString(record.situation, undefined),
+          motivation: asString(record.motivation, undefined),
+          outcome: asString(record.outcome, undefined),
+          priority: asString(record.priority, undefined),
+          related_features: asArray<string>(record.related_features ?? record.relatedFeatures),
+        };
+      }),
+      user_journeys: asArray(source.user_journeys ?? source.userJourneys).map((item) => {
+        const record = asRecord(item);
+        return {
+          id: asString(record.id, ""),
+          persona_name: asString(record.persona_name ?? record.personaName, ""),
+          critical_touchpoints: asArray(record.critical_touchpoints ?? record.criticalTouchpoints).map((entry) => {
+            const point = asRecord(entry);
+            return {
+              phase: asString(point.phase, undefined),
+              action: asString(point.action, undefined),
+              touchpoint: asString(point.touchpoint, undefined),
+              emotion: asString(point.emotion, undefined),
+              pain_point: asString(point.pain_point ?? point.painPoint, undefined),
+              opportunity: asString(point.opportunity, undefined),
+            };
+          }),
+          failure_moments: asArray<string>(record.failure_moments ?? record.failureMoments),
+        };
+      }),
+      kano_focus: (() => {
+        const focus = asRecord(source.kano_focus ?? source.kanoFocus);
+        return Object.keys(focus).length > 0 ? {
+          must_be: asArray<string>(focus.must_be ?? focus.mustBe),
+          performance: asArray<string>(focus.performance),
+          attractive: asArray<string>(focus.attractive),
+        } : undefined;
+      })(),
+      information_architecture: (() => {
+        const ia = asRecord(source.information_architecture ?? source.informationArchitecture);
+        return Object.keys(ia).length > 0 ? {
+          navigation_model: asString(ia.navigation_model ?? ia.navigationModel, undefined),
+          top_level_nodes: asArray(ia.top_level_nodes ?? ia.topLevelNodes).map((entry) => {
+            const node = asRecord(entry);
+            return {
+              id: asString(node.id, ""),
+              label: asString(node.label, ""),
+              priority: asString(node.priority, undefined),
+              description: asString(node.description, undefined),
+            };
+          }),
+          key_paths: asArray(ia.key_paths ?? ia.keyPaths).map((entry) => {
+            const path = asRecord(entry);
+            return {
+              name: asString(path.name, ""),
+              steps: asArray<string>(path.steps),
+            };
+          }),
+          top_tasks: asArray<string>(ia.top_tasks ?? ia.topTasks),
+        } : undefined;
+      })(),
+      success_metrics: asArray(source.success_metrics ?? source.successMetrics).map((item) => {
+        const metric = asRecord(item);
+        return {
+          id: asString(metric.id, ""),
+          name: asString(metric.name, ""),
+          signal: asString(metric.signal, ""),
+          target: asString(metric.target, ""),
+          source: asString(metric.source, ""),
+          leading_indicator: asString(metric.leading_indicator ?? metric.leadingIndicator, undefined),
+        };
+      }),
+      kill_criteria: asArray<string>(source.kill_criteria ?? source.killCriteria),
+      release_readiness_signals: asArray<string>(source.release_readiness_signals ?? source.releaseReadinessSignals),
+      decision_context_fingerprint: asString(
+        source.decision_context_fingerprint ?? source.decisionContextFingerprint,
+        undefined,
+      ),
+    };
+  };
+  const parseOutcomeTelemetryContract = (value: unknown): LifecycleOutcomeTelemetryContract | undefined => {
+    const source = asRecord(value);
+    if (Object.keys(source).length === 0) return undefined;
+    return {
+      id: asString(source.id, "outcome-telemetry-contract"),
+      schema_version: asNumber(source.schema_version ?? source.schemaVersion, 1),
+      summary: asString(source.summary, ""),
+      success_metrics: asArray(source.success_metrics ?? source.successMetrics).map((item) => {
+        const metric = asRecord(item);
+        return {
+          id: asString(metric.id, ""),
+          name: asString(metric.name, ""),
+          signal: asString(metric.signal, ""),
+          target: asString(metric.target, ""),
+          source: asString(metric.source, ""),
+          leading_indicator: asString(metric.leading_indicator ?? metric.leadingIndicator, undefined),
+        };
+      }),
+      kill_criteria: asArray<string>(source.kill_criteria ?? source.killCriteria),
+      telemetry_events: asArray(source.telemetry_events ?? source.telemetryEvents).map((item) => {
+        const event = asRecord(item);
+        return {
+          id: asString(event.id, ""),
+          name: asString(event.name, ""),
+          purpose: asString(event.purpose, undefined),
+          properties: asArray<string>(event.properties),
+          success_metric_ids: asArray<string>(event.success_metric_ids ?? event.successMetricIds),
+        };
+      }),
+      workspace_artifacts: asArray<string>(source.workspace_artifacts ?? source.workspaceArtifacts),
+      release_checks: asArray(source.release_checks ?? source.releaseChecks).map((item) => {
+        const record = asRecord(item);
+        return {
+          id: asString(record.id, ""),
+          title: asString(record.title, ""),
+          detail: asString(record.detail, undefined),
+        };
+      }),
+      instrumentation_requirements: asArray<string>(
+        source.instrumentation_requirements ?? source.instrumentationRequirements,
+      ),
+      experiment_questions: asArray<string>(source.experiment_questions ?? source.experimentQuestions),
+      decision_context_fingerprint: asString(
+        source.decision_context_fingerprint ?? source.decisionContextFingerprint,
+        undefined,
+      ),
+    };
+  };
+  const existingDeliveryPlan = asRecord(raw.deliveryPlan);
+  const normalizedValueContract = parseValueContract(
+    raw.valueContract ?? existingDeliveryPlan.value_contract ?? existingDeliveryPlan.valueContract,
+  );
+  const normalizedOutcomeTelemetryContract = parseOutcomeTelemetryContract(
+    raw.outcomeTelemetryContract
+      ?? existingDeliveryPlan.outcome_telemetry_contract
+      ?? existingDeliveryPlan.outcomeTelemetryContract,
+  );
+  const normalizedDeliveryPlan = Object.keys(existingDeliveryPlan).length > 0
+    ? {
+        ...(existingDeliveryPlan as unknown as LifecycleDeliveryPlan),
+        value_contract: normalizedValueContract ?? null,
+        outcome_telemetry_contract: normalizedOutcomeTelemetryContract ?? null,
+      }
+    : undefined;
+  const normalized = {
+    ...(project as LifecycleProject),
+    governanceMode: asString(raw.governanceMode, "governed") as LifecycleGovernanceMode,
+    decisionContext,
+    decision_context: decisionContext,
+    valueContract: normalizedValueContract,
+    outcomeTelemetryContract: normalizedOutcomeTelemetryContract,
+    deliveryPlan: normalizedDeliveryPlan,
+    requirements: parseRequirementsBundle(raw.requirements),
+    requirementsConfig: (() => {
+      const config = asRecord(raw.requirementsConfig);
+      return Object.keys(config).length > 0
+        ? {
+            earsEnabled: asBoolean(config.earsEnabled, true),
+            interactiveClarification: asBoolean(config.interactiveClarification, true),
+            confidenceFloor: asNumber(config.confidenceFloor, 0.6),
+          }
+        : undefined;
+    })(),
+    reverseEngineering: parseReverseEngineering(raw.reverseEngineering),
+    taskDecomposition: parseTaskDecomposition(raw.taskDecomposition),
+    dcsAnalysis: parseDCSAnalysis(raw.dcsAnalysis),
+    technicalDesign: parseTechnicalDesign(raw.technicalDesign),
+  } satisfies LifecycleProject;
+  return normalized;
+}
+
+function normalizeLifecycleMutationResponse(
+  response: LifecycleMutationResponse,
+): LifecycleMutationResponse {
+  const normalizedProject = normalizeLifecycleProject(response.project ?? response);
+  return {
+    ...response,
+    ...normalizedProject,
+    project: normalizedProject,
+  };
 }
 
 export function parseResearchOutput(
@@ -746,10 +1285,82 @@ function parseConfidenceSummary(raw: Record<string, unknown>): Pick<AnalysisResu
   };
 }
 
+function parsePlanningCoverageSummary(raw: Record<string, unknown>): Pick<AnalysisResult, "coverage_summary"> {
+  const summary = asRecord(raw.coverage_summary ?? raw.coverageSummary);
+  if (Object.keys(summary).length === 0) return {};
+  const presetBreakdown = asArray(summary.preset_breakdown ?? summary.presetBreakdown).map((entry) => {
+    const record = asRecord(entry);
+    const preset = asString(record.preset, "standard");
+    return {
+      preset: (["minimal", "standard", "full"].includes(preset) ? preset : "standard") as "minimal" | "standard" | "full",
+      epic_count: asNumber(record.epic_count ?? record.epicCount, 0),
+      wbs_count: asNumber(record.wbs_count ?? record.wbsCount, 0),
+      total_effort_hours: asNumber(record.total_effort_hours ?? record.totalEffortHours, 0),
+    };
+  });
+  return {
+    coverage_summary: {
+      selected_feature_count: asNumber(summary.selected_feature_count ?? summary.selectedFeatureCount, 0),
+      job_story_count: asNumber(summary.job_story_count ?? summary.jobStoryCount, 0),
+      use_case_count: asNumber(summary.use_case_count ?? summary.useCaseCount, 0),
+      actor_count: asNumber(summary.actor_count ?? summary.actorCount, 0),
+      role_count: asNumber(summary.role_count ?? summary.roleCount, 0),
+      traceability_count: asNumber(summary.traceability_count ?? summary.traceabilityCount, 0),
+      milestone_count: asNumber(summary.milestone_count ?? summary.milestoneCount, 0),
+      uncovered_features: asArray<string>(summary.uncovered_features ?? summary.uncoveredFeatures),
+      use_cases_without_milestone: asArray<string>(summary.use_cases_without_milestone ?? summary.useCasesWithoutMilestone),
+      use_cases_without_traceability: asArray<string>(summary.use_cases_without_traceability ?? summary.useCasesWithoutTraceability),
+      preset_breakdown: presetBreakdown,
+    },
+  };
+}
+
+function parsePlanningOperatorCopy(raw: Record<string, unknown>): Pick<AnalysisResult, "operator_copy"> {
+  const operatorCopy = asRecord(raw.operator_copy ?? raw.operatorCopy);
+  if (Object.keys(operatorCopy).length === 0) return {};
+
+  const councilCards = asArray(operatorCopy.council_cards ?? operatorCopy.councilCards).map((entry, index) => {
+    const card = asRecord(entry);
+    return {
+      id: asString(card.id, `council-${index + 1}`),
+      agent: asString(card.agent, ""),
+      lens: asString(card.lens, ""),
+      title: asString(card.title, ""),
+      summary: asString(card.summary, ""),
+      action_label: asString(card.action_label ?? card.actionLabel, ""),
+      target_tab: asString(card.target_tab ?? card.targetTab, "") || undefined,
+      target_section: ((): "risk" | "recommendation" | undefined => {
+        const targetSection = asString(card.target_section ?? card.targetSection, "");
+        return targetSection === "risk" || targetSection === "recommendation" ? targetSection : undefined;
+      })(),
+      tone: asString(card.tone, "") || undefined,
+    };
+  }).filter((card) => card.agent || card.title || card.summary);
+
+  const handoffRaw = asRecord(operatorCopy.handoff_brief ?? operatorCopy.handoffBrief);
+  const handoffBrief = Object.keys(handoffRaw).length > 0
+    ? {
+        headline: asString(handoffRaw.headline, ""),
+        summary: asString(handoffRaw.summary, ""),
+        bullets: asArray<string>(handoffRaw.bullets),
+      }
+    : undefined;
+
+  if (councilCards.length === 0 && !handoffBrief) return {};
+  return {
+    operator_copy: {
+      ...(councilCards.length > 0 ? { council_cards: councilCards } : {}),
+      ...(handoffBrief ? { handoff_brief: handoffBrief } : {}),
+    },
+  };
+}
+
 export function parsePlanningOutput(
   state: Record<string, unknown>,
 ): { analysis: AnalysisResult; features: FeatureSelection[]; planEstimates: PlanEstimate[] } {
   const raw = asRecord(state.planning ?? state.output ?? state);
+  const localized = asRecord(raw.localized);
+  const source = Object.keys(localized).length > 0 ? localized : raw;
 
   const parsePersona = (p: unknown): Persona => {
     const r = asRecord(p);
@@ -803,22 +1414,22 @@ export function parsePlanningOutput(
     };
   };
 
-  const personas = asArray(raw.personas).map(parsePersona);
+  const personas = asArray(source.personas).map(parsePersona);
   const userStories = asArray(
-    raw.user_stories ?? raw.userStories,
+    source.user_stories ?? source.userStories,
   ).map(parseUserStory);
   const kanoFeatures = asArray(
-    raw.kano_features ?? raw.kanoFeatures,
+    source.kano_features ?? source.kanoFeatures,
   ).map(parseKanoFeature);
 
-  const bm = asRecord(raw.business_model ?? raw.businessModel);
+  const bm = asRecord(source.business_model ?? source.businessModel);
   const hasBm = Object.keys(bm).length > 0;
 
   const analysis: AnalysisResult = {
     personas,
     user_stories: userStories,
     kano_features: kanoFeatures,
-    recommendations: asArray<string>(raw.recommendations),
+    recommendations: asArray<string>(source.recommendations),
     ...(hasBm
       ? {
           business_model: {
@@ -829,27 +1440,33 @@ export function parsePlanningOutput(
           },
         }
       : {}),
-    ...parseUserJourneys(raw),
-    ...parseJobStories(raw),
-    ...parseIAAnalysis(raw),
-    ...parseActors(raw),
-    ...parseRoles(raw),
-    ...parseUseCases(raw),
-    ...parseRecommendedMilestones(raw),
-    ...parseDesignTokens(raw),
-    ...parseFeatureDecisions(raw),
-    ...parseRejectedFeatures(raw),
-    ...parsePlanningAssumptions(raw),
-    ...parseRedTeamFindings(raw),
-    ...parseNegativePersonas(raw),
-    ...parseTraceability(raw),
-    ...parseKillCriteria(raw),
-    ...parseConfidenceSummary(raw),
-    ...(asString(raw.judge_summary ?? raw.judgeSummary, "") ? { judge_summary: asString(raw.judge_summary ?? raw.judgeSummary, "") } : {}),
-    ...(Object.keys(asRecord(raw.model_assignments ?? raw.modelAssignments)).length > 0 ? {
-      model_assignments: Object.fromEntries(Object.entries(asRecord(raw.model_assignments ?? raw.modelAssignments)).map(([key, value]) => [key, asString(value, "")])),
+    ...parseUserJourneys(source),
+    ...parseJobStories(source),
+    ...parseIAAnalysis(source),
+    ...parseActors(source),
+    ...parseRoles(source),
+    ...parseUseCases(source),
+    ...parseRecommendedMilestones(source),
+    ...parseDesignTokens(source),
+    ...parseFeatureDecisions(source),
+    ...parseRejectedFeatures(source),
+    ...parsePlanningAssumptions(source),
+    ...parseRedTeamFindings(source),
+    ...parseNegativePersonas(source),
+    ...parseTraceability(source),
+    ...parseKillCriteria(source),
+    ...parseConfidenceSummary(source),
+    ...parsePlanningCoverageSummary(source),
+    ...parsePlanningOperatorCopy(source),
+    ...(asString(source.judge_summary ?? source.judgeSummary, "") ? { judge_summary: asString(source.judge_summary ?? source.judgeSummary, "") } : {}),
+    ...(Object.keys(asRecord(source.model_assignments ?? source.modelAssignments)).length > 0 ? {
+      model_assignments: Object.fromEntries(Object.entries(asRecord(source.model_assignments ?? source.modelAssignments)).map(([key, value]) => [key, asString(value, "")])),
     } : {}),
-    ...(raw.low_diversity_mode === true || raw.lowDiversityMode === true ? { low_diversity_mode: true } : {}),
+    ...(source.low_diversity_mode === true || source.lowDiversityMode === true ? { low_diversity_mode: true } : {}),
+    ...(Object.keys(asRecord(raw.canonical)).length > 0 ? { canonical: asRecord(raw.canonical) } : {}),
+    ...(Object.keys(localized).length > 0 ? { localized } : {}),
+    ...(asString(raw.display_language ?? raw.displayLanguage, "") ? { display_language: asString(raw.display_language ?? raw.displayLanguage, "") } : {}),
+    ...(asString(raw.localization_status ?? raw.localizationStatus, "") ? { localization_status: asString(raw.localization_status ?? raw.localizationStatus, "") } : {}),
   };
 
   const features: FeatureSelection[] = asArray(
@@ -935,26 +1552,188 @@ export function parseDesignOutput(
 
   return variants.map((v, idx) => {
     const r = asRecord(v);
-    const scores = asRecord(r.scores);
-    const tokens = asRecord(r.tokens);
-    const prototype = asRecord(r.prototype);
+    const localized = asRecord(r.localized);
+    const source = Object.keys(localized).length > 0 ? { ...r, ...localized } : r;
+    const scores = asRecord(source.scores ?? r.scores);
+    const tokens = asRecord(source.tokens ?? r.tokens);
+    const prototype = asRecord(source.prototype ?? r.prototype);
+    const prototypeSpec = asRecord(r.prototype_spec ?? r.prototypeSpec ?? source.prototype_spec ?? source.prototypeSpec);
+    const prototypeApp = asRecord(r.prototype_app ?? r.prototypeApp ?? source.prototype_app ?? source.prototypeApp);
     const appShell = asRecord(prototype.app_shell);
+    const implementationBrief = asRecord(source.implementation_brief ?? source.implementationBrief);
 
     return {
       id: asString(r.id, `variant-${idx}`),
-      model: asString(r.model, "unknown"),
+      model: asString(source.model ?? r.model, "unknown"),
       pattern_name: asString(
-        r.pattern_name ?? r.patternName,
+        source.pattern_name ?? source.patternName ?? r.pattern_name ?? r.patternName,
         "Untitled",
       ),
-      description: asString(r.description, ""),
+      description: asString(source.description ?? r.description, ""),
       preview_html: asString(
-        r.preview_html ?? r.previewHtml ?? r.html,
+        source.preview_html ?? source.previewHtml ?? source.html ?? r.preview_html ?? r.previewHtml ?? r.html,
         "",
       ),
-      primary_color: asString(r.primary_color ?? r.primaryColor, undefined),
-      accent_color: asString(r.accent_color ?? r.accentColor, undefined),
-      quality_focus: asArray<string>(r.quality_focus ?? r.qualityFocus),
+      primary_color: asString(source.primary_color ?? source.primaryColor ?? r.primary_color ?? r.primaryColor, undefined),
+      accent_color: asString(source.accent_color ?? source.accentColor ?? r.accent_color ?? r.accentColor, undefined),
+      prototype_spec: prototypeSpec && Object.keys(prototypeSpec).length > 0 ? {
+        schema_version: asString(prototypeSpec.schema_version ?? prototypeSpec.schemaVersion, "1.0"),
+        framework_target: asString(prototypeSpec.framework_target ?? prototypeSpec.frameworkTarget, "nextjs-app-router"),
+        title: asString(prototypeSpec.title, ""),
+        subtitle: asString(prototypeSpec.subtitle, ""),
+        shell: (() => {
+          const shell = asRecord(prototypeSpec.shell);
+          return {
+            kind: asString(shell.kind, "product-workspace"),
+            layout: asString(shell.layout, "sidebar"),
+            density: asString(shell.density, "medium"),
+            status_badges: asArray<string>(shell.status_badges ?? shell.statusBadges),
+            primary_navigation: asArray(shell.primary_navigation ?? shell.primaryNavigation).map((item, navIdx) => {
+              const nav = asRecord(item);
+              return {
+                id: asString(nav.id, `nav-${navIdx}`),
+                label: asString(nav.label, "Section"),
+                priority: asString(nav.priority, "primary"),
+              };
+            }),
+          };
+        })(),
+        theme: (() => {
+          const theme = asRecord(prototypeSpec.theme);
+          return {
+            primary: asString(theme.primary, "#2563eb"),
+            accent: asString(theme.accent, "#f59e0b"),
+            background: asString(theme.background, "#0b1020"),
+            surface: asString(theme.surface, "#111827"),
+            text: asString(theme.text, "#f8fafc"),
+            heading_font: asString(theme.heading_font ?? theme.headingFont, "IBM Plex Sans"),
+            body_font: asString(theme.body_font ?? theme.bodyFont, "Noto Sans JP"),
+          };
+        })(),
+        selected_features: asArray<string>(prototypeSpec.selected_features ?? prototypeSpec.selectedFeatures),
+        screens: asArray(prototypeSpec.screens).map((item, screenIdx) => {
+          const screen = asRecord(item);
+          return {
+            id: asString(screen.id, `screen-${screenIdx}`),
+            title: asString(screen.title, "Screen"),
+            purpose: asString(screen.purpose, ""),
+            layout: asString(screen.layout, "workspace"),
+            headline: asString(screen.headline, ""),
+            supporting_text: asString(screen.supporting_text ?? screen.supportingText, ""),
+            primary_actions: asArray<string>(screen.primary_actions ?? screen.primaryActions),
+            modules: asArray(screen.modules).map((module, moduleIdx) => {
+              const mod = asRecord(module);
+              return {
+                name: asString(mod.name, `Module ${moduleIdx + 1}`),
+                type: asString(mod.type, "panel"),
+                items: asArray<string>(mod.items),
+              };
+            }),
+            success_state: asString(screen.success_state ?? screen.successState, ""),
+          };
+        }),
+        routes: asArray(prototypeSpec.routes).map((item, routeIdx) => {
+          const route = asRecord(item);
+          return {
+            id: asString(route.id, `route-${routeIdx}`),
+            screen_id: asString(route.screen_id ?? route.screenId, ""),
+            path: asString(route.path, "/"),
+            segment: asString(route.segment, ""),
+            title: asString(route.title, "Route"),
+            headline: asString(route.headline, ""),
+            layout: asString(route.layout, "workspace"),
+            primary_actions: asArray<string>(route.primary_actions ?? route.primaryActions),
+            states: asArray<string>(route.states),
+          };
+        }),
+        components: asArray(prototypeSpec.components).map((item, componentIdx) => {
+          const component = asRecord(item);
+          return {
+            id: asString(component.id, `component-${componentIdx}`),
+            screen_id: asString(component.screen_id ?? component.screenId, ""),
+            kind: asString(component.kind, "panel"),
+            title: asString(component.title, "Component"),
+            purpose: asString(component.purpose, ""),
+            data_keys: asArray<string>(component.data_keys ?? component.dataKeys),
+          };
+        }),
+        mock_data: asRecord(prototypeSpec.mock_data ?? prototypeSpec.mockData),
+        state_matrix: Object.fromEntries(
+          Object.entries(asRecord(prototypeSpec.state_matrix ?? prototypeSpec.stateMatrix)).map(([screenId, states]) => [
+            screenId,
+            asArray(states).map((item) => {
+              const state = asRecord(item);
+              return {
+                state: asString(state.state, "default"),
+                trigger: asString(state.trigger, ""),
+                summary: asString(state.summary, ""),
+              };
+            }),
+          ]),
+        ),
+        interaction_map: asArray(prototypeSpec.interaction_map ?? prototypeSpec.interactionMap).map((item) => {
+          const interaction = asRecord(item);
+          return {
+            screen_id: asString(interaction.screen_id ?? interaction.screenId, ""),
+            action: asString(interaction.action, ""),
+            result: asString(interaction.result, ""),
+          };
+        }),
+        acceptance_flows: asArray(prototypeSpec.acceptance_flows ?? prototypeSpec.acceptanceFlows).map((item, flowIdx) => {
+          const flow = asRecord(item);
+          return {
+            id: asString(flow.id, `flow-${flowIdx}`),
+            name: asString(flow.name, "Flow"),
+            steps: asArray<string>(flow.steps),
+            goal: asString(flow.goal, ""),
+          };
+        }),
+        quality_targets: asArray<string>(prototypeSpec.quality_targets ?? prototypeSpec.qualityTargets),
+        decision_scope: (() => {
+          const scope = asRecord(prototypeSpec.decision_scope ?? prototypeSpec.decisionScope);
+          return Object.keys(scope).length > 0 ? {
+            phase: asString(scope.phase, undefined),
+            fingerprint: asString(scope.fingerprint, undefined),
+            lead_thesis: asString(scope.lead_thesis ?? scope.leadThesis, undefined),
+            thesis_ids: asArray<string>(scope.thesis_ids ?? scope.thesisIds),
+            risk_ids: asArray<string>(scope.risk_ids ?? scope.riskIds),
+            primary_use_case_ids: asArray<string>(scope.primary_use_case_ids ?? scope.primaryUseCaseIds),
+            selected_features: asArray<string>(scope.selected_features ?? scope.selectedFeatures),
+            milestone_ids: asArray<string>(scope.milestone_ids ?? scope.milestoneIds),
+            selected_design_id: asString(scope.selected_design_id ?? scope.selectedDesignId, undefined),
+            selected_design_name: asString(scope.selected_design_name ?? scope.selectedDesignName, undefined),
+          } : undefined;
+        })(),
+      } : undefined,
+      prototype_app: prototypeApp && Object.keys(prototypeApp).length > 0 ? {
+        artifact_kind: asString(prototypeApp.artifact_kind ?? prototypeApp.artifactKind, "runnable-prototype"),
+        framework: asString(prototypeApp.framework, "nextjs"),
+        router: asString(prototypeApp.router, "app"),
+        entry_routes: asArray<string>(prototypeApp.entry_routes ?? prototypeApp.entryRoutes),
+        dependencies: asRecord(prototypeApp.dependencies) as Record<string, string>,
+        dev_dependencies: asRecord(prototypeApp.dev_dependencies ?? prototypeApp.devDependencies) as Record<string, string>,
+        install_command: asString(prototypeApp.install_command ?? prototypeApp.installCommand, "npm install"),
+        dev_command: asString(prototypeApp.dev_command ?? prototypeApp.devCommand, "npm run dev"),
+        build_command: asString(prototypeApp.build_command ?? prototypeApp.buildCommand, "npm run build"),
+        mock_api: asArray<string>(prototypeApp.mock_api ?? prototypeApp.mockApi),
+        files: asArray(prototypeApp.files).map((item) => {
+          const file = asRecord(item);
+          return {
+            path: asString(file.path, ""),
+            kind: asString(file.kind, "txt"),
+            content: asString(file.content, ""),
+          };
+        }),
+        artifact_summary: (() => {
+          const summary = asRecord(prototypeApp.artifact_summary ?? prototypeApp.artifactSummary);
+          return Object.keys(summary).length > 0 ? {
+            screen_count: asNumber(summary.screen_count ?? summary.screenCount, 0),
+            route_count: asNumber(summary.route_count ?? summary.routeCount, 0),
+            file_count: asNumber(summary.file_count ?? summary.fileCount, 0),
+          } : undefined;
+        })(),
+      } : undefined,
+      quality_focus: asArray<string>(source.quality_focus ?? source.qualityFocus ?? r.quality_focus ?? r.qualityFocus),
       prototype: prototype && Object.keys(prototype).length > 0 ? {
         kind: asString(prototype.kind, "product-workspace"),
         app_shell: {
@@ -1010,11 +1789,165 @@ export function parseDesignOutput(
           } : undefined;
         })(),
       } : undefined,
+      implementation_brief: implementationBrief && Object.keys(implementationBrief).length > 0 ? {
+        architecture_thesis: asString(
+          implementationBrief.architecture_thesis ?? implementationBrief.architectureThesis,
+          "",
+        ),
+        system_shape: asArray<string>(implementationBrief.system_shape ?? implementationBrief.systemShape),
+        technical_choices: asArray(implementationBrief.technical_choices ?? implementationBrief.technicalChoices).map((item) => {
+          const choice = asRecord(item);
+          return {
+            area: asString(choice.area, ""),
+            decision: asString(choice.decision, ""),
+            rationale: asString(choice.rationale, ""),
+          };
+        }),
+        agent_lanes: asArray(implementationBrief.agent_lanes ?? implementationBrief.agentLanes).map((item) => {
+          const lane = asRecord(item);
+          return {
+            role: asString(lane.role, ""),
+            remit: asString(lane.remit, ""),
+            skills: asArray<string>(lane.skills),
+          };
+        }),
+        delivery_slices: asArray<string>(implementationBrief.delivery_slices ?? implementationBrief.deliverySlices),
+      } : undefined,
+      scorecard: (() => {
+        const scorecard = asRecord(source.scorecard ?? r.scorecard);
+        return Object.keys(scorecard).length > 0 ? {
+          overall_score: asNumber(scorecard.overall_score ?? scorecard.overallScore, 0),
+          summary: asString(scorecard.summary, ""),
+          dimensions: asArray(scorecard.dimensions).map((item, dimensionIdx) => {
+            const dimension = asRecord(item);
+            return {
+              id: asString(dimension.id, `dimension-${dimensionIdx}`),
+              label: asString(dimension.label, "Dimension"),
+              score: asNumber(dimension.score, 0),
+              evidence: asString(dimension.evidence, ""),
+            };
+          }),
+        } : undefined;
+      })(),
+      selection_rationale: (() => {
+        const rationale = asRecord(source.selection_rationale ?? source.selectionRationale ?? r.selection_rationale ?? r.selectionRationale);
+        return Object.keys(rationale).length > 0 ? {
+          summary: asString(rationale.summary, ""),
+          reasons: asArray<string>(rationale.reasons),
+          tradeoffs: asArray<string>(rationale.tradeoffs),
+          approval_focus: asArray<string>(rationale.approval_focus ?? rationale.approvalFocus),
+          confidence: asNumber(rationale.confidence, 0),
+          verdict: asString(rationale.verdict, "candidate") as "selected" | "candidate",
+        } : undefined;
+      })(),
+      approval_packet: (() => {
+        const packet = asRecord(source.approval_packet ?? source.approvalPacket ?? r.approval_packet ?? r.approvalPacket);
+        return Object.keys(packet).length > 0 ? {
+          operator_promise: asString(packet.operator_promise ?? packet.operatorPromise, ""),
+          must_keep: asArray<string>(packet.must_keep ?? packet.mustKeep),
+          guardrails: asArray<string>(packet.guardrails),
+          review_checklist: asArray<string>(packet.review_checklist ?? packet.reviewChecklist),
+          handoff_summary: asString(packet.handoff_summary ?? packet.handoffSummary, ""),
+        } : undefined;
+      })(),
+      primary_workflows: asArray(source.primary_workflows ?? source.primaryWorkflows ?? r.primary_workflows ?? r.primaryWorkflows).map((item, workflowIdx) => {
+        const workflow = asRecord(item);
+        return {
+          id: asString(workflow.id, `workflow-${workflowIdx}`),
+          name: asString(workflow.name, "Workflow"),
+          goal: asString(workflow.goal, ""),
+          steps: asArray<string>(workflow.steps),
+        };
+      }),
+      screen_specs: asArray(source.screen_specs ?? source.screenSpecs ?? r.screen_specs ?? r.screenSpecs).map((item, screenIdx) => {
+        const screen = asRecord(item);
+        return {
+          id: asString(screen.id, `screen-spec-${screenIdx}`),
+          title: asString(screen.title, "Screen"),
+          purpose: asString(screen.purpose, ""),
+          layout: asString(screen.layout, "workspace"),
+          primary_actions: asArray<string>(screen.primary_actions ?? screen.primaryActions),
+          module_count: asNumber(screen.module_count ?? screen.moduleCount, 0),
+          route_path: asString(screen.route_path ?? screen.routePath, undefined),
+        };
+      }),
+      artifact_completeness: (() => {
+        const completeness = asRecord(source.artifact_completeness ?? source.artifactCompleteness ?? r.artifact_completeness ?? r.artifactCompleteness);
+        return Object.keys(completeness).length > 0 ? {
+          score: asNumber(completeness.score, 0),
+          status: asString(completeness.status, "partial") as "complete" | "partial" | "incomplete",
+          present: asArray<string>(completeness.present),
+          missing: asArray<string>(completeness.missing),
+          screen_count: asNumber(completeness.screen_count ?? completeness.screenCount, 0),
+          workflow_count: asNumber(completeness.workflow_count ?? completeness.workflowCount, 0),
+          route_count: asNumber(completeness.route_count ?? completeness.routeCount, 0),
+        } : undefined;
+      })(),
+      freshness: (() => {
+        const freshness = asRecord(source.freshness ?? r.freshness);
+        return Object.keys(freshness).length > 0 ? {
+          status: asString(freshness.status, "unknown") as "fresh" | "stale" | "unknown",
+          can_handoff: asBoolean(freshness.can_handoff ?? freshness.canHandoff, false),
+          current_fingerprint: asString(freshness.current_fingerprint ?? freshness.currentFingerprint, undefined),
+          variant_fingerprint: asString(freshness.variant_fingerprint ?? freshness.variantFingerprint, undefined),
+          reasons: asArray<string>(freshness.reasons),
+        } : undefined;
+      })(),
+      preview_meta: (() => {
+        const meta = asRecord(source.preview_meta ?? source.previewMeta ?? r.preview_meta ?? r.previewMeta);
+        return Object.keys(meta).length > 0 ? {
+          source: asString(meta.source, "template"),
+          extraction_ok: asBoolean(meta.extraction_ok ?? meta.extractionOk, false),
+          validation_ok: asBoolean(meta.validation_ok ?? meta.validationOk, false),
+          fallback_reason: asString(meta.fallback_reason ?? meta.fallbackReason, undefined),
+          html_size: asNumber(meta.html_size ?? meta.htmlSize, 0),
+          screen_count_estimate: asNumber(meta.screen_count_estimate ?? meta.screenCountEstimate, 0),
+          interactive_features: asArray<string>(meta.interactive_features ?? meta.interactiveFeatures),
+          validation_issues: asArray<string>(meta.validation_issues ?? meta.validationIssues),
+          copy_issues: asArray<string>(meta.copy_issues ?? meta.copyIssues),
+          copy_issue_examples: asArray<string>(meta.copy_issue_examples ?? meta.copyIssueExamples),
+          copy_quality_score: asNumber(meta.copy_quality_score ?? meta.copyQualityScore, 0),
+        } : undefined;
+      })(),
+      decision_context_fingerprint: asString(
+        source.decision_context_fingerprint ?? source.decisionContextFingerprint ?? r.decision_context_fingerprint ?? r.decisionContextFingerprint,
+        undefined,
+      ),
+      rationale: asString(source.rationale ?? r.rationale, undefined),
+      provider_note: asString(source.provider_note ?? source.providerNote ?? r.provider_note ?? r.providerNote, undefined),
+      decision_scope: (() => {
+        const scope = asRecord(source.decision_scope ?? source.decisionScope ?? r.decision_scope ?? r.decisionScope);
+        return Object.keys(scope).length > 0 ? {
+          phase: asString(scope.phase, undefined),
+          fingerprint: asString(scope.fingerprint, undefined),
+          lead_thesis: asString(scope.lead_thesis ?? scope.leadThesis, undefined),
+          thesis_ids: asArray<string>(scope.thesis_ids ?? scope.thesisIds),
+          risk_ids: asArray<string>(scope.risk_ids ?? scope.riskIds),
+          primary_use_case_ids: asArray<string>(scope.primary_use_case_ids ?? scope.primaryUseCaseIds),
+          selected_features: asArray<string>(scope.selected_features ?? scope.selectedFeatures),
+          milestone_ids: asArray<string>(scope.milestone_ids ?? scope.milestoneIds),
+          selected_design_id: asString(scope.selected_design_id ?? scope.selectedDesignId, undefined),
+          selected_design_name: asString(scope.selected_design_name ?? scope.selectedDesignName, undefined),
+        } : undefined;
+      })(),
+      narrative: (() => {
+        const narrative = asRecord(source.narrative ?? r.narrative);
+        return Object.keys(narrative).length > 0 ? {
+          experience_thesis: asString(narrative.experience_thesis ?? narrative.experienceThesis, ""),
+          operational_bet: asString(narrative.operational_bet ?? narrative.operationalBet, ""),
+          signature_moments: asArray<string>(narrative.signature_moments ?? narrative.signatureMoments),
+          handoff_note: asString(narrative.handoff_note ?? narrative.handoffNote, ""),
+        } : undefined;
+      })(),
+      canonical: asRecord(r.canonical),
+      localized,
+      display_language: asString(r.display_language ?? r.displayLanguage, undefined),
+      localization_status: asString(r.localization_status ?? r.localizationStatus, undefined),
       tokens: {
         in: asNumber(tokens.in ?? tokens.input, 0),
         out: asNumber(tokens.out ?? tokens.output, 0),
       },
-      cost_usd: asNumber(r.cost_usd ?? r.costUsd, 0),
+      cost_usd: asNumber(source.cost_usd ?? source.costUsd ?? r.cost_usd ?? r.costUsd, 0),
       scores: {
         ux_quality: asNumber(scores.ux_quality ?? scores.uxQuality, 0),
         code_quality: asNumber(

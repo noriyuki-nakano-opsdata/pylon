@@ -1,0 +1,6 @@
+interface:
+  display_name: "Google Workspace CLI"
+  short_description: "Use gws for Gmail, Drive, Calendar, Docs, and Sheets"
+  default_prompt: "Use $google-workspace-cli to inspect or automate Google Workspace resources through the gws CLI with auth checks and structured JSON requests."
+policy:
+  allow_implicit_invocation: true

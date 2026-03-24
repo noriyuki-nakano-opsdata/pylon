@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+import threading
 import time
+from pathlib import Path
 
 from pylon.api.async_runs import (
     AsyncWorkflowRunManager,
     reconcile_lifecycle_projects_for_terminal_runs,
     sync_lifecycle_project_for_run,
 )
-from pylon.control_plane import InMemoryWorkflowControlPlaneStore
+from pylon.control_plane import (
+    InMemoryWorkflowControlPlaneStore,
+    JsonFileWorkflowControlPlaneStore,
+)
 from pylon.dsl.parser import PylonProject
-from pylon.lifecycle import default_lifecycle_project_record
+from pylon.lifecycle import (
+    build_lifecycle_workflow_definition,
+    default_lifecycle_project_record,
+)
 from pylon.observability.run_payload import build_public_run_payload
 from pylon.types import RunStatus, RunStopReason
 
@@ -31,6 +39,10 @@ def _workflow_project(name: str = "demo-project") -> PylonProject:
             },
         }
     )
+
+
+def _json_store(path: Path) -> JsonFileWorkflowControlPlaneStore:
+    return JsonFileWorkflowControlPlaneStore(path)
 
 
 def _wait_for_terminal(
@@ -74,6 +86,53 @@ def test_async_workflow_run_manager_completes_and_persists_checkpoints() -> None
     assert finished["status"] == RunStatus.COMPLETED.value
     assert finished["execution_mode"] == "async"
     assert len(store.list_run_checkpoints(str(started["id"]))) == 2
+
+
+def test_async_workflow_run_manager_persists_progress_before_terminal_completion() -> None:
+    store = InMemoryWorkflowControlPlaneStore()
+    workflow_id = "echo"
+    store.register_workflow_project(workflow_id, _workflow_project(), tenant_id="tenant-a")
+    writer_started = threading.Event()
+    allow_writer_finish = threading.Event()
+
+    def _researcher(_node_id: str, state: dict[str, object]) -> dict[str, object]:
+        return {"msg": state.get("msg"), "researched": True}
+
+    def _writer(_node_id: str, state: dict[str, object]) -> dict[str, object]:
+        writer_started.set()
+        assert allow_writer_finish.wait(timeout=2.0)
+        return {"output": f"done:{state.get('msg')}"}
+
+    store.set_handlers(
+        workflow_id,
+        agent_handlers={
+            "researcher": _researcher,
+            "writer": _writer,
+        },
+    )
+    manager = AsyncWorkflowRunManager(store)
+
+    started = manager.start_run(
+        workflow_id=workflow_id,
+        tenant_id="tenant-a",
+        input_data={"msg": "hi"},
+    )
+    run_id = str(started["id"])
+
+    assert writer_started.wait(timeout=2.0)
+
+    progress = manager.get_run(run_id, tenant_id="tenant-a")
+    assert progress is not None
+    assert progress["status"] == RunStatus.RUNNING.value
+    assert progress["execution_summary"]["total_events"] == 1
+    assert progress["execution_summary"]["last_node"] == "start"
+    assert progress["state"]["execution"]["node_status"]["start"] == "succeeded"
+    assert len(store.list_run_checkpoints(run_id)) == 1
+
+    allow_writer_finish.set()
+    finished = _wait_for_terminal(manager, run_id)
+    assert finished["status"] == RunStatus.COMPLETED.value
+    assert len(store.list_run_checkpoints(run_id)) == 2
 
 
 def test_async_workflow_run_manager_persists_failures() -> None:
@@ -193,6 +252,34 @@ def test_async_workflow_run_manager_list_runs_reconciles_orphans() -> None:
     assert payloads[0]["id"] == "run_async_orphaned_list"
     assert payloads[0]["status"] == RunStatus.FAILED.value
     assert "worker is no longer running" in str(payloads[0].get("error"))
+
+
+def test_async_workflow_run_manager_rehydrates_lifecycle_handlers_after_store_reload(tmp_path: Path) -> None:
+    state_path = tmp_path / "control-plane.json"
+    workflow_id = "lifecycle-research-demo-project"
+    initial = _json_store(state_path)
+    initial.register_workflow_project(
+        workflow_id,
+        build_lifecycle_workflow_definition("demo-project", "research")["project"],
+        tenant_id="tenant-a",
+    )
+
+    reopened = _json_store(state_path)
+    assert reopened.get_node_handlers(workflow_id) in (None, {})
+
+    manager = AsyncWorkflowRunManager(reopened)
+    started = manager.start_run(
+        workflow_id=workflow_id,
+        tenant_id="tenant-a",
+        input_data={"spec": "Operator-led lifecycle workspace"},
+    )
+
+    finished = _wait_for_terminal(manager, str(started["id"]), timeout_seconds=5.0)
+    assert finished["status"] == RunStatus.COMPLETED.value
+    assert reopened.get_node_handlers(workflow_id)
+    research = finished["state"].get("research")
+    assert isinstance(research, dict)
+    assert research
 
 
 def test_sync_lifecycle_project_for_run_persists_phase_status_and_runs() -> None:
@@ -456,6 +543,60 @@ def test_reconcile_lifecycle_projects_for_terminal_runs_backfills_stale_project(
     assert any(item["runId"] == "run_async_backfill" for item in updated["phaseRuns"])
 
 
+def test_reconcile_lifecycle_projects_for_terminal_runs_resyncs_when_spec_is_missing() -> None:
+    store = InMemoryWorkflowControlPlaneStore()
+    workflow_id = "lifecycle-planning-demo-project"
+    lifecycle_key = "tenant-a:demo-project"
+    existing_project = default_lifecycle_project_record("demo-project", tenant_id="tenant-a")
+    existing_project["analysis"] = {"summary": "Planning synthesis"}
+    existing_project["features"] = [{"id": "artifact-lineage", "name": "Artifact lineage", "selected": True}]
+    existing_project["phaseStatuses"][1]["status"] = "completed"
+    existing_project["phaseStatuses"][2]["status"] = "available"
+    existing_project["phaseRuns"] = [
+        {
+            "id": "run_async_planning_complete",
+            "runId": "run_async_planning_complete",
+            "phase": "planning",
+            "status": "completed",
+            "createdAt": "2026-03-12T00:16:10Z",
+            "totalTokens": 1650,
+            "inputTokens": 1200,
+            "outputTokens": 450,
+            "costMeasured": False,
+        }
+    ]
+    store.put_surface_record("lifecycle_projects", lifecycle_key, existing_project)
+    run_record = build_public_run_payload(
+        run_id="run_async_planning_complete",
+        workflow_id=workflow_id,
+        project_name="demo-project",
+        workflow_name=workflow_id,
+        execution_mode="async",
+        status=RunStatus.COMPLETED,
+        stop_reason=RunStopReason.NONE,
+        suspension_reason=RunStopReason.NONE,
+        input_data={"spec": "Operator-led lifecycle workspace"},
+        state={
+            "spec": "Operator-led lifecycle workspace",
+            "analysis": {"summary": "Planning synthesis"},
+            "features": [{"id": "artifact-lineage", "name": "Artifact lineage", "selected": True}],
+            "planEstimates": [],
+        },
+        event_log=[],
+        created_at="2026-03-12T00:15:25Z",
+        started_at="2026-03-12T00:15:25Z",
+        completed_at="2026-03-12T00:16:10Z",
+    )
+    store.put_run_record(run_record, workflow_id=workflow_id, tenant_id="tenant-a", parameters={})
+
+    synced = reconcile_lifecycle_projects_for_terminal_runs(store)
+
+    updated = store.get_surface_record("lifecycle_projects", lifecycle_key)
+    assert synced == 1
+    assert updated is not None
+    assert updated["spec"] == "Operator-led lifecycle workspace"
+
+
 def test_reconcile_lifecycle_projects_for_terminal_runs_replays_valid_research_before_empty_rerun() -> None:
     store = InMemoryWorkflowControlPlaneStore()
     workflow_id = "lifecycle-research-demo-project"
@@ -638,6 +779,55 @@ def test_reconcile_lifecycle_projects_for_terminal_runs_keeps_current_research_w
     assert synced == 1
     assert updated is not None
     assert updated["research"]["winning_theses"] == ["Newest thesis"]
+
+
+def test_reconcile_lifecycle_projects_for_terminal_runs_skips_failed_research_when_downstream_phases_exist() -> None:
+    store = InMemoryWorkflowControlPlaneStore()
+    workflow_id = "lifecycle-research-demo-project"
+    lifecycle_key = "tenant-a:demo-project"
+    existing_project = default_lifecycle_project_record("demo-project", tenant_id="tenant-a")
+    existing_project["analysis"] = {"summary": "Planning synthesis"}
+    existing_project["features"] = [{"feature": "artifact lineage", "selected": True}]
+    existing_project["designVariants"] = [{"id": "claude-designer", "pattern_name": "Signal Canvas"}]
+    existing_project["selectedDesignId"] = "claude-designer"
+    existing_project["phaseStatuses"] = [
+        {"phase": "research", "status": "completed", "version": 1},
+        {"phase": "planning", "status": "completed", "version": 1},
+        {"phase": "design", "status": "completed", "version": 1},
+        {"phase": "approval", "status": "available", "version": 1},
+        {"phase": "development", "status": "locked", "version": 1},
+        {"phase": "deploy", "status": "locked", "version": 1},
+        {"phase": "iterate", "status": "locked", "version": 1},
+    ]
+    store.put_surface_record("lifecycle_projects", lifecycle_key, existing_project)
+    failed_run = build_public_run_payload(
+        run_id="run_async_research_failed_old",
+        workflow_id=workflow_id,
+        project_name="demo-project",
+        workflow_name=workflow_id,
+        execution_mode="async",
+        status=RunStatus.FAILED,
+        stop_reason=RunStopReason.WORKFLOW_ERROR,
+        suspension_reason=RunStopReason.NONE,
+        input_data={"spec": "brief"},
+        state={"spec": "brief", "error": "worker exited"},
+        event_log=[],
+        created_at="2026-03-12T00:15:25Z",
+        started_at="2026-03-12T00:15:25Z",
+        completed_at="2026-03-12T00:16:10Z",
+    )
+    store.put_run_record(failed_run, workflow_id=workflow_id, tenant_id="tenant-a", parameters={})
+
+    synced = reconcile_lifecycle_projects_for_terminal_runs(store)
+
+    updated = store.get_surface_record("lifecycle_projects", lifecycle_key)
+    assert synced == 0
+    assert updated is not None
+    phase_lookup = {item["phase"]: item["status"] for item in updated["phaseStatuses"]}
+    assert phase_lookup["research"] == "completed"
+    assert phase_lookup["planning"] == "completed"
+    assert phase_lookup["design"] == "completed"
+    assert updated["selectedDesignId"] == "claude-designer"
 
 
 def test_reconcile_lifecycle_projects_for_terminal_runs_rebuilds_empty_research_even_if_phase_runs_exist() -> None:

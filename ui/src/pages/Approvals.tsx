@@ -143,12 +143,22 @@ function ApprovalCard({
               </span>
               {(() => {
                 const runId = approval.context?.workflow_run_id ?? approval.context?.run_id;
+                const campaignId = approval.context?.campaign_id ?? approval.context?.resource_id;
                 return runId ? (
                   <span className="font-mono">
                     run: {String(runId).slice(0, 8)}
                   </span>
+                ) : campaignId ? (
+                  <span className="font-mono">
+                    campaign: {String(campaignId).slice(0, 8)}
+                  </span>
                 ) : null;
               })()}
+              {Boolean(approval.context?.target_branch) && (
+                <span className="font-mono">
+                  branch: {String(approval.context.target_branch)}
+                </span>
+              )}
               {approval.plan_hash && (
                 <span className="font-mono">
                   plan: {approval.plan_hash.slice(0, 8)}

@@ -8,6 +8,11 @@ from typing import Any
 
 from pylon.lifecycle.contracts import build_phase_contract
 from pylon.lifecycle.orchestrator import PHASE_ORDER, build_lifecycle_phase_blueprints
+from pylon.lifecycle.runtime_projection import summarize_development_execution
+from pylon.lifecycle.services.value_contracts import (
+    build_outcome_telemetry_contract,
+    build_value_contract,
+)
 from pylon.protocols.a2a.card import AgentCardRegistry, generate_card
 from pylon.protocols.a2a.types import (
     A2AMessage,
@@ -22,6 +27,7 @@ from pylon.protocols.a2a.types import (
 )
 from pylon.providers.base import TokenUsage
 from pylon.runtime.llm import estimate_cost_from_usage
+from pylon.workflow.replay import ReplayEngine
 
 
 def _utc_now_iso() -> str:
@@ -46,6 +52,156 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 def _as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
+
+
+def _phase_run_execution_summary(
+    run_record: dict[str, Any],
+    *,
+    checkpoints: list[dict[str, Any]],
+    run_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    execution_summary = dict(_as_dict(run_record.get("execution_summary")))
+    run_state = _as_dict(run_state) or _as_dict(run_record.get("state"))
+    execution_state = _as_dict(run_state.get("execution"))
+    node_status = {
+        str(node_id): str(status)
+        for node_id, status in _as_dict(execution_state.get("node_status")).items()
+        if str(node_id).strip()
+    }
+
+    event_log = [item for item in _as_list(run_record.get("event_log")) if isinstance(item, dict)]
+    if not event_log:
+        chronological_checkpoints = sorted(
+            [checkpoint for checkpoint in checkpoints if isinstance(checkpoint, dict)],
+            key=lambda payload: str(payload.get("created_at", "")),
+        )
+        for checkpoint in chronological_checkpoints:
+            event_log.extend(
+                item for item in _as_list(checkpoint.get("event_log"))
+                if isinstance(item, dict)
+            )
+
+    node_sequence = [
+        str(event.get("node_id", "")).strip()
+        for event in event_log
+        if str(event.get("node_id", "")).strip()
+    ]
+    if not node_sequence:
+        node_sequence = [
+            str(item).strip()
+            for item in _as_list(execution_summary.get("node_sequence"))
+            if str(item).strip()
+        ]
+
+    completed_node_ids = {
+        node_id
+        for node_id, status in node_status.items()
+        if status in {"completed", "succeeded"}
+    }
+    completed_node_ids.update(node_sequence)
+    running_node_ids = [
+        node_id
+        for node_id, status in node_status.items()
+        if status == "running"
+    ]
+    failed_node_ids = [
+        node_id
+        for node_id, status in node_status.items()
+        if status == "failed"
+    ]
+
+    recent_node_ids: list[str] = []
+    for node_id in reversed(node_sequence):
+        if node_id in recent_node_ids:
+            continue
+        recent_node_ids.append(node_id)
+        if len(recent_node_ids) == 3:
+            break
+
+    total_events = int(execution_summary.get("total_events", 0) or 0)
+    if total_events <= 0:
+        total_events = len(event_log) or len(node_sequence)
+
+    execution_summary.update(
+        {
+            "total_events": total_events,
+            "eventCount": total_events,
+            "node_sequence": node_sequence,
+            "last_node": (
+                str(execution_summary.get("last_node", "")).strip()
+                or (node_sequence[-1] if node_sequence else None)
+            ),
+            "lastNodeId": (
+                str(execution_summary.get("lastNodeId", "")).strip()
+                or str(execution_summary.get("last_node", "")).strip()
+                or (node_sequence[-1] if node_sequence else None)
+            ),
+            "recentNodeIds": recent_node_ids,
+            "completedNodeCount": len(completed_node_ids),
+            "runningNodeIds": running_node_ids,
+            "failedNodeIds": failed_node_ids,
+            "nodeStatus": node_status,
+        }
+    )
+    development = _as_dict(run_state.get("development"))
+    development_mesh = summarize_development_execution(
+        delivery_plan=_as_dict(run_state.get("delivery_plan")) or _as_dict(development.get("delivery_plan")),
+        development_execution=_as_dict(run_state.get("development_execution")),
+        qa_report=_as_dict(run_state.get("qa_report")),
+        security_report=_as_dict(run_state.get("security_report")),
+        development_handoff=_as_dict(run_state.get("development_handoff")) or _as_dict(development.get("handoff")),
+        node_status=node_status,
+        current_decision_context_fingerprint=str(_as_dict(run_state.get("decision_context")).get("fingerprint") or ""),
+    )
+    if development_mesh:
+        execution_summary.update(
+            {
+                "currentWaveIndex": development_mesh.get("currentWaveIndex"),
+                "waveCount": int(development_mesh.get("waveCount", 0) or 0),
+                "workUnitCount": int(development_mesh.get("workUnitCount", 0) or 0),
+                "blockedWorkUnitIds": [
+                    str(item).strip()
+                    for item in _as_list(development_mesh.get("blockedWorkUnitIds"))
+                    if str(item).strip()
+                ],
+                "retryNodeIds": [
+                    str(item).strip()
+                    for item in _as_list(development_mesh.get("retryNodeIds"))
+                    if str(item).strip()
+                ],
+                "focusWorkUnitIds": [
+                    str(item).strip()
+                    for item in _as_list(development_mesh.get("focusWorkUnitIds"))
+                    if str(item).strip()
+                ],
+                "topologyFingerprint": development_mesh.get("topologyFingerprint"),
+                "runtimeGraphFingerprint": development_mesh.get("runtimeGraphFingerprint"),
+                "topologyFresh": development_mesh.get("topologyFresh"),
+                "readyWaveCount": sum(
+                    1
+                    for item in _as_list(development_mesh.get("waves"))
+                    if _as_dict(item).get("ready") is True
+                ),
+            }
+        )
+    return execution_summary
+
+
+def _run_project_context_patch(
+    project_record: dict[str, Any],
+    *,
+    run_record: dict[str, Any],
+) -> dict[str, Any]:
+    patch: dict[str, Any] = {}
+    if str(project_record.get("spec", "") or "").strip():
+        return patch
+    for field_name in ("state", "input_data", "input"):
+        payload = _as_dict(run_record.get(field_name))
+        spec = str(payload.get("spec", "") or "").strip()
+        if spec:
+            patch["spec"] = spec
+            break
+    return patch
 
 
 def _compact_value(value: Any, *, depth: int = 0) -> Any:
@@ -340,6 +496,12 @@ def _phase_output_patch(
                 for index, item in enumerate(recommended)
                 if isinstance(item, dict)
             ]
+        candidate_record = {**project_record, **patch}
+        value_contract = build_value_contract(candidate_record)
+        patch["valueContract"] = value_contract or None
+        patch["outcomeTelemetryContract"] = (
+            build_outcome_telemetry_contract(candidate_record, value_contract=value_contract) or None
+        )
     elif phase == "design":
         variants = _as_list(run_state.get("variants"))
         patch["designVariants"] = variants
@@ -355,8 +517,60 @@ def _phase_output_patch(
         patch["buildCode"] = str(development.get("code", "") or "")
         patch["buildCost"] = float(run_state.get("estimated_cost_usd", 0.0) or 0.0)
         patch["buildIteration"] = int(run_state.get("_build_iteration", 0) or 0)
+        patch["buildDecisionFingerprint"] = (
+            str(development.get("decision_context_fingerprint", "") or "")
+            or str(_as_dict(run_state.get("integrated_build")).get("decision_context_fingerprint", "") or "")
+            or None
+        )
         patch["milestoneResults"] = _as_list(development.get("milestone_results"))
+        patch["deliveryPlan"] = (
+            _as_dict(development.get("delivery_plan"))
+            or _as_dict(run_state.get("delivery_plan"))
+            or None
+        )
+        patch["developmentHandoff"] = (
+            _as_dict(development.get("handoff"))
+            or _as_dict(run_state.get("development_handoff"))
+            or None
+        )
+        development_execution = summarize_development_execution(
+            delivery_plan=patch["deliveryPlan"],
+            development_execution=_as_dict(run_state.get("development_execution")),
+            qa_report=_as_dict(run_state.get("qa_report")),
+            security_report=_as_dict(run_state.get("security_report")),
+            development_handoff=patch["developmentHandoff"],
+            node_status=_as_dict(_as_dict(run_state.get("execution")).get("node_status")),
+            current_decision_context_fingerprint=str(_as_dict(run_state.get("decision_context")).get("fingerprint") or ""),
+        )
+        patch["developmentExecution"] = development_execution or None
     return patch
+
+
+def _effective_run_state_for_sync(
+    run_record: dict[str, Any],
+    *,
+    checkpoints: list[dict[str, Any]],
+) -> dict[str, Any]:
+    run_state = _as_dict(run_record.get("state"))
+    event_log = [item for item in _as_list(run_record.get("event_log")) if isinstance(item, dict)]
+    if not event_log:
+        chronological_checkpoints = sorted(
+            [checkpoint for checkpoint in checkpoints if isinstance(checkpoint, dict)],
+            key=lambda payload: str(payload.get("created_at", "")),
+        )
+        for checkpoint in chronological_checkpoints:
+            event_log.extend(
+                item
+                for item in _as_list(checkpoint.get("event_log"))
+                if isinstance(item, dict)
+            )
+    if not event_log:
+        return run_state
+    try:
+        replayed = ReplayEngine.replay_event_log(event_log, initial_state=run_state)
+    except Exception:
+        return run_state
+    return _as_dict(replayed.state) or run_state
 
 
 def _contract_blocking_issues(contract: dict[str, Any] | None) -> list[str]:
@@ -721,6 +935,7 @@ def _phase_run_summary(
     checkpoints: list[dict[str, Any]],
     artifact_count: int,
     decision_count: int,
+    run_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     runtime_metrics = _as_dict(run_record.get("runtime_metrics"))
     token_usage = _as_dict(runtime_metrics.get("token_usage"))
@@ -791,6 +1006,27 @@ def _phase_run_summary(
     if checkpoint_cost_usd > cost_usd:
         cost_usd = checkpoint_cost_usd
     cost_measured = checkpoint_cost_usd > 0.0 or cost_usd > 0.0
+    execution_summary = _phase_run_execution_summary(
+        run_record,
+        checkpoints=checkpoints,
+        run_state=run_state,
+    )
+    compact_execution_summary = _compact_value(execution_summary)
+    if isinstance(compact_execution_summary, dict):
+        for key in (
+            "currentWaveIndex",
+            "waveCount",
+            "workUnitCount",
+            "blockedWorkUnitIds",
+            "retryNodeIds",
+            "focusWorkUnitIds",
+            "topologyFingerprint",
+            "runtimeGraphFingerprint",
+            "topologyFresh",
+            "readyWaveCount",
+        ):
+            if key in execution_summary:
+                compact_execution_summary[key] = execution_summary[key]
     return {
         "id": str(run_record.get("id", "")),
         "runId": str(run_record.get("id", "")),
@@ -812,7 +1048,7 @@ def _phase_run_summary(
         "cacheReadTokens": cache_read_tokens,
         "cacheWriteTokens": cache_write_tokens,
         "reasoningTokens": reasoning_tokens,
-        "executionSummary": _compact_value(_as_dict(run_record.get("execution_summary"))),
+        "executionSummary": compact_execution_summary,
     }
 
 
@@ -824,8 +1060,9 @@ def sync_lifecycle_project_with_run(
     checkpoints: list[dict[str, Any]],
 ) -> dict[str, Any]:
     project_id = str(project_record.get("projectId", project_record.get("id", "")))
-    run_state = _as_dict(run_record.get("state"))
-    patch = _phase_output_patch(project_record, phase=phase, run_state=run_state)
+    run_state = _effective_run_state_for_sync(run_record, checkpoints=checkpoints)
+    patch = _run_project_context_patch(project_record, run_record=run_record)
+    patch.update(_phase_output_patch(project_record, phase=phase, run_state=run_state))
     phase_status, blocking_issues = _resolve_phase_sync_status(
         project_record,
         phase=phase,
@@ -858,6 +1095,7 @@ def sync_lifecycle_project_with_run(
         checkpoints=checkpoints,
         artifact_count=len(artifacts),
         decision_count=len(decisions),
+        run_state=run_state,
     )
     patch.update(
         merge_operator_records(

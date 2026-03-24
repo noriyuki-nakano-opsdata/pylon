@@ -54,6 +54,30 @@ spec:
                   name: {{ include "pylon.secretName" . }}
                   key: db-password
                   optional: true
+            {{- if .Values.sandbox.firecrackerRunnerMode }}
+            - name: PYLON_FIRECRACKER_RUNNER_MODE
+              value: {{ .Values.sandbox.firecrackerRunnerMode | quote }}
+            {{- end }}
+            {{- if .Values.sandbox.firecrackerDelegateCommand }}
+            - name: PYLON_FIRECRACKER_DELEGATE_COMMAND
+              value: {{ .Values.sandbox.firecrackerDelegateCommand | quote }}
+            {{- end }}
+            {{- if .Values.sandbox.firecrackerDockerImage }}
+            - name: PYLON_FIRECRACKER_DOCKER_IMAGE
+              value: {{ .Values.sandbox.firecrackerDockerImage | quote }}
+            {{- end }}
+            {{- if .Values.sandbox.firecrackerExecutorMode }}
+            - name: PYLON_FIRECRACKER_EXECUTOR_MODE
+              value: {{ .Values.sandbox.firecrackerExecutorMode | quote }}
+            {{- end }}
+            {{- if .Values.sandbox.firecrackerVmCommand }}
+            - name: PYLON_FIRECRACKER_VM_COMMAND
+              value: {{ .Values.sandbox.firecrackerVmCommand | quote }}
+            {{- end }}
+            {{- if .Values.sandbox.firecrackerAllowProcessFallback }}
+            - name: PYLON_FIRECRACKER_ALLOW_PROCESS_FALLBACK
+              value: "1"
+            {{- end }}
             {{- if .Values.vault.address }}
             - name: VAULT_TOKEN
               valueFrom:

@@ -156,6 +156,32 @@ def dedupe_strings(values: list[str]) -> list[str]:
     return ordered
 
 
+def _external_source_count(research: dict[str, Any]) -> int:
+    source_links = [
+        str(item).strip()
+        for item in _as_list(research.get("source_links"))
+        if str(item).strip().lower().startswith(("http://", "https://"))
+    ]
+    evidence_links = [
+        str(_as_dict(item).get("source_ref", "")).strip()
+        for item in _as_list(research.get("evidence"))
+        if str(_as_dict(item).get("source_type", "")).strip() == "url"
+        and str(_as_dict(item).get("source_ref", "")).strip().lower().startswith(("http://", "https://"))
+    ]
+    return len(dedupe_strings([*source_links, *evidence_links]))
+
+
+def _critical_dissent_count(research: dict[str, Any]) -> int:
+    count = research.get("critical_dissent_count")
+    if isinstance(count, int):
+        return count
+    return sum(
+        1
+        for item in _as_list(research.get("dissent"))
+        if _as_dict(item).get("severity") == "critical" and _as_dict(item).get("resolved") is not True
+    )
+
+
 def research_runtime_output(research: dict[str, Any]) -> dict[str, Any]:
     quality_gates = [
         {
@@ -209,6 +235,10 @@ def research_runtime_output(research: dict[str, Any]) -> dict[str, Any]:
                 "objective": first_research_text(autonomous_remediation.get("objective"), char_limit=180),
                 "retryNodeIds": _as_list(autonomous_remediation.get("retryNodeIds"))[:4],
                 "blockingGateIds": _as_list(autonomous_remediation.get("blockingGateIds"))[:4],
+                "recoveryMode": autonomous_remediation.get("recoveryMode"),
+                "recommendedOperatorAction": autonomous_remediation.get("recommendedOperatorAction"),
+                "conditionalHandoffAllowed": autonomous_remediation.get("conditionalHandoffAllowed"),
+                "strategySummary": first_research_text(autonomous_remediation.get("strategySummary"), char_limit=180),
                 "stopReason": first_research_text(autonomous_remediation.get("stopReason"), char_limit=180),
             }
             if autonomous_remediation
@@ -256,6 +286,63 @@ def research_autonomous_remediation_state(
     attempt_count = int(remediation_context.get("attempt", 0) or 0)
     max_attempts = int(remediation_context.get("maxAttempts", 2) or 2)
     remaining_attempts = max(0, max_attempts - attempt_count)
+    confidence_floor = float(_as_dict(research.get("confidence_summary")).get("floor", 0.0) or 0.0)
+    winning_thesis_count = len(normalized_research_strings(research.get("winning_theses"), limit=4, char_limit=180))
+    external_source_count = _external_source_count(research)
+    critical_dissent_count = _critical_dissent_count(research)
+    current_signature = "|".join(
+        sorted(
+            str(gate.get("id", ""))
+            for gate in failed_gates
+            if str(gate.get("id", "")).strip()
+        )
+    )
+    previous_signature = str(remediation_context.get("lastBlockingSignature", "") or "").strip()
+    stalled_signature = bool(attempt_count > 0 and current_signature and current_signature == previous_signature)
+    recovery_mode = str(remediation_context.get("recoveryMode", "") or "").strip() or "deepen_evidence"
+    strategy_summary = str(remediation_context.get("strategySummary", "") or "").strip()
+    strategy_checklist = [
+        first_research_text(item, char_limit=160)
+        for item in _as_list(remediation_context.get("strategyChecklist"))
+        if first_research_text(item, char_limit=160)
+    ][:3]
+    if not strategy_summary:
+        strategy_summary = (
+            "同じ問いを繰り返さず、対象セグメントや評価軸を切り替えて再調査します。"
+            if recovery_mode == "reframe_research"
+            else "外部根拠の厚みを増やし、弱い主張を再採点します。"
+        )
+    has_minimum_handoff_evidence = (
+        winning_thesis_count > 0
+        and external_source_count > 0
+    )
+    exhausted_retry_budget = remaining_attempts == 0 and max_attempts > 0
+    strict_handoff_allowed = (
+        readiness != "ready"
+        and has_minimum_handoff_evidence
+        and confidence_floor >= 0.45
+        and critical_dissent_count == 0
+    )
+    conditional_handoff_allowed = strict_handoff_allowed or (
+        readiness != "ready"
+        and has_minimum_handoff_evidence
+        and exhausted_retry_budget
+    )
+    recommended_operator_action = str(
+        _as_dict(remediation_context.get("operatorGuidance")).get("recommendedAction", "")
+        or ""
+    ).strip()
+    if not recommended_operator_action:
+        if conditional_handoff_allowed and exhausted_retry_budget:
+            recommended_operator_action = "conditional_handoff"
+        elif critical_dissent_count > 0 and not exhausted_retry_budget:
+            recommended_operator_action = "clarify_scope"
+        elif confidence_floor < 0.45 or external_source_count == 0 or winning_thesis_count == 0:
+            recommended_operator_action = "deepen_evidence"
+        elif stalled_signature and exhausted_retry_budget:
+            recommended_operator_action = "clarify_scope"
+        else:
+            recommended_operator_action = "wait_for_autonomous_recovery"
     auto_runnable = readiness != "ready" and bool(failed_gates) and remaining_attempts > 0
     if readiness == "ready":
         status = "resolved" if attempt_count > 0 else "not_needed"
@@ -266,9 +353,9 @@ def research_autonomous_remediation_state(
     else:
         status = "blocked"
         stop_reason = (
-            "Autonomous remediation budget is exhausted."
+            "自動補完の回数上限に達しました。"
             if failed_gates and remaining_attempts == 0
-            else "The current research blockers need operator guidance."
+            else "現在の research blocker は operator の判断が必要です。"
         )
     return {
         "status": status,
@@ -296,12 +383,26 @@ def research_autonomous_remediation_state(
             for gate in failed_gates
             if first_research_text(_as_dict(gate).get("reason"), char_limit=180)
         ][:4],
-        "lastBlockingSignature": "|".join(
-            sorted(
-                str(gate.get("id", ""))
-                for gate in failed_gates
-                if str(gate.get("id", "")).strip()
-            )
+        "lastBlockingSignature": current_signature,
+        "recoveryMode": recovery_mode,
+        "recommendedOperatorAction": recommended_operator_action,
+        "conditionalHandoffAllowed": conditional_handoff_allowed,
+        "strategySummary": strategy_summary,
+        "strategyChecklist": strategy_checklist,
+        "planningGuardrails": [
+            "未解決の論点を前提条件と除外条件に変換する",
+            "信頼度下限が低い論点は主計画ではなく検証タスクとして扱う",
+            "重大な反証が残る論点は企画内で検証マイルストーンか除外条件として扱う",
+        ][:3] if conditional_handoff_allowed else [],
+        "followUpQuestion": first_research_text(
+            _as_dict(remediation_context.get("operatorGuidance")).get("followUpQuestion"),
+            char_limit=180,
+        ) or None,
+        "stalledSignature": stalled_signature,
+        "confidenceFloor": confidence_floor,
+        "targetConfidenceFloor": float(
+            _as_dict(remediation_context.get("operatorGuidance")).get("targetConfidenceFloor", 0.6)
+            or 0.6
         ),
         "stopReason": stop_reason,
     }

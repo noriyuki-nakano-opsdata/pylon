@@ -72,11 +72,29 @@ def build_lifecycle_invalidation_patch(
     patch: dict[str, Any] = {}
     reset_from = ""
     reason = ""
+    # --- Tsumiki-integrated fields to reset at each cascade level ---
+    _TSUMIKI_ALL = {
+        "requirements": None,
+        "reverseEngineering": None,
+        "taskDecomposition": None,
+        "dcsAnalysis": None,
+        "technicalDesign": None,
+    }
+    _TSUMIKI_FROM_PLANNING = {
+        "taskDecomposition": None,
+        "dcsAnalysis": None,
+        "technicalDesign": None,
+    }
+    _TSUMIKI_FROM_DESIGN = {
+        "technicalDesign": None,
+    }
+
     if "spec" in changed_fields:
         reset_from = "research"
         reason = "Project spec changed; regenerate research and all downstream artifacts."
         patch.update(
             {
+                "researchOperatorDecision": None,
                 "research": None,
                 "analysis": None,
                 "features": [],
@@ -87,21 +105,29 @@ def build_lifecycle_invalidation_patch(
                 "buildCode": None,
                 "buildCost": 0.0,
                 "buildIteration": 0,
+                "buildDecisionFingerprint": None,
                 "milestoneResults": [],
+                "deliveryPlan": None,
+                "developmentExecution": None,
+                "developmentHandoff": None,
+                "valueContract": None,
+                "outcomeTelemetryContract": None,
                 "deployChecks": [],
                 "releases": [],
                 "feedbackItems": [],
                 "approvalStatus": "pending",
                 "approvalComments": [],
                 "approvalRequestId": None,
+                **_TSUMIKI_ALL,
                 "phaseStatuses": rebuild_lifecycle_phase_statuses(project_record, completed_until=None),
             }
         )
-    elif "researchConfig" in changed_fields:
+    elif changed_fields & {"researchConfig", "productIdentity", "githubRepo", "requirementsConfig"}:
         reset_from = "research"
-        reason = "Research execution inputs changed; regenerate research and all downstream artifacts."
+        reason = "Research or code-context inputs changed; regenerate research and all downstream artifacts."
         patch.update(
             {
+                "researchOperatorDecision": None,
                 "research": None,
                 "analysis": None,
                 "features": [],
@@ -112,13 +138,20 @@ def build_lifecycle_invalidation_patch(
                 "buildCode": None,
                 "buildCost": 0.0,
                 "buildIteration": 0,
+                "buildDecisionFingerprint": None,
                 "milestoneResults": [],
+                "deliveryPlan": None,
+                "developmentExecution": None,
+                "developmentHandoff": None,
+                "valueContract": None,
+                "outcomeTelemetryContract": None,
                 "deployChecks": [],
                 "releases": [],
                 "feedbackItems": [],
                 "approvalStatus": "pending",
                 "approvalComments": [],
                 "approvalRequestId": None,
+                **_TSUMIKI_ALL,
                 "phaseStatuses": rebuild_lifecycle_phase_statuses(project_record, completed_until=None),
             }
         )
@@ -127,6 +160,7 @@ def build_lifecycle_invalidation_patch(
         reason = "Research evidence changed; planning and downstream artifacts were invalidated."
         patch.update(
             {
+                "researchOperatorDecision": None,
                 "analysis": None,
                 "features": [],
                 "milestones": [],
@@ -136,13 +170,21 @@ def build_lifecycle_invalidation_patch(
                 "buildCode": None,
                 "buildCost": 0.0,
                 "buildIteration": 0,
+                "buildDecisionFingerprint": None,
                 "milestoneResults": [],
+                "deliveryPlan": None,
+                "developmentExecution": None,
+                "developmentHandoff": None,
+                "valueContract": None,
+                "outcomeTelemetryContract": None,
                 "deployChecks": [],
                 "releases": [],
                 "feedbackItems": [],
                 "approvalStatus": "pending",
                 "approvalComments": [],
                 "approvalRequestId": None,
+                "requirements": None,
+                **_TSUMIKI_FROM_PLANNING,
                 "phaseStatuses": rebuild_lifecycle_phase_statuses(project_record, completed_until="research"),
             }
         )
@@ -153,16 +195,23 @@ def build_lifecycle_invalidation_patch(
             {
                 "designVariants": [],
                 "selectedDesignId": None,
+                "valueContract": None,
+                "outcomeTelemetryContract": None,
                 "buildCode": None,
                 "buildCost": 0.0,
                 "buildIteration": 0,
+                "buildDecisionFingerprint": None,
                 "milestoneResults": [],
+                "deliveryPlan": None,
+                "developmentExecution": None,
+                "developmentHandoff": None,
                 "deployChecks": [],
                 "releases": [],
                 "feedbackItems": [],
                 "approvalStatus": "pending",
                 "approvalComments": [],
                 "approvalRequestId": None,
+                **_TSUMIKI_FROM_DESIGN,
                 "phaseStatuses": rebuild_lifecycle_phase_statuses(project_record, completed_until="planning"),
             }
         )
@@ -174,7 +223,11 @@ def build_lifecycle_invalidation_patch(
                 "buildCode": None,
                 "buildCost": 0.0,
                 "buildIteration": 0,
+                "buildDecisionFingerprint": None,
                 "milestoneResults": [],
+                "deliveryPlan": None,
+                "developmentExecution": None,
+                "developmentHandoff": None,
                 "deployChecks": [],
                 "releases": [],
                 "feedbackItems": [],

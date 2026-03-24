@@ -380,6 +380,94 @@ def _research_quality_gate_payload(
     }
 
 
+def _normalize_identity_profile(value: Any) -> dict[str, Any]:
+    profile = _as_dict(value)
+    official_domains = _dedupe_strings(
+        [
+            _source_host(str(item))
+            for item in _as_list(profile.get("officialDomains"))
+            if _source_host(str(item))
+        ]
+    )
+    if str(profile.get("officialWebsite", "")).strip():
+        website_host = _source_host(str(profile.get("officialWebsite", "")))
+        if website_host and website_host not in official_domains:
+            official_domains.append(website_host)
+    return {
+        "companyName": _normalize_space(profile.get("companyName")),
+        "productName": _normalize_space(profile.get("productName")),
+        "aliases": _dedupe_strings(
+            [_normalize_space(item) for item in _as_list(profile.get("aliases")) if _normalize_space(item)]
+        ),
+        "excludedEntityNames": _dedupe_strings(
+            [_normalize_space(item) for item in _as_list(profile.get("excludedEntityNames")) if _normalize_space(item)]
+        ),
+        "officialDomains": official_domains,
+    }
+
+
+def _identity_text_match(text: str, candidates: list[str]) -> bool:
+    normalized = _normalize_space(text).lower()
+    return any(candidate.lower() in normalized for candidate in candidates if candidate)
+
+
+def _identity_homonym_collision(
+    research: dict[str, Any],
+    identity_profile: dict[str, Any],
+) -> bool:
+    product_terms = _dedupe_strings(
+        [
+            str(identity_profile.get("productName", "")).strip(),
+            *[str(item).strip() for item in _as_list(identity_profile.get("aliases"))],
+        ]
+    )
+    company_name = str(identity_profile.get("companyName", "")).strip()
+    official_domains = [str(item).strip() for item in _as_list(identity_profile.get("officialDomains")) if str(item).strip()]
+    excluded_names = [str(item).strip() for item in _as_list(identity_profile.get("excludedEntityNames")) if str(item).strip()]
+    official_match = lambda url: any(
+        _source_host(url) == domain or _source_host(url).endswith(f".{domain}")
+        for domain in official_domains
+    )
+
+    for item in _as_list(research.get("source_links")):
+        url = str(item).strip()
+        if not url:
+            continue
+        if _identity_text_match(url, excluded_names):
+            return True
+        if product_terms and not official_match(url) and _identity_text_match(url, product_terms) and not _identity_text_match(url, [company_name]):
+            return True
+    for item in _as_list(research.get("evidence")):
+        evidence = _as_dict(item)
+        source_ref = str(evidence.get("source_ref", "")).strip()
+        combined = " ".join(
+            part for part in [source_ref, str(evidence.get("snippet", "")).strip()] if part
+        )
+        if _identity_text_match(combined, excluded_names):
+            return True
+        if source_ref and product_terms and not official_match(source_ref) and _identity_text_match(combined, product_terms) and not _identity_text_match(combined, [company_name]):
+            return True
+    for item in _as_list(research.get("competitors")):
+        competitor = _as_dict(item)
+        url = str(competitor.get("url", "")).strip()
+        combined = " ".join(
+            part
+            for part in [
+                str(competitor.get("name", "")).strip(),
+                url,
+                str(competitor.get("target", "")).strip(),
+            ]
+            if part
+        )
+        if _identity_text_match(combined, excluded_names):
+            return True
+        if url and official_match(url):
+            return True
+        if product_terms and url and not official_match(url) and _identity_text_match(combined, product_terms) and not _identity_text_match(combined, [company_name]):
+            return True
+    return False
+
+
 def evaluate_research_quality(
     research: dict[str, Any],
     *,
@@ -387,6 +475,7 @@ def evaluate_research_quality(
     remaining_iterations: int,
     proposal_node_ids: list[str],
     review_node_ids: list[str],
+    identity_profile: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], str, dict[str, Any] | None]:
     winning_theses = _normalized_research_strings(research.get("winning_theses"), limit=3, char_limit=220)
     floor = float(_as_dict(research.get("confidence_summary")).get("floor", 0.0) or 0.0)
@@ -400,7 +489,46 @@ def evaluate_research_quality(
     ]
     accepted_claim_nodes = _blocking_claim_node_ids(research)
     has_external_evidence = _research_has_external_evidence(research)
+    normalized_identity = _normalize_identity_profile(identity_profile)
+    has_company_name = bool(str(normalized_identity.get("companyName", "")).strip())
+    has_product_name = bool(str(normalized_identity.get("productName", "")).strip())
+    has_official_domains = bool(_as_list(normalized_identity.get("officialDomains")))
+    has_excluded_entities = bool(_as_list(normalized_identity.get("excludedEntityNames")))
+    identity_lock_ready = (
+        (has_company_name and has_product_name)
+        or has_official_domains
+        or has_excluded_entities
+    )
+    identity_gate_required = identity_lock_ready
     gates = [
+        *(
+            [
+                _research_quality_gate_payload(
+                    "target-identity-locked",
+                    "調査対象の会社名と自社プロダクト名が固定されている",
+                    identity_lock_ready,
+                    (
+                        "target identity lock signals are present"
+                        if identity_lock_ready
+                        else "target identity is incomplete"
+                    ),
+                    ["research-judge"],
+                ),
+                _research_quality_gate_payload(
+                    "homonym-risk-cleared",
+                    "同名他社との混同が検出されていない",
+                    not _identity_homonym_collision(research, normalized_identity),
+                    (
+                        "no homonym collision detected"
+                        if not _identity_homonym_collision(research, normalized_identity)
+                        else "same-name or excluded entity contamination detected"
+                    ),
+                    ["competitor-analyst", "evidence-librarian", "research-judge"],
+                ),
+            ]
+            if identity_gate_required
+            else []
+        ),
         _research_quality_gate_payload(
             "source-grounding",
             "採択主張が source と evidence に接地している",
@@ -461,4 +589,3 @@ def evaluate_research_quality(
             "maxIterations": remaining_iterations,
         }
     return gates, "rework", remediation_plan
-

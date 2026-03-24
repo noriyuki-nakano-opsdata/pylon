@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { defaultProductIdentity } from "@/lifecycle/productIdentity";
 import {
   createWorkspaceProjectState,
   defaultResearchConfig,
@@ -16,7 +17,13 @@ function makeProject(overrides: Partial<LifecycleProject> = {}): LifecycleProjec
     name: "manu",
     spec: "Initial spec",
     orchestrationMode: "workflow",
+    governanceMode: "governed",
     autonomyLevel: "A3",
+    productIdentity: {
+      ...defaultProductIdentity(),
+      companyName: "Pylon Labs",
+      productName: "manu",
+    },
     researchConfig: defaultResearchConfig(),
     features: [],
     milestones: [],
@@ -84,6 +91,46 @@ describe("lifecycleWorkspaceReducer", () => {
     expect(refreshed.spec).toBe("Locally edited spec");
     expect(refreshed.editableBaseline.spec).toBe("Initial spec");
     expect(selectEditableProjectPatch(refreshed).spec).toBe("Locally edited spec");
+  });
+
+  it("tracks product identity as an editable project field", () => {
+    const hydrated = lifecycleWorkspaceReducer(
+      createWorkspaceProjectState(),
+      { type: "apply_project", project: makeProject() },
+    );
+    const updated = lifecycleWorkspaceReducer(
+      hydrated,
+      {
+        type: "update_product_identity",
+        value: {
+          ...defaultProductIdentity(),
+          companyName: "Updated Co",
+          productName: "manu",
+          officialWebsite: "https://updated.example.com",
+          officialDomains: ["updated.example.com"],
+          aliases: ["manu cloud"],
+          excludedEntityNames: ["Basler pylon"],
+        },
+      },
+    );
+
+    expect(updated.productIdentity.companyName).toBe("Updated Co");
+    expect(selectEditableProjectPatch(updated).productIdentity.officialDomains).toEqual(["updated.example.com"]);
+    expect(selectEditableProjectPatch(updated).productIdentity.excludedEntityNames).toEqual(["Basler pylon"]);
+  });
+
+  it("tracks governance mode as an editable project field", () => {
+    const hydrated = lifecycleWorkspaceReducer(
+      createWorkspaceProjectState(),
+      { type: "apply_project", project: makeProject() },
+    );
+    const updated = lifecycleWorkspaceReducer(
+      hydrated,
+      { type: "update_governance_mode", value: "complete_autonomy" },
+    );
+
+    expect(updated.governanceMode).toBe("complete_autonomy");
+    expect(selectEditableProjectPatch(updated).governanceMode).toBe("complete_autonomy");
   });
 
   it("tracks save lifecycle in reducer state", () => {

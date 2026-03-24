@@ -463,7 +463,9 @@ Execution isolation.
 | Executor | Sandboxed code execution |
 | Registry | Sandbox type registration |
 
-Note: The current implementation provides an in-memory manager with a policy model. Concrete gVisor and Firecracker runtime integrations are planned but not yet implemented.
+Note: The generic sandbox manager remains a reference lifecycle layer, but
+experiment campaigns now ship with a self-hosted execution path: Docker-backed
+local isolation plus a delegated Firecracker executor hook for AWS/Linux.
 
 ### pylon.tenancy
 

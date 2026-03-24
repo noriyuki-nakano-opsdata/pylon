@@ -12,6 +12,7 @@ import {
 import { cn } from "@/lib/utils";
 import type {
   LifecycleArtifact,
+  LifecycleAutonomyState,
   LifecycleDecision,
   LifecycleDelegation,
   LifecyclePhase,
@@ -30,6 +31,7 @@ interface OperatorConsoleProps {
   delegations: LifecycleDelegation[];
   phaseRuns: LifecyclePhaseRun[];
   research?: MarketResearch | null;
+  autonomyState?: LifecycleAutonomyState | null;
   liveTelemetry?: WorkflowRunLiveTelemetry | null;
   phaseSummary?: LifecyclePhaseRuntimeSummary | null;
   activePhaseSummary?: LifecyclePhaseRuntimeSummary | null;
@@ -117,6 +119,33 @@ function agentRuntimeStatusLabel(status: string): string {
   return labels[status] ?? polishConsoleCopy(status);
 }
 
+function developmentMeshStatusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    pending: "待機",
+    running: "進行中",
+    completed: "完了",
+    blocked: "要再実行",
+    failed: "失敗",
+  };
+  return labels[status] ?? agentRuntimeStatusLabel(status);
+}
+
+function governanceModeLabel(mode?: string): string {
+  return mode === "complete_autonomy" ? "complete autonomy" : "governed";
+}
+
+function executionPolicyLabel(policy: string): string {
+  const labels: Record<string, string> = {
+    auto_with_human_override: "自律実行 + 人の上書き",
+    human_required: "人の判断必須",
+    autonomous_work_unit_loops: "WU 自律ループ",
+    auto_release_candidate_with_optional_hold: "自動 release + hold 可",
+    auto_synthesis_with_human_prioritization: "自動合成 + 人の優先付け",
+    continuous_autonomous_iteration: "継続自律 iteration",
+  };
+  return labels[policy] ?? polishConsoleCopy(policy.replaceAll("_", " "));
+}
+
 function artifactSummaryText(artifact: LifecycleArtifact): string {
   const payload = artifact.payload ?? {};
   if (artifact.title === "Research Judgement") {
@@ -150,6 +179,7 @@ export function LifecycleOperatorConsole({
   delegations: allDelegations,
   phaseRuns,
   research,
+  autonomyState,
   liveTelemetry,
   phaseSummary,
   activePhaseSummary,
@@ -196,6 +226,25 @@ export function LifecycleOperatorConsole({
   const recentLiveNodes = (liveTelemetry?.recentNodeIds ?? []).map(formatResearchNodeLabel);
   const runtimeAgents = displayedPhaseSummary?.agents ?? [];
   const runtimeActions = displayedPhaseSummary?.recentActions ?? [];
+  const runtimeWaves = displayedPhaseSummary?.executionWaves ?? [];
+  const pendingHumanDecisions = autonomyState?.requiredHumanDecisions ?? [];
+  const phasePolicy = autonomyState?.phasePolicies?.[phase];
+  const runtimeWorkUnits = [...(displayedPhaseSummary?.workUnits ?? [])].sort((left, right) => {
+    const statusRank = (status: string) => ({
+      blocked: 0,
+      failed: 1,
+      running: 2,
+      pending: 3,
+      completed: 4,
+    }[status] ?? 9);
+    const leftWave = left.waveIndex ?? 0;
+    const rightWave = right.waveIndex ?? 0;
+    if (leftWave !== rightWave) return leftWave - rightWave;
+    const leftStatus = statusRank(left.status);
+    const rightStatus = statusRank(right.status);
+    if (leftStatus !== rightStatus) return leftStatus - rightStatus;
+    return left.title.localeCompare(right.title, "ja-JP");
+  });
 
   return (
     <aside className={cn("flex flex-col border-l border-border bg-card/40", className)}>
@@ -228,6 +277,37 @@ export function LifecycleOperatorConsole({
             <EmptyLine text="まだ実行履歴はありません。" />
           )}
         </ConsoleSection>
+
+        {autonomyState && (
+          <ConsoleSection title="Governance">
+            <div className="rounded-lg border border-border bg-card p-3 text-xs">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-medium text-foreground">{governanceModeLabel(autonomyState.governanceMode)}</span>
+                <Badge variant="outline" className="text-[10px]">
+                  {autonomyState.orchestrationMode}
+                </Badge>
+              </div>
+              {phasePolicy && (
+                <p className="mt-2 text-[11px] text-muted-foreground">
+                  {executionPolicyLabel(phasePolicy.executionPolicy)} · {compactText(phasePolicy.summary, 120)}
+                </p>
+              )}
+              <div className="mt-3 space-y-2">
+                {pendingHumanDecisions.length > 0 ? pendingHumanDecisions.slice(0, 3).map((decision) => (
+                  <div key={`${decision.phase}:${decision.decisionId}`} className="rounded-md border border-border/70 bg-background/80 px-2.5 py-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[11px] font-medium text-foreground">{decision.title}</span>
+                      <Badge variant="secondary" className="text-[10px]">{formatPhaseLabel(decision.phase)}</Badge>
+                    </div>
+                    <p className="mt-1 text-[11px] text-muted-foreground">{compactText(decision.reason, 120)}</p>
+                  </div>
+                )) : (
+                  <EmptyLine text="現在、必須の human gate はありません。" />
+                )}
+              </div>
+            </div>
+          </ConsoleSection>
+        )}
 
         {liveTelemetry?.run && (
           <ConsoleSection title="ライブ実行">
@@ -300,6 +380,18 @@ export function LifecycleOperatorConsole({
                 {typeof displayedPhaseSummary.attemptCount === "number" && typeof displayedPhaseSummary.maxAttempts === "number" && (
                   <span>自動補完 {displayedPhaseSummary.attemptCount}/{displayedPhaseSummary.maxAttempts}</span>
                 )}
+                {phase === "development" && typeof displayedPhaseSummary.waveCount === "number" && (
+                  <span>wave {displayedPhaseSummary.waveCount}件</span>
+                )}
+                {phase === "development" && typeof displayedPhaseSummary.workUnitCount === "number" && (
+                  <span>WU {displayedPhaseSummary.workUnitCount}件</span>
+                )}
+                {phase === "development" && typeof displayedPhaseSummary.currentWaveIndex === "number" && (
+                  <span>現在 wave {displayedPhaseSummary.currentWaveIndex + 1}</span>
+                )}
+                {phase === "development" && displayedPhaseSummary.topologyFresh === false && (
+                  <span>topology 要再生成</span>
+                )}
                 {displayedPhaseSummary.canAutorun && <span>次の処理は自動で継続</span>}
               </div>
               {displayedPhaseSummary.blockingSummary.length > 0 && (
@@ -309,12 +401,50 @@ export function LifecycleOperatorConsole({
                   ))}
                 </div>
               )}
+              {phase === "development" && (displayedPhaseSummary.retryNodeIds?.length ?? 0) > 0 && (
+                <p className="mt-2 text-muted-foreground">
+                  再試行ノード: {(displayedPhaseSummary.retryNodeIds ?? []).slice(0, 4).join(" / ")}
+                </p>
+              )}
+              {phase === "development" && (displayedPhaseSummary.focusWorkUnitIds?.length ?? 0) > 0 && (
+                <p className="mt-1 text-muted-foreground">
+                  注力 WU: {(displayedPhaseSummary.focusWorkUnitIds ?? []).slice(0, 4).join(" / ")}
+                </p>
+              )}
             </div>
           </ConsoleSection>
         )}
 
+        {phase === "development" && displayedPhaseSummary && (
+          <ConsoleSection title="Delivery Mesh" defaultOpen>
+            <div className="grid grid-cols-2 gap-2">
+              {typeof displayedPhaseSummary.waveCount === "number" ? (
+                <MetricCard
+                  label="wave"
+                  value={`${typeof displayedPhaseSummary.currentWaveIndex === "number" ? displayedPhaseSummary.currentWaveIndex + 1 : 0}/${displayedPhaseSummary.waveCount}`}
+                />
+              ) : null}
+              {typeof displayedPhaseSummary.workUnitCount === "number" ? (
+                <MetricCard label="work unit" value={`${displayedPhaseSummary.workUnitCount}件`} />
+              ) : null}
+              <MetricCard label="retry nodes" value={`${displayedPhaseSummary.retryNodeIds?.length ?? 0}件`} />
+              <MetricCard label="focus WU" value={`${displayedPhaseSummary.focusWorkUnitIds?.length ?? 0}件`} />
+            </div>
+            {(displayedPhaseSummary.retryNodeIds?.length ?? 0) > 0 && (
+              <div className="rounded-lg border border-border bg-card px-3 py-2 text-[11px] text-muted-foreground">
+                再試行ノード: {(displayedPhaseSummary.retryNodeIds ?? []).slice(0, 4).join(" / ")}
+              </div>
+            )}
+            {(displayedPhaseSummary.focusWorkUnitIds?.length ?? 0) > 0 && (
+              <div className="rounded-lg border border-border bg-card px-3 py-2 text-[11px] text-muted-foreground">
+                注力 WU: {(displayedPhaseSummary.focusWorkUnitIds ?? []).slice(0, 4).join(" / ")}
+              </div>
+            )}
+          </ConsoleSection>
+        )}
+
         {runtimeAgents.length > 0 && (
-          <ConsoleSection title="担当エージェント">
+          <ConsoleSection title="担当エージェント" defaultOpen={phase !== "development"}>
             {runtimeAgents.map((agent) => (
               <div key={agent.agentId} className="rounded-lg border border-border bg-card p-3 text-xs">
                 <div className="flex items-center justify-between gap-2">
@@ -335,7 +465,7 @@ export function LifecycleOperatorConsole({
         )}
 
         {runtimeActions.length > 0 && (
-          <ConsoleSection title="直近の自動処理">
+          <ConsoleSection title="直近の自動処理" defaultOpen={phase !== "development"}>
             {runtimeActions.map((action) => (
               <div key={`${action.nodeId}:${action.summary}`} className="rounded-lg border border-border bg-card p-3 text-xs">
                 <div className="flex items-center justify-between gap-2">
@@ -345,6 +475,62 @@ export function LifecycleOperatorConsole({
                 <p className="mt-1 text-muted-foreground">{compactText(polishConsoleCopy(action.summary), 170)}</p>
                 {action.agentLabel && <p className="mt-1 text-muted-foreground">担当: {action.agentLabel}</p>}
                 {action.nodeLabel && <p className="mt-1 text-muted-foreground">ノード: {action.nodeLabel}</p>}
+              </div>
+            ))}
+          </ConsoleSection>
+        )}
+
+        {phase === "development" && runtimeWaves.length > 0 && (
+          <ConsoleSection title="Execution Waves" defaultOpen={false}>
+            {runtimeWaves.map((wave) => (
+              <div key={wave.waveIndex} className="rounded-lg border border-border bg-card p-3 text-xs">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-medium text-foreground">Wave {wave.waveIndex + 1}</span>
+                  <Badge variant="outline" className="text-[10px]">{developmentMeshStatusLabel(wave.status)}</Badge>
+                </div>
+                <p className="mt-1 text-muted-foreground">
+                  WU {wave.completedWorkUnitCount}/{wave.workUnitCount}
+                  {wave.ready ? " / exit ready" : ""}
+                </p>
+                {wave.laneIds.length > 0 && (
+                  <p className="mt-1 text-muted-foreground">担当 lane: {wave.laneIds.join(" / ")}</p>
+                )}
+                {wave.blockedWorkUnitIds.length > 0 && (
+                  <p className="mt-1 text-muted-foreground">
+                    ブロック中: {wave.blockedWorkUnitIds.slice(0, 3).join(" / ")}
+                  </p>
+                )}
+                {wave.activeNodeIds.length > 0 && (
+                  <p className="mt-1 text-muted-foreground">
+                    稼働ノード: {wave.activeNodeIds.slice(0, 3).join(" / ")}
+                  </p>
+                )}
+              </div>
+            ))}
+          </ConsoleSection>
+        )}
+
+        {phase === "development" && runtimeWorkUnits.length > 0 && (
+          <ConsoleSection title="Work Unit 状態" defaultOpen={false}>
+            {runtimeWorkUnits.slice(0, 8).map((workUnit) => (
+              <div key={workUnit.id} className="rounded-lg border border-border bg-card p-3 text-xs">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-medium text-foreground">{compactText(polishConsoleCopy(workUnit.title), 120)}</span>
+                  <Badge variant="outline" className="text-[10px]">{developmentMeshStatusLabel(workUnit.status)}</Badge>
+                </div>
+                <p className="mt-1 text-muted-foreground">
+                  Wave {workUnit.waveIndex + 1} / {polishConsoleCopy(workUnit.lane || "unassigned")}
+                </p>
+                {(workUnit.builderStatus || workUnit.qaStatus || workUnit.securityStatus) && (
+                  <p className="mt-1 text-muted-foreground">
+                    build {workUnit.builderStatus ?? "pending"} / qa {workUnit.qaStatus ?? "pending"} / security {workUnit.securityStatus ?? "pending"}
+                  </p>
+                )}
+                {(workUnit.blockedBy?.length ?? 0) > 0 && (
+                  <p className="mt-1 text-muted-foreground">
+                    原因: {workUnit.blockedBy?.join(" / ")}
+                  </p>
+                )}
               </div>
             ))}
           </ConsoleSection>
@@ -440,7 +626,7 @@ export function LifecycleOperatorConsole({
         )}
 
         {artifacts.length > 0 && (
-          <ConsoleSection title="主要成果物">
+          <ConsoleSection title="主要成果物" defaultOpen={phase !== "development"}>
             {artifacts.map((artifact) => (
             <div key={artifact.id} className="rounded-lg border border-border bg-card p-3 text-xs">
               <div className="flex items-center justify-between gap-2">
@@ -461,7 +647,7 @@ export function LifecycleOperatorConsole({
         )}
 
         {decisions.length > 0 && (
-          <ConsoleSection title="直近の判断">
+          <ConsoleSection title="直近の判断" defaultOpen={phase !== "development"}>
             {decisions.map((decision) => (
             <div key={decision.id} className="rounded-lg border border-border bg-card p-3 text-xs">
               <div className="flex items-center justify-between gap-2">
@@ -475,7 +661,7 @@ export function LifecycleOperatorConsole({
         )}
 
         {skills.length > 0 && (
-          <ConsoleSection title="使われたスキル">
+          <ConsoleSection title="使われたスキル" defaultOpen={phase !== "development"}>
             {skills.map((skill) => (
             <div key={skill.id} className="rounded-lg border border-border bg-card p-3 text-xs">
               <div className="flex items-center justify-between gap-2">
@@ -491,7 +677,7 @@ export function LifecycleOperatorConsole({
         )}
 
         {delegations.length > 0 && (
-          <ConsoleSection title="エージェント間委譲">
+          <ConsoleSection title="エージェント間委譲" defaultOpen={phase !== "development"}>
             {delegations.map((delegation) => (
             <div key={delegation.id} className="rounded-lg border border-border bg-card p-3 text-xs">
               <div className="flex items-center justify-between gap-2">
@@ -518,14 +704,27 @@ function MetricCard({ label, value }: { label: string; value: string }) {
   );
 }
 
-function ConsoleSection({ title, children }: { title: string; children: ReactNode }) {
+function ConsoleSection({
+  title,
+  children,
+  defaultOpen = true,
+}: {
+  title: string;
+  children: ReactNode;
+  defaultOpen?: boolean;
+}) {
   return (
-    <section className="space-y-2">
-      <div className="flex items-center justify-between">
+    <details open={defaultOpen} className="rounded-[1rem] border border-border/60 bg-card/30 px-3 py-2">
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-3">
         <h3 className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">{title}</h3>
+        <span className="rounded-full border border-border bg-card px-2 py-0.5 text-[9px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
+          section
+        </span>
+      </summary>
+      <div className="mt-3 space-y-2">
+        {children}
       </div>
-      {children}
-    </section>
+    </details>
   );
 }
 

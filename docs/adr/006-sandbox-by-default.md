@@ -24,10 +24,20 @@ All agent code execution runs in gVisor (runsc) sandboxes by default. Firecracke
 
 ## Implementation Note
 
-The current codebase provides the policy and lifecycle scaffolding for this ADR:
+The current codebase now provides the policy/lifecycle scaffolding plus a
+self-hosted execution path for experiment workloads:
 
 - `pylon.sandbox.policy` defines default tiers, limits, and network rules
 - `pylon.sandbox.manager` manages sandbox records in memory
 - `pylon.sandbox.executor` and `pylon.sandbox.registry` provide reference execution/lookup helpers
+- `pylon.sandbox.firecracker_runner` provides the app-side runner
+- `pylon.sandbox.firecracker_executor` provides the operator-side delegated executor
 
-Concrete gVisor and Firecracker runtime integrations are not implemented yet. The current runtime is therefore a reference sandbox layer, not a production backend integration.
+The production path today is:
+
+- local/macOS/Linux: Docker-backed self-hosted isolation
+- AWS/Linux: delegated executor path that can call an operator-managed Firecracker launcher
+
+The generic `pylon.sandbox.manager` layer remains a reference lifecycle model,
+but experiment campaigns are no longer blocked on a purely in-memory sandbox
+stub.

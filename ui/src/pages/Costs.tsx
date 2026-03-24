@@ -7,6 +7,7 @@ import { PageSkeleton } from "@/components/PageSkeleton";
 import { EmptyState } from "@/components/EmptyState";
 import { queryKeys } from "@/lib/queryKeys";
 import { costsApi } from "@/api/costs";
+import { useI18n } from "@/contexts/I18nContext";
 import { cn } from "@/lib/utils";
 
 const PERIODS = [
@@ -18,6 +19,7 @@ const PERIODS = [
 ] as const;
 
 export function Costs() {
+  const { t } = useI18n();
   const [period, setPeriod] = useState("mtd");
 
   const query = useQuery({
@@ -33,11 +35,11 @@ export function Costs() {
   if (query.isError || !data) {
     return (
       <div className="p-6">
-        <h1 className="text-2xl font-bold tracking-tight">コスト分析</h1>
+        <h1 className="text-2xl font-bold tracking-tight">{t("costs.title")}</h1>
         <EmptyState
           icon={DollarSign}
-          title="コストデータなし"
-          description="ワークフロー実行時にコスト追跡が開始されます。"
+          title={t("costs.empty.title")}
+          description={t("costs.empty.description")}
         />
       </div>
     );
@@ -58,9 +60,9 @@ export function Costs() {
   return (
     <div className="space-y-6 p-6">
       <div>
-        <h1 className="text-2xl font-bold tracking-tight">コスト分析</h1>
+        <h1 className="text-2xl font-bold tracking-tight">{t("costs.title")}</h1>
         <p className="text-sm text-muted-foreground">
-          LLM利用コスト分析
+          {t("costs.description")}
         </p>
       </div>
 
@@ -83,12 +85,12 @@ export function Costs() {
         <CardContent className="p-6">
           <div className="flex items-baseline justify-between">
             <div>
-              <p className="text-sm text-muted-foreground">合計支出</p>
+              <p className="text-sm text-muted-foreground">{t("costs.totalSpend")}</p>
               <p className="text-3xl font-bold">${data.total_usd.toFixed(2)}</p>
             </div>
             {data.budget_usd > 0 && (
               <div className="text-right">
-                <p className="text-sm text-muted-foreground">予算</p>
+                <p className="text-sm text-muted-foreground">{t("costs.budget")}</p>
                 <p className="text-lg font-semibold">
                   ${data.budget_usd.toFixed(2)}
                 </p>
@@ -99,9 +101,9 @@ export function Costs() {
           {data.budget_usd > 0 && (
             <div className="mt-4 space-y-1">
               <div className="flex justify-between text-xs text-muted-foreground">
-                <span>{budgetPercent}% 使用</span>
+                <span>{t("costs.usedPercent", { percent: budgetPercent })}</span>
                 <span>
-                  ${(data.budget_usd - data.total_usd).toFixed(2)} 残り
+                  {t("costs.remaining", { amount: (data.budget_usd - data.total_usd).toFixed(2) })}
                 </span>
               </div>
               <div className="h-2 w-full rounded-full bg-muted">
@@ -121,9 +123,9 @@ export function Costs() {
           )}
 
           <div className="mt-4 flex gap-6 text-sm text-muted-foreground">
-            <span>{data.run_count} runs</span>
-            <span>{data.total_tokens_in.toLocaleString()} tokens in</span>
-            <span>{data.total_tokens_out.toLocaleString()} tokens out</span>
+            <span>{t("costs.runs", { count: data.run_count })}</span>
+            <span>{t("costs.tokensIn", { count: data.total_tokens_in.toLocaleString() })}</span>
+            <span>{t("costs.tokensOut", { count: data.total_tokens_out.toLocaleString() })}</span>
           </div>
         </CardContent>
       </Card>
@@ -133,11 +135,11 @@ export function Costs() {
         {/* By Provider */}
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">プロバイダー別</CardTitle>
+            <CardTitle className="text-base">{t("costs.byProvider")}</CardTitle>
           </CardHeader>
           <CardContent>
             {providerEntries.length === 0 ? (
-              <p className="text-sm text-muted-foreground">データなし</p>
+              <p className="text-sm text-muted-foreground">{t("common.noData")}</p>
             ) : (
               <div className="space-y-3">
                 {providerEntries.map(([provider, cost]) => (
@@ -156,11 +158,11 @@ export function Costs() {
         {/* By Model */}
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">モデル別</CardTitle>
+            <CardTitle className="text-base">{t("costs.byModel")}</CardTitle>
           </CardHeader>
           <CardContent>
             {modelEntries.length === 0 ? (
-              <p className="text-sm text-muted-foreground">データなし</p>
+              <p className="text-sm text-muted-foreground">{t("common.noData")}</p>
             ) : (
               <div className="space-y-3">
                 {modelEntries.map(([model, cost]) => (

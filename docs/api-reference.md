@@ -825,6 +825,18 @@ Return built-in benchmark metadata for one ads platform.
 
 Return the built-in industry templates used by the ads planning flow.
 
+### `GET /api/v1/gtm/overview`
+
+Return one project-scoped GTM operating summary derived from current agents,
+tasks, events, content items, ads reports, and available skills. The payload
+includes:
+
+- `summary`
+- `teams`
+- `motions`
+- `capabilities`
+- `recommendations`
+
 ### `GET /api/v1/costs/summary`
 
 Return a tenant-scoped cost aggregate for the requested period.

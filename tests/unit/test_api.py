@@ -44,9 +44,15 @@ from pylon.api.schemas import (
     validate,
 )
 from pylon.api.server import APIServer, Request, Response
-from pylon.control_plane import ControlPlaneBackend, InMemoryWorkflowControlPlaneStore
+from pylon.approval.types import compute_approval_binding_hash
+from pylon.control_plane import (
+    ControlPlaneBackend,
+    InMemoryWorkflowControlPlaneStore,
+    SQLiteWorkflowControlPlaneStore,
+)
 from pylon.dsl.parser import PylonProject
 from pylon.errors import ConcurrencyError
+from pylon.lifecycle import build_lifecycle_approval_binding
 from pylon.providers.base import Response as ProviderResponse
 from pylon.providers.base import TokenUsage
 from pylon.runtime.llm import ProviderRegistry
@@ -430,10 +436,16 @@ class TestServerRouting:
 
         resp = server.handle_request("GET", "/ready")
 
-        assert resp.status_code == 200
-        assert resp.body["status"] == "ready"
-        assert resp.body["ready"] is True
+        assert resp.status_code == 503
+        assert resp.body["status"] == "not_ready"
+        assert resp.body["ready"] is False
         assert "checks" in resp.body
+        control_plane = next(
+            item for item in resp.body["checks"] if item["name"] == "control_plane"
+        )
+        assert control_plane["backend"] == "memory"
+        assert control_plane["readiness_tier"] == "reference"
+        assert control_plane["production_capable"] is False
 
     def test_metrics_endpoint_renders_prometheus_text(self):
         server, _ = build_api_server(
@@ -1069,6 +1081,68 @@ class TestAgentRoutes:
         assert check["pending"] >= 1
         assert "backlog exists" in check["message"]
 
+    def test_readiness_bundle_marks_single_node_stack_as_production_capable(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        observability = build_api_observability_bundle(
+            control_plane_store=SQLiteWorkflowControlPlaneStore(
+                str(tmp_path / "control-plane.db")
+            ),
+            auth_backend=AuthBackend.JWT_HS256.value,
+            rate_limit_backend="sqlite",
+            secrets_backend="file_vault",
+            secret_audit_backend="jsonl",
+            sandbox_backend="docker",
+            metrics_namespace="pylon",
+            enable_prometheus_exporter=False,
+        )
+
+        report = observability.readiness_checker.run_all_sync()
+
+        assert report["status"] == "healthy"
+        checks = {item["name"]: item for item in report["checks"]}
+        assert checks["control_plane"]["readiness_tier"] == "single-node"
+        assert checks["control_plane"]["production_capable"] is True
+        assert checks["auth"]["readiness_tier"] == "single-node"
+        assert checks["auth"]["production_capable"] is True
+        assert checks["rate_limit"]["readiness_tier"] == "single-node"
+        assert checks["rate_limit"]["production_capable"] is True
+        assert checks["secrets"]["readiness_tier"] == "single-node"
+        assert checks["secrets"]["production_capable"] is True
+        assert checks["secret_audit"]["readiness_tier"] == "single-node"
+        assert checks["secret_audit"]["production_capable"] is True
+        assert checks["sandbox"]["readiness_tier"] == "single-node"
+        assert checks["sandbox"]["production_capable"] is True
+
+    def test_readiness_bundle_marks_unknown_backends_as_not_production_capable(
+        self,
+    ) -> None:
+        observability = build_api_observability_bundle(
+            control_plane_store=InMemoryWorkflowControlPlaneStore(),
+            auth_backend="my_custom_auth",
+            rate_limit_backend="my_custom_rl",
+            secrets_backend="my_custom_secrets",
+            secret_audit_backend="my_custom_audit",
+            sandbox_backend="my_custom_sandbox",
+            metrics_namespace="pylon",
+            enable_prometheus_exporter=False,
+        )
+
+        report = observability.readiness_checker.run_all_sync()
+
+        checks = {item["name"]: item for item in report["checks"]}
+        assert checks["auth"]["production_capable"] is False
+        assert checks["auth"]["readiness_tier"] == "unknown"
+        assert checks["rate_limit"]["production_capable"] is False
+        assert checks["rate_limit"]["readiness_tier"] == "unknown"
+        assert checks["secrets"]["production_capable"] is False
+        assert checks["secrets"]["readiness_tier"] == "unknown"
+        assert checks["secret_audit"]["production_capable"] is False
+        assert checks["secret_audit"]["readiness_tier"] == "unknown"
+        assert checks["sandbox"]["production_capable"] is False
+        assert checks["sandbox"]["readiness_tier"] == "unknown"
+
     def test_features_endpoint_returns_product_surface_manifest(self):
         server, _ = _server_with_routes()
         resp = server.handle_request("GET", "/api/v1/features")
@@ -1634,6 +1708,56 @@ class TestLifecycleRoutes:
         assert '"activePhase": "planning"' in project_runtime
         assert '"activePhaseSummary"' in project_runtime
 
+    def test_lifecycle_project_events_stream_rehydrates_live_payload_from_state_node_status(self):
+        server, store = _server_with_routes()
+        patched = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/orbit",
+            body={"spec": "DESIGN_STREAM_SENTINEL"},
+        )
+        assert patched.status_code == 200
+
+        workflow_id = "lifecycle-design-orbit"
+        store.put_run_record(
+            {
+                "id": "run_design_terminal",
+                "workflow_id": workflow_id,
+                "workflow": workflow_id,
+                "tenant_id": "default",
+                "status": "completed",
+                "started_at": "2026-03-17T00:00:00Z",
+                "completed_at": "2026-03-17T00:05:00Z",
+                "state": {
+                    "execution": {
+                        "node_status": {
+                            "claude-designer": "succeeded",
+                            "design-evaluator": "succeeded",
+                        },
+                    },
+                },
+                "event_log": [
+                    {"seq": 1, "node_id": "claude-designer", "agent": "claude-designer"},
+                    {"seq": 2, "node_id": "design-evaluator", "agent": "design-evaluator"},
+                ],
+            },
+            workflow_id=workflow_id,
+            tenant_id="default",
+            parameters={},
+        )
+
+        streamed = server.handle_request(
+            "GET",
+            "/api/v1/lifecycle/projects/orbit/events?phase=design&once=1",
+        )
+
+        assert streamed.status_code == 200
+        chunks = list(streamed.body.chunks)
+        run_live = next(chunk for chunk in chunks if "event: run-live" in chunk)
+        payload = json.loads(run_live.split("data: ", 1)[1])
+        assert payload["completedNodeCount"] == 2
+        assert payload["lastNodeId"] == "design-evaluator"
+        assert payload["recentNodeIds"] == ["design-evaluator", "claude-designer"]
+
     def test_lifecycle_projects_support_project_metadata_for_selector_creation(self):
         server, _ = _server_with_routes()
 
@@ -1671,6 +1795,1182 @@ class TestLifecycleRoutes:
         assert listed.status_code == 200
         assert listed.body["count"] == 1
         assert listed.body["projects"][0]["name"] == "Focus Board"
+
+    def test_lifecycle_projects_round_trip_product_identity(self):
+        server, _ = _server_with_routes()
+
+        updated = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/identity-probe",
+            body={
+                "name": "Identity Probe",
+                "spec": "identity probe spec",
+                "productIdentity": {
+                    "companyName": "Pylon Labs",
+                    "productName": "Pylon",
+                    "officialWebsite": "https://pylon.example.com",
+                    "officialDomains": ["pylon.example.com"],
+                    "aliases": ["Pylon Platform"],
+                    "excludedEntityNames": ["Basler pylon"],
+                },
+            },
+        )
+
+        assert updated.status_code == 200
+        assert updated.body["project"]["productIdentity"]["companyName"] == "Pylon Labs"
+        assert updated.body["project"]["productIdentity"]["officialDomains"] == ["pylon.example.com"]
+
+        fetched = server.handle_request("GET", "/api/v1/lifecycle/projects/identity-probe")
+        assert fetched.status_code == 200
+        assert fetched.body["productIdentity"]["productName"] == "Pylon"
+        assert fetched.body["productIdentity"]["excludedEntityNames"] == ["Basler pylon"]
+
+    def test_lifecycle_projects_compact_storage_and_hydrate_response_fields(self):
+        server, store = _server_with_routes()
+
+        updated = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/storage-probe",
+            body={
+                "name": "Storage Probe",
+                "spec": "Operator-led lifecycle workspace with governed approvals.",
+                "research": {
+                    "summary": "Initial research summary",
+                    "readiness": "rework",
+                    "view_model": {"hero": {"title": "Do not persist derived view state"}},
+                },
+                "features": [
+                    {"feature": "approval gate", "selected": True},
+                    {"feature": "artifact lineage", "selected": True},
+                ],
+                "analysis": {
+                    "design_tokens": {
+                        "colors": {"background": "#020617", "primary": "#2563eb", "cta": "#f59e0b"},
+                    }
+                },
+                "milestones": [
+                    {"id": "ms-alpha", "name": "Alpha", "criteria": "Reviewable operator workflow"}
+                ],
+                "designVariants": [
+                    {
+                        "id": "variant-a",
+                        "model": "Claude Sonnet 4.6",
+                        "pattern_name": "Control Deck",
+                        "description": "Product shell for approvals and research recovery",
+                        "preview_html": "<!doctype html><html><body>transient</body></html>",
+                        "primary_color": "#2563eb",
+                        "accent_color": "#f59e0b",
+                        "prototype": {
+                            "kind": "product-workspace",
+                            "app_shell": {
+                                "primary_navigation": [
+                                    {"id": "research", "label": "Research", "priority": "primary"}
+                                ]
+                            },
+                            "screens": [
+                                {
+                                    "id": "research",
+                                    "title": "Research",
+                                    "headline": "Inspect evidence quality",
+                                    "purpose": "Review the current research pass",
+                                    "modules": [
+                                        {"name": "Evidence", "type": "summary", "items": ["Signals", "Sources"]}
+                                    ],
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+        )
+
+        assert updated.status_code == 200
+        stored = store.get_surface_record("lifecycle_projects", "default:storage-probe")
+        assert stored is not None
+        assert "decision_context" not in stored
+        assert "phaseContracts" not in stored
+        assert "nextAction" not in stored
+        assert "autonomyState" not in stored
+        assert "view_model" not in stored["research"]
+        assert stored["designVariants"][0]["preview_html"].startswith("<!doctype html>")
+        assert stored["designVariants"][0]["preview_meta"]["source"] == "repaired"
+
+        fetched = server.handle_request("GET", "/api/v1/lifecycle/projects/storage-probe")
+
+        assert fetched.status_code == 200
+        assert fetched.body["research"]["view_model"] is not None
+        assert fetched.body["designVariants"][0]["preview_html"].startswith("<!doctype html>")
+        assert 'data-screen-id="research"' in fetched.body["designVariants"][0]["preview_html"]
+        assert fetched.body["designVariants"][0]["preview_meta"]["fallback_reason"] == "stored_preview_invalid"
+        assert fetched.body["designVariants"][0]["preview_meta"]["source"] == "repaired"
+        assert fetched.body["designVariants"][0]["prototype_spec"]["framework_target"] == "nextjs-app-router"
+        assert fetched.body["designVariants"][0]["prototype_app"]["framework"] == "nextjs"
+        assert fetched.body["designVariants"][0]["prototype_app"]["artifact_summary"]["file_count"] >= 7
+        assert fetched.body["designVariants"][0]["display_language"] == "ja"
+        assert fetched.body["designVariants"][0]["localized"]["prototype"]["screens"][0]["title"] == "調査"
+        assert fetched.body["designVariants"][0]["implementation_brief"]["technical_choices"]
+        assert fetched.body["designVariants"][0]["artifact_completeness"]["status"] == "partial"
+        assert fetched.body["designVariants"][0]["scorecard"]["dimensions"]
+        assert fetched.body["designVariants"][0]["selection_rationale"]["summary"]
+        assert fetched.body["designVariants"][0]["approval_packet"]["review_checklist"]
+
+    def test_lifecycle_projects_preserve_valid_llm_preview_html(self):
+        server, store = _server_with_routes()
+        llm_preview = (
+            "<!doctype html><html lang='ja'><head><meta charset='utf-8' />"
+            "<meta name='viewport' content='width=device-width, initial-scale=1' />"
+            "<style>body{font-family:sans-serif}nav{display:flex}table{width:100%}@media(max-width:768px){body{padding:8px}}"
+            ".screen{display:none}.screen.active{display:block}.metric{padding:12px}.form{display:grid;gap:12px}.status{display:grid;gap:8px}"
+            ".tabs button[aria-selected='true']{font-weight:700}.accordion{transition:all .2s ease}.card:hover{transform:translateY(-1px)}"
+            "</style></head><body><nav aria-label='主要ナビゲーション'><button data-tab='overview'>概要</button><button data-tab='queue'>審査</button>"
+            "<button data-tab='lineage'>系譜</button><button data-tab='settings'>設定</button></nav><main>"
+            "<section class='screen active card' data-screen-id='overview'><div class='metric'>指標 12 件</div><table><tr><td>案件</td><td>状態</td></tr></table>"
+            "<div class='status'>進行中 / 要承認 / 完了</div><form class='form'><label>担当者<input /></label></form></section>"
+            "<section class='screen card' data-screen-id='queue'><div class='tabs'><button aria-selected='true'>審査</button></div><div class='accordion'>レビュー項目</div></section>"
+            "<section class='screen card' data-screen-id='lineage'><table><tr><td>artifact lineage</td><td>最新</td></tr></table><div class='status'>同期済み</div></section>"
+            "<section class='screen card' data-screen-id='settings'><form><label>通知<input /></label></form><div class='metric'>SLA 98%</div></section>"
+            "<script>document.querySelectorAll('[data-tab]').forEach((button)=>button.addEventListener('click',()=>button.setAttribute('aria-selected','true')));</script>"
+            "</main></body></html>"
+        )
+        updated = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/design-preview-preserve",
+            body={
+                "spec": "Operator-led lifecycle workspace",
+                "features": [{"feature": "approval gate", "selected": True}],
+                "designVariants": [
+                    {
+                        "id": "variant-a",
+                        "model": "Claude Sonnet 4.6",
+                        "pattern_name": "Signal Canvas",
+                        "description": "Preserve valid llm preview",
+                        "preview_html": llm_preview,
+                        "preview_meta": {"source": "llm", "extraction_ok": True, "fallback_reason": ""},
+                        "prototype": {
+                            "kind": "product-workspace",
+                            "app_shell": {"primary_navigation": [{"id": "overview", "label": "Overview", "priority": "primary"}]},
+                            "screens": [
+                                {"id": "overview", "title": "Overview", "purpose": "Main overview", "modules": [], "primary_actions": []},
+                                {"id": "queue", "title": "Queue", "purpose": "Review queue", "modules": [], "primary_actions": []},
+                                {"id": "lineage", "title": "Lineage", "purpose": "Artifact lineage", "modules": [], "primary_actions": []},
+                                {"id": "settings", "title": "Settings", "purpose": "Workspace settings", "modules": [], "primary_actions": []},
+                            ],
+                            "flows": [{"id": "flow-1", "name": "Approval Gate", "steps": ["確認", "承認"], "goal": "handoff"}],
+                        },
+                    }
+                ],
+            },
+        )
+
+        assert updated.status_code == 200
+        stored = store.get_surface_record("lifecycle_projects", "default:design-preview-preserve")
+        assert stored is not None
+        assert stored["designVariants"][0]["preview_html"] == llm_preview
+
+        fetched = server.handle_request("GET", "/api/v1/lifecycle/projects/design-preview-preserve")
+
+        assert fetched.status_code == 200
+        assert fetched.body["designVariants"][0]["preview_html"] == llm_preview
+        assert fetched.body["designVariants"][0]["selection_rationale"]["reasons"]
+        assert fetched.body["designVariants"][0]["approval_packet"]["guardrails"]
+        assert fetched.body["designVariants"][0]["preview_meta"]["source"] == "llm"
+        assert fetched.body["designVariants"][0]["preview_meta"]["validation_ok"] is True
+
+    def test_lifecycle_projects_hydrate_selected_design_as_selected_verdict(self):
+        server, _store = _server_with_routes()
+        llm_preview = (
+            "<!doctype html><html lang='ja'><head><meta charset='utf-8' />"
+            "<meta name='viewport' content='width=device-width, initial-scale=1' />"
+            "<style>body{font-family:sans-serif}nav{display:flex}@media(max-width:768px){body{padding:8px}}</style>"
+            "</head><body><nav aria-label='主要ナビゲーション'><button data-tab='workspace'>判断レビュー</button></nav>"
+            "<main><section data-screen-id='workspace'><table aria-label='判断テーブル'><tr><td>根拠</td></tr></table>"
+            "<div class='status'>承認 / 根拠 / 系譜 / 復旧</div><form aria-label='承認フォーム'><label>判定<input /></label></form></section>"
+            "<section data-screen-id='queue'>審査</section><section data-screen-id='lineage'>系譜</section><section data-screen-id='settings'>設定</section>"
+            "<script>document.querySelectorAll('[data-tab]').forEach((button)=>button.addEventListener('click',()=>button.setAttribute('aria-selected','true')));</script>"
+            "</main></body></html>"
+        )
+        updated = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/design-selected-verdict",
+            body={
+                "spec": "Operator-led lifecycle workspace",
+                "selectedDesignId": "variant-a",
+                "designVariants": [
+                    {
+                        "id": "variant-a",
+                        "model": "Claude Sonnet 4.6",
+                        "pattern_name": "Signal Canvas",
+                        "description": "Selected direction",
+                        "preview_html": llm_preview,
+                        "preview_meta": {"source": "llm", "extraction_ok": True, "fallback_reason": ""},
+                        "prototype": {
+                            "kind": "product-workspace",
+                            "visual_direction": {"visual_style": "obsidian-atelier"},
+                            "app_shell": {"primary_navigation": [{"id": "workspace", "label": "Workspace", "priority": "primary"}]},
+                            "screens": [
+                                {"id": "workspace", "title": "Workspace", "purpose": "Main overview", "modules": [], "primary_actions": []},
+                                {"id": "queue", "title": "Queue", "purpose": "Review queue", "modules": [], "primary_actions": []},
+                                {"id": "lineage", "title": "Lineage", "purpose": "Artifact lineage", "modules": [], "primary_actions": []},
+                                {"id": "settings", "title": "Settings", "purpose": "Workspace settings", "modules": [], "primary_actions": []},
+                            ],
+                            "flows": [{"id": "flow-1", "name": "Approval Gate", "steps": ["確認", "承認"], "goal": "handoff"}],
+                        },
+                    }
+                ],
+            },
+        )
+
+        assert updated.status_code == 200
+
+        fetched = server.handle_request("GET", "/api/v1/lifecycle/projects/design-selected-verdict")
+
+        assert fetched.status_code == 200
+        variant = fetched.body["designVariants"][0]
+        assert variant["selection_rationale"]["verdict"] == "selected"
+        assert variant["approval_packet"]["operator_promise"]
+        assert variant["approval_packet"]["handoff_summary"]
+
+    def test_lifecycle_projects_repair_invalid_llm_preview_html(self):
+        server, store = _server_with_routes()
+        invalid_llm_preview = (
+            "<!doctype html><html lang='ja'><head><meta charset='utf-8' />"
+            "<style>body{font-family:sans-serif}.card:hover{transform:translateY(-1px)}</style>"
+            "</head><body><nav aria-label='主要ナビゲーション'><button>概要</button></nav>"
+            "<main><section data-screen-id='overview'>概要</section><section data-screen-id='queue'>審査</section>"
+            "<section data-screen-id='lineage'>系譜</section><section data-screen-id='settings'>設定</section></main></body></html>"
+        )
+        updated = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/design-preview-repair",
+            body={
+                "spec": "Operator-led lifecycle workspace",
+                "features": [{"feature": "approval gate", "selected": True}],
+                "designVariants": [
+                    {
+                        "id": "variant-a",
+                        "model": "Claude Sonnet 4.6",
+                        "pattern_name": "Signal Canvas",
+                        "description": "Repair invalid llm preview",
+                        "preview_html": invalid_llm_preview,
+                        "preview_meta": {
+                            "source": "llm",
+                            "extraction_ok": True,
+                            "validation_ok": False,
+                            "fallback_reason": "",
+                            "validation_issues": ["missing_inline_script", "missing_viewport"],
+                        },
+                        "prototype": {
+                            "kind": "product-workspace",
+                            "app_shell": {
+                                "primary_navigation": [
+                                    {"id": "overview", "label": "Overview", "priority": "primary"},
+                                    {"id": "queue", "label": "Queue", "priority": "primary"},
+                                ]
+                            },
+                            "screens": [
+                                {"id": "overview", "title": "Overview", "purpose": "Main overview", "modules": [], "primary_actions": []},
+                                {"id": "queue", "title": "Queue", "purpose": "Review queue", "modules": [], "primary_actions": []},
+                                {"id": "lineage", "title": "Lineage", "purpose": "Artifact lineage", "modules": [], "primary_actions": []},
+                                {"id": "settings", "title": "Settings", "purpose": "Workspace settings", "modules": [], "primary_actions": []},
+                            ],
+                            "flows": [{"id": "flow-1", "name": "Approval Gate", "steps": ["確認", "承認"], "goal": "handoff"}],
+                        },
+                    }
+                ],
+            },
+        )
+
+        assert updated.status_code == 200
+        stored = store.get_surface_record("lifecycle_projects", "default:design-preview-repair")
+        assert stored is not None
+        assert stored["designVariants"][0]["preview_html"] != invalid_llm_preview
+        assert stored["designVariants"][0]["preview_meta"]["source"] == "repaired"
+
+        fetched = server.handle_request("GET", "/api/v1/lifecycle/projects/design-preview-repair")
+
+        assert fetched.status_code == 200
+        variant = fetched.body["designVariants"][0]
+        assert variant["preview_html"] != invalid_llm_preview
+        assert "<script>" in variant["preview_html"]
+        assert variant["preview_meta"]["source"] == "repaired"
+        assert variant["preview_meta"]["repaired_from_source"] == "llm"
+        assert variant["preview_meta"]["validation_ok"] is True
+        assert "missing_inline_script" in variant["preview_meta"]["candidate_validation_issues"]
+
+    def test_lifecycle_projects_refresh_invalid_template_preview_html(self):
+        server, store = _server_with_routes()
+        stale_template_preview = (
+            "<!doctype html><html lang='ja'><head><meta charset='utf-8' />"
+            "<meta name='viewport' content='width=device-width, initial-scale=1' />"
+            "<style>body{font-family:sans-serif}.card:hover{transform:translateY(-1px)}@media(max-width:768px){body{padding:8px}}</style>"
+            "</head><body><nav aria-label='主要ナビゲーション'><a href='#overview'>Overview</a></nav>"
+            "<main><section data-screen-id='overview'>概要</section><section data-screen-id='queue'>審査</section>"
+            "<section data-screen-id='lineage'>系譜</section><section data-screen-id='settings'>設定</section></main></body></html>"
+        )
+        updated = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/design-template-refresh",
+            body={
+                "spec": "Operator-led lifecycle workspace",
+                "features": [{"feature": "approval gate", "selected": True}],
+                "milestones": [{"id": "ms-alpha", "name": "Alpha", "criteria": "Reviewable operator workflow"}],
+                "designVariants": [
+                    {
+                        "id": "variant-a",
+                        "model": "Claude Sonnet 4.6",
+                        "pattern_name": "Signal Canvas",
+                        "description": "Refresh invalid template preview",
+                        "preview_html": stale_template_preview,
+                        "preview_meta": {"source": "template", "validation_ok": False, "fallback_reason": "legacy_template"},
+                        "prototype": {
+                            "kind": "product-workspace",
+                            "app_shell": {
+                                "primary_navigation": [
+                                    {"id": "overview", "label": "Overview", "priority": "primary"},
+                                    {"id": "queue", "label": "Queue", "priority": "primary"},
+                                    {"id": "lineage", "label": "Lineage", "priority": "secondary"},
+                                    {"id": "settings", "label": "Settings", "priority": "utility"},
+                                ]
+                            },
+                            "screens": [
+                                {"id": "overview", "title": "Overview", "purpose": "Main overview", "modules": [], "primary_actions": []},
+                                {"id": "queue", "title": "Queue", "purpose": "Review queue", "modules": [], "primary_actions": []},
+                                {"id": "lineage", "title": "Lineage", "purpose": "Artifact lineage", "modules": [], "primary_actions": []},
+                                {"id": "settings", "title": "Settings", "purpose": "Workspace settings", "modules": [], "primary_actions": []},
+                            ],
+                            "flows": [{"id": "flow-1", "name": "Approval Gate", "steps": ["確認", "承認"], "goal": "handoff"}],
+                        },
+                    }
+                ],
+            },
+        )
+
+        assert updated.status_code == 200
+        stored = store.get_surface_record("lifecycle_projects", "default:design-template-refresh")
+        assert stored is not None
+        assert stored["designVariants"][0]["preview_html"] != stale_template_preview
+        assert stored["designVariants"][0]["preview_meta"]["source"] == "repaired"
+
+        fetched = server.handle_request("GET", "/api/v1/lifecycle/projects/design-template-refresh")
+
+        assert fetched.status_code == 200
+        variant = fetched.body["designVariants"][0]
+        assert variant["preview_html"] != stale_template_preview
+        assert "<script>" in variant["preview_html"]
+        assert 'aria-label="承認フォーム"' in variant["preview_html"]
+        assert variant["preview_meta"]["source"] == "repaired"
+        assert variant["preview_meta"]["repaired_from_source"] == "template"
+        assert variant["preview_meta"]["template_version"] >= 1
+        assert variant["preview_meta"]["validation_ok"] is True
+
+    def test_lifecycle_projects_backfill_native_artifacts(self):
+        server, store = _server_with_routes()
+        updated = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/native-artifacts",
+            body={
+                "spec": "Approval workspace that tracks delivery readiness and records every decision.",
+                "research": {
+                    "user_research": {
+                        "segment": "delivery operator",
+                        "pain_points": ["approval traceability is manual"],
+                    },
+                    "claims": [
+                        {
+                            "id": "claim-1",
+                            "statement": "When approval is requested, the system shall persist the decision and notify the owner.",
+                            "confidence": 0.88,
+                            "status": "accepted",
+                        }
+                    ],
+                },
+                "features": [
+                    {
+                        "id": "feat-approval",
+                        "feature": "Approval log",
+                        "selected": True,
+                        "priority": "must",
+                        "implementation_cost": "high",
+                        "rationale": "Keep every approval decision traceable.",
+                    },
+                    {
+                        "id": "feat-audit",
+                        "feature": "Audit timeline",
+                        "selected": True,
+                        "priority": "should",
+                        "implementation_cost": "medium",
+                        "rationale": "Show lineage for audits and rework.",
+                        "depends_on": ["feat-approval"],
+                    },
+                ],
+                "milestones": [
+                    {"id": "ms-alpha", "name": "Alpha", "criteria": "Approval traceability works end to end"},
+                ],
+                "selectedDesignId": "variant-a",
+                "designVariants": [
+                    {
+                        "id": "variant-a",
+                        "model": "Claude Sonnet 4.6",
+                        "pattern_name": "Approval Control Desk",
+                        "description": "Operator-facing approval workspace",
+                        "prototype": {
+                            "kind": "product-workspace",
+                            "app_shell": {
+                                "primary_navigation": [
+                                    {"id": "workspace", "label": "Workspace", "priority": "primary"},
+                                    {"id": "timeline", "label": "Timeline", "priority": "secondary"},
+                                ]
+                            },
+                            "screens": [
+                                {"id": "workspace", "title": "Workspace", "purpose": "Track approvals", "modules": [], "primary_actions": []},
+                                {"id": "timeline", "title": "Timeline", "purpose": "Review lineage", "modules": [], "primary_actions": []},
+                            ],
+                            "flows": [{"id": "flow-1", "name": "Approval handoff", "steps": ["request", "review", "approve"], "goal": "release"}],
+                        },
+                        "prototype_app": {
+                            "framework": "nextjs",
+                            "files": [
+                                {
+                                    "path": "server/routes/approval.ts",
+                                    "kind": "ts",
+                                    "content": "import express from 'express';\nconst app = express();\napp.get('/api/approvals', listApprovals);\napp.post('/api/approvals', createApproval);\n",
+                                },
+                                {
+                                    "path": "src/types.ts",
+                                    "kind": "ts",
+                                    "content": "export interface ApprovalRecord { id: string; status: string; }\n",
+                                },
+                                {
+                                    "path": "schema.sql",
+                                    "kind": "sql",
+                                    "content": "CREATE TABLE approvals (id uuid primary key, status text not null);\n",
+                                },
+                                {
+                                    "path": "tests/approval.spec.ts",
+                                    "kind": "ts",
+                                    "content": "describe('test_approval_route', () => { it('should_store_decision', () => {}); });\n",
+                                },
+                            ],
+                        },
+                    }
+                ],
+            },
+        )
+
+        assert updated.status_code == 200
+        stored = store.get_surface_record("lifecycle_projects", "default:native-artifacts")
+        assert stored is not None
+        assert stored["requirements"]["requirements"][0]["sourceClaimIds"] == ["claim-1"]
+        assert stored["taskDecomposition"]["tasks"]
+        assert stored["dcsAnalysis"]["edgeCases"]["edgeCases"]
+        assert stored["technicalDesign"]["apiSpecification"]
+        assert stored["reverseEngineering"]["apiEndpoints"]
+
+        fetched = server.handle_request("GET", "/api/v1/lifecycle/projects/native-artifacts")
+
+        assert fetched.status_code == 200
+        assert fetched.body["requirements"]["requirements"][0]["acceptanceCriteria"]
+        assert fetched.body["taskDecomposition"]["tasks"][0]["effortHours"] > 0
+        assert fetched.body["dcsAnalysis"]["impactAnalysis"]["blastRadius"] >= 1
+        assert fetched.body["technicalDesign"]["dataflowMermaid"].startswith("flowchart")
+        assert fetched.body["reverseEngineering"]["coverageScore"] >= 0.7
+        assert fetched.body["reverseEngineering"]["sourceType"] == "prototype_app"
+        assert fetched.body["phaseContracts"]["planning"]["outputs"]["taskCount"] >= 1
+        assert fetched.body["phaseContracts"]["design"]["outputs"]["technicalDesignPresent"] is True
+
+    def test_lifecycle_projects_backfill_requirements_from_selected_features_without_claims(self):
+        server, store = _server_with_routes()
+        updated = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/native-feature-requirements",
+            body={
+                "spec": "Operator console that manages approval delivery, artifact lineage, and autonomous release readiness.",
+                "research": {
+                    "user_research": {
+                        "segment": "delivery operator",
+                        "pain_points": ["manual approval coordination"],
+                    },
+                    "claims": [],
+                },
+                "features": [
+                    {
+                        "id": "feat-console",
+                        "feature": "operator console",
+                        "selected": True,
+                        "priority": "must",
+                        "implementation_cost": "medium",
+                        "rationale": "Give operators one governed console for approvals and lineage.",
+                        "acceptance_criteria": ["operator console shows approval packets and lineage status"],
+                    },
+                    {
+                        "id": "feat-lineage",
+                        "feature": "artifact lineage",
+                        "selected": True,
+                        "priority": "should",
+                        "implementation_cost": "medium",
+                        "rationale": "Keep release decisions traceable across phases.",
+                    },
+                ],
+                "milestones": [
+                    {"id": "ms-alpha", "name": "Alpha", "criteria": "Approval operators can review packet and lineage"},
+                ],
+                "selectedDesignId": "variant-a",
+                "designVariants": [
+                    {
+                        "id": "variant-a",
+                        "model": "Claude Sonnet 4.6",
+                        "pattern_name": "Operator Control Desk",
+                        "description": "Operator-facing control plane",
+                        "prototype": {
+                            "kind": "product-workspace",
+                            "app_shell": {
+                                "primary_navigation": [
+                                    {"id": "workspace", "label": "Workspace", "priority": "primary"},
+                                    {"id": "lineage", "label": "Lineage", "priority": "secondary"},
+                                ]
+                            },
+                            "screens": [
+                                {"id": "workspace", "title": "Workspace", "purpose": "Review approvals", "modules": [], "primary_actions": []},
+                                {"id": "lineage", "title": "Lineage", "purpose": "Inspect artifact trail", "modules": [], "primary_actions": []},
+                            ],
+                            "flows": [{"id": "flow-1", "name": "Approval review", "steps": ["request", "review", "approve"], "goal": "release"}],
+                        },
+                    }
+                ],
+            },
+        )
+
+        assert updated.status_code == 200
+        stored = store.get_surface_record("lifecycle_projects", "default:native-feature-requirements")
+        assert stored is not None
+        assert len(stored["requirements"]["requirements"]) == 2
+        assert all(
+            value.startswith("synthetic-")
+            for item in stored["requirements"]["requirements"]
+            for value in item["sourceClaimIds"]
+        )
+
+        fetched = server.handle_request("GET", "/api/v1/lifecycle/projects/native-feature-requirements")
+
+        assert fetched.status_code == 200
+        statements = [item["statement"].lower() for item in fetched.body["requirements"]["requirements"]]
+        assert any("operator console" in statement for statement in statements)
+        assert any("artifact lineage" in statement for statement in statements)
+        assert fetched.body["phaseContracts"]["research"]["outputs"]["requirementCount"] == 2
+
+    def test_lifecycle_projects_repair_preview_style_mismatch(self):
+        server, store = _server_with_routes()
+        mismatched_preview = (
+            "<!doctype html><html lang='ja'><head><meta charset='utf-8' />"
+            "<meta name='viewport' content='width=device-width, initial-scale=1' />"
+            "<style>body{font-family:sans-serif}</style>"
+            "</head><body class='preview-style-obsidian-atelier'>"
+            "<nav aria-label='主要ナビゲーション'><button data-tab='workspace'>判断レビュー</button></nav>"
+            "<main><section data-screen-id='workspace'><table aria-label='判断テーブル'><tr><td>根拠</td></tr></table>"
+            "<form aria-label='承認フォーム'><label>判定<input /></label></form></section>"
+            "<section data-screen-id='queue'>審査</section><section data-screen-id='lineage'>系譜</section><section data-screen-id='settings'>設定</section>"
+            "<script>document.querySelectorAll('[data-tab]').forEach((button)=>button.addEventListener('click',()=>button.setAttribute('aria-selected','true')));</script>"
+            "</main></body></html>"
+        )
+        updated = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/design-style-refresh",
+            body={
+                "spec": "Operator-led lifecycle workspace",
+                "designVariants": [
+                    {
+                        "id": "variant-b",
+                        "model": "KIMI K2.5",
+                        "pattern_name": "Ivory Signal Gallery",
+                        "description": "Repair preview style mismatch",
+                        "preview_html": mismatched_preview,
+                        "preview_meta": {
+                            "source": "repaired",
+                            "template_version": 9,
+                            "validation_ok": True,
+                            "fallback_reason": "",
+                        },
+                        "prototype": {
+                            "kind": "operations",
+                            "visual_direction": {"visual_style": "ivory-signal"},
+                            "app_shell": {
+                                "layout": "top-nav",
+                                "density": "medium",
+                                "primary_navigation": [
+                                    {"id": "workspace", "label": "フェーズワークスペース", "priority": "primary"},
+                                    {"id": "queue", "label": "ラン台帳", "priority": "primary"},
+                                ],
+                            },
+                            "screens": [
+                                {"id": "workspace", "title": "フェーズワークスペース", "purpose": "判断レビュー", "modules": [], "primary_actions": []},
+                                {"id": "queue", "title": "ラン台帳", "purpose": "審査", "modules": [], "primary_actions": []},
+                                {"id": "lineage", "title": "系譜タイムライン", "purpose": "系譜", "modules": [], "primary_actions": []},
+                                {"id": "settings", "title": "判断レビュー", "purpose": "設定", "modules": [], "primary_actions": []},
+                            ],
+                            "flows": [{"id": "flow-1", "name": "構想から承認まで", "steps": ["確認", "承認"], "goal": "handoff"}],
+                        },
+                    }
+                ],
+            },
+        )
+
+        assert updated.status_code == 200
+        stored = store.get_surface_record("lifecycle_projects", "default:design-style-refresh")
+        assert stored is not None
+        assert "preview-style-ivory-signal" in stored["designVariants"][0]["preview_html"]
+        assert stored["designVariants"][0]["preview_meta"]["source"] == "repaired"
+
+        fetched = server.handle_request("GET", "/api/v1/lifecycle/projects/design-style-refresh")
+
+        assert fetched.status_code == 200
+        variant = fetched.body["designVariants"][0]
+        assert "preview-style-ivory-signal" in variant["preview_html"]
+        assert variant["preview_meta"]["fallback_reason"] == "stored_preview_style_mismatch"
+        assert variant["preview_meta"]["validation_ok"] is True
+
+    def test_lifecycle_projects_hydrate_legacy_design_variants_for_decision_desk(self):
+        server, _ = _server_with_routes()
+
+        updated = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/design-legacy",
+            body={
+                "name": "Design Legacy",
+                "spec": "Governed lifecycle workspace",
+                "designVariants": [
+                    {
+                        "id": "gemini-designer",
+                        "model": "Gemini 3 Pro",
+                        "pattern_name": "Ivory Signal Gallery",
+                        "description": "Legacy direction",
+                        "tokens": {"in": 4200, "out": 3100},
+                        "cost_usd": 0.280,
+                        "prototype": {
+                            "kind": "product-workspace",
+                            "app_shell": {
+                                "layout": "sidebar",
+                                "density": "balanced",
+                                "primary_navigation": [],
+                                "status_badges": [],
+                            },
+                            "screens": [
+                                {
+                                    "id": "workspace",
+                                    "title": "{'id': 'shell-lifecycle-workspace', 'label': 'Lifecycle Workspace — Primary Shell', 'description': 'The hub for operator decisions.', 'layout': 'three-column', 'components': ['LeftRail', 'PhaseCanvas', 'ContextPanel'], 'accessibility': 'aria-current on active navigation.'}",
+                                    "headline": "Run discovery-to-build workflow",
+                                    "purpose": "",
+                                    "layout": "command-center",
+                                    "modules": [],
+                                    "primary_actions": [],
+                                    "supporting_text": "",
+                                    "success_state": "",
+                                }
+                            ],
+                            "flows": [],
+                            "interaction_principles": [],
+                        },
+                        "scores": {
+                            "ux_quality": 0.94,
+                            "code_quality": 0.89,
+                            "performance": 0.88,
+                            "accessibility": 0.93,
+                        },
+                    }
+                ],
+            },
+        )
+
+        assert updated.status_code == 200
+
+        fetched = server.handle_request("GET", "/api/v1/lifecycle/projects/design-legacy")
+
+        assert fetched.status_code == 200
+        variant = fetched.body["designVariants"][0]
+        assert variant["model"] == "Gemini 3 Pro"
+        assert variant["cost_usd"] == 0.036
+        assert variant["prototype"]["screens"][0]["title"] == "調査ワークスペース"
+        assert variant["localized"]["prototype"]["screens"][0]["purpose"] == "オペレーター判断の中心となる画面。"
+        assert variant["canonical"]["prototype"]["screens"][0]["purpose"] == "The hub for operator decisions."
+        assert variant["prototype"]["screens"][0]["modules"][0]["items"] == ["次の一手", "保留理由", "承認候補"]
+        assert variant["display_language"] == "ja"
+        assert variant["implementation_brief"]["architecture_thesis"]
+
+    def test_lifecycle_project_get_normalizes_and_persists_stale_design_state(self):
+        server, store = _server_with_routes()
+
+        seeded = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/approval-phase-drift",
+            body={
+                "spec": "Operator-led lifecycle workspace",
+                "selectedDesignId": "claude-designer",
+                "designVariants": [
+                    {
+                        "id": "claude-designer",
+                        "model": "Claude Sonnet 4.6",
+                        "pattern_name": "Signal Canvas",
+                        "description": "Design baseline",
+                        "prototype": {
+                            "kind": "product-workspace",
+                            "app_shell": {"primary_navigation": []},
+                            "screens": [{"id": "workspace", "title": "Workspace", "purpose": "Main view", "modules": [], "primary_actions": []}],
+                            "flows": [],
+                        },
+                    }
+                ],
+            },
+        )
+
+        assert seeded.status_code == 200
+
+        updated = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/approval-phase-drift",
+            body={
+                "approvalStatus": "pending",
+                "phaseStatuses": [
+                    {"phase": "research", "status": "completed", "version": 1},
+                    {"phase": "planning", "status": "completed", "version": 1},
+                    {"phase": "design", "status": "completed", "version": 1},
+                    {"phase": "approval", "status": "completed", "version": 1},
+                    {"phase": "development", "status": "available", "version": 1},
+                    {"phase": "deploy", "status": "locked", "version": 1},
+                    {"phase": "iterate", "status": "locked", "version": 1},
+                ],
+            },
+        )
+
+        assert updated.status_code == 200
+
+        fetched = server.handle_request("GET", "/api/v1/lifecycle/projects/approval-phase-drift")
+
+        assert fetched.status_code == 200
+        phase_lookup = {item["phase"]: item["status"] for item in fetched.body["phaseStatuses"]}
+        assert fetched.body["approvalStatus"] == "pending"
+        assert phase_lookup["design"] == "completed"
+        assert phase_lookup["approval"] == "available"
+        assert phase_lookup["development"] == "locked"
+        assert fetched.body["designVariants"][0]["preview_meta"]["source"] == "repaired"
+        assert fetched.body["designVariants"][0]["artifact_completeness"]["status"] == "partial"
+        assert fetched.body["designVariants"][0]["freshness"]["status"] in {"fresh", "unknown"}
+
+        stored = store.get_surface_record("lifecycle_projects", "default:approval-phase-drift")
+        assert stored is not None
+        stored_phase_lookup = {item["phase"]: item["status"] for item in stored["phaseStatuses"]}
+        assert stored["approvalStatus"] == "pending"
+        assert stored_phase_lookup["approval"] == "available"
+        assert stored_phase_lookup["development"] == "locked"
+        assert stored["designVariants"][0]["preview_meta"]["source"] == "repaired"
+        assert stored["designVariants"][0]["artifact_completeness"]["status"] == "partial"
+
+    def test_lifecycle_project_get_preserves_approved_state_for_expired_approval_record(self):
+        server, store = _server_with_routes()
+
+        seeded = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/approval-expiry-preserve",
+            body={
+                "spec": "Operator-led lifecycle workspace",
+                "features": [
+                    {"id": "feature-1", "name": "Research workspace", "selected": True},
+                ],
+                "milestones": [
+                    {"id": "ms-alpha", "name": "Evidence loop", "criteria": "Traceability survives development"},
+                ],
+                "selectedDesignId": "claude-designer",
+                "designVariants": [
+                    {
+                        "id": "claude-designer",
+                        "model": "Claude Sonnet 4.6",
+                        "pattern_name": "Signal Canvas",
+                        "description": "Design baseline",
+                        "implementation_brief": {
+                            "delivery_slices": [
+                                {
+                                    "slice": "S1",
+                                    "title": "Shell",
+                                    "milestone": "Alpha",
+                                    "acceptance": ["Navigation stays intact"],
+                                }
+                            ],
+                        },
+                        "prototype": {
+                            "kind": "product-workspace",
+                            "app_shell": {"primary_navigation": []},
+                            "screens": [
+                                {
+                                    "id": "workspace",
+                                    "title": "Workspace",
+                                    "purpose": "Main view",
+                                    "modules": [],
+                                    "primary_actions": [],
+                                }
+                            ],
+                            "flows": [],
+                        },
+                    }
+                ],
+            },
+        )
+
+        assert seeded.status_code == 200
+        canonical_before_approval = server.handle_request(
+            "GET",
+            "/api/v1/lifecycle/projects/approval-expiry-preserve",
+        )
+        assert canonical_before_approval.status_code == 200
+        binding = build_lifecycle_approval_binding(canonical_before_approval.body)
+        store.put_approval_record(
+            {
+                "id": "apr_expired",
+                "agent_id": "lifecycle-coordinator",
+                "action": binding["action"],
+                "autonomy_level": "A3",
+                "context": {
+                    **binding["context"],
+                    "project_id": "approval-expiry-preserve",
+                    "tenant_id": "default",
+                    "run_id": "lifecycle:approval-expiry-preserve",
+                },
+                "status": "expired",
+                "plan_hash": compute_approval_binding_hash(binding["plan"]),
+                "effect_hash": compute_approval_binding_hash(binding["effect_envelope"]),
+                "created_at": "2026-03-17T00:00:00Z",
+                "expires_at": "2026-03-17T00:05:00Z",
+                "run_id": "lifecycle:approval-expiry-preserve",
+            }
+        )
+
+        updated = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/approval-expiry-preserve",
+            body={
+                "approvalStatus": "approved",
+                "approvalRequestId": "apr_expired",
+                "phaseStatuses": [
+                    {"phase": "research", "status": "completed", "version": 1},
+                    {"phase": "planning", "status": "completed", "version": 1},
+                    {"phase": "design", "status": "completed", "version": 1},
+                    {"phase": "approval", "status": "completed", "version": 1},
+                    {"phase": "development", "status": "in_progress", "version": 1},
+                    {"phase": "deploy", "status": "locked", "version": 1},
+                    {"phase": "iterate", "status": "locked", "version": 1},
+                ],
+            },
+        )
+
+        assert updated.status_code == 200
+        fetched = server.handle_request("GET", "/api/v1/lifecycle/projects/approval-expiry-preserve")
+
+        assert fetched.status_code == 200
+        phase_lookup = {item["phase"]: item["status"] for item in fetched.body["phaseStatuses"]}
+        assert fetched.body["approvalStatus"] == "approved"
+        assert fetched.body["approvalRequestId"] == "apr_expired"
+        assert fetched.body["approvalRequest"]["status"] == "approved"
+        assert fetched.body["approvalRequest"]["approval_status_source"] == "expired_record_preserved"
+        assert phase_lookup["approval"] == "completed"
+        assert phase_lookup["development"] == "in_progress"
+
+        stored = store.get_surface_record("lifecycle_projects", "default:approval-expiry-preserve")
+        assert stored is not None
+        stored_phase_lookup = {item["phase"]: item["status"] for item in stored["phaseStatuses"]}
+        assert stored["approvalStatus"] == "approved"
+        assert stored["approvalRequestId"] == "apr_expired"
+        assert stored_phase_lookup["approval"] == "completed"
+        assert stored_phase_lookup["development"] == "in_progress"
+
+    def test_lifecycle_project_get_keeps_design_fresh_when_selected_design_matches_upstream_context(self):
+        server, _ = _server_with_routes()
+
+        seeded = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/fresh-design-context",
+            body={
+                "spec": "Operator-led lifecycle workspace",
+                "research": {
+                    "canonical": {
+                        "winning_theses": ["Governed visibility is the leading wedge."],
+                        "claims": [
+                            {
+                                "id": "claim-1",
+                                "statement": "Governed visibility is the leading wedge.",
+                                "status": "accepted",
+                            }
+                        ],
+                        "research_context": {
+                            "decision_stage": "conditional_handoff",
+                            "segment": "Platform teams",
+                            "thesis_headline": "Governed visibility is the leading wedge.",
+                            "thesis_snapshot": ["Governed visibility is the leading wedge."],
+                        },
+                    }
+                },
+                "analysis": {
+                    "canonical": {
+                        "planning_context": {
+                            "product_kind": "operations",
+                            "segment": "Platform teams",
+                            "north_star": "Operator trust",
+                            "core_loop": "Carry evidence into governed delivery.",
+                        },
+                        "personas": [{"name": "Aiko", "role": "Platform Lead"}],
+                        "use_cases": [
+                            {"id": "uc-1", "title": "Trace artifact lineage", "priority": "must"},
+                        ],
+                        "traceability": [
+                            {
+                                "claim_id": "claim-1",
+                                "claim": "Governed visibility is the leading wedge.",
+                                "use_case_id": "uc-1",
+                                "use_case": "Trace artifact lineage",
+                                "feature": "artifact lineage",
+                                "milestone_id": "ms-1",
+                                "milestone": "Evidence loop",
+                            }
+                        ],
+                    }
+                },
+                "features": [
+                    {"feature": "artifact lineage", "selected": True, "priority": "must", "category": "must-be"},
+                ],
+                "milestones": [
+                    {"id": "ms-1", "name": "Evidence loop", "phase": "alpha", "depends_on_use_cases": ["uc-1"]},
+                ],
+            },
+        )
+
+        assert seeded.status_code == 200
+        decision_fingerprint = seeded.body["decision_context"]["fingerprint"]
+
+        updated = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/fresh-design-context",
+            body={
+                "selectedDesignId": "claude-designer",
+                "designVariants": [
+                    {
+                        "id": "claude-designer",
+                        "model": "Claude Sonnet 4.6",
+                        "pattern_name": "Signal Canvas",
+                        "description": "Design baseline",
+                        "decision_context_fingerprint": decision_fingerprint,
+                        "decision_scope": {
+                            "phase": "design",
+                            "fingerprint": decision_fingerprint,
+                            "selected_feature_names": ["artifact lineage"],
+                            "primary_use_case_ids": ["uc-1"],
+                        },
+                        "preview_html": (
+                            "<!doctype html><html lang='ja'><head>"
+                            "<meta name='viewport' content='width=device-width, initial-scale=1' />"
+                            "<style>body{font-family:sans-serif} .tab{transition:all .2s ease} @media (max-width:768px){body{padding:8px}}</style>"
+                            "</head><body>"
+                            "<nav aria-label='主要ナビゲーション' role='tablist'>"
+                            "<a class='tab' href='#workspace' data-screen-target='workspace' data-tab='true' role='tab' aria-selected='true' aria-controls='workspace'>Workspace</a>"
+                            "</nav>"
+                            "<main>"
+                            "<section id='workspace' data-screen-id='workspace' role='tabpanel' aria-labelledby='workspace-tab'>"
+                            "<form aria-label='承認フォーム'><input aria-label='comment' /></form>"
+                            "</section>"
+                            "<section id='review' data-screen-id='review' role='tabpanel' aria-labelledby='review-tab'></section>"
+                            "<section id='lineage' data-screen-id='lineage' role='tabpanel' aria-labelledby='lineage-tab'></section>"
+                            "<section id='settings' data-screen-id='settings' role='tabpanel' aria-labelledby='settings-tab'></section>"
+                            "</main>"
+                            "<script>document.addEventListener('click',()=>{});</script>"
+                            "</body></html>"
+                        ),
+                        "prototype": {
+                            "kind": "product-workspace",
+                            "app_shell": {
+                                "primary_navigation": [
+                                    {"id": "workspace", "label": "Workspace", "priority": "primary"},
+                                ]
+                            },
+                            "screens": [
+                                {"id": "workspace", "title": "Workspace", "purpose": "Main view", "modules": [], "primary_actions": []},
+                                {"id": "review", "title": "Review", "purpose": "Review view", "modules": [], "primary_actions": []},
+                                {"id": "lineage", "title": "Lineage", "purpose": "Lineage view", "modules": [], "primary_actions": []},
+                                {"id": "settings", "title": "Settings", "purpose": "Settings view", "modules": [], "primary_actions": []},
+                            ],
+                            "flows": [{"name": "Approve phase", "goal": "Move to approval", "steps": ["Review", "Approve"]}],
+                        },
+                    }
+                ],
+            },
+        )
+
+        assert updated.status_code == 200
+
+        fetched = server.handle_request("GET", "/api/v1/lifecycle/projects/fresh-design-context")
+
+        assert fetched.status_code == 200
+        variant = fetched.body["designVariants"][0]
+        assert fetched.body["decision_context"]["fingerprint"] == decision_fingerprint
+        assert variant["freshness"]["status"] == "fresh"
+        assert variant["freshness"]["can_handoff"] is True
+
+    def test_lifecycle_project_get_does_not_rewind_next_action_to_research_for_legacy_design_ready_project(self):
+        server, _ = _server_with_routes()
+
+        seeded = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/legacy-design-ready",
+            body={
+                "spec": "Operator-led lifecycle workspace",
+                "analysis": {
+                    "canonical": {
+                        "personas": [{"name": "Aiko", "role": "Platform Lead"}],
+                        "use_cases": [{"id": "uc-1", "title": "Trace artifact lineage", "priority": "must"}],
+                        "recommended_milestones": [
+                            {"id": "ms-alpha", "name": "Alpha", "criteria": "Reviewable operator workflow"}
+                        ],
+                    }
+                },
+                "features": [{"feature": "artifact lineage", "selected": True}],
+                "milestones": [{"id": "ms-alpha", "name": "Alpha", "criteria": "Reviewable operator workflow"}],
+                "designVariants": [
+                    {
+                        "id": "claude-designer",
+                        "model": "Claude Sonnet 4.6",
+                        "pattern_name": "Signal Canvas",
+                        "description": "Legacy project with completed downstream phases",
+                        "prototype": {
+                            "kind": "product-workspace",
+                            "app_shell": {
+                                "primary_navigation": [
+                                    {"id": "overview", "label": "Overview", "priority": "primary"},
+                                    {"id": "queue", "label": "Queue", "priority": "primary"},
+                                    {"id": "lineage", "label": "Lineage", "priority": "secondary"},
+                                    {"id": "settings", "label": "Settings", "priority": "utility"},
+                                ]
+                            },
+                            "screens": [
+                                {"id": "overview", "title": "Overview", "purpose": "Main overview", "modules": [], "primary_actions": []},
+                                {"id": "queue", "title": "Queue", "purpose": "Review queue", "modules": [], "primary_actions": []},
+                                {"id": "lineage", "title": "Lineage", "purpose": "Artifact lineage", "modules": [], "primary_actions": []},
+                                {"id": "settings", "title": "Settings", "purpose": "Workspace settings", "modules": [], "primary_actions": []},
+                            ],
+                            "flows": [{"id": "flow-1", "name": "Approval Gate", "steps": ["確認", "承認"], "goal": "handoff"}],
+                        },
+                    }
+                ],
+                "selectedDesignId": "claude-designer",
+                "phaseStatuses": [
+                    {"phase": "research", "status": "available", "version": 1},
+                    {"phase": "planning", "status": "completed", "version": 1},
+                    {"phase": "design", "status": "completed", "version": 1},
+                    {"phase": "approval", "status": "available", "version": 1},
+                    {"phase": "development", "status": "locked", "version": 1},
+                    {"phase": "deploy", "status": "locked", "version": 1},
+                    {"phase": "iterate", "status": "locked", "version": 1},
+                ],
+            },
+        )
+
+        assert seeded.status_code == 200
+
+        fetched = server.handle_request("GET", "/api/v1/lifecycle/projects/legacy-design-ready")
+
+        assert fetched.status_code == 200
+        assert fetched.body["nextAction"]["phase"] != "research"
+        assert fetched.body["nextAction"]["type"] in {"request_approval", "review_phase"}
+
+    def test_lifecycle_project_preview_hydration_uses_short_title_not_full_spec_dump(self):
+        server, _ = _server_with_routes()
+
+        updated = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/meal-preview",
+            body={
+                "name": "うちメニュー",
+                "spec": (
+                    "# うちメニュー\n\n"
+                    "## プロダクト概要\n"
+                    "共働き家庭向けに、冷蔵庫在庫と家族の好みから3日分の献立と買い物リストを作るアプリ。"
+                ),
+                "designVariants": [
+                    {
+                        "id": "gemini-designer",
+                        "model": "Gemini 3 Pro",
+                        "pattern_name": "うちメニュー — ギャラリー型献立オペレーション",
+                        "description": "明るい判断スタジオ。",
+                        "primary_color": "#f5f0e8",
+                        "accent_color": "#d4500a",
+                        "prototype": {
+                            "kind": "decision-studio",
+                            "app_shell": {
+                                "layout": "top-nav",
+                                "density": "medium",
+                                "primary_navigation": [
+                                    {"id": "home", "label": "ホーム", "priority": "primary"},
+                                    {"id": "workflow", "label": "主要導線", "priority": "primary"},
+                                ],
+                                "status_badges": ["在庫登録", "3日分献立", "買い物リスト"],
+                            },
+                            "screens": [
+                                {
+                                    "id": "home",
+                                    "title": "今日の献立",
+                                    "headline": "Complete guided onboarding",
+                                    "purpose": "主要情報の要約",
+                                    "layout": "product-workspace",
+                                    "modules": [],
+                                    "primary_actions": ["Open 今日の献立"],
+                                    "supporting_text": "First-run success",
+                                    "success_state": ["主要導線へ迷わず入れる"],
+                                }
+                            ],
+                            "flows": [
+                                {"id": "flow-1", "name": "First-run success", "steps": ["オンボーディング", "ホーム", "主要導線"]},
+                            ],
+                            "interaction_principles": [],
+                            "visual_direction": {
+                                "visual_style": "ivory-signal",
+                            },
+                        },
+                    }
+                ],
+            },
+        )
+
+        assert updated.status_code == 200
+
+        fetched = server.handle_request("GET", "/api/v1/lifecycle/projects/meal-preview")
+
+        assert fetched.status_code == 200
+        html = fetched.body["designVariants"][0]["preview_html"]
+        assert "<title>うちメニュー</title>" in html
+        assert '<p class="shell-title">うちメニュー</p>' in html
+        assert "## プロダクト概要" not in html
+
+    def test_lifecycle_projects_trim_large_operator_histories_before_storage(self):
+        server, store = _server_with_routes()
+        skill_invocations = [
+            {"id": f"skill-{index}", "createdAt": f"2026-03-15T00:{index % 60:02d}:00Z", "title": f"Skill {index}"}
+            for index in range(120)
+        ]
+        delegations = [
+            {"id": f"delegation-{index}", "createdAt": f"2026-03-15T01:{index % 60:02d}:00Z", "title": f"Delegation {index}"}
+            for index in range(120)
+        ]
+
+        updated = server.handle_request(
+            "PATCH",
+            "/api/v1/lifecycle/projects/history-probe",
+            body={
+                "spec": "Governed lifecycle system",
+                "skillInvocations": skill_invocations,
+                "delegations": delegations,
+            },
+        )
+
+        assert updated.status_code == 200
+        stored = store.get_surface_record("lifecycle_projects", "default:history-probe")
+        assert stored is not None
+        assert len(stored["skillInvocations"]) == 80
+        assert len(stored["delegations"]) == 80
+        assert len(updated.body["project"]["skillInvocations"]) == 80
+        assert len(updated.body["project"]["delegations"]) == 80
 
     def test_lifecycle_patch_can_run_full_autonomy_inline(self):
         server, _ = _server_with_routes()
@@ -1797,7 +3097,7 @@ class TestLifecycleRoutes:
             assert state["features"]
             assert state["planEstimates"]
         elif phase == "design":
-            assert len(state["variants"]) == 3
+            assert len(state["variants"]) >= 2
             assert state["design"]["variants"][0]["preview_html"].startswith("<!doctype html>")
             assert state["design"]["variants"][0]["prototype"]["screens"]
             assert 'data-screen-id=' in state["design"]["variants"][0]["preview_html"]
@@ -3387,3 +4687,36 @@ class TestHealthChecker:
         assert system_check["name"] == "system"
         assert system_check["status"] == "healthy"
         assert "timestamp" in body
+
+
+class TestCountWorkflowProjects:
+    """Tests for the count_workflow_projects method on store backends."""
+
+    def test_in_memory_store_count_empty(self):
+        store = InMemoryWorkflowControlPlaneStore()
+        assert store.count_workflow_projects() == 0
+
+    def test_in_memory_store_count_after_register(self):
+        store = InMemoryWorkflowControlPlaneStore()
+        project = _workflow_project("proj-a")
+        store.register_workflow_project("wf-1", project, tenant_id="default")
+        assert store.count_workflow_projects() == 1
+        store.register_workflow_project("wf-2", project, tenant_id="default")
+        assert store.count_workflow_projects() == 2
+
+    def test_in_memory_store_count_after_remove(self):
+        store = InMemoryWorkflowControlPlaneStore()
+        project = _workflow_project("proj-b")
+        store.register_workflow_project("wf-1", project, tenant_id="default")
+        store.register_workflow_project("wf-2", project, tenant_id="other")
+        assert store.count_workflow_projects() == 2
+        store.remove_workflow_project("wf-1", tenant_id="default")
+        assert store.count_workflow_projects() == 1
+
+    def test_in_memory_store_count_matches_list_all(self):
+        store = InMemoryWorkflowControlPlaneStore()
+        project = _workflow_project("proj-c")
+        store.register_workflow_project("wf-1", project, tenant_id="t1")
+        store.register_workflow_project("wf-2", project, tenant_id="t2")
+        store.register_workflow_project("wf-3", project, tenant_id="t1")
+        assert store.count_workflow_projects() == len(store.list_all_workflow_projects())

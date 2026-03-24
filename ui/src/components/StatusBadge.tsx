@@ -1,4 +1,5 @@
 import { Badge } from "@/components/ui/badge";
+import { useI18n } from "@/contexts/I18nContext";
 
 const STATUS_MAP: Record<
   string,
@@ -8,6 +9,7 @@ const STATUS_MAP: Record<
   }
 > = {
   // Agent states
+  draft: { label: "Draft", variant: "secondary" },
   init: { label: "Init", variant: "secondary" },
   ready: { label: "Ready", variant: "default" },
   running: { label: "Running", variant: "success" },
@@ -23,6 +25,7 @@ const STATUS_MAP: Record<
   healthy: { label: "Healthy", variant: "success" },
   degraded: { label: "Degraded", variant: "warning" },
   down: { label: "Down", variant: "destructive" },
+  not_ready: { label: "Not Ready", variant: "warning" },
   // Circuit breaker
   closed: { label: "Closed", variant: "success" },
   open: { label: "Open", variant: "destructive" },
@@ -44,8 +47,9 @@ export function StatusBadge({
   showDot = true,
   className,
 }: StatusBadgeProps) {
+  const { t } = useI18n();
   const config = STATUS_MAP[status] ?? {
-    label: status,
+    label: t(`status.${status}`),
     variant: "secondary" as const,
   };
   const isActive = status === "running";
@@ -60,7 +64,7 @@ export function StatusBadge({
           <span className="relative inline-flex h-2 w-2 rounded-full bg-current" />
         </span>
       )}
-      {config.label}
+      {t(`status.${status}`) === `status.${status}` ? config.label : t(`status.${status}`)}
     </Badge>
   );
 }

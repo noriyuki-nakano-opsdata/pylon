@@ -10,8 +10,10 @@ import { healthApi } from "@/api/health";
 import { agentsApi, type Agent } from "@/api/agents";
 import { approvalsApi } from "@/api/approvals";
 import { workflowsApi } from "@/api/workflows";
+import { useI18n } from "@/contexts/I18nContext";
 
 export function Dashboard() {
+  const { t } = useI18n();
   const healthQuery = useQuery({
     queryKey: queryKeys.health,
     queryFn: () => healthApi.get(),
@@ -48,55 +50,55 @@ export function Dashboard() {
   return (
     <div className="space-y-6 p-6">
       <div>
-        <h1 className="text-2xl font-bold tracking-tight">Dashboard</h1>
+        <h1 className="text-2xl font-bold tracking-tight">{t("dashboard.title")}</h1>
         <p className="text-sm text-muted-foreground">
-          System overview and real-time status
+          {t("dashboard.description")}
         </p>
       </div>
 
       {/* Metric Cards */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <MetricCard
-          title="Active Agents"
+          title={t("dashboard.activeAgents")}
           value={activeAgents.length}
           icon={Bot}
-          description={`${agents.length} total agents`}
+          description={t("dashboard.totalAgents", { count: agents.length })}
         />
         <MetricCard
-          title="Workflows"
+          title={t("dashboard.workflows")}
           value={workflows.length}
           icon={GitBranch}
-          description="registered workflows"
+          description={t("dashboard.workflowsRegistered")}
         />
         <MetricCard
-          title="System Status"
-          value={health?.status ?? "unknown"}
+          title={t("dashboard.systemStatus")}
+          value={health?.status ? t(`status.${health.status}`) : t("common.status.unknown")}
           icon={DollarSign}
-          description={`${health?.checks.length ?? 0} health checks`}
+          description={t("dashboard.healthChecks", { count: health?.checks.length ?? 0 })}
         />
         <MetricCard
-          title="Pending Approvals"
+          title={t("dashboard.pendingApprovals")}
           value={pendingApprovals.length}
           icon={ShieldCheck}
-          description={`${approvals.length} total approvals`}
+          description={t("dashboard.totalApprovals", { count: approvals.length })}
         />
       </div>
 
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">クイック操作</CardTitle>
+          <CardTitle className="text-base">{t("common.quickActions")}</CardTitle>
         </CardHeader>
         <CardContent>
           <div className="space-y-3 text-sm">
             <p className="text-muted-foreground">
-              まずはプロジェクト名だけで作成し、research kickoff で brief を固めてください。
+              {t("dashboard.quickActions.description")}
             </p>
             <Link
               to="/projects/new"
               className="inline-flex items-center gap-2 rounded-md border border-border px-3 py-2 text-sm font-medium text-foreground hover:bg-accent hover:text-foreground transition-colors"
             >
               <FolderPlus className="h-4 w-4" />
-              新規プロジェクトを作成
+              {t("dashboard.quickActions.createProject")}
             </Link>
           </div>
         </CardContent>
@@ -108,12 +110,12 @@ export function Dashboard() {
         <Card>
           <CardHeader>
             <CardTitle className="text-base">
-              Agents ({agents.length})
+              {t("dashboard.agentsPanel", { count: agents.length })}
             </CardTitle>
           </CardHeader>
           <CardContent>
             {agents.length === 0 ? (
-              <p className="text-sm text-muted-foreground">No agents registered</p>
+              <p className="text-sm text-muted-foreground">{t("dashboard.noAgents")}</p>
             ) : (
               <div className="space-y-3">
                 {agents.slice(0, 8).map((agent) => (
@@ -128,13 +130,13 @@ export function Dashboard() {
         <Card>
           <CardHeader>
             <CardTitle className="text-base">
-              Pending Approvals ({pendingApprovals.length})
+              {t("dashboard.pendingApprovalsPanel", { count: pendingApprovals.length })}
             </CardTitle>
           </CardHeader>
           <CardContent>
             {pendingApprovals.length === 0 ? (
               <p className="text-sm text-muted-foreground">
-                No pending approvals
+                {t("dashboard.noPendingApprovals")}
               </p>
             ) : (
               <div className="space-y-3">

@@ -1,0 +1,6 @@
+interface:
+  display_name: "CRM Lead Ops"
+  short_description: "Lead hygiene, routing, and follow-up discipline"
+  default_prompt: "Use $crm-lead-ops to improve lead intake quality, routing logic, dedupe rules, and speed-to-lead operations."
+policy:
+  allow_implicit_invocation: true

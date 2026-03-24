@@ -37,6 +37,10 @@ def test_build_research_view_model_normalizes_core_fields():
             "objective": "Strengthen source grounding.",
             "retryNodeIds": ["competitor-analyst"],
             "blockingGateIds": ["confidence-floor"],
+            "recoveryMode": "reframe_research",
+            "recommendedOperatorAction": "conditional_handoff",
+            "conditionalHandoffAllowed": True,
+            "strategySummary": "Split the question by segment and continue with guarded planning if needed.",
         },
     }
 
@@ -47,6 +51,8 @@ def test_build_research_view_model_normalizes_core_fields():
     assert view_model["claims"][0]["id"] == "claim-1"
     assert view_model["quality_gates"][0]["blockingNodeIds"] == ["research-judge"]
     assert view_model["autonomous_remediation"]["status"] == "retrying"
+    assert view_model["autonomous_remediation"]["recoveryMode"] == "reframe_research"
+    assert view_model["autonomous_remediation"]["conditionalHandoffAllowed"] is True
 
 
 def test_build_research_view_model_supplies_defaults_when_fields_are_missing():

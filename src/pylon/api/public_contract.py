@@ -181,8 +181,10 @@ def build_feature_manifest() -> dict[str, Any]:
         project={
             "runs": True,
             "approvals": True,
+            "experiments": True,
             "studio": False,
             "lifecycle": True,
+            "gtm": True,
             "tasks": True,
             "team": True,
             "memory": True,
@@ -191,6 +193,11 @@ def build_feature_manifest() -> dict[str, Any]:
             "ads": True,
             "issues": False,
             "pulls": False,
+            "tsumiki_requirements": True,
+            "tsumiki_reverse_engineering": True,
+            "tsumiki_task_decomposition": True,
+            "tsumiki_dcs_analysis": True,
+            "tsumiki_technical_design": True,
         },
     )
     return {

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -43,6 +44,10 @@ from pylon.workflow.result import NodeResult
 from pylon.workflow.state import StatePatch, compute_state_hash
 
 NodeHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any] | NodeResult]]
+ProgressObserver = Callable[
+    [WorkflowRun, tuple[Checkpoint, ...]],
+    Awaitable[None] | None,
+]
 
 
 @dataclass
@@ -85,9 +90,11 @@ class GraphExecutor:
         self,
         checkpoint_repo: CheckpointRepository | None = None,
         approval_manager: ApprovalManager | None = None,
+        progress_observer: ProgressObserver | None = None,
     ) -> None:
         self._checkpoint_repo = checkpoint_repo or CheckpointRepository()
         self._approval_manager = approval_manager
+        self._progress_observer = progress_observer
 
     async def execute(
         self,
@@ -258,6 +265,8 @@ class GraphExecutor:
                 input_state_keys = list(ctx.state.keys())
                 for node_id in current_nodes:
                     ctx.node_status[node_id] = "running"
+                self._assign_run_state(run, ctx)
+                await self._emit_progress_snapshot(ctx)
 
                 input_state_version = ctx.state_version
                 input_state_hash = ctx.state_hash
@@ -397,6 +406,8 @@ class GraphExecutor:
                     run.state["termination_reason"] = termination_decision.reason
                     return run
 
+                self._assign_run_state(run, ctx)
+                await self._emit_progress_snapshot(ctx)
                 current_nodes = next_nodes
 
             unresolved = [
@@ -1348,6 +1359,14 @@ class GraphExecutor:
                 state_hash=ctx.state_hash,
             )
             await self._checkpoint_repo.create(checkpoint)
+
+    async def _emit_progress_snapshot(self, ctx: ExecutionContext) -> None:
+        if self._progress_observer is None:
+            return
+        checkpoints = tuple(await self._checkpoint_repo.list(workflow_run_id=ctx.run.id))
+        maybe_awaitable = self._progress_observer(ctx.run, checkpoints)
+        if inspect.isawaitable(maybe_awaitable):
+            await maybe_awaitable
 
     async def replay(
         self,

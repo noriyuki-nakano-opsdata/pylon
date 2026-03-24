@@ -374,6 +374,35 @@ class TestApprovalManagerTimeout:
         assert result is not None
         assert result.status == ApprovalStatus.EXPIRED
 
+    @pytest.mark.asyncio
+    async def test_validate_binding_keeps_approved_request_valid_after_expiry(
+        self, store: ApprovalStore, audit: AuditRepository
+    ) -> None:
+        mgr = ApprovalManager(store, audit, timeout_seconds=300)
+        plan = {"nodes": ["plan", "apply"]}
+        effects = {"write": ["git"], "secrets": []}
+        req = await mgr.submit_request(
+            "agent-1",
+            "deploy",
+            AutonomyLevel.A3,
+            plan=plan,
+            effect_envelope=effects,
+        )
+        await mgr.approve(req.id, "admin")
+        req.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await store.update(req)
+
+        validated = await mgr.validate_binding(
+            req.id,
+            plan=plan,
+            effect_envelope=effects,
+        )
+
+        assert validated.status == ApprovalStatus.APPROVED
+        stored = await store.get(req.id)
+        assert stored is not None
+        assert stored.status == ApprovalStatus.APPROVED
+
 
 class TestApprovalManagerPending:
     @pytest.mark.asyncio

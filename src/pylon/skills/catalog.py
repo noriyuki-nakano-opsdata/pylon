@@ -8,7 +8,7 @@ import os
 import threading
 import time
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -18,10 +18,16 @@ import yaml
 from pylon.skills.models import SkillRecord, SkillToolSpec
 
 
+def _bundled_skill_dir() -> Path:
+    return Path(__file__).resolve().parent / "bundled" / "agency-agents"
+
+
 def default_skill_dirs() -> tuple[str, ...]:
     return (
+        str(_bundled_skill_dir()),
         str(Path.home() / ".codex" / "skills"),
         str(Path.home() / ".claude" / "skills"),
+        str(Path("ui") / "scripts" / "skills"),
         str(Path(".pylon") / "skills"),
         str(Path(".pylon") / "tenants" / "{tenant_id}" / "skills"),
     )
@@ -43,7 +49,7 @@ def _read_frontmatter(text: str) -> tuple[dict[str, Any], str]:
 
 
 def _iso_timestamp(path: Path) -> str:
-    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).isoformat()
 
 
 def _coerce_str_list(value: Any) -> tuple[str, ...]:
@@ -98,7 +104,10 @@ def _normalize_tool_spec(
     )
 
 
-def _parse_tool_descriptors(skill_dir: Path, toolset_ids: tuple[str, ...]) -> tuple[SkillToolSpec, ...]:
+def _parse_tool_descriptors(
+    skill_dir: Path,
+    toolset_ids: tuple[str, ...],
+) -> tuple[SkillToolSpec, ...]:
     descriptors: dict[str, SkillToolSpec] = {}
     tools_dir = skill_dir / "tools"
     if tools_dir.is_dir():
@@ -119,12 +128,19 @@ def _parse_tool_descriptors(skill_dir: Path, toolset_ids: tuple[str, ...]) -> tu
     return tuple(descriptors.values())
 
 
-def parse_skill_dir(skill_dir: Path, *, source: str = "local", source_kind: str = "filesystem") -> SkillRecord | None:
+def parse_skill_dir(
+    skill_dir: Path,
+    *,
+    source: str = "local",
+    source_kind: str = "filesystem",
+) -> SkillRecord | None:
     skill_file = skill_dir / "SKILL.md"
     if not skill_file.exists():
         return None
     raw = skill_file.read_text(encoding="utf-8")
     frontmatter, body = _read_frontmatter(raw)
+    metadata = frontmatter.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
     skill_id = str(frontmatter.get("id", skill_dir.name)).strip() or skill_dir.name
     toolset_ids = _coerce_str_list(frontmatter.get("toolsets"))
     tools = _parse_tool_descriptors(skill_dir, toolset_ids)
@@ -137,20 +153,33 @@ def parse_skill_dir(skill_dir: Path, *, source: str = "local", source_kind: str 
     return SkillRecord(
         id=skill_id,
         alias=str(frontmatter.get("alias", skill_id)).strip() or skill_id,
-        skill_key=str(frontmatter.get("skill_key", frontmatter.get("alias", skill_id))).strip() or skill_id,
+        skill_key=(
+            str(frontmatter.get("skill_key", frontmatter.get("alias", skill_id))).strip()
+            or skill_id
+        ),
         name=str(frontmatter.get("name", skill_id)).strip() or skill_id,
         version=str(frontmatter.get("version", "0.0.1")).strip() or "0.0.1",
         description=str(frontmatter.get("description", "")).strip(),
         content=body.strip(),
         content_preview=preview,
-        category=str(frontmatter.get("category", "other")).strip() or "other",
-        risk=str(frontmatter.get("risk", "unknown")).strip() or "unknown",
-        source=str(frontmatter.get("source", source)).strip() or source,
-        source_kind=str(frontmatter.get("source_kind", source_kind)).strip() or source_kind,
-        tags=_coerce_str_list(frontmatter.get("tags")),
+        category=(
+            str(frontmatter.get("category", metadata.get("category", "other"))).strip()
+            or "other"
+        ),
+        risk=str(frontmatter.get("risk", metadata.get("risk", "unknown"))).strip() or "unknown",
+        source=str(frontmatter.get("source", metadata.get("source", source))).strip() or source,
+        source_kind=(
+            str(frontmatter.get("source_kind", metadata.get("source_kind", source_kind))).strip()
+            or source_kind
+        ),
+        tags=_coerce_str_list(frontmatter.get("tags", metadata.get("tags"))),
         path=str(skill_dir),
         installed_at=_iso_timestamp(skill_file),
-        has_scripts=(skill_dir / "scripts").is_dir() or any(skill_dir.glob("*.py")) or any(skill_dir.glob("*.sh")),
+        has_scripts=(
+            (skill_dir / "scripts").is_dir()
+            or any(skill_dir.glob("*.py"))
+            or any(skill_dir.glob("*.sh"))
+        ),
         dependencies=_coerce_str_list(frontmatter.get("dependencies")),
         toolsets=toolset_ids,
         tools=tools,
@@ -249,7 +278,11 @@ class SkillCatalog:
                 merged.update({skill.id: skill.digest for skill in tenant_skills.values()})
         return merged
 
-    def _scan_all(self, *, tenant_id: str | None) -> tuple[dict[str, SkillRecord], dict[str, dict[str, SkillRecord]], str]:
+    def _scan_all(
+        self,
+        *,
+        tenant_id: str | None,
+    ) -> tuple[dict[str, SkillRecord], dict[str, dict[str, SkillRecord]], str]:
         shared: dict[str, SkillRecord] = {}
         tenant_map: dict[str, dict[str, SkillRecord]] = {}
         snapshot_parts: list[str] = []
@@ -276,11 +309,15 @@ class SkillCatalog:
                 f"shared:{skill_id}:{record.digest}"
                 for skill_id, record in scanned.items()
             )
-        import_root = Path(os.getenv("PYLON_SKILL_IMPORT_ROOT", "").strip() or (Path(".pylon") / "imports"))
+        import_root = Path(
+            os.getenv("PYLON_SKILL_IMPORT_ROOT", "").strip()
+            or (Path(".pylon") / "imports")
+        )
         if self._scan_imported_skills_enabled() and import_root.is_dir():
             for skills_root in sorted(import_root.glob("*/normalized/skills")):
                 scanned = self._scan_dir(skills_root, source="imported", source_kind="imported")
-                shared.update(scanned)
+                for skill_id, record in scanned.items():
+                    shared.setdefault(skill_id, record)
                 snapshot_parts.extend(
                     f"imported:{skill_id}:{record.digest}"
                     for skill_id, record in scanned.items()

@@ -4,7 +4,7 @@ import { formatUptime } from "@/lib/time";
 import {
   Bot, User, Users, Shield, Code2, Palette, PenTool, Monitor, Network,
   Zap, ChevronRight, X, Loader2, Cpu, MemoryStick, Clock, Wifi, WifiOff, Megaphone,
-  CheckCircle2, Plus, Pencil, Trash2, Save,
+  CheckCircle2, Plus, Pencil, Trash2, Save, BriefcaseBusiness, Target, Landmark, TrendingUp, Handshake,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
@@ -40,7 +40,7 @@ interface Team {
 }
 
 const ICON_MAP: Record<string, React.ElementType> = {
-  Code2, Palette, PenTool, Zap, Shield, Network, Users, Monitor, Bot, Megaphone,
+  Code2, Palette, PenTool, Zap, Shield, Network, Users, Monitor, Bot, Megaphone, BriefcaseBusiness, Target, Landmark, TrendingUp, Handshake,
 };
 function resolveIcon(name: string): React.ElementType {
   return ICON_MAP[name] ?? Users;

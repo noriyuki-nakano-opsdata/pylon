@@ -131,6 +131,9 @@ export async function apiStream(
 export async function apiFetch<T>(
   path: string,
   options: RequestInit = {},
+  responseOptions: {
+    allowStatuses?: number[];
+  } = {},
 ): Promise<T> {
   const url = `${BASE}${path}`;
   const headers: Record<string, string> = {
@@ -148,7 +151,7 @@ export async function apiFetch<T>(
     credentials: "include",
   });
 
-  if (!res.ok) {
+  if (!res.ok && !responseOptions.allowStatuses?.includes(res.status)) {
     const body = await res.json().catch(() => null);
     throw new ApiError(
       body?.error ?? body?.message ?? `Request failed: ${res.status}`,

@@ -7,6 +7,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from pylon.sdk.decorators import ToolRegistry as SDKToolRegistry
 from pylon.skills.catalog import _read_frontmatter
 from pylon.skills.import_types import (
@@ -70,8 +72,30 @@ def parse_markdown_table(text: str) -> list[dict[str, str]]:
 
 def agent_skills_frontmatter(raw: Path) -> tuple[dict[str, Any], str]:
     text = raw.read_text(encoding="utf-8")
-    frontmatter, body = _read_frontmatter(text)
+    try:
+        frontmatter, body = _read_frontmatter(text)
+    except yaml.YAMLError:
+        frontmatter, body = _fallback_frontmatter(text)
     return frontmatter, body.strip()
+
+
+def _fallback_frontmatter(text: str) -> tuple[dict[str, Any], str]:
+    if not text.startswith("---\n"):
+        return {}, text
+    _, _, tail = text.partition("---\n")
+    yaml_text, sep, body = tail.partition("\n---\n")
+    if not sep:
+        return {}, text
+    payload: dict[str, Any] = {}
+    for line in yaml_text.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        normalized_key = key.strip()
+        if not normalized_key:
+            continue
+        payload[normalized_key] = value.strip().strip('"').strip("'")
+    return payload, body
 
 
 def tool_registry_index(registry_path: Path) -> dict[str, dict[str, str]]:
@@ -97,6 +121,30 @@ class CompatibilityAdapter(ABC):
     @abstractmethod
     def matches_repository(self, root: Path) -> bool:
         raise NotImplementedError
+
+    def import_records(
+        self,
+        *,
+        source_root: Path,
+        source_payload: dict[str, Any],
+        source_revision: str,
+    ) -> list[ImportedSkillRecord]:
+        records: list[ImportedSkillRecord] = []
+        skill_root = source_root / "skills"
+        if not skill_root.is_dir():
+            return records
+        for skill_dir in sorted(skill_root.iterdir()):
+            if not skill_dir.is_dir() or not (skill_dir / "SKILL.md").exists():
+                continue
+            records.append(
+                self.normalize_skill(
+                    source_root=source_root,
+                    source_payload=source_payload,
+                    source_revision=source_revision,
+                    skill_dir=skill_dir,
+                )
+            )
+        return records
 
     def normalize_skill(
         self,
@@ -142,6 +190,7 @@ class CompatibilityAdapter(ABC):
             description=str(frontmatter.get("description", "")).strip(),
             content=body,
             version=version or "0.0.1",
+            category=str(frontmatter.get("category", "other")).strip() or "other",
             references=tuple(references),
             default_reference_bundle=tuple(default_reference_bundle),
             context_contracts=tuple(context_contracts),

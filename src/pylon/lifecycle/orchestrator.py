@@ -4,29 +4,76 @@ from __future__ import annotations
 
 import ast
 import contextvars
+import hashlib
 import inspect
 import json
 import math
 import os
 import re
+import time
 import uuid
 from datetime import UTC, datetime
 from html import escape, unescape
-from typing import Any, Callable
+from typing import Any, Callable, TypedDict
 from urllib import request as urllib_request
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 from pylon.agents.cognitive import ReActEngine
 from pylon.autonomy.routing import ModelRouteRequest
+from pylon.control_plane.scheduler.scheduler import (
+    SchedulerDependencyError,
+    WorkflowScheduler,
+    WorkflowTask,
+)
 from pylon.lifecycle.services.research_localization import (
     merge_research_localization,
     research_localization_payload,
+    with_research_operator_copy,
     translate_fixed_research_text,
+)
+from pylon.lifecycle.services.planning_localization import (
+    merge_planning_localization,
+    planning_localization_payload,
+    with_planning_operator_copy,
+)
+from pylon.lifecycle.services.design_localization import (
+    backfill_design_localization,
+)
+from pylon.lifecycle.services.development_workspace import (
+    build_development_code_workspace,
+    build_development_spec_audit,
+    refine_development_code_workspace,
+)
+from pylon.lifecycle.services.value_contracts import (
+    OUTCOME_TELEMETRY_CONTRACT_ID,
+    REQUIRED_DELIVERY_CONTRACT_IDS,
+    VALUE_CONTRACT_ID,
+    build_outcome_telemetry_contract,
+    build_value_contract,
+    outcome_telemetry_contract_ready,
+    value_contract_ready,
+)
+from pylon.lifecycle.services.development_repo_execution import (
+    execute_development_code_workspace,
+)
+from pylon.lifecycle.services.native_artifacts import (
+    normalize_dcs_analysis,
+    normalize_requirements_bundle,
+    normalize_reverse_engineering_result,
+    normalize_task_decomposition,
+    normalize_technical_design_bundle,
+)
+from pylon.prototyping import (
+    build_nextjs_prototype_app,
+    build_prototype_spec,
 )
 from pylon.lifecycle.services.research_quality import (
     collect_research_node_results,
     evaluate_research_quality,
     research_node_result,
+)
+from pylon.lifecycle.services.decision_context import (
+    build_lifecycle_decision_context,
 )
 from pylon.lifecycle.services.research_sources import (
     pricing_hint_from_packet as _pricing_hint_from_packet,
@@ -46,10 +93,41 @@ from pylon.lifecycle.services.research_runtime import (
     truncate_research_text as _truncate_research_text,
 )
 from pylon.lifecycle.services.research_view_model import build_research_view_model
-from pylon.providers.base import Message
-from pylon.runtime.llm import LLMRuntime, ProviderRegistry
+from pylon.providers.base import Message, TokenUsage
+from pylon.runtime.llm import LLMRuntime, ProviderRegistry, estimate_cost_from_usage, parse_model_ref
 from pylon.skills.runtime import SkillRuntime, get_default_skill_runtime
 from pylon.workflow.result import NodeResult
+
+class EvidenceItem(TypedDict):
+    """Structured evidence for deploy readiness."""
+    category: str  # e.g. "work_package", "milestone", "critical_path", "execution", "contract", "file", "route", "package"
+    label: str  # Human-readable description
+    value: str | int | float  # The evidence value
+    unit: str  # e.g. "count", "path", "id", "percentage"
+
+
+class ChecklistItem(TypedDict):
+    """Structured deploy checklist entry."""
+    id: str  # Machine-readable identifier
+    label: str  # Human-readable description
+    category: str  # e.g. "integration", "security", "quality", "readiness"
+    required: bool  # Whether this is a blocking requirement
+
+
+class BlockingIssue(TypedDict):
+    """Structured blocking issue."""
+    id: str
+    severity: str  # "critical" | "major"
+    description: str
+    source_phase: str  # Which phase raised it
+
+
+class ReviewFocusItem(TypedDict):
+    """Structured review focus area."""
+    area: str  # e.g. "security", "performance", "integration"
+    description: str
+    priority: str  # "high" | "medium" | "low"
+
 
 PHASE_ORDER: tuple[str, ...] = (
     "research",
@@ -71,9 +149,11 @@ _MUTABLE_PROJECT_FIELDS = frozenset(
         "name",
         "description",
         "githubRepo",
+        "productIdentity",
         "spec",
         "autonomyLevel",
         "researchConfig",
+        "researchOperatorDecision",
         "research",
         "analysis",
         "features",
@@ -86,10 +166,17 @@ _MUTABLE_PROJECT_FIELDS = frozenset(
         "buildCode",
         "buildCost",
         "buildIteration",
+        "buildDecisionFingerprint",
         "milestoneResults",
+        "deliveryPlan",
+        "developmentExecution",
+        "developmentHandoff",
+        "valueContract",
+        "outcomeTelemetryContract",
         "planEstimates",
         "selectedPreset",
         "orchestrationMode",
+        "governanceMode",
         "phaseStatuses",
         "deployChecks",
         "releases",
@@ -100,6 +187,12 @@ _MUTABLE_PROJECT_FIELDS = frozenset(
         "skillInvocations",
         "delegations",
         "phaseRuns",
+        "requirements",
+        "requirementsConfig",
+        "reverseEngineering",
+        "taskDecomposition",
+        "dcsAnalysis",
+        "technicalDesign",
     }
 )
 
@@ -120,6 +213,10 @@ def _slug(value: str, *, prefix: str) -> str:
     if not cleaned:
         cleaned = f"{prefix}-{uuid.uuid4().hex[:6]}"
     return cleaned[:48]
+
+
+def _ns(value: Any) -> str:
+    return " ".join(str(value or "").strip().split())
 
 
 def _keywords(spec: str) -> list[str]:
@@ -151,6 +248,20 @@ _PRODUCT_KIND_SIGNALS: dict[str, tuple[tuple[str, int], ...]] = {
         ("approval", 3),
         ("operator", 3),
         ("orchestration", 3),
+        ("lifecycle", 3),
+        ("phase", 2),
+        ("planning", 2),
+        ("design", 2),
+        ("research", 2),
+        ("multi-agent", 3),
+        ("マルチエージェント", 3),
+        ("自律", 3),
+        ("基盤", 2),
+        ("ライフサイクル", 3),
+        ("フェーズ", 2),
+        ("成果物", 2),
+        ("系譜", 2),
+        ("品質ゲート", 2),
         ("運用", 3),
         ("承認", 3),
         ("監査", 3),
@@ -478,6 +589,10 @@ _RESEARCH_ARTICLE_TEXT_HINTS = (
     "vs ",
 )
 
+_RESEARCH_NETWORK_FAILURE_TTL_SECONDS = 120.0
+_RESEARCH_NETWORK_BACKOFF: dict[str, float] = {}
+_RESEARCH_SEARCH_HOST_KEY = "__research-search__"
+
 def _research_retry_count(state: dict[str, Any], node_id: str) -> int:
     return int(
         _as_dict(state.get(_node_state_key(node_id, "result"))).get("retryCount", 0)
@@ -485,15 +600,99 @@ def _research_retry_count(state: dict[str, Any], node_id: str) -> int:
     )
 
 
+def _research_recovery_mode(state: dict[str, Any]) -> str:
+    remediation_mode = str(_research_remediation_context(state).get("recoveryMode", "") or "").strip()
+    if remediation_mode:
+        return remediation_mode
+    return str(state.get("recovery_mode", state.get("recoveryMode", "auto")) or "auto").strip()
+
+
+def _research_effective_recovery_mode(
+    state: dict[str, Any],
+    *,
+    node_id: str | None = None,
+) -> str:
+    configured = _research_recovery_mode(state)
+    if configured != "auto":
+        return configured
+    research = _as_dict(state.get("research"))
+    if not research:
+        return "auto"
+    prior_retry_count = 0
+    if node_id:
+        prior_retry_count = _research_retry_count(state, node_id)
+    if prior_retry_count > 0 or any(
+        int(_as_dict(item).get("retryCount", 0) or 0) > 0
+        for item in _as_list(research.get("node_results"))
+    ):
+        return "reframe_research"
+    return "deepen_evidence"
+
+
 def _research_depth(state: dict[str, Any]) -> str:
-    return str(state.get("depth", "standard") or "standard")
+    configured = str(state.get("depth", "standard") or "standard")
+    recovery_mode = _research_effective_recovery_mode(state)
+    if recovery_mode == "deepen_evidence":
+        return "deep"
+    return configured
 
 
 def _research_source_limit(state: dict[str, Any]) -> int:
     return _RESEARCH_RESULT_LIMITS.get(_research_depth(state), 3)
 
+def _normalize_identity_profile(value: Any) -> dict[str, Any]:
+    profile = _as_dict(value)
+    official_website = _normalize_external_url(str(profile.get("officialWebsite", "") or ""))
+    official_domains = _dedupe_strings(
+        [
+            _source_host(str(item))
+            for item in _as_list(profile.get("officialDomains"))
+            if _source_host(str(item))
+        ]
+    )
+    if official_website:
+        host = _source_host(official_website)
+        if host and host not in official_domains:
+            official_domains.append(host)
+    return {
+        "companyName": _normalize_space(profile.get("companyName")),
+        "productName": _normalize_space(profile.get("productName")),
+        "officialWebsite": official_website,
+        "officialDomains": official_domains,
+        "aliases": _dedupe_strings(_normalize_space(item) for item in _as_list(profile.get("aliases"))),
+        "excludedEntityNames": _dedupe_strings(
+            _normalize_space(item) for item in _as_list(profile.get("excludedEntityNames"))
+        ),
+    }
 
-def _research_query_anchor(spec: str) -> str:
+
+def _research_identity_profile(state: dict[str, Any]) -> dict[str, Any]:
+    return _normalize_identity_profile(
+        _as_dict(state.get("identity_profile")) or _as_dict(state.get("productIdentity"))
+    )
+
+
+def _identity_anchor_exclusions(identity_profile: dict[str, Any]) -> list[str]:
+    exclusions: list[str] = []
+    for item in _as_list(identity_profile.get("excludedEntityNames"))[:3]:
+        text = _normalize_space(item)
+        if text:
+            exclusions.append(f'-"{text[:48]}"')
+    return exclusions
+
+
+def _research_query_anchor(spec: str, identity_profile: dict[str, Any] | None = None) -> str:
+    identity = _normalize_identity_profile(identity_profile)
+    anchor_parts = _dedupe_strings(
+        [
+            _normalize_space(identity.get("productName")),
+            _normalize_space(identity.get("companyName")),
+            *[str(item) for item in _as_list(identity.get("aliases"))[:2]],
+            *[str(item) for item in _as_list(identity.get("officialDomains"))[:1]],
+        ]
+    )
+    if anchor_parts:
+        return " ".join([*anchor_parts, *_identity_anchor_exclusions(identity)])[:180]
     title = _normalize_space(_preview_title(spec))
     if len(title) >= 18:
         return title[:120]
@@ -531,9 +730,18 @@ def _research_remediation_queries(
     queries: list[str],
 ) -> list[str]:
     context = _research_remediation_context(state)
-    if not context or not _research_node_is_targeted_for_remediation(state, node_id):
+    recovery_mode = _research_effective_recovery_mode(state, node_id=node_id)
+    if (
+        not context
+        and recovery_mode in {"", "auto"}
+    ):
         return list(dict.fromkeys(str(item) for item in queries if str(item).strip()))
-    anchor = _research_query_anchor(str(state.get("spec", "")))
+    if context and not _research_node_is_targeted_for_remediation(state, node_id):
+        return list(dict.fromkeys(str(item) for item in queries if str(item).strip()))
+    anchor = _research_query_anchor(
+        str(state.get("spec", "")),
+        _research_identity_profile(state),
+    )
     objective = _normalize_space(context.get("objective"))
     missing = {
         str(item)
@@ -556,8 +764,8 @@ def _research_remediation_queries(
                     f"{anchor} product overview",
                     f"{anchor} pricing page",
                     f"{anchor} integration documentation",
-                ]
-            )
+            ]
+        )
     elif node_id == "market-researcher":
         extra.extend(
             [
@@ -582,6 +790,43 @@ def _research_remediation_queries(
                 f"{anchor} implementation guide",
             ]
         )
+    if recovery_mode == "reframe_research":
+        if node_id == "competitor-analyst":
+            extra.extend(
+                [
+                    f"{anchor} enterprise use case",
+                    f"{anchor} team workflow",
+                    f"{anchor} governance requirement",
+                    f"{anchor} implementation friction",
+                ]
+            )
+        elif node_id == "market-researcher":
+            extra.extend(
+                [
+                    f"{anchor} buyer segment",
+                    f"{anchor} adoption barrier",
+                    f"{anchor} implementation obstacle",
+                    f"{anchor} change management",
+                ]
+            )
+        elif node_id == "user-researcher":
+            extra.extend(
+                [
+                    f"{anchor} jobs to be done",
+                    f"{anchor} switching cost",
+                    f"{anchor} manual workaround",
+                    f"{anchor} budget owner",
+                ]
+            )
+        elif node_id == "tech-evaluator":
+            extra.extend(
+                [
+                    f"{anchor} audit trail",
+                    f"{anchor} role based access",
+                    f"{anchor} operational constraint",
+                    f"{anchor} implementation risk",
+                ]
+            )
     if objective:
         extra.append(f"{anchor} {objective[:80]}")
     return list(
@@ -624,6 +869,26 @@ def _research_network_enabled() -> bool:
     return not bool(os.environ.get("PYTEST_CURRENT_TEST"))
 
 
+def _research_network_host_available(host_key: str) -> bool:
+    if not host_key:
+        return True
+    blocked_until = float(_RESEARCH_NETWORK_BACKOFF.get(host_key, 0.0) or 0.0)
+    if blocked_until <= 0.0:
+        return True
+    if blocked_until <= time.monotonic():
+        _RESEARCH_NETWORK_BACKOFF.pop(host_key, None)
+        return True
+    return False
+
+
+def _mark_research_network_host_unavailable(host_key: str) -> None:
+    if not host_key:
+        return
+    _RESEARCH_NETWORK_BACKOFF[host_key] = (
+        time.monotonic() + _RESEARCH_NETWORK_FAILURE_TTL_SECONDS
+    )
+
+
 def _extract_html_title(html: str) -> str:
     match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
     return _truncate_research_text(unescape(match.group(1)), limit=140) if match else ""
@@ -656,6 +921,9 @@ def _fetch_research_packet(url: str) -> dict[str, Any]:
     normalized = _normalize_external_url(url)
     if not normalized or not _research_network_enabled():
         return {}
+    host_key = _source_host(normalized)
+    if not _research_network_host_available(host_key):
+        return {}
     request = urllib_request.Request(
         normalized,
         headers={
@@ -665,7 +933,7 @@ def _fetch_research_packet(url: str) -> dict[str, Any]:
         },
     )
     try:
-        with urllib_request.urlopen(request, timeout=8.0) as response:  # noqa: S310
+        with urllib_request.urlopen(request, timeout=3.0) as response:  # noqa: S310
             content_type = str(response.headers.get("Content-Type", ""))
             lowered_content_type = content_type.lower()
             if lowered_content_type and "text/html" not in lowered_content_type and "application/xhtml+xml" not in lowered_content_type:
@@ -673,6 +941,7 @@ def _fetch_research_packet(url: str) -> dict[str, Any]:
             raw = response.read(240_000)
             charset = response.headers.get_content_charset() or "utf-8"
     except Exception:
+        _mark_research_network_host_unavailable(host_key)
         return {}
     html = raw.decode(charset, errors="replace")
     text_excerpt = _truncate_research_text(_visible_text_from_html(html), limit=1000)
@@ -733,6 +1002,8 @@ def _extract_search_results(html: str, *, limit: int) -> list[dict[str, str]]:
 def _search_web(query: str, *, limit: int) -> list[dict[str, str]]:
     if not _research_network_enabled():
         return []
+    if not _research_network_host_available(_RESEARCH_SEARCH_HOST_KEY):
+        return []
     endpoints = (
         "https://duckduckgo.com/html/?" + urlencode({"q": query}),
         "https://lite.duckduckgo.com/lite/?" + urlencode({"q": query}),
@@ -747,13 +1018,14 @@ def _search_web(query: str, *, limit: int) -> list[dict[str, str]]:
             },
         )
         try:
-            with urllib_request.urlopen(request, timeout=6.0) as response:  # noqa: S310
+            with urllib_request.urlopen(request, timeout=2.0) as response:  # noqa: S310
                 html = response.read(180_000).decode(
                     response.headers.get_content_charset() or "utf-8",
                     errors="replace",
                 )
         except Exception:
-            continue
+            _mark_research_network_host_unavailable(_RESEARCH_SEARCH_HOST_KEY)
+            break
         results = _extract_search_results(html, limit=limit)
         if results:
             return results
@@ -1142,41 +1414,41 @@ def _build_persona_bundle(state: dict[str, Any]) -> tuple[list[dict[str, Any]], 
                 "name": "Aiko",
                 "role": f"{segment} Platform Lead",
                 "age_range": "30-45",
-                "goals": _dedupe_strings(["意思決定から実装までの文脈をつなぐこと", "品質と自律性を両立すること", signals[0]]),
-                "frustrations": _dedupe_strings(["handoff ごとに文脈が失われる", "承認や監査の根拠が散らばる", pain_points[0]]),
+                "goals": _dedupe_strings(["Keep context intact from decision to build", "Balance quality with autonomy", signals[0]]),
+                "frustrations": _dedupe_strings(["Context is lost at each handoff", "Approval and audit evidence is scattered", pain_points[0]]),
                 "tech_proficiency": "high",
-                "context": "複数職能をまたいで delivery を統制する責任を持つ。",
+                "context": "Owns cross-functional delivery decisions across research, planning, and release review.",
             },
             {
                 "name": "Ken",
                 "role": "Workflow Operator",
                 "age_range": "28-40",
-                "goals": ["run の進行状況と blocker を即座に把握すること", "次の承認や修正指示を迷わず出すこと"],
-                "frustrations": ["artifact とレビュー論点が分断される", "phase ごとの進捗根拠が薄い"],
+                "goals": ["See run state and blockers immediately", "Issue the next approval or rework decision without hesitation"],
+                "frustrations": ["Artifacts and review decisions live in separate places", "Phase progress lacks durable evidence"],
                 "tech_proficiency": "high",
-                "context": "daily operation と release 判断を担う。",
+                "context": "Handles daily workflow operations and release readiness decisions.",
             },
         ]
         stories = [
             {
                 "role": "Platform Lead",
-                "action": "調査から build までの意思決定根拠を残したい",
-                "benefit": "レビューと承認の説明責任を果たせる",
-                "acceptance_criteria": ["phase ごとに artifact が残る", "差し戻し理由が追える", "品質ゲートが見える"],
+                "action": "preserve decision evidence from research through build",
+                "benefit": "review and approval decisions stay explainable",
+                "acceptance_criteria": ["artifacts remain attached to each phase", "rework reasons are traceable", "quality gates stay visible"],
                 "priority": "must",
             },
             {
                 "role": "Workflow Operator",
-                "action": "multi-agent run の状況と次の判断を把握したい",
-                "benefit": "詰まりを早く解消できる",
-                "acceptance_criteria": ["run 状態が見える", "agent handoff が分かる", "次アクションが示される"],
+                "action": "understand multi-agent run status and the next decision",
+                "benefit": "stalls can be resolved quickly",
+                "acceptance_criteria": ["run state is visible", "agent handoffs are explicit", "the next action is shown"],
                 "priority": "must",
             },
             {
                 "role": "Platform Lead",
-                "action": "選択した design と feature scope を一貫して build に渡したい",
-                "benefit": "手戻りを減らせる",
-                "acceptance_criteria": ["selected design が build に反映される", "feature scope と milestone が連動する"],
+                "action": "carry the selected design and feature scope into build without drift",
+                "benefit": "delivery churn stays low",
+                "acceptance_criteria": ["the selected design is reflected in build", "feature scope and milestones stay linked"],
                 "priority": "should",
             },
         ]
@@ -1184,11 +1456,11 @@ def _build_persona_bundle(state: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             {
                 "persona_name": "Aiko",
                 "touchpoints": [
-                    {"phase": "awareness", "persona": "Aiko", "action": "新しい product initiative を起票する", "touchpoint": "Research brief", "emotion": "neutral", "opportunity": "価値仮説と競合観点を最初に並べる"},
-                    {"phase": "consideration", "persona": "Aiko", "action": "scope を調整する", "touchpoint": "Planning review", "emotion": "neutral", "pain_point": "優先順位と根拠が揃わない", "opportunity": "Must/Should/Could と rationale をセットで出す"},
-                    {"phase": "acquisition", "persona": "Aiko", "action": "Go/No-Go を決める", "touchpoint": "Approval gate", "emotion": "positive", "opportunity": "差し戻し先に深くリンクする"},
-                    {"phase": "usage", "persona": "Aiko", "action": "build と quality を確認する", "touchpoint": "Development review", "emotion": "positive", "opportunity": "artifact lineage と milestone を並べる"},
-                    {"phase": "advocacy", "persona": "Aiko", "action": "運用チームに共有する", "touchpoint": "Release summary", "emotion": "positive", "opportunity": "release-ready 条件を明文化する"},
+                    {"phase": "awareness", "persona": "Aiko", "action": "open a new product initiative", "touchpoint": "Research brief", "emotion": "neutral", "opportunity": "Put value hypotheses and competitor pressure side by side from the start"},
+                    {"phase": "consideration", "persona": "Aiko", "action": "reshape scope", "touchpoint": "Planning review", "emotion": "neutral", "pain_point": "Priorities and evidence drift apart", "opportunity": "Present Must/Should/Could with rationale in the same view"},
+                    {"phase": "acquisition", "persona": "Aiko", "action": "make a go or no-go decision", "touchpoint": "Approval gate", "emotion": "positive", "opportunity": "Link directly into the exact rework destination"},
+                    {"phase": "usage", "persona": "Aiko", "action": "review build and quality state", "touchpoint": "Development review", "emotion": "positive", "opportunity": "Keep artifact lineage and milestone state visible together"},
+                    {"phase": "advocacy", "persona": "Aiko", "action": "share the outcome with the operating team", "touchpoint": "Release summary", "emotion": "positive", "opportunity": "Spell out what makes the release operator-ready"},
                 ],
             }
         ]
@@ -1261,27 +1533,46 @@ def _build_story_architecture_bundle(state: dict[str, Any]) -> dict[str, Any]:
                     "related_features": ["日次レッスン", "ごほうび", "進捗トラッキング"],
                 },
                 {
+                    "situation": "When a learner returns after being interrupted",
+                    "motivation": "I want to resume from the exact point I left off",
+                    "outcome": "So I can finish the session without losing confidence",
+                    "priority": "core",
+                    "related_features": ["日次レッスン", "進捗トラッキング"],
+                },
+                {
                     "situation": "When a guardian checks progress after a busy day",
                     "motivation": "I want a quick summary of what was learned and what needs help",
                     "outcome": "So I can support the child without reading a long report",
                     "priority": "supporting",
                     "related_features": ["保護者ダッシュボード", "進捗トラッキング"],
                 },
+                {
+                    "situation": "When a guardian wants the routine to fit family life",
+                    "motivation": "I want to tune difficulty, reminders, and schedule quickly",
+                    "outcome": "So the learning habit survives real-world interruptions",
+                    "priority": "supporting",
+                    "related_features": ["保護者コントロール", "通知", "難易度の自動調整"],
+                },
             ],
             "actors": [
                 {"name": "Guardian", "type": "primary", "description": "学習習慣を支援する保護者", "goals": ["継続率の把握", "安全な利用"], "interactions": ["progress review", "settings"]},
                 {"name": "Learner", "type": "primary", "description": "短時間の学習を行う子ども", "goals": ["達成感", "楽しい学習"], "interactions": ["daily lesson", "rewards"]},
                 {"name": "Recommendation Engine", "type": "external_system", "description": "難易度や次の課題を提案する外部ロジック", "goals": ["最適難易度提示"], "interactions": ["lesson personalization"]},
+                {"name": "Content Admin", "type": "secondary", "description": "学習素材と到達度を管理する運営担当", "goals": ["教材品質の維持", "難所の把握"], "interactions": ["content review", "difficulty tuning"]},
             ],
             "roles": [
                 {"name": "Guardian", "responsibilities": ["目標設定", "利用管理", "進捗確認"], "permissions": ["view_progress", "update_goals", "manage_notifications"], "related_actors": ["Guardian"]},
                 {"name": "Learner", "responsibilities": ["日次課題の実行", "報酬の受け取り"], "permissions": ["start_lesson", "view_rewards"], "related_actors": ["Learner"]},
                 {"name": "Content Admin", "responsibilities": ["問題セットの更新", "学習シナリオの管理"], "permissions": ["manage_content", "review_metrics"], "related_actors": ["Recommendation Engine"]},
+                {"name": "Support Coach", "responsibilities": ["保護者の問い合わせ対応", "学習停滞時の支援"], "permissions": ["view_progress", "recommend_support_actions"], "related_actors": ["Guardian", "Content Admin"]},
             ],
             "use_cases": [
                 {"id": "uc-learn-001", "title": "Start daily lesson", "actor": "Learner", "category": "学習体験", "sub_category": "実行", "preconditions": ["今日の課題が生成されている"], "main_flow": ["ホームを開く", "今日の課題を開始する", "問題に回答する", "結果と報酬を受け取る"], "postconditions": ["学習結果が保存される"], "priority": "must", "related_stories": ["日次レッスン"]},
-                {"id": "uc-learn-002", "title": "Review guardian summary", "actor": "Guardian", "category": "保護者管理", "sub_category": "確認", "preconditions": ["学習履歴が存在する"], "main_flow": ["進捗画面を開く", "今日の達成と継続日数を確認する", "次の推奨行動を確認する"], "postconditions": ["支援内容を判断できる"], "priority": "must", "related_stories": ["進捗トラッキング"]},
-                {"id": "uc-learn-003", "title": "Adjust learning plan", "actor": "Guardian", "category": "保護者管理", "sub_category": "設定", "preconditions": ["利用者プロフィールが存在する"], "main_flow": ["目標設定を開く", "難易度や時間帯を変更する", "通知設定を保存する"], "postconditions": ["次回提案に設定が反映される"], "priority": "should", "related_stories": ["保護者コントロール"]},
+                {"id": "uc-learn-002", "title": "Resume interrupted lesson", "actor": "Learner", "category": "学習体験", "sub_category": "再開", "preconditions": ["途中保存された学習履歴が存在する"], "main_flow": ["アプリを再度開く", "前回の途中状態を確認する", "続きから再開する", "残りの課題を完了する"], "postconditions": ["中断前後を含む学習履歴が統合される"], "priority": "must", "related_stories": ["進捗トラッキング", "日次レッスン"]},
+                {"id": "uc-learn-003", "title": "Review guardian summary", "actor": "Guardian", "category": "保護者管理", "sub_category": "確認", "preconditions": ["学習履歴が存在する"], "main_flow": ["進捗画面を開く", "今日の達成と継続日数を確認する", "つまずきポイントと次の推奨行動を確認する"], "postconditions": ["支援内容を判断できる"], "priority": "must", "related_stories": ["進捗トラッキング", "保護者ダッシュボード"]},
+                {"id": "uc-learn-004", "title": "Adjust learning plan", "actor": "Guardian", "category": "保護者管理", "sub_category": "設定", "preconditions": ["利用者プロフィールが存在する"], "main_flow": ["目標設定を開く", "難易度や時間帯を変更する", "通知設定を保存する"], "postconditions": ["次回提案に設定が反映される"], "priority": "should", "related_stories": ["保護者コントロール", "通知"]},
+                {"id": "uc-learn-005", "title": "Claim reward and streak", "actor": "Learner", "category": "学習体験", "sub_category": "定着", "preconditions": ["その日の課題が完了している"], "main_flow": ["結果画面を開く", "獲得した報酬とストリークを確認する", "次回の目標を知る"], "postconditions": ["継続動機が強化される"], "priority": "should", "related_stories": ["ごほうび・ストリーク"]},
+                {"id": "uc-learn-006", "title": "Review content performance", "actor": "Content Admin", "category": "運営管理", "sub_category": "品質改善", "preconditions": ["学習データが蓄積されている"], "main_flow": ["教材レポートを開く", "正答率と離脱率を確認する", "改善が必要なコンテンツを特定する"], "postconditions": ["教材改善の優先順位が決まる"], "priority": "could", "related_stories": ["難易度の自動調整", "進捗トラッキング"]},
             ],
             "ia_analysis": {
                 "navigation_model": "hierarchical",
@@ -1290,11 +1581,15 @@ def _build_story_architecture_bundle(state: dict[str, Any]) -> dict[str, Any]:
                     {"id": "lessons", "label": "レッスン", "description": "学習コンテンツ一覧", "priority": "primary", "children": []},
                     {"id": "progress", "label": "進捗", "description": "習慣と理解度の確認", "priority": "primary", "children": []},
                     {"id": "guardian", "label": "保護者設定", "description": "目標・通知・制限の管理", "priority": "secondary", "children": []},
+                    {"id": "rewards", "label": "ごほうび", "description": "達成と継続の確認", "priority": "secondary", "children": []},
+                    {"id": "admin", "label": "教材管理", "description": "教材品質と到達度の確認", "priority": "utility", "children": []},
                     {"id": "support", "label": "ヘルプ", "description": "FAQ と問い合わせ", "priority": "utility", "children": []},
                 ],
                 "key_paths": [
                     {"name": "Daily lesson loop", "steps": ["ホーム", "今日の課題", "結果", "報酬"]},
+                    {"name": "Resume learning", "steps": ["ホーム", "途中再開", "結果"]},
                     {"name": "Guardian review", "steps": ["進捗", "学習サマリー", "目標設定"]},
+                    {"name": "Content quality loop", "steps": ["教材管理", "教材レポート", "改善判断"]},
                 ],
             },
         }
@@ -1303,34 +1598,44 @@ def _build_story_architecture_bundle(state: dict[str, Any]) -> dict[str, Any]:
         return {
             "job_stories": [
                 {"situation": "When a buyer is comparing multiple products on mobile", "motivation": "I want filters and trust signals to narrow my choices fast", "outcome": "So I can buy without second-guessing the decision", "priority": "core", "related_features": ["商品検索", "比較", "在庫表示"]},
+                {"situation": "When a buyer has already shortlisted products", "motivation": "I want to compare the differences side by side", "outcome": "So I can commit to the right option without reopening every detail page", "priority": "core", "related_features": ["商品比較", "商品詳細"]},
                 {"situation": "When an operator spots a low-stock item", "motivation": "I want to react before high-intent demand is lost", "outcome": "So I can protect conversion and reduce support load", "priority": "supporting", "related_features": ["在庫アラート", "注文管理"]},
+                {"situation": "When a buyer is waiting after payment", "motivation": "I want proactive delivery visibility", "outcome": "So I can stay confident without contacting support", "priority": "supporting", "related_features": ["配送トラッキング", "通知"]},
             ],
             "actors": [
                 {"name": "Buyer", "type": "primary", "description": "購入検討中のユーザー", "goals": ["比較の簡略化", "安心して決済"], "interactions": ["search", "checkout"]},
                 {"name": "Store Operator", "type": "primary", "description": "商品と注文を管理する運営担当", "goals": ["在庫最適化", "CVR改善"], "interactions": ["inventory", "order review"]},
                 {"name": "Payment Provider", "type": "external_system", "description": "決済を処理する外部サービス", "goals": ["安全な決済"], "interactions": ["checkout"]},
+                {"name": "Carrier Service", "type": "external_system", "description": "配送状況を返す外部配送サービス", "goals": ["配送更新"], "interactions": ["shipment tracking"]},
             ],
             "roles": [
                 {"name": "Buyer", "responsibilities": ["商品探索", "注文", "配送確認"], "permissions": ["browse_products", "checkout", "view_orders"], "related_actors": ["Buyer"]},
                 {"name": "Merchandiser", "responsibilities": ["商品情報更新", "在庫管理"], "permissions": ["manage_catalog", "manage_inventory"], "related_actors": ["Store Operator"]},
                 {"name": "Support Operator", "responsibilities": ["注文対応", "返品確認"], "permissions": ["view_orders", "update_order_status"], "related_actors": ["Store Operator"]},
+                {"name": "Fulfillment Lead", "responsibilities": ["出荷状況確認", "配送障害対応"], "permissions": ["view_shipments", "update_delivery_status"], "related_actors": ["Carrier Service", "Store Operator"]},
             ],
             "use_cases": [
                 {"id": "uc-commerce-001", "title": "Browse and filter products", "actor": "Buyer", "category": "商品探索", "sub_category": "検索・比較", "preconditions": ["商品データが存在する"], "main_flow": ["商品一覧を開く", "条件で絞り込む", "比較候補を選ぶ", "詳細を確認する"], "postconditions": ["比較候補が決まる"], "priority": "must", "related_stories": ["商品検索"]},
-                {"id": "uc-commerce-002", "title": "Complete checkout", "actor": "Buyer", "category": "購入", "sub_category": "決済", "preconditions": ["カートに商品が入っている"], "main_flow": ["配送先を入力する", "支払方法を選ぶ", "合計金額を確認する", "注文を確定する"], "postconditions": ["注文が作成される"], "priority": "must", "related_stories": ["チェックアウト"]},
-                {"id": "uc-commerce-003", "title": "Manage inventory risk", "actor": "Merchandiser", "category": "運営管理", "sub_category": "在庫", "preconditions": ["在庫データが連携されている"], "main_flow": ["在庫画面を開く", "欠品リスクを確認する", "補充アクションを決める"], "postconditions": ["在庫リスクが整理される"], "priority": "should", "related_stories": ["在庫アラート"]},
+                {"id": "uc-commerce-002", "title": "Compare shortlisted products", "actor": "Buyer", "category": "商品探索", "sub_category": "比較", "preconditions": ["比較候補が2件以上ある"], "main_flow": ["比較画面を開く", "価格・仕様・レビューを見比べる", "購入候補を1つに絞る"], "postconditions": ["購入判断が固まる"], "priority": "must", "related_stories": ["商品比較"]},
+                {"id": "uc-commerce-003", "title": "Complete checkout", "actor": "Buyer", "category": "購入", "sub_category": "決済", "preconditions": ["カートに商品が入っている"], "main_flow": ["配送先を入力する", "支払方法を選ぶ", "合計金額を確認する", "注文を確定する"], "postconditions": ["注文が作成される"], "priority": "must", "related_stories": ["チェックアウト"]},
+                {"id": "uc-commerce-004", "title": "Track order and delivery", "actor": "Buyer", "category": "購入後体験", "sub_category": "配送確認", "preconditions": ["注文が確定している"], "main_flow": ["注文履歴を開く", "配送状況を確認する", "到着見込みを把握する"], "postconditions": ["問い合わせなしで状況を理解できる"], "priority": "should", "related_stories": ["配送トラッキング", "通知"]},
+                {"id": "uc-commerce-005", "title": "Manage inventory risk", "actor": "Merchandiser", "category": "運営管理", "sub_category": "在庫", "preconditions": ["在庫データが連携されている"], "main_flow": ["在庫画面を開く", "欠品リスクを確認する", "補充アクションを決める"], "postconditions": ["在庫リスクが整理される"], "priority": "should", "related_stories": ["在庫アラート"]},
+                {"id": "uc-commerce-006", "title": "Resolve return or support issue", "actor": "Support Operator", "category": "運営管理", "sub_category": "サポート", "preconditions": ["注文データが存在する"], "main_flow": ["対象注文を検索する", "配送・返品状況を確認する", "返金または再送を判断する"], "postconditions": ["顧客対応が完了する"], "priority": "could", "related_stories": ["注文管理", "配送トラッキング"]},
             ],
             "ia_analysis": {
                 "navigation_model": "hierarchical",
                 "site_map": [
                     {"id": "catalog", "label": "商品一覧", "description": "カテゴリ・検索・比較", "priority": "primary", "children": []},
                     {"id": "product", "label": "商品詳細", "description": "比較と購入判断", "priority": "primary", "children": []},
+                    {"id": "compare", "label": "比較", "description": "候補商品の比較", "priority": "primary", "children": []},
                     {"id": "checkout", "label": "チェックアウト", "description": "配送と決済", "priority": "primary", "children": []},
                     {"id": "orders", "label": "注文管理", "description": "購入履歴と配送確認", "priority": "secondary", "children": []},
                     {"id": "ops", "label": "運営管理", "description": "在庫・販促・問い合わせ", "priority": "secondary", "children": []},
                 ],
                 "key_paths": [
+                    {"name": "Browse to compare", "steps": ["商品一覧", "比較", "商品詳細"]},
                     {"name": "Browse to buy", "steps": ["商品一覧", "商品詳細", "チェックアウト", "注文確認"]},
+                    {"name": "Order confidence", "steps": ["注文管理", "配送確認", "通知"]},
                     {"name": "Inventory mitigation", "steps": ["運営管理", "在庫一覧", "補充判断"]},
                 ],
             },
@@ -1341,33 +1646,45 @@ def _build_story_architecture_bundle(state: dict[str, Any]) -> dict[str, Any]:
             "job_stories": [
                 {"situation": "When a product team starts a new initiative", "motivation": "I want the system to turn evidence into a decision-ready plan", "outcome": "So I can move into delivery without losing context", "priority": "core", "related_features": ["research workspace", "planning synthesis", "approval gate"]},
                 {"situation": "When a release is blocked by quality or governance concerns", "motivation": "I want the blocking artifacts and next action to be obvious", "outcome": "So I can resolve the issue quickly instead of chasing context", "priority": "core", "related_features": ["artifact lineage", "release gate", "operator console"]},
+                {"situation": "When a research lane degrades or stalls", "motivation": "I want to recover only the weak lane instead of repeating the whole run", "outcome": "So I can keep momentum while preserving trustworthy evidence", "priority": "core", "related_features": ["research workspace", "operator console", "artifact lineage"]},
+                {"situation": "When platform governance changes", "motivation": "I want approval rules and team routing to update without breaking active delivery", "outcome": "So I can adapt the operating model without losing auditability", "priority": "supporting", "related_features": ["approval gate", "operator console", "planning synthesis"]},
             ],
             "actors": [
-                {"name": "Platform Lead", "type": "primary", "description": "product delivery を統制する責任者", "goals": ["意思決定速度", "説明責任"], "interactions": ["planning review", "approval gate"]},
-                {"name": "Lifecycle Operator", "type": "primary", "description": "phase 実行と blocker 解消を担う運用者", "goals": ["run 可視化", "handoff 制御"], "interactions": ["run monitor", "deploy review"]},
-                {"name": "Audit Peer", "type": "external_system", "description": "承認・安全性の妥当性を確認する peer", "goals": ["監査可能性"], "interactions": ["approval", "security review"]},
+                {"name": "Platform Lead", "type": "primary", "description": "Owns delivery governance across the product lifecycle", "goals": ["Decision velocity", "Explainable approvals"], "interactions": ["planning review", "approval gate"]},
+                {"name": "Lifecycle Operator", "type": "primary", "description": "Runs phases, monitors blockers, and manages interventions", "goals": ["Run visibility", "Controlled handoffs"], "interactions": ["run monitor", "deploy review"]},
+                {"name": "Audit Peer", "type": "external_system", "description": "Validates approvals, safety, and governance posture", "goals": ["Auditability"], "interactions": ["approval", "security review"]},
+                {"name": "Delivery Engineer", "type": "secondary", "description": "Turns selected design and scope into an executable build plan", "goals": ["Less rework", "Build quality"], "interactions": ["development handoff", "release readiness"]},
             ],
             "roles": [
                 {"name": "Platform Lead", "responsibilities": ["scope judgment", "approval", "release oversight"], "permissions": ["approve", "select_design", "view_costs"], "related_actors": ["Platform Lead"]},
                 {"name": "Lifecycle Operator", "responsibilities": ["phase execution", "exception handling", "deploy checks"], "permissions": ["run_phase", "view_artifacts", "create_release"], "related_actors": ["Lifecycle Operator"]},
                 {"name": "Reviewer", "responsibilities": ["quality and security review", "rework guidance"], "permissions": ["comment", "request_changes", "view_operator_console"], "related_actors": ["Audit Peer"]},
+                {"name": "Delivery Engineer", "responsibilities": ["implementation planning", "build handoff", "release coordination"], "permissions": ["view_scope", "view_design", "prepare_release"], "related_actors": ["Delivery Engineer", "Lifecycle Operator"]},
             ],
             "use_cases": [
-                {"id": "uc-ops-001", "title": "Run discovery-to-build workflow", "actor": "Lifecycle Operator", "category": "ワークフロー運用", "sub_category": "実行・監視", "preconditions": ["spec が存在する"], "main_flow": ["research を開始する", "planning をレビューする", "design を選択する", "development を実行する"], "postconditions": ["build artifact と phase history が残る"], "priority": "must", "related_stories": ["research workspace"]},
-                {"id": "uc-ops-002", "title": "Approve or rework a phase", "actor": "Platform Lead", "category": "ガバナンス", "sub_category": "承認", "preconditions": ["phase artifact が揃っている"], "main_flow": ["approval gate を開く", "根拠を確認する", "承認または差し戻しを行う"], "postconditions": ["決定履歴が残る"], "priority": "must", "related_stories": ["approval gate"]},
-                {"id": "uc-ops-003", "title": "Trace artifact lineage", "actor": "Reviewer", "category": "品質管理", "sub_category": "調査", "preconditions": ["run が完了している"], "main_flow": ["artifact を開く", "関連 decision を確認する", "どの agent が作成したか追う"], "postconditions": ["根拠が説明できる"], "priority": "should", "related_stories": ["artifact lineage"]},
+                {"id": "uc-ops-001", "title": "Run discovery-to-build workflow", "actor": "Lifecycle Operator", "category": "Workflow operations", "sub_category": "Execution", "preconditions": ["A project spec exists"], "main_flow": ["Start research", "Review planning", "Select a design", "Run development"], "postconditions": ["Build artifacts and phase history are recorded"], "priority": "must", "related_stories": ["research workspace"]},
+                {"id": "uc-ops-002", "title": "Recover degraded research lane", "actor": "Lifecycle Operator", "category": "Workflow operations", "sub_category": "Recovery", "preconditions": ["A research node is degraded or failed"], "main_flow": ["Open the degraded lane", "Review missing evidence and blockers", "Choose a recovery strategy", "Re-run only the affected lane"], "postconditions": ["The recovery reason and delta are recorded"], "priority": "must", "related_stories": ["research workspace", "operator console"]},
+                {"id": "uc-ops-003", "title": "Approve or rework a phase", "actor": "Platform Lead", "category": "Governance", "sub_category": "Approval", "preconditions": ["Phase artifacts are ready"], "main_flow": ["Open the approval gate", "Review the evidence", "Approve or request rework"], "postconditions": ["The decision history is recorded"], "priority": "must", "related_stories": ["approval gate"]},
+                {"id": "uc-ops-004", "title": "Trace artifact lineage", "actor": "Reviewer", "category": "Quality control", "sub_category": "Investigation", "preconditions": ["A run has completed"], "main_flow": ["Open an artifact", "Inspect the linked decisions", "Trace which agent produced it"], "postconditions": ["The evidence chain is explainable"], "priority": "must", "related_stories": ["artifact lineage"]},
+                {"id": "uc-ops-005", "title": "Configure policies and team routing", "actor": "Platform Lead", "category": "Platform configuration", "sub_category": "Governance", "preconditions": ["The user has workspace admin access"], "main_flow": ["Open settings", "Update approval rules and quality gates", "Save team routing"], "postconditions": ["The new operating policy applies to the next run"], "priority": "should", "related_stories": ["approval gate", "planning synthesis"]},
+                {"id": "uc-ops-006", "title": "Monitor active runs and intervene", "actor": "Lifecycle Operator", "category": "Workflow operations", "sub_category": "Monitoring", "preconditions": ["An active run exists"], "main_flow": ["Open the run monitor", "Inspect phase state and blockers", "Choose the required intervention"], "postconditions": ["The blockage and response history are recorded"], "priority": "should", "related_stories": ["operator console", "artifact lineage"]},
+                {"id": "uc-ops-007", "title": "Review release readiness and publish outcome", "actor": "Delivery Engineer", "category": "Release management", "sub_category": "Release decision", "preconditions": ["Build artifacts and quality reports are available"], "main_flow": ["Open release readiness", "Review the milestone report and quality gate", "Create the release record"], "postconditions": ["The shipping decision and release artifacts are recorded"], "priority": "could", "related_stories": ["release readiness", "operator console"]},
             ],
             "ia_analysis": {
                 "navigation_model": "hub-and-spoke",
                 "site_map": [
-                    {"id": "workspace", "label": "Lifecycle Workspace", "description": "phase ごとの主作業領域", "priority": "primary", "children": []},
-                    {"id": "runs", "label": "Runs", "description": "run と checkpoint の確認", "priority": "primary", "children": []},
-                    {"id": "approvals", "label": "Approvals", "description": "承認待ちと差し戻し履歴", "priority": "primary", "children": []},
-                    {"id": "artifacts", "label": "Artifacts", "description": "phase 成果物と lineage", "priority": "secondary", "children": []},
-                    {"id": "settings", "label": "Settings", "description": "policy と環境設定", "priority": "utility", "children": []},
+                    {"id": "workspace", "label": "Lifecycle Workspace", "description": "Primary work area for each phase", "priority": "primary", "children": []},
+                    {"id": "runs", "label": "Runs", "description": "Review runs and checkpoints", "priority": "primary", "children": []},
+                    {"id": "approvals", "label": "Approvals", "description": "Pending approvals and rework history", "priority": "primary", "children": []},
+                    {"id": "artifacts", "label": "Artifacts", "description": "Phase artifacts and lineage", "priority": "secondary", "children": []},
+                    {"id": "policies", "label": "Policies", "description": "Approval rules and quality gate settings", "priority": "secondary", "children": []},
+                    {"id": "release", "label": "Release", "description": "Release readiness and shipment history", "priority": "secondary", "children": []},
+                    {"id": "settings", "label": "Settings", "description": "Policy and environment settings", "priority": "utility", "children": []},
                 ],
                 "key_paths": [
                     {"name": "Idea to approval", "steps": ["Lifecycle Workspace", "Research", "Planning", "Approval"]},
+                    {"name": "Lane recovery", "steps": ["Runs", "Degraded lane", "Recovery strategy", "Research"]},
+                    {"name": "Policy update", "steps": ["Policies", "Approval rules", "Team routing"]},
                     {"name": "Build to release", "steps": ["Development", "Runs", "Deploy", "Release"]},
                 ],
             },
@@ -1376,31 +1693,42 @@ def _build_story_architecture_bundle(state: dict[str, Any]) -> dict[str, Any]:
     return {
         "job_stories": [
             {"situation": "When a user first tries the product", "motivation": "I want the core path to be obvious", "outcome": "So I can reach value without reading a manual", "priority": "core", "related_features": feature_names[:3] or ["onboarding", "primary workflow"]},
+            {"situation": "When a user is midway through the product's main task", "motivation": "I want the current state and next action to stay visible", "outcome": "So I can complete the workflow without second-guessing what happens next", "priority": "core", "related_features": feature_names[:3] or ["status visibility", "primary workflow"]},
             {"situation": "When a product team scopes the first release", "motivation": "I want a crisp definition of the MVP", "outcome": "So I can ship without uncontrolled scope growth", "priority": "supporting", "related_features": feature_names[:3] or ["MVP scope"]},
+            {"situation": "When a returning user resumes the product", "motivation": "I want my previous context to be restored quickly", "outcome": "So I can continue instead of restarting from scratch", "priority": "supporting", "related_features": feature_names[:3] or ["history and recovery", "notifications"]},
         ],
         "actors": [
             {"name": "Primary User", "type": "primary", "description": "主要タスクを実行する利用者", "goals": ["価値到達", "迷わない操作"], "interactions": ["onboarding", "main workflow"]},
             {"name": "Product Owner", "type": "secondary", "description": "価値仮説と scope を管理する担当者", "goals": ["初期リリース成功"], "interactions": ["planning", "review"]},
+            {"name": "Operator", "type": "secondary", "description": "状態確認や問い合わせ対応を担う運用者", "goals": ["状態把握", "問い合わせ削減"], "interactions": ["status review", "history lookup"]},
         ],
         "roles": [
             {"name": "Primary User", "responsibilities": ["主要タスク実行"], "permissions": ["use_core_flow"], "related_actors": ["Primary User"]},
             {"name": "Admin", "responsibilities": ["設定と品質管理"], "permissions": ["configure", "review_metrics"], "related_actors": ["Product Owner"]},
+            {"name": "Support Operator", "responsibilities": ["状態確認", "復旧支援"], "permissions": ["view_status", "view_history"], "related_actors": ["Operator"]},
         ],
         "use_cases": [
-            {"id": "uc-generic-001", "title": "Complete the primary workflow", "actor": "Primary User", "category": "主要体験", "sub_category": "実行", "preconditions": ["利用開始条件が満たされている"], "main_flow": ["ホームを開く", "主要タスクを開始する", "結果を確認する"], "postconditions": ["価値が伝わる"], "priority": "must", "related_stories": feature_names[:2]},
-            {"id": "uc-generic-002", "title": "Adjust settings", "actor": "Admin", "category": "設定管理", "sub_category": "構成", "preconditions": ["設定権限がある"], "main_flow": ["設定画面を開く", "主要設定を変更する", "保存する"], "postconditions": ["次回利用に反映される"], "priority": "should", "related_stories": feature_names[:2]},
+            {"id": "uc-generic-001", "title": "Complete guided onboarding", "actor": "Primary User", "category": "初回導線", "sub_category": "立ち上げ", "preconditions": ["初回利用または新規セットアップである"], "main_flow": ["オンボーディングを開始する", "必要情報を入力する", "最初の成功条件を確認する"], "postconditions": ["主要導線へ迷わず入れる"], "priority": "must", "related_stories": ["guided onboarding"]},
+            {"id": "uc-generic-002", "title": "Complete the primary workflow", "actor": "Primary User", "category": "主要体験", "sub_category": "実行", "preconditions": ["利用開始条件が満たされている"], "main_flow": ["ホームを開く", "主要タスクを開始する", "結果を確認する"], "postconditions": ["価値が伝わる"], "priority": "must", "related_stories": ["primary workflow"]},
+            {"id": "uc-generic-003", "title": "Review status and next action", "actor": "Primary User", "category": "主要体験", "sub_category": "把握", "preconditions": ["進行中または完了したタスクが存在する"], "main_flow": ["ステータス画面を開く", "現在状態を確認する", "次の推奨アクションを把握する"], "postconditions": ["迷わず次の操作に進める"], "priority": "must", "related_stories": ["status visibility"]},
+            {"id": "uc-generic-004", "title": "Recover previous work context", "actor": "Primary User", "category": "継続利用", "sub_category": "復旧", "preconditions": ["過去の履歴または中断状態が存在する"], "main_flow": ["履歴を開く", "前回の状態を選択する", "復旧して再開する"], "postconditions": ["作業が中断前の文脈で再開される"], "priority": "should", "related_stories": ["history and recovery"]},
+            {"id": "uc-generic-005", "title": "Configure notifications and preferences", "actor": "Admin", "category": "設定管理", "sub_category": "構成", "preconditions": ["設定権限がある"], "main_flow": ["設定画面を開く", "通知と基本設定を変更する", "保存する"], "postconditions": ["次回利用に反映される"], "priority": "should", "related_stories": ["notifications"]},
+            {"id": "uc-generic-006", "title": "Administer workspace settings", "actor": "Admin", "category": "設定管理", "sub_category": "運用", "preconditions": ["管理権限がある"], "main_flow": ["ワークスペース設定を開く", "利用ルールや表示設定を更新する", "反映状況を確認する"], "postconditions": ["運用条件が整う"], "priority": "could", "related_stories": feature_names[:2]},
         ],
         "ia_analysis": {
             "navigation_model": "hierarchical",
             "site_map": [
                 {"id": "home", "label": "ホーム", "description": "主要情報の要約", "priority": "primary", "children": []},
                 {"id": "workflow", "label": "主要導線", "description": "最も価値のある操作", "priority": "primary", "children": []},
+                {"id": "status", "label": "状態", "description": "進行状況と次アクション", "priority": "primary", "children": []},
                 {"id": "history", "label": "履歴", "description": "過去の操作と成果", "priority": "secondary", "children": []},
                 {"id": "settings", "label": "設定", "description": "環境や通知の設定", "priority": "utility", "children": []},
             ],
             "key_paths": [
-                {"name": "First-run success", "steps": ["ホーム", "主要導線", "結果"]},
+                {"name": "First-run success", "steps": ["オンボーディング", "ホーム", "主要導線", "結果"]},
+                {"name": "In-product orientation", "steps": ["状態", "次アクション", "主要導線"]},
                 {"name": "Configuration", "steps": ["設定", "保存"]},
+                {"name": "Recovery", "steps": ["履歴", "復旧", "主要導線"]},
             ],
         },
     }
@@ -1429,12 +1757,12 @@ def _feature_catalog_for_spec(state: dict[str, Any]) -> list[tuple[str, str, str
         ]
     if kind == "operations":
         return [
-            ("research workspace", "must-be", "medium", "仮説と証拠を1か所に集約する"),
-            ("planning synthesis", "must-be", "medium", "優先順位と実装計画を明文化する"),
-            ("artifact lineage", "one-dimensional", "medium", "どの根拠から判断したかを追跡できる"),
-            ("approval gate", "must-be", "medium", "説明責任のあるGo/Rework判断を可能にする"),
-            ("operator console", "one-dimensional", "high", "run 状況と specialist handoff を監視できる"),
-            ("release readiness", "attractive", "medium", "build から deploy までを統制する"),
+            ("research workspace", "must-be", "medium", "Concentrate hypotheses and evidence in one surface"),
+            ("planning synthesis", "must-be", "medium", "Make priorities and execution scope explicit"),
+            ("artifact lineage", "one-dimensional", "medium", "Trace each decision back to its evidence"),
+            ("approval gate", "must-be", "medium", "Support explainable go or rework decisions"),
+            ("operator console", "one-dimensional", "high", "Monitor run state and specialist handoffs"),
+            ("release readiness", "attractive", "medium", "Control the path from build to deploy"),
         ]
     return [
         ("guided onboarding", "must-be", "low", "最初の価値到達を早める"),
@@ -1443,6 +1771,34 @@ def _feature_catalog_for_spec(state: dict[str, Any]) -> list[tuple[str, str, str
         ("notifications", "one-dimensional", "medium", "継続利用を促す"),
         ("history and recovery", "one-dimensional", "medium", "再訪時の文脈復元を容易にする"),
         ("personalization", "attractive", "high", "利用継続時の満足度を高める"),
+    ]
+
+
+def _default_kano_features_for_spec(state: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "feature": name,
+            "category": category,
+            "user_delight": 0.95 if category == "attractive" else 0.82 if category == "one-dimensional" else 0.72,
+            "implementation_cost": cost,
+            "rationale": rationale,
+        }
+        for name, category, cost, rationale in _feature_catalog_for_spec(state)
+    ]
+
+
+def _default_feature_selections_for_spec(state: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "feature": item["feature"],
+            "category": item["category"],
+            "selected": item["category"] != "attractive",
+            "priority": "must" if item["category"] == "must-be" else "should" if item["category"] == "one-dimensional" else "could",
+            "user_delight": item["user_delight"],
+            "implementation_cost": item["implementation_cost"],
+            "rationale": item["rationale"],
+        }
+        for item in _default_kano_features_for_spec(state)
     ]
 
 
@@ -1460,9 +1816,9 @@ def _solution_bundle(state: dict[str, Any]) -> dict[str, Any]:
             "revenue_streams": ["Family subscription", "Education bundle", "Premium content packs"],
         }
         milestones = [
-            {"id": "ms-alpha", "name": "Daily learning loop", "criteria": f"{prominent[0]} と {prominent[1]} が1日の学習導線で完結する", "rationale": "最初に継続の核となる日次体験を成立させる", "phase": "alpha", "depends_on_use_cases": ["uc-learn-001"]},
-            {"id": "ms-beta", "name": "Guardian confidence", "criteria": "保護者が進捗と設定を1画面で確認・変更できる", "rationale": "継続課金の判断材料を作る", "phase": "beta", "depends_on_use_cases": ["uc-learn-002", "uc-learn-003"]},
-            {"id": "ms-release", "name": "Habit-ready release", "criteria": "通知、レスポンシブ、アクセシビリティが整い7日継続を支援できる", "rationale": "習慣化に必要な運用品質を満たす", "phase": "release", "depends_on_use_cases": ["uc-learn-001", "uc-learn-002"]},
+            {"id": "ms-alpha", "name": "Daily learning loop", "criteria": f"{prominent[0]} と {prominent[1]} が1日の学習導線で完結し、中断からも再開できる", "rationale": "最初に継続の核となる日次体験を成立させる", "phase": "alpha", "depends_on_use_cases": ["uc-learn-001", "uc-learn-002"]},
+            {"id": "ms-beta", "name": "Guardian confidence", "criteria": "保護者が進捗、設定、つまずきポイントを1画面で確認できる", "rationale": "継続課金の判断材料を作る", "phase": "beta", "depends_on_use_cases": ["uc-learn-003", "uc-learn-004", "uc-learn-005"]},
+            {"id": "ms-release", "name": "Habit-ready release", "criteria": "通知、教材品質レビュー、アクセシビリティが整い7日継続を支援できる", "rationale": "習慣化に必要な運用品質を満たす", "phase": "release", "depends_on_use_cases": ["uc-learn-001", "uc-learn-003", "uc-learn-005", "uc-learn-006"]},
         ]
         return {"business_model": business_model, "recommended_milestones": milestones, "design_tokens": _base_design_tokens(spec)}
 
@@ -1474,23 +1830,23 @@ def _solution_bundle(state: dict[str, Any]) -> dict[str, Any]:
             "revenue_streams": ["Product margin", "Subscription perks", "Merchant tooling upsell"],
         }
         milestones = [
-            {"id": "ms-alpha", "name": "Browse to buy", "criteria": "検索・比較・チェックアウトまでの購入導線が成立する", "rationale": "最初にCVRを生むコアループを作る", "phase": "alpha", "depends_on_use_cases": ["uc-commerce-001", "uc-commerce-002"]},
-            {"id": "ms-beta", "name": "Operational confidence", "criteria": "在庫リスクと注文状況を運営者が確認できる", "rationale": "運営上のボトルネックを減らす", "phase": "beta", "depends_on_use_cases": ["uc-commerce-003"]},
-            {"id": "ms-release", "name": "Trustworthy commerce release", "criteria": "レスポンシブ、アクセシビリティ、配送通知が整った購入体験を提供する", "rationale": "実運用での安心感を確保する", "phase": "release", "depends_on_use_cases": ["uc-commerce-001", "uc-commerce-002"]},
+            {"id": "ms-alpha", "name": "Browse to buy", "criteria": "検索・比較・チェックアウトまでの購入導線が成立する", "rationale": "最初にCVRを生むコアループを作る", "phase": "alpha", "depends_on_use_cases": ["uc-commerce-001", "uc-commerce-002", "uc-commerce-003"]},
+            {"id": "ms-beta", "name": "Operational confidence", "criteria": "在庫リスク、配送状況、問い合わせ対応を運営者が確認できる", "rationale": "運営上のボトルネックを減らす", "phase": "beta", "depends_on_use_cases": ["uc-commerce-004", "uc-commerce-005", "uc-commerce-006"]},
+            {"id": "ms-release", "name": "Trustworthy commerce release", "criteria": "レスポンシブ、アクセシビリティ、配送通知が整った購入体験を提供する", "rationale": "実運用での安心感を確保する", "phase": "release", "depends_on_use_cases": ["uc-commerce-001", "uc-commerce-003", "uc-commerce-004"]},
         ]
         return {"business_model": business_model, "recommended_milestones": milestones, "design_tokens": _base_design_tokens(spec)}
 
     if kind == "operations":
         business_model = {
-            "value_propositions": ["意思決定から実装までの context loss を減らす", "ガバナンス付き自律実行を安全に進める"],
-            "customer_segments": ["AI プラットフォームチーム", "プロダクト運用チーム", "内部開発基盤チーム"],
+            "value_propositions": ["Reduce context loss from decision to build", "Run autonomous delivery safely with governance"],
+            "customer_segments": ["AI platform teams", "Product operations teams", "Internal developer platform teams"],
             "channels": ["Developer tooling", "Internal platform rollout", "Ops enablement"],
             "revenue_streams": ["Platform seat", "Usage-based orchestration", "Premium governance modules"],
         }
         milestones = [
-            {"id": "ms-alpha", "name": "Evidence-to-build loop", "criteria": "research から development までの artifact lineage が1本で追える", "rationale": "完全自律より先に traceability を成立させる", "phase": "alpha", "depends_on_use_cases": ["uc-ops-001"]},
-            {"id": "ms-beta", "name": "Governed delivery", "criteria": "approval と rework が phase deep link 付きで運用できる", "rationale": "マルチエージェント運用の制御面を固める", "phase": "beta", "depends_on_use_cases": ["uc-ops-002"]},
-            {"id": "ms-release", "name": "Operator-ready release", "criteria": "run telemetry、release gate、feedback loop が一貫して利用できる", "rationale": "運用に渡せる完成度を作る", "phase": "release", "depends_on_use_cases": ["uc-ops-001", "uc-ops-003"]},
+            {"id": "ms-alpha", "name": "Evidence-to-build loop", "criteria": "Artifact lineage stays continuous from research through development, and degraded lanes can be recovered individually", "rationale": "Establish traceability and localized recovery before pursuing full autonomy", "phase": "alpha", "depends_on_use_cases": ["uc-ops-001", "uc-ops-002", "uc-ops-004"]},
+            {"id": "ms-beta", "name": "Governed delivery", "criteria": "Approval, rework, and policy changes can be operated with phase-level deep links", "rationale": "Stabilize the control surface for multi-agent operations", "phase": "beta", "depends_on_use_cases": ["uc-ops-003", "uc-ops-005", "uc-ops-006"]},
+            {"id": "ms-release", "name": "Operator-ready release", "criteria": "Run telemetry, release gating, and release records work together as one operating flow", "rationale": "Reach a delivery quality bar that is safe to hand off to operators", "phase": "release", "depends_on_use_cases": ["uc-ops-001", "uc-ops-003", "uc-ops-006", "uc-ops-007"]},
         ]
         return {"business_model": business_model, "recommended_milestones": milestones, "design_tokens": _base_design_tokens(spec)}
 
@@ -1501,9 +1857,9 @@ def _solution_bundle(state: dict[str, Any]) -> dict[str, Any]:
         "revenue_streams": ["Subscription", "Team plan", "Premium capabilities"],
     }
     milestones = [
-        {"id": "ms-alpha", "name": "Core workflow ready", "criteria": f"{prominent[0]} と {prominent[1]} を含む主要導線が成立する", "rationale": "最初に価値到達を成立させる", "phase": "alpha", "depends_on_use_cases": ["uc-generic-001"]},
-        {"id": "ms-beta", "name": "Configuration and recovery", "criteria": "設定変更と履歴復元ができる", "rationale": "継続利用の土台を作る", "phase": "beta", "depends_on_use_cases": ["uc-generic-002"]},
-        {"id": "ms-release", "name": "Release quality", "criteria": "レスポンシブ・a11y・主要状態表示が揃う", "rationale": "運用品質の下限を満たす", "phase": "release", "depends_on_use_cases": ["uc-generic-001", "uc-generic-002"]},
+        {"id": "ms-alpha", "name": "Core workflow ready", "criteria": f"{prominent[0]} と {prominent[1]} を含む主要導線が成立し、初回成功が計測できる", "rationale": "最初に価値到達を成立させる", "phase": "alpha", "depends_on_use_cases": ["uc-generic-001", "uc-generic-002", "uc-generic-003"]},
+        {"id": "ms-beta", "name": "Configuration and recovery", "criteria": "設定変更、通知、履歴復元が一貫して扱える", "rationale": "継続利用の土台を作る", "phase": "beta", "depends_on_use_cases": ["uc-generic-004", "uc-generic-005"]},
+        {"id": "ms-release", "name": "Release quality", "criteria": "レスポンシブ・a11y・主要状態表示と運用設定が揃う", "rationale": "運用品質の下限を満たす", "phase": "release", "depends_on_use_cases": ["uc-generic-002", "uc-generic-003", "uc-generic-004", "uc-generic-006"]},
     ]
     return {"business_model": business_model, "recommended_milestones": milestones, "design_tokens": _base_design_tokens(spec)}
 
@@ -1528,8 +1884,8 @@ def _planning_recommendations(state: dict[str, Any]) -> list[str]:
         ])
     elif kind == "operations":
         recommendations.extend([
-            "phase ごとの artifact lineage を first-class にし、承認判断の根拠を失わないようにする",
-            "multi-agent の並列実行より先に、handoff と rework の制御面を固める",
+            "Treat phase-by-phase artifact lineage as a first-class surface so approval evidence never gets lost.",
+            "Stabilize handoff and rework control before widening multi-agent parallelism.",
         ])
     else:
         recommendations.extend([
@@ -1537,9 +1893,16 @@ def _planning_recommendations(state: dict[str, Any]) -> list[str]:
             "主要状態と次アクションを常に明示して、利用中の迷いを減らす",
         ])
     if context["opportunities"]:
-        recommendations.append(f"市場機会: {context['opportunities'][0]}")
+        if kind == "operations":
+            recommendations.append("市場の追い風があっても、alpha は operator workflow の必須判断面に絞って優位性を検証する")
+        elif kind == "commerce":
+            recommendations.append("市場機会を広く追う前に、比較から決済までの不安除去を最短距離で検証する")
+        elif kind == "learning":
+            recommendations.append("市場機会の広がりより先に、短時間でも継続できる日次習慣の成立を検証する")
+        else:
+            recommendations.append("市場機会の広さよりも、最初の成功導線が成立するかを優先して検証する")
     if context["threats"]:
-        recommendations.append(f"リスク: {context['threats'][0]}")
+        recommendations.append("外部ノイズや競争圧があるため、初期計画は説明可能で検証しやすいコアループに集中する")
     if score < 0.78:
         recommendations.append("技術実現性スコアが相対的に低いため、alpha では scope を絞って検証可能性を優先する")
     return _dedupe_strings(recommendations)
@@ -1568,6 +1931,61 @@ def _color_or(value: Any, fallback: str) -> str:
     return fallback
 
 
+def _hex_to_rgb(value: Any) -> tuple[int, int, int] | None:
+    text = _color_or(value, "")
+    if not text:
+        return None
+    if len(text) == 4:
+        text = "#" + "".join(ch * 2 for ch in text[1:])
+    try:
+        return (
+            int(text[1:3], 16),
+            int(text[3:5], 16),
+            int(text[5:7], 16),
+        )
+    except ValueError:
+        return None
+
+
+def _relative_luminance(value: Any) -> float:
+    rgb = _hex_to_rgb(value)
+    if rgb is None:
+        return 1.0
+
+    def _channel(component: int) -> float:
+        normalized = component / 255
+        if normalized <= 0.03928:
+            return normalized / 12.92
+        return ((normalized + 0.055) / 1.055) ** 2.4
+
+    red, green, blue = (_channel(component) for component in rgb)
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+
+def _contrast_ratio(foreground: Any, background: Any) -> float:
+    fg = _relative_luminance(foreground)
+    bg = _relative_luminance(background)
+    lighter = max(fg, bg)
+    darker = min(fg, bg)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def _accessible_preview_text_color(
+    *,
+    preferred: Any,
+    background: Any,
+    light_fallback: str,
+    dark_fallback: str,
+) -> str:
+    preferred_hex = _color_or(preferred, "")
+    background_hex = _color_or(background, "")
+    if preferred_hex and background_hex and _contrast_ratio(preferred_hex, background_hex) >= 4.5:
+        return preferred_hex
+    if background_hex and _relative_luminance(background_hex) <= 0.18:
+        return light_fallback
+    return dark_fallback
+
+
 def _preview_title(spec: str) -> str:
     for line in str(spec or "").splitlines():
         cleaned = line.strip().lstrip("#").strip()
@@ -1576,25 +1994,1026 @@ def _preview_title(spec: str) -> str:
     return "Lifecycle Product"
 
 
+def _normalize_override_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+_DESIGN_PREVIEW_REPLACEMENTS: tuple[tuple[str, str], ...] = (
+    (r"\bComplete guided onboarding\b", "初回設定を完了する"),
+    (r"\bComplete the primary workflow\b", "主要タスクを完了する"),
+    (r"\bComplete the 主要 workflow\b", "主要タスクを完了する"),
+    (r"\bReview status and next action\b", "状態と次の操作を確認する"),
+    (r"\bRecover previous work context\b", "前回の続きから再開する"),
+    (r"\bFirst-run success\b", "初回設定から最初の成果まで"),
+    (r"\bIn-product orientation\b", "利用中の状況確認"),
+    (r"\bConfiguration\b", "設定を更新する"),
+    (r"\bhistory and recovery\b", "履歴と復帰"),
+    (r"\bguided onboarding\b", "初回設定"),
+    (r"\bprimary workflow\b", "主要タスク"),
+    (r"\bstatus visibility\b", "状態の見える化"),
+    (r"\bOpen\s+(.+)", r"\1を開く"),
+    (r"\bLifecycle Workspace\b", "ライフサイクルワークスペース"),
+    (r"\bResearch Workspace\b", "調査ワークスペース"),
+    (r"\bApproval Gate\b", "承認ゲート"),
+    (r"\bArtifact Lineage\b", "成果物系譜"),
+    (r"\bLineage Explorer\b", "リネージ探索"),
+    (r"\bDecision Review\b", "判断レビュー"),
+    (r"\bRun Ledger\b", "ラン台帳"),
+    (r"\bRelease Readiness\b", "リリース準備"),
+    (r"\bPhase Workspace\b", "フェーズワークスペース"),
+    (r"\bCommand Deck\b", "判断デッキ"),
+    (r"\bResearch Recovery\b", "調査復旧"),
+    (r"\bRuns\b", "実行レーン"),
+    (r"\bApprovals\b", "承認レビュー"),
+    (r"\bArtifacts\b", "成果物系譜"),
+    (r"\bOperator Shell\b", "オペレーターシェル"),
+    (r"\bActive Screen\b", "アクティブ画面"),
+    (r"\bPrimary Flow\b", "主要フロー"),
+    (r"\bLayout\b", "レイアウト"),
+    (r"\bPrototype Screens\b", "画面ストーリーボード"),
+    (r"\bInteraction Principles\b", "操作原則"),
+    (r"\bPrimary Flows\b", "主要フロー"),
+    (r"\bMilestone Readiness\b", "マイルストーン準備"),
+    (r"\bSystem Signals\b", "システムシグナル"),
+    (r"\bPrimary work area for each phase\b", "各フェーズの主要作業面"),
+    (r"\bReview runs and checkpoints\b", "ランとチェックポイントを確認する"),
+    (r"\bReview approvals and handoff readiness\b", "承認レビューと引き継ぎ準備を確認する"),
+    (r"\bReview approvals and release readiness\b", "承認とリリース準備を確認する"),
+    (r"\bTrace\s+artifact\s+lineage\b", "成果物の系譜を追跡する"),
+    (r"\bRun discovery-to-build workflow\b", "調査から実装準備までを進める"),
+    (r"\bRecover degraded research lane\b", "劣化した調査レーンを復旧する"),
+    (r"\bReview planning\b", "企画内容を確認する"),
+    (r"\bStart research\b", "調査を開始する"),
+    (r"\bSelect a design\b", "デザイン案を選ぶ"),
+    (r"\bRun development\b", "開発準備へ進める"),
+    (r"\bOpen primary workspace\b", "主要ワークスペースを開く"),
+    (r"\bOpen the approval gate\b", "承認ゲートを開く"),
+    (r"\bReview missing evidence and blockers\b", "不足根拠とブロッカーを確認する"),
+    (r"\bChoose a recovery strategy\b", "復旧方針を選ぶ"),
+    (r"\bRe-run only the affected lane\b", "影響したレーンだけ再実行する"),
+    (r"\bIdea to approval\b", "構想から承認まで"),
+    (r"\bLane recovery\b", "レーン復旧"),
+    (r"\bBuild artifacts and phase history are recorded\b", "成果物とフェーズ履歴が記録される"),
+    (r"\bThe recovery reason and delta are recorded\b", "復旧理由と差分が記録される"),
+    (r"\bSelected design was generated from an older decision context\b", "選択中の案は古い判断文脈で生成されています"),
+    (r"\bReview queue\b", "レビューキュー"),
+    (r"\bDecision checklist\b", "判断チェックリスト"),
+    (r"\bGovernance context\b", "統治コンテキスト"),
+    (r"\bRun monitor\b", "ラン監視"),
+    (r"\bCheckpoint lane\b", "復旧レーン"),
+    (r"\bOperator notes\b", "運用メモ"),
+    (r"\bDecision snapshot\b", "判断サマリー"),
+    (r"\bWorkflow lane\b", "進行レーン"),
+    (r"\bOperator context\b", "運用コンテキスト"),
+    (r"\bEvidence-to-build loop\b", "根拠から実装への連鎖"),
+    (r"\bGoverned delivery\b", "統制されたデリバリー"),
+    (r"\bOperator-ready release\b", "オペレーターが扱えるリリース"),
+    (r"\bTrace View\b", "追跡ビュー"),
+    (r"\bTrace\b", "追跡"),
+    (r"\bcommand-center\b", "コマンドセンター"),
+    (r"\bdecision-studio\b", "判断スタジオ"),
+    (r"\bcontrol-center\b", "コントロールセンター"),
+    (r"\bsplit-review\b", "比較レビュー"),
+    (r"\bsidebar\b", "サイドバー"),
+    (r"\btop-nav\b", "トップナビ"),
+    (r"\bhigh\b", "高"),
+    (r"\bmedium\b", "中"),
+    (r"\bbalanced\b", "標準"),
+    (r"\btwo-column: 60% evidence brief \| 40% decision panel; single column on mobile\b", "2カラム: 根拠ブリーフ / 判断パネル。モバイルでは1カラム"),
+    (r"\bsingle centered column \(max-width 800px\) with vertical timeline spine; full-width on mobile\b", "中央1カラム: 縦タイムライン軸。モバイルでは全幅"),
+    (r"\bEvidence\s+Review\b", "根拠レビュー"),
+    (r"\bEvidence\b", "根拠"),
+    (r"\bPrimary Shell\b", "主要シェル"),
+    (r"\bqueue\b", "キュー"),
+    (r"\bchecklist\b", "チェックリスト"),
+    (r"\bpacket\b", "パケット"),
+    (r"\bsummary\b", "サマリー"),
+    (r"\btimeline\b", "タイムライン"),
+    (r"\bpanel\b", "パネル"),
+    (r"\bgraph\b", "グラフ"),
+    (r"\bform\b", "フォーム"),
+    (r"\bstructure\b", "構成"),
+    (r"\bPolicy update\b", "ポリシー更新"),
+    (r"\bThe decision history is recorded\b", "判断履歴が記録される"),
+    (r"\bThe evidence chain is explainable\b", "根拠のつながりを説明できる"),
+    (r"\bthree-column: 240px rail \| flex center \| 320px context panel\b", "3カラム: 左レール / 主作業面 / 右コンテキスト"),
+    (r"\btwo-panel: 55% run log \| 45% evidence accumulator, stacked on mobile\b", "2パネル: 実行ログ / 根拠蓄積面。モバイルでは縦積み"),
+    (r"\bhigh-fidelity application shell with task flows\b", "主要フローを含む高精度プロダクトワークスペース"),
+    (r"\bhigh-fidelity application shell with five primary screens and one degraded-state recovery flow\b", "主要5画面と復旧フローを含む高精度プロダクトワークスペース"),
+    (r"\bartifact lineage\b", "成果物系譜"),
+    (r"\bdevelopment\b", "開発"),
+    (r"\bprimary\b", "主要"),
+    (r"\bsecondary\b", "補助"),
+    (r"\butility\b", "ユーティリティ"),
+    (r"\bvisible copy\b", "画面文言"),
+    (r"\bproduct workspace\b", "プロダクトワークスペース"),
+    (r"\bartifact contract\b", "成果物契約"),
+    (r"\btechnical choices\b", "技術判断"),
+    (r"\bhandoff\b", "引き継ぎ"),
+    (r"\bProduct Platform Lead\b", "プロダクト基盤責任者"),
+    (r"\bEvidence-to-build loop\b", "根拠から実装への連鎖"),
+    (r"\bGoverned delivery\b", "統制されたデリバリー"),
+    (r"\bOperator-ready release\b", "運用可能なリリース"),
+    (r"\bplanning synthesis\b", "企画シンセシス"),
+    (r"\bworkspace\b", "ワークスペース"),
+    (r"\bvisible UI\b", "画面上"),
+)
+
+
+_DESIGN_TEMPLATE_PREVIEW_VERSION = 9
+
+_PREVIEW_INTERNAL_COPY_PATTERN = re.compile(
+    r"(?:"
+    r"(?:\b\d{2,4}px\b)|"
+    r"(?:#[0-9a-f]{3,8})|"
+    r"(?:grid-template-columns)|"
+    r"(?:12-column)|"
+    r"(?:phase-anchored)|"
+    r"(?:icon nav)|"
+    r"(?:context drawer)|"
+    r"(?:main canvas)|"
+    r"(?:slide-in)|"
+    r"(?:diff highlighting)|"
+    r"(?:mandatory rationale textarea)|"
+    r"(?:character count)|"
+    r"(?:cta[s]?)|"
+    r"(?:svg)|"
+    r"(?:dag)|"
+    r"(?:virtuali[sz]ed)|"
+    r"(?:crossfade)|"
+    r"(?:barlow)|"
+    r"(?:jetbrains)|"
+    r"(?:color system)|"
+    r"(?:typography)|"
+    r"(?:aria-live)|"
+    r"(?:operator shell)|"
+    r"(?:product workspace)|"
+    r"(?:artifact contract)|"
+    r"(?:technical choices)|"
+    r"(?:visible copy)|"
+    r"(?:approval action surface)|"
+    r"(?:phase nodes)|"
+    r"(?:flush-right)|"
+    r"(?:full-bleed)"
+    r")",
+    re.IGNORECASE,
+)
+
+_OPERATIONS_SCREEN_BLUEPRINTS: tuple[dict[str, Any], ...] = (
+    {
+        "ids": ("workspace", "research", "overview"),
+        "keywords": ("workspace", "research", "phase workspace", "調査", "ワークスペース"),
+        "title": "調査ワークスペース",
+        "headline": "調査から実装準備までを一気通貫で進める",
+        "purpose": "調査・企画・承認候補を同じ作業面で照合し、次に進むべき判断をすぐ決める。",
+        "supporting_text": "構想から承認まで",
+        "actions": ["調査ワークスペースを開く", "ライフサイクルワークスペースを確認する"],
+        "modules": [
+            {"name": "判断サマリー", "type": "summary", "items": ["次の一手", "保留理由", "承認候補"]},
+            {"name": "進行レーン", "type": "timeline", "items": ["調査", "企画", "デザイン", "承認"]},
+            {"name": "運用コンテキスト", "type": "summary", "items": ["判断責任者", "根拠の更新状況", "リリース準備"]},
+        ],
+        "success_state": "調査の根拠と次の一手が同じ画面でそろう",
+    },
+    {
+        "ids": ("runs", "planning", "queue"),
+        "keywords": ("runs", "planning synthesis", "run ledger", "計画", "ラン", "実行"),
+        "title": "計画合成",
+        "headline": "止まったレーンの原因を見極めて復旧する",
+        "purpose": "停止したレーンの原因、影響範囲、復旧手順を並べ、必要な介入だけで再実行できるようにする。",
+        "supporting_text": "実装準備からリリースまで",
+        "actions": ["計画合成を開く", "復旧手順を確認する"],
+        "modules": [
+            {"name": "停止要因", "type": "summary", "items": ["失敗した条件", "影響したレーン", "優先度"]},
+            {"name": "復旧レーン", "type": "timeline", "items": ["原因を確認する", "介入を選ぶ", "再実行する"]},
+            {"name": "判断メモ", "type": "summary", "items": ["再試行余力", "残る懸念", "次の確認項目"]},
+        ],
+        "success_state": "復旧に必要な介入だけを迷わず選べる",
+    },
+    {
+        "ids": ("approvals", "approval", "review"),
+        "keywords": ("approval", "review", "承認", "判断レビュー"),
+        "title": "承認ゲート",
+        "headline": "承認するか差し戻すかを根拠付きで決める",
+        "purpose": "承認理由、差し戻し条件、直近の変更点を同時に見比べ、決裁をその場で完了する。",
+        "supporting_text": "構想から承認まで",
+        "actions": ["承認ゲートを開く", "判断理由を記録する"],
+        "modules": [
+            {"name": "承認パケット", "type": "summary", "items": ["採用理由", "主要リスク", "次の一手"]},
+            {"name": "判断チェックリスト", "type": "checklist", "items": ["根拠を確認する", "差し戻し条件を見る", "決裁する"]},
+            {"name": "統治コンテキスト", "type": "summary", "items": ["監査証跡", "判断責任者", "リリース条件"]},
+        ],
+        "success_state": "承認判断と差し戻し条件を同じ面で確定できる",
+    },
+    {
+        "ids": ("artifacts", "lineage", "history"),
+        "keywords": ("artifact", "lineage", "history", "成果物", "系譜"),
+        "title": "成果物系譜",
+        "headline": "根拠から成果物までのつながりを追跡する",
+        "purpose": "どの判断がどの成果物に反映されたかを遡り、差し戻しや再検証の影響をすぐ把握する。",
+        "supporting_text": "構想から承認まで",
+        "actions": ["成果物系譜を開く", "関連する判断を確認する"],
+        "modules": [
+            {"name": "根拠ソース", "type": "summary", "items": ["調査メモ", "企画判断", "承認履歴"]},
+            {"name": "追跡経路", "type": "timeline", "items": ["調査", "企画", "デザイン", "承認"]},
+            {"name": "参照レール", "type": "summary", "items": ["作成者", "更新時刻", "関連成果物"]},
+        ],
+        "success_state": "成果物の来歴と影響範囲をその場で説明できる",
+    },
+)
+
+_OPERATIONS_SCREEN_BLUEPRINTS_IVORY: tuple[dict[str, Any], ...] = (
+    {
+        "ids": ("workspace", "research", "overview"),
+        "keywords": ("workspace", "research", "phase workspace", "調査", "ワークスペース"),
+        "title": "フェーズワークスペース",
+        "headline": "判断の前提を静かに束ね、次の決裁へ進める",
+        "purpose": "調査、企画、承認候補を落ち着いた余白で比較し、判断理由を保ったまま次の一手へ進む。",
+        "supporting_text": "判断前提と差分を同じ視界で保つ",
+        "actions": ["フェーズワークスペースを開く", "判断の前提を確認する"],
+        "modules": [
+            {"name": "判断カード", "type": "summary", "items": ["次に決めること", "保留理由", "承認候補"]},
+            {"name": "進行の温度", "type": "timeline", "items": ["調査", "企画", "デザイン", "承認"]},
+            {"name": "合意コンテキスト", "type": "summary", "items": ["判断責任者", "更新差分", "公開準備"]},
+        ],
+        "success_state": "判断前提と次の一手が穏やかな密度で揃う",
+    },
+    {
+        "ids": ("runs", "planning", "queue"),
+        "keywords": ("runs", "planning synthesis", "run ledger", "計画", "ラン", "実行"),
+        "title": "ラン台帳",
+        "headline": "止まった流れの差分を並べ、復旧方針を整流する",
+        "purpose": "停止理由、影響範囲、復旧案を文脈ごと比較し、必要な介入だけを選べるようにする。",
+        "supporting_text": "復旧方針を比較しながら選ぶ",
+        "actions": ["ラン台帳を開く", "復旧方針を比較する"],
+        "modules": [
+            {"name": "停止差分", "type": "summary", "items": ["止まった条件", "影響レーン", "判断優先度"]},
+            {"name": "復旧プラン", "type": "timeline", "items": ["原因を読む", "介入を選ぶ", "再実行する"]},
+            {"name": "レビュー余白", "type": "summary", "items": ["再試行余力", "残る懸念", "次の確認点"]},
+        ],
+        "success_state": "復旧方針の比較と介入選択を落ち着いて完了できる",
+    },
+    {
+        "ids": ("approvals", "approval", "review"),
+        "keywords": ("approval", "review", "承認", "判断レビュー"),
+        "title": "判断レビュー",
+        "headline": "根拠を読み比べながら、承認条件を静かに固める",
+        "purpose": "承認理由、差し戻し条件、直近の変更点を整った順序で見比べ、合意形成をその場で完了する。",
+        "supporting_text": "根拠から決裁までを一連で確認する",
+        "actions": ["判断レビューを開く", "判断理由を記録する"],
+        "modules": [
+            {"name": "承認サマリー", "type": "summary", "items": ["採用理由", "主要リスク", "次の判断"]},
+            {"name": "比較チェック", "type": "checklist", "items": ["根拠を照合する", "差し戻し条件を見る", "決裁する"]},
+            {"name": "統治ノート", "type": "summary", "items": ["監査証跡", "判断責任者", "公開条件"]},
+        ],
+        "success_state": "承認判断と差し戻し条件を穏やかな読解リズムで確定できる",
+    },
+    {
+        "ids": ("artifacts", "lineage", "history"),
+        "keywords": ("artifact", "lineage", "history", "成果物", "系譜"),
+        "title": "系譜タイムライン",
+        "headline": "判断から成果物までの反映順を時系列で追う",
+        "purpose": "どの判断がどの成果物に反映されたかを時系列でたどり、差し戻しや再検証の影響をすぐ把握する。",
+        "supporting_text": "変更の前後関係を同じ線で読む",
+        "actions": ["系譜タイムラインを開く", "関連する判断を確認する"],
+        "modules": [
+            {"name": "根拠の出所", "type": "summary", "items": ["調査メモ", "企画判断", "承認履歴"]},
+            {"name": "反映ライン", "type": "timeline", "items": ["調査", "企画", "デザイン", "承認"]},
+            {"name": "参照ノート", "type": "summary", "items": ["作成者", "更新時刻", "関連成果物"]},
+        ],
+        "success_state": "判断の来歴と影響範囲を一本のタイムラインで説明できる",
+    },
+)
+
+
+def _design_preview_text(value: Any) -> str:
+    text = _normalize_override_text(value)
+    if not text:
+        return ""
+    for pattern, replacement in _DESIGN_PREVIEW_REPLACEMENTS:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    return (
+        text
+        .replace("画面上 に", "画面上に")
+        .replace(" 根拠 が", " 根拠が")
+        .replace("成果物リネージ", "成果物系譜")
+        .replace("追跡 成果物の系譜", "成果物の系譜を追跡する")
+        .replace("追跡 成果物系譜", "成果物の系譜を追跡する")
+        .replace(" preview ", " プレビュー ")
+        .replace(" handoff ", " 引き継ぎ ")
+        .replace(" operator ", " 運用者 ")
+        .replace("product workspace", "プロダクトワークスペース")
+    )
+
+
+def _contains_japanese_preview_text(text: str) -> bool:
+    return any((("\u3040" <= ch <= "\u30ff") or ("\u4e00" <= ch <= "\u9fff")) for ch in text)
+
+
+def _looks_english_heavy_preview_text(text: str) -> bool:
+    ascii_letters = sum(1 for ch in text if ch.isascii() and ch.isalpha())
+    japanese_letters = sum(1 for ch in text if ("\u3040" <= ch <= "\u30ff") or ("\u4e00" <= ch <= "\u9fff"))
+    return ascii_letters >= 24 and ascii_letters > japanese_letters * 2
+
+
+def _preview_copy_needs_rewrite(
+    value: Any,
+    *,
+    max_length: int = 180,
+) -> bool:
+    text = _design_preview_text(value)
+    if not text:
+        return True
+    lowered = text.lower()
+    if _looks_like_placeholder_preview_copy(text):
+        return True
+    if _looks_english_heavy_preview_text(text):
+        return True
+    if len(text) > max_length:
+        return True
+    if _PREVIEW_INTERNAL_COPY_PATTERN.search(text):
+        return True
+    if text.count(":") >= 3 or text.count("→") >= 2:
+        return True
+    if any(marker in lowered for marker in ("left rail", "right tray", "main canvas", "full-bleed", "operator shell", "phase-anchored")):
+        return True
+    if any(marker in lowered for marker in ("degraded", "trace ", " lane", "evidence review", "artifact lineage", "run ledger")):
+        return True
+    return False
+
+
+def _preview_copy_or_fallback(
+    value: Any,
+    *,
+    fallback: str = "",
+    max_length: int = 180,
+) -> str:
+    text = _design_preview_text(value)
+    if not text:
+        return fallback
+    if fallback and _preview_copy_needs_rewrite(text, max_length=max_length):
+        return fallback[:max_length]
+    lowered = text.lower()
+    if fallback and lowered.startswith(("the ", "and ", "with ", "without ")):
+        return fallback
+    if fallback and any(marker in lowered for marker in (" and ", " the ", " with ", " without ", "built on ", "operator shell")):
+        return fallback
+    if _looks_english_heavy_preview_text(text):
+        return fallback or text[:max_length]
+    if len(text) > max_length and fallback:
+        return fallback
+    return text[:max_length]
+
+
+def _operations_screen_blueprint(*, screen_id: str, label: str, variant_style: str = "") -> dict[str, Any] | None:
+    normalized_id = _normalize_override_text(screen_id).lower()
+    normalized_label = _normalize_override_text(label).lower()
+    blueprints = (
+        _OPERATIONS_SCREEN_BLUEPRINTS_IVORY
+        if str(variant_style or "").strip().lower() == "ivory-signal"
+        else _OPERATIONS_SCREEN_BLUEPRINTS
+    )
+    for blueprint in blueprints:
+        ids = {str(item).lower() for item in blueprint.get("ids", ())}
+        keywords = tuple(str(item).lower() for item in blueprint.get("keywords", ()))
+        if normalized_id and normalized_id in ids:
+            return blueprint
+        if normalized_label and any(keyword in normalized_label for keyword in keywords):
+            return blueprint
+    return None
+
+
+def _preferred_operations_screen_label(*, screen_id: str, label: str, variant_style: str = "") -> str:
+    blueprint = _operations_screen_blueprint(screen_id=screen_id, label=label, variant_style=variant_style)
+    if blueprint:
+        return str(blueprint.get("title") or _design_preview_text(label) or "主要画面")
+    return _design_preview_text(label)
+
+
+def _preview_subtitle_fallback(
+    *,
+    screens: list[dict[str, Any]],
+    flows: list[dict[str, Any]],
+    features: list[str],
+    variant_style: str = "",
+) -> str:
+    screen_ids = {str(_as_dict(item).get("id") or "").strip().lower() for item in screens}
+    if screen_ids & {"workspace", "runs", "approvals", "artifacts", "lineage"}:
+        if variant_style == "ivory-signal":
+            return "根拠、差分、承認条件を静かな余白で比較し、合意形成の流れを切らさない設計。"
+        return "調査、復旧、承認、成果物系譜を同じ制御面で往復し、判断文脈を切らさない設計。"
+    flow_names = [
+        _design_preview_text(item.get("name") or "")
+        for item in flows[:2]
+        if str(item.get("name") or "").strip()
+    ]
+    feature_names = [
+        _design_preview_text(item)
+        for item in features[:3]
+        if str(item).strip()
+    ]
+    focus = " / ".join(flow_names[:2]) or "承認・差し戻し・系譜確認"
+    support = " / ".join(feature_names[:2]) or "主要判断"
+    return (
+        f"{max(len(screens), 1)}画面を切り替えながら {focus} を同じワークスペースで扱い、"
+        f"{support} の判断文脈を失わない設計。"
+    )[:180]
+
+
+def _preview_screen_purpose(screen: dict[str, Any]) -> str:
+    screen_id = str(screen.get("id") or "").strip().lower()
+    title = _design_preview_text(screen.get("title") or "主要画面")
+    variant_style = str(screen.get("variant_style") or "").strip().lower()
+    blueprint = _operations_screen_blueprint(screen_id=screen_id, label=title, variant_style=variant_style) or _screen_blueprint_for_label(title)
+    fallback_by_id = {
+        "workspace": "各フェーズの主要作業面",
+        "run": "各フェーズの主要作業面",
+        "overview": "各フェーズの主要作業面",
+        "research": "ランとチェックポイントを確認する",
+        "queue": "ランとチェックポイントを確認する",
+        "approval": "保留中の承認と差し戻し履歴を確認する",
+        "review": "保留中の承認と差し戻し履歴を確認する",
+        "lineage": "フェーズ成果物と系譜を確認する",
+        "artifacts": "フェーズ成果物と系譜を確認する",
+        "settings": "ポリシーと通知条件を調整する",
+    }
+    fallback = str(_as_dict(blueprint).get("purpose") or fallback_by_id.get(screen_id) or f"{title}で必要な判断を1画面で完了する")
+    return _preview_copy_or_fallback(screen.get("purpose"), fallback=fallback, max_length=72)
+
+
+def _preview_primary_action(action: Any, *, screen: dict[str, Any]) -> str:
+    screen_id = str(screen.get("id") or "").strip().lower()
+    title = _design_preview_text(screen.get("title") or "主要画面")
+    variant_style = str(screen.get("variant_style") or "").strip().lower()
+    blueprint = _operations_screen_blueprint(screen_id=screen_id, label=title, variant_style=variant_style) or _screen_blueprint_for_label(title)
+    fallback_by_id = {
+        "workspace": "実行台を開く",
+        "run": "実行台を開く",
+        "overview": "実行台を開く",
+        "research": "劣化レーンを開く",
+        "queue": "劣化レーンを開く",
+        "approval": "承認ゲートを開く",
+        "review": "承認ゲートを開く",
+        "lineage": "成果物を開く",
+        "artifacts": "成果物を開く",
+        "settings": "設定を開く",
+    }
+    blueprint_actions = [str(item) for item in _as_list(_as_dict(blueprint).get("actions")) if str(item).strip()]
+    fallback = blueprint_actions[0] if blueprint_actions else fallback_by_id.get(screen_id, f"{title}を開く")
+    candidate = _preview_copy_or_fallback(action, fallback=fallback, max_length=48)
+    if not candidate:
+        return fallback
+    if not re.search(r"(する|開く|確認|記録|選ぶ|進める|保存|更新|追加|作成|再実行|比較|戻る|承認|差し戻し|登録|送る)", candidate):
+        return fallback
+    return candidate
+
+
+def _default_operations_interaction_principles() -> list[str]:
+    return [
+        "次の一手は主要作業面の近くに置き、判断と操作を行き来しやすくする。",
+        "差し戻しや復旧の理由は、別画面に逃がさずその場で説明できるようにする。",
+        "根拠、承認、成果物系譜を同じ流れで追え、担当者が迷わない状態を保つ。",
+        "モバイルでは要約を先に見せ、詳細と操作は段階的に開けるようにする。",
+    ]
+
+
+def _interaction_principles_need_product_copy(values: list[str]) -> bool:
+    if not values:
+        return True
+    generic_count = 0
+    for item in values:
+        text = _normalize_override_text(item)
+        if (
+            _preview_copy_needs_rewrite(text, max_length=96)
+            or re.search(r"\d+ms|px\b|grid|drawer|overlay|clickable|crossfade|トレイ|ドロワー|クリッカブル|クロスフェード", text, re.IGNORECASE)
+        ):
+            generic_count += 1
+    return generic_count >= max(1, math.ceil(len(values) / 2))
+
+
+_GENERIC_PREVIEW_MARKERS = (
+    "guided onboarding",
+    "primary workflow",
+    "status visibility",
+    "history and recovery",
+    "complete guided onboarding",
+    "complete the primary workflow",
+    "complete the 主要 workflow",
+    "review status and next action",
+    "recover previous work context",
+    "first-run success",
+    "in-product orientation",
+    "configuration",
+    "primary tasks",
+    "task flow",
+    "support context",
+    "primary user",
+)
+
+
+_CONSUMER_SCREEN_BLUEPRINTS: tuple[dict[str, Any], ...] = (
+    {
+        "keywords": ("献立", "メニュー", "meal", "menu"),
+        "headline": "3日分の献立を素早く決める",
+        "purpose": "家族の好み、在庫、調理時間を踏まえて、今日から数日分の候補を迷わず確定する。",
+        "supporting_text": "候補の比較、差し替え、買い物準備までをひとつの面で完了させる。",
+        "actions": ["献立を生成する", "候補を差し替える", "買い物リストへ送る"],
+        "modules": [
+            {"name": "今日の候補", "type": "summary", "items": ["3日分のおすすめ", "時間と予算のバランス", "アレルギー配慮"]},
+            {"name": "判断フロー", "type": "timeline", "items": ["候補を比較する", "夕食を確定する", "必要食材を確認する"]},
+            {"name": "確認ポイント", "type": "summary", "items": ["家族の好み", "在庫の使い切り", "調理負荷"]},
+        ],
+        "success_state": "3日分の献立が迷わず決まる",
+    },
+    {
+        "keywords": ("在庫", "冷蔵庫", "inventory", "stock"),
+        "headline": "冷蔵庫の在庫をすばやく登録する",
+        "purpose": "写真、音声、手入力を使い分けながら、食材の状態を最短で更新する。",
+        "supporting_text": "入力の負担を抑えつつ、賞味期限と不足食材を次の提案に反映する。",
+        "actions": ["写真で登録する", "手入力で補正する", "在庫を保存する"],
+        "modules": [
+            {"name": "登録対象", "type": "summary", "items": ["冷蔵庫の食材", "冷凍ストック", "賞味期限が近い食材"]},
+            {"name": "入力モード", "type": "timeline", "items": ["写真で読み取る", "音声で追加する", "手入力で修正する"]},
+            {"name": "精度チェック", "type": "summary", "items": ["認識漏れを確認", "数量を調整", "献立提案へ反映"]},
+        ],
+        "success_state": "在庫の状態が次の献立提案に反映される",
+    },
+    {
+        "keywords": ("買い物", "shopping", "list"),
+        "headline": "不足食材だけを買い物リストにまとめる",
+        "purpose": "献立に必要な食材だけを抽出し、店内で迷わない順番で並べる。",
+        "supporting_text": "在庫との差分、カテゴリ、チェック状況を一つの視点で確認できるようにする。",
+        "actions": ["不足分を確認する", "カテゴリ順に並べる", "購入済みにする"],
+        "modules": [
+            {"name": "不足食材", "type": "summary", "items": ["今日の不足分", "まとめ買い候補", "特売活用"]},
+            {"name": "買い回り順", "type": "timeline", "items": ["野菜", "肉・魚", "日配", "乾物"]},
+            {"name": "再利用候補", "type": "summary", "items": ["在庫から代替する", "残り物を使う", "次回へ繰り越す"]},
+        ],
+        "success_state": "必要な食材だけを漏れなく買える",
+    },
+    {
+        "keywords": ("家族", "プロフィール", "profile", "preference"),
+        "headline": "家族の好みと制約を登録する",
+        "purpose": "好き嫌い、アレルギー、量、辛さなどの条件を更新して提案精度を上げる。",
+        "supporting_text": "家族ごとの差分を保ったまま、次回の献立提案にすぐ反映できるようにする。",
+        "actions": ["家族を追加する", "制約を更新する", "提案条件を保存する"],
+        "modules": [
+            {"name": "家族プロフィール", "type": "summary", "items": ["好き嫌い", "アレルギー", "量の好み"]},
+            {"name": "制約更新", "type": "timeline", "items": ["家族を選ぶ", "条件を編集する", "保存して反映する"]},
+            {"name": "提案ルール", "type": "summary", "items": ["幼児向け可否", "辛さ", "栄養バランス"]},
+        ],
+        "success_state": "家族ごとの条件が提案に正しく反映される",
+    },
+    {
+        "keywords": ("履歴", "history", "recovery"),
+        "headline": "前回の献立と反応を振り返る",
+        "purpose": "過去の献立、家族の反応、差し替え履歴を見返して次回の判断に活かす。",
+        "supporting_text": "よく使う献立や好評だった組み合わせをすぐ再利用できるようにする。",
+        "actions": ["前回の献立を見る", "反応を確認する", "再利用する"],
+        "modules": [
+            {"name": "最近の献立", "type": "summary", "items": ["先週の人気メニュー", "差し替え履歴", "作成メモ"]},
+            {"name": "振り返り", "type": "timeline", "items": ["献立を開く", "家族評価を見る", "次回へ反映する"]},
+            {"name": "再利用候補", "type": "summary", "items": ["時短献立", "食材使い切り", "よく作る組み合わせ"]},
+        ],
+        "success_state": "前回の文脈を引き継いで次の献立に進める",
+    },
+    {
+        "keywords": ("設定", "notification", "settings", "preference"),
+        "headline": "通知と基本設定を整える",
+        "purpose": "献立の提案タイミングやリマインド、家族共有の基本ルールを調整する。",
+        "supporting_text": "次の利用時に迷わないよう、通知と既定値を先に整えておく。",
+        "actions": ["通知を切り替える", "基本設定を更新する", "変更を保存する"],
+        "modules": [
+            {"name": "通知設定", "type": "summary", "items": ["夕方の提案通知", "買い物前リマインド", "家族共有通知"]},
+            {"name": "変更フロー", "type": "timeline", "items": ["設定を選ぶ", "値を更新する", "保存して反映する"]},
+            {"name": "既定ルール", "type": "summary", "items": ["調理時間", "予算", "通知頻度"]},
+        ],
+        "success_state": "次回から同じ設定で迷わず使い始められる",
+    },
+    {
+        "keywords": ("状態", "status", "progress"),
+        "headline": "今の準備状況と次の一手を確認する",
+        "purpose": "献立決定、買い物準備、在庫更新のどこまで進んだかをひと目で把握する。",
+        "supporting_text": "止まっている箇所を見つけて、次に取るべき操作へすぐ戻れるようにする。",
+        "actions": ["進行状況を見る", "次の操作へ進む", "未完了を確認する"],
+        "modules": [
+            {"name": "進行状況", "type": "summary", "items": ["献立決定", "買い物準備", "在庫更新"]},
+            {"name": "次の一手", "type": "timeline", "items": ["未完了を確認する", "必要な操作を選ぶ", "続きから再開する"]},
+            {"name": "気になる項目", "type": "summary", "items": ["不足食材", "家族制約", "賞味期限"]},
+        ],
+        "success_state": "今どこまで進んだかと次の操作がすぐ分かる",
+    },
+)
+
+
+def _first_preview_text(value: Any) -> str:
+    if isinstance(value, dict):
+        for key in ("title", "name", "label", "description", "text", "value"):
+            candidate = _first_preview_text(value.get(key))
+            if candidate:
+                return candidate
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            candidate = _first_preview_text(item)
+            if candidate:
+                return candidate
+        return ""
+    return _normalize_override_text(value).strip("'\"")
+
+
+def _looks_like_placeholder_preview_copy(value: Any) -> bool:
+    text = _normalize_override_text(value).lower()
+    if not text:
+        return False
+    return any(marker in text for marker in _GENERIC_PREVIEW_MARKERS)
+
+
+def _looks_like_component_token(value: Any) -> bool:
+    text = _normalize_override_text(value)
+    if not text:
+        return False
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{4,}", text))
+
+
+def _normalize_preview_action(value: Any, *, fallback_label: str) -> str:
+    text = _normalize_override_text(value)
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered.startswith("open "):
+        target = text[5:].strip() or fallback_label
+        return f"{target}を開く"
+    return _design_preview_text(text)
+
+
+def _screen_blueprint_for_label(label: str) -> dict[str, Any] | None:
+    lowered = _normalize_override_text(label).lower()
+    if not lowered:
+        return None
+    for blueprint in _CONSUMER_SCREEN_BLUEPRINTS:
+        if any(keyword.lower() in lowered for keyword in blueprint["keywords"]):
+            return blueprint
+    return None
+
+
+def _screen_modules_need_product_copy(modules: list[dict[str, Any]]) -> bool:
+    if not modules:
+        return True
+    generic_count = 0
+    for module in modules:
+        payload = _as_dict(module)
+        texts = [
+            payload.get("name"),
+            payload.get("type"),
+            *_as_list(payload.get("items"))[:3],
+        ]
+        if any(
+            _looks_like_placeholder_preview_copy(item)
+            or _preview_copy_needs_rewrite(item, max_length=96)
+            or _looks_like_component_token(item)
+            for item in texts
+        ):
+            generic_count += 1
+    return generic_count >= max(1, math.ceil(len(modules) / 2))
+
+
+def _actions_need_product_copy(actions: list[str], *, label: str) -> bool:
+    if not actions:
+        return True
+    label_open = f"{_design_preview_text(label) or label}を開く"
+    generic_actions = {
+        "ホーム",
+        "ホームを開く",
+        "主要導線",
+        "主要タスクを開始する",
+        "結果",
+        "結果を確認する",
+        "設定",
+        "設定を開く",
+        "履歴",
+        "履歴を開く",
+        "状態",
+        "次アクション",
+        "前回の続きから再開する",
+        "状態と次の操作を確認する",
+    }
+    for action in actions:
+        if not action:
+            continue
+        if action == label_open:
+            continue
+        if action in generic_actions:
+            continue
+        if _looks_like_placeholder_preview_copy(action):
+            continue
+        if _preview_copy_needs_rewrite(action, max_length=48):
+            continue
+        return False
+    return True
+
+
+def _default_generic_headline(label: str) -> str:
+    normalized = _design_preview_text(label)
+    if not normalized:
+        return "主要タスクを進める"
+    return f"{normalized}で主要タスクを進める"
+
+
+def _default_generic_purpose(label: str, description: str) -> str:
+    normalized_label = _design_preview_text(label)
+    normalized_description = _design_preview_text(description)
+    if normalized_description:
+        return normalized_description
+    if normalized_label:
+        return f"{normalized_label}に必要な判断と操作をひとつの面で扱う。"
+    return "主要タスクに必要な判断と操作をひとつの面で扱う。"
+
+
+def _screen_copy_for_context(
+    *,
+    screen_id: str,
+    label: str,
+    variant_style: str,
+    description: str,
+    use_case: dict[str, Any],
+    key_path: dict[str, Any],
+    modules: list[dict[str, Any]],
+    fallback_actions: list[str],
+) -> dict[str, Any]:
+    blueprint = _operations_screen_blueprint(screen_id=screen_id, label=label, variant_style=variant_style) or _screen_blueprint_for_label(label)
+    use_case_payload = _as_dict(use_case)
+    key_path_payload = _as_dict(key_path)
+
+    headline = _first_preview_text(use_case_payload.get("title"))
+    if not headline or _looks_like_placeholder_preview_copy(headline) or _preview_copy_needs_rewrite(headline, max_length=80):
+        headline = str(blueprint.get("headline")) if blueprint else _default_generic_headline(label)
+
+    purpose = _first_preview_text(description or use_case_payload.get("goal") or use_case_payload.get("category"))
+    if not purpose or _looks_like_placeholder_preview_copy(purpose) or _preview_copy_needs_rewrite(purpose, max_length=120):
+        purpose = str(blueprint.get("purpose")) if blueprint else _default_generic_purpose(label, description)
+
+    supporting_text = _first_preview_text(key_path_payload.get("name") or use_case_payload.get("sub_category"))
+    if not supporting_text or _looks_like_placeholder_preview_copy(supporting_text) or _preview_copy_needs_rewrite(supporting_text, max_length=64):
+        supporting_text = str(blueprint.get("supporting_text")) if blueprint else (
+            f"{_design_preview_text(label) or 'この画面'}から次の操作へ迷わず進めるようにする。"
+        )
+
+    primary_actions = [
+        action
+        for action in (
+            _normalize_preview_action(item, fallback_label=label)
+            for item in fallback_actions
+        )
+        if action
+    ]
+    if blueprint and _actions_need_product_copy(primary_actions, label=label):
+        primary_actions = [str(item) for item in blueprint["actions"]]
+    if not primary_actions:
+        primary_actions = (
+            [str(item) for item in blueprint["actions"]]
+            if blueprint
+            else [f"{_design_preview_text(label) or '画面'}を開く"]
+        )
+
+    success_state = _first_preview_text(
+        use_case_payload.get("postconditions")
+        or key_path_payload.get("goal")
+    )
+    if not success_state or _looks_like_placeholder_preview_copy(success_state) or _preview_copy_needs_rewrite(success_state, max_length=72):
+        success_state = str(blueprint.get("success_state")) if blueprint else (
+            f"{_design_preview_text(label) or 'この画面'}で次の操作が迷わず決まる"
+        )
+
+    resolved_modules = modules
+    if blueprint and _screen_modules_need_product_copy(modules):
+        resolved_modules = [dict(item) for item in blueprint["modules"]]
+
+    return {
+        "headline": headline,
+        "purpose": purpose,
+        "supporting_text": supporting_text,
+        "primary_actions": primary_actions,
+        "modules": resolved_modules,
+        "success_state": success_state,
+    }
+
+
+def _flow_name_for_context(index: int, raw_name: Any, screens: list[dict[str, Any]]) -> str:
+    name = _first_preview_text(raw_name)
+    if name and not _looks_like_placeholder_preview_copy(name):
+        return name
+    screen = _as_dict(screens[min(index, len(screens) - 1)]) if screens else {}
+    screen_title = _design_preview_text(screen.get("title") or "")
+    if not screen_title:
+        return f"主要フロー {index + 1}"
+    if index == 0:
+        return f"{screen_title}の初回導線"
+    if index == 1:
+        return f"{screen_title}の主要操作"
+    return f"{screen_title}の更新フロー"
+
+
+def _parse_loose_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    text = _normalize_override_text(value)
+    if not text or text[0] not in "{[":
+        return {}
+    for parser in (json.loads, ast.literal_eval):
+        try:
+            payload = parser(text)
+        except (ValueError, SyntaxError, TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            return dict(payload)
+    return {}
+
+
+def _normalize_enum_value(value: Any, *, exact: dict[str, str], keywords: list[tuple[str, str]]) -> str:
+    text = _normalize_override_text(value)
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered in exact:
+        return exact[lowered]
+    for needle, normalized in keywords:
+        if needle in lowered:
+            return normalized
+    return ""
+
+
+def _normalize_prototype_kind(value: Any) -> str:
+    return _normalize_enum_value(
+        value,
+        exact={
+            "control-center": "control-center",
+            "decision-studio": "decision-studio",
+            "storefront": "storefront",
+            "guided-product": "guided-product",
+            "product-workspace": "product-workspace",
+        },
+        keywords=[
+            ("control", "control-center"),
+            ("operator", "control-center"),
+            ("approval", "control-center"),
+            ("decision", "decision-studio"),
+            ("studio", "decision-studio"),
+            ("gallery", "decision-studio"),
+            ("store", "storefront"),
+            ("catalog", "storefront"),
+            ("checkout", "storefront"),
+            ("lesson", "guided-product"),
+            ("learning", "guided-product"),
+            ("workspace", "product-workspace"),
+            ("shell", "product-workspace"),
+            ("application", "product-workspace"),
+        ],
+    )
+
+
+def _normalize_navigation_style(value: Any) -> str:
+    return _normalize_enum_value(
+        value,
+        exact={"sidebar": "sidebar", "top-nav": "top-nav"},
+        keywords=[
+            ("left rail", "sidebar"),
+            ("sidebar", "sidebar"),
+            ("side rail", "sidebar"),
+            ("persistent left", "sidebar"),
+            ("hub-and-spoke", "sidebar"),
+            ("drawer", "sidebar"),
+            ("top-nav", "top-nav"),
+            ("top nav", "top-nav"),
+            ("top bar", "top-nav"),
+            ("horizontal nav", "top-nav"),
+            ("horizontal", "top-nav"),
+            ("masthead", "top-nav"),
+        ],
+    )
+
+
+def _normalize_density(value: Any) -> str:
+    text = _normalize_override_text(value).lower()
+    if not text:
+        return ""
+    if "medium-high" in text or "high" in text or "dense" in text:
+        return "high"
+    if "medium" in text:
+        return "medium"
+    if "low" in text or "airy" in text or "spacious" in text:
+        return "low"
+    return ""
+
+
+def _normalize_visual_style(value: Any) -> str:
+    return _normalize_enum_value(
+        value,
+        exact={
+            "obsidian-atelier": "obsidian-atelier",
+            "ivory-signal": "ivory-signal",
+            "balanced-product": "balanced-product",
+        },
+        keywords=[
+            ("obsidian", "obsidian-atelier"),
+            ("control room", "obsidian-atelier"),
+            ("architectural dark", "obsidian-atelier"),
+            ("dark shell", "obsidian-atelier"),
+            ("ivory", "ivory-signal"),
+            ("luminous", "ivory-signal"),
+            ("gallery", "ivory-signal"),
+            ("editorial", "ivory-signal"),
+            ("balanced", "balanced-product"),
+            ("neutral", "balanced-product"),
+        ],
+    )
+
+
+def _normalize_font_choice(value: Any) -> str:
+    text = _normalize_override_text(value).strip("'\"")
+    if not text:
+        return ""
+    if len(text) > 48:
+        head = text.split(",", 1)[0].strip()
+        return head if 1 < len(head) <= 36 else ""
+    if any(marker in text.lower() for marker in ("layout", "component", "background", "#", "button")):
+        return ""
+    return text
+
+
+def _normalize_screen_label(value: Any) -> str:
+    mapping = _parse_loose_mapping(value)
+    if mapping:
+        value = (
+            mapping.get("label")
+            or mapping.get("title")
+            or mapping.get("name")
+            or mapping.get("screen")
+            or mapping.get("id")
+            or ""
+        )
+    text = _normalize_override_text(value).strip("'\"")
+    if not text or any(marker in text for marker in ("'description':", '"description":', "'components':", '"components":')):
+        return ""
+    if len(text) > 64:
+        for separator in (" — ", ": ", " | ", ". "):
+            head = text.split(separator, 1)[0].strip()
+            if 3 <= len(head) <= 48:
+                return head
+        return text[:56].rstrip(" -:")
+    return text
+
+
+def _normalize_interaction_principle(value: Any) -> str:
+    text = _normalize_override_text(value)
+    if not text or len(text) > 180:
+        return ""
+    if any(marker in text for marker in ("'components':", '"components":', "'layout':", '"layout":')):
+        return ""
+    return text
+
+
 def _prototype_overrides_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {
-        "prototype_kind": str(payload.get("prototype_kind") or payload.get("prototypeKind") or "").strip(),
-        "navigation_style": str(payload.get("navigation_style") or payload.get("navigationStyle") or "").strip(),
-        "density": str(payload.get("density") or "").strip(),
+        "prototype_kind": _normalize_prototype_kind(payload.get("prototype_kind") or payload.get("prototypeKind")),
+        "navigation_style": _normalize_navigation_style(payload.get("navigation_style") or payload.get("navigationStyle")),
+        "density": _normalize_density(payload.get("density")),
+        "visual_style": _normalize_visual_style(payload.get("visual_style") or payload.get("visualStyle")),
+        "display_font": _normalize_font_choice(payload.get("display_font") or payload.get("displayFont")),
+        "body_font": _normalize_font_choice(payload.get("body_font") or payload.get("bodyFont")),
         "screen_labels": [
-            str(item).strip()
+            label
             for item in _as_list(payload.get("screen_labels") or payload.get("screenLabels"))
-            if str(item).strip()
+            if (label := _normalize_screen_label(item))
         ],
         "interaction_principles": [
-            str(item).strip()
+            principle
             for item in _as_list(payload.get("interaction_principles") or payload.get("interactionPrinciples"))
-            if str(item).strip()
+            if (principle := _normalize_interaction_principle(item))
         ],
     }
 
 
-def _default_site_map_for_kind(kind: str) -> list[dict[str, str]]:
+def _merge_prototype_overrides(
+    base: dict[str, Any] | None,
+    incoming: dict[str, Any] | None,
+) -> dict[str, Any]:
+    merged = dict(base or {})
+    for key, value in _as_dict(incoming).items():
+        if isinstance(value, list):
+            if value:
+                merged[key] = value
+            continue
+        if isinstance(value, str):
+            if value.strip():
+                merged[key] = value.strip()
+            continue
+        if value not in (None, "", {}):
+            merged[key] = value
+    return merged
+
+
+def _default_site_map_for_context(kind: str, variant_style: str = "") -> list[dict[str, str]]:
     if kind == "learning":
         return [
             {"id": "home", "label": "ホーム", "priority": "primary"},
@@ -1610,11 +3029,18 @@ def _default_site_map_for_kind(kind: str) -> list[dict[str, str]]:
             {"id": "ops", "label": "運営管理", "priority": "secondary"},
         ]
     if kind == "operations":
+        if variant_style == "ivory-signal":
+            return [
+                {"id": "workspace", "label": "フェーズワークスペース", "priority": "primary"},
+                {"id": "runs", "label": "ラン台帳", "priority": "primary"},
+                {"id": "approvals", "label": "判断レビュー", "priority": "primary"},
+                {"id": "artifacts", "label": "系譜タイムライン", "priority": "secondary"},
+            ]
         return [
-            {"id": "workspace", "label": "Lifecycle Workspace", "priority": "primary"},
-            {"id": "runs", "label": "Runs", "priority": "primary"},
-            {"id": "approvals", "label": "Approvals", "priority": "primary"},
-            {"id": "artifacts", "label": "Artifacts", "priority": "secondary"},
+            {"id": "workspace", "label": "ライフサイクルワークスペース", "priority": "primary"},
+            {"id": "runs", "label": "実行レーン", "priority": "primary"},
+            {"id": "approvals", "label": "承認レビュー", "priority": "primary"},
+            {"id": "artifacts", "label": "成果物系譜", "priority": "secondary"},
         ]
     return [
         {"id": "home", "label": "ホーム", "priority": "primary"},
@@ -1624,7 +3050,7 @@ def _default_site_map_for_kind(kind: str) -> list[dict[str, str]]:
     ]
 
 
-def _default_key_paths_for_kind(kind: str) -> list[dict[str, Any]]:
+def _default_key_paths_for_context(kind: str, variant_style: str = "") -> list[dict[str, Any]]:
     if kind == "learning":
         return [
             {"name": "Daily lesson loop", "steps": ["ホーム", "今日の課題", "結果", "報酬"]},
@@ -1636,9 +3062,14 @@ def _default_key_paths_for_kind(kind: str) -> list[dict[str, Any]]:
             {"name": "Inventory mitigation", "steps": ["運営管理", "在庫一覧", "補充判断"]},
         ]
     if kind == "operations":
+        if variant_style == "ivory-signal":
+            return [
+                {"name": "判断前提をそろえる", "steps": ["フェーズワークスペース", "ラン台帳", "判断レビュー", "決裁"]},
+                {"name": "レビューから反映準備まで", "steps": ["判断レビュー", "系譜タイムライン", "公開準備", "反映"]},
+            ]
         return [
-            {"name": "Idea to approval", "steps": ["Lifecycle Workspace", "Research", "Planning", "Approval"]},
-            {"name": "Build to release", "steps": ["Development", "Runs", "Deploy", "Release"]},
+            {"name": "構想から承認まで", "steps": ["ライフサイクルワークスペース", "調査", "企画", "承認"]},
+            {"name": "実装準備からリリースまで", "steps": ["開発準備", "実行レーン", "リリース確認", "反映"]},
         ]
     return [
         {"name": "First-run success", "steps": ["ホーム", "主要導線", "結果"]},
@@ -1665,7 +3096,9 @@ def _screen_layout_for_kind(kind: str, *, index: int) -> str:
 def _screen_modules_for_context(
     *,
     kind: str,
+    screen_id: str,
     label: str,
+    variant_style: str,
     features: list[str],
     use_case: dict[str, Any],
     key_path: dict[str, Any],
@@ -1683,24 +3116,27 @@ def _screen_modules_for_context(
         for item in milestones[:3]
         if str(_as_dict(item).get("name") or _as_dict(item).get("criteria") or "").strip()
     ]
+    operations_blueprint = _operations_screen_blueprint(screen_id=screen_id, label=label, variant_style=variant_style)
+    if kind == "operations" and operations_blueprint:
+        return [dict(item) for item in _as_list(operations_blueprint.get("modules")) if isinstance(item, dict)]
 
     if "approval" in lowered or "承認" in lowered:
         return [
-            {"name": "Review queue", "type": "queue", "items": related[:3] or ["Approval packet", "Rework request", "Decision note"]},
-            {"name": "Decision checklist", "type": "checklist", "items": flow_steps[:4] or ["Inspect evidence", "Review risks", "Approve or rework"]},
-            {"name": "Governance context", "type": "summary", "items": milestone_names[:3] or ["Policy coverage", "Audit trail", "Decision owner"]},
+            {"name": "レビューキュー", "type": "queue", "items": related[:3] or ["承認パケット", "差し戻し依頼", "判断メモ"]},
+            {"name": "判断チェックリスト", "type": "checklist", "items": flow_steps[:4] or ["根拠を確認する", "リスクを確認する", "承認するか差し戻す"]},
+            {"name": "統治コンテキスト", "type": "summary", "items": milestone_names[:3] or ["ポリシー充足", "監査証跡", "判断責任者"]},
         ]
     if "run" in lowered or "telemetry" in lowered or "実行" in lowered:
         return [
-            {"name": "Run monitor", "type": "timeline", "items": related[:3] or ["Active run", "Blocked node", "Next step"]},
-            {"name": "Checkpoint lane", "type": "timeline", "items": flow_steps[:4] or ["Queued", "Running", "Review", "Released"]},
-            {"name": "Operator notes", "type": "summary", "items": milestone_names[:3] or ["Escalations", "Retry budget", "Handoff clarity"]},
+            {"name": "ラン監視", "type": "timeline", "items": related[:3] or ["稼働中ラン", "停止ノード", "次の一手"]},
+            {"name": "復旧レーン", "type": "timeline", "items": flow_steps[:4] or ["待機中", "進行中", "レビュー", "反映済み"]},
+            {"name": "運用メモ", "type": "summary", "items": milestone_names[:3] or ["要対応事項", "再試行余力", "引き継ぎ明快さ"]},
         ]
     if "artifact" in lowered or "履歴" in lowered or "lineage" in lowered:
         return [
-            {"name": "Lineage explorer", "type": "graph", "items": related[:3] or ["Evidence source", "Decision log", "Build artifact"]},
-            {"name": "Trace path", "type": "timeline", "items": flow_steps[:4] or ["Research", "Planning", "Design", "Build"]},
-            {"name": "Reference rail", "type": "summary", "items": milestone_names[:3] or ["Owner", "Timestamp", "Export"]},
+            {"name": "リネージ探索", "type": "graph", "items": related[:3] or ["根拠ソース", "判断ログ", "ビルド成果物"]},
+            {"name": "追跡経路", "type": "timeline", "items": flow_steps[:4] or ["調査", "企画", "デザイン", "開発準備"]},
+            {"name": "参照レール", "type": "summary", "items": milestone_names[:3] or ["担当者", "記録時刻", "書き出し"]},
         ]
     if "setting" in lowered or "設定" in lowered:
         return [
@@ -1722,9 +3158,9 @@ def _screen_modules_for_context(
         ]
     if kind == "operations":
         return [
-            {"name": "Decision snapshot", "type": "summary", "items": related[:3] or ["Next action", "Blocked phase", "Approval state"]},
-            {"name": "Workflow lane", "type": "timeline", "items": flow_steps[:4] or ["Research", "Planning", "Design", "Deploy"]},
-            {"name": "Operator context", "type": "summary", "items": [role, *(milestone_names[:2] or ["Risk register", "Release signal"])]},
+            {"name": "判断サマリー", "type": "summary", "items": related[:3] or ["次の一手", "停止フェーズ", "承認状態"]},
+            {"name": "進行レーン", "type": "timeline", "items": flow_steps[:4] or ["調査", "企画", "デザイン", "開発準備"]},
+            {"name": "運用コンテキスト", "type": "summary", "items": [role, *(milestone_names[:2] or ["リスク台帳", "リリース判断シグナル"])]},
         ]
     return [
         {"name": "Primary tasks", "type": "summary", "items": related[:3] or ["Core workflow", "Status", "Recovery"]},
@@ -1743,12 +3179,13 @@ def _build_design_prototype(
     prototype_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     kind = _infer_product_kind(spec)
-    overrides = prototype_overrides or {}
+    overrides = _prototype_overrides_from_payload(prototype_overrides or {})
+    visual_style = str(overrides.get("visual_style") or ("obsidian-atelier" if kind == "operations" else "balanced-product"))
     ia_analysis = _as_dict(analysis.get("ia_analysis"))
     personas = [dict(item) for item in _as_list(analysis.get("personas")) if isinstance(item, dict)]
     use_cases = [dict(item) for item in _as_list(analysis.get("use_cases")) if isinstance(item, dict)]
-    key_paths = [dict(item) for item in _as_list(ia_analysis.get("key_paths")) if isinstance(item, dict)] or _default_key_paths_for_kind(kind)
-    site_map = [dict(item) for item in _as_list(ia_analysis.get("site_map")) if isinstance(item, dict)] or _default_site_map_for_kind(kind)
+    key_paths = [dict(item) for item in _as_list(ia_analysis.get("key_paths")) if isinstance(item, dict)] or _default_key_paths_for_context(kind, visual_style)
+    site_map = [dict(item) for item in _as_list(ia_analysis.get("site_map")) if isinstance(item, dict)] or _default_site_map_for_context(kind, visual_style)
     design_tokens = _as_dict(analysis.get("design_tokens")) or _base_design_tokens(spec)
     milestones = [dict(item) for item in _as_list(analysis.get("recommended_milestones")) if isinstance(item, dict)]
     if not milestones:
@@ -1758,40 +3195,55 @@ def _build_design_prototype(
     screens: list[dict[str, Any]] = []
     for index, raw in enumerate(site_map[:4]):
         node = _as_dict(raw)
-        label = screen_labels[index] if index < len(screen_labels) else str(node.get("label") or node.get("id") or f"Screen {index + 1}")
+        raw_label = screen_labels[index] if index < len(screen_labels) else str(node.get("label") or node.get("id") or f"Screen {index + 1}")
+        screen_id = str(node.get("id") or _slug(raw_label, prefix="screen"))
+        label = (
+            _preferred_operations_screen_label(screen_id=screen_id, label=raw_label, variant_style=visual_style)
+            if kind == "operations"
+            else raw_label
+        )
         use_case = use_cases[index] if index < len(use_cases) else (use_cases[0] if use_cases else {})
         key_path = key_paths[index] if index < len(key_paths) else (key_paths[0] if key_paths else {})
         modules = _screen_modules_for_context(
             kind=kind,
+            screen_id=screen_id,
             label=label,
+            variant_style=visual_style,
             features=selected_features,
             use_case=_as_dict(use_case),
             key_path=_as_dict(key_path),
             personas=personas,
             milestones=milestones,
         )
-        primary_actions = _dedupe_strings(
+        fallback_actions = _dedupe_strings(
             [
                 *(str(item) for item in _as_list(_as_dict(use_case).get("main_flow"))[:2]),
                 f"Open {label}",
                 *(str(item) for item in _as_list(_as_dict(key_path).get("steps"))[:1]),
             ]
         )[:3]
+        screen_copy = _screen_copy_for_context(
+            screen_id=screen_id,
+            label=label,
+            variant_style=visual_style,
+            description=str(node.get("description") or description),
+            use_case=_as_dict(use_case),
+            key_path=_as_dict(key_path),
+            modules=modules,
+            fallback_actions=fallback_actions,
+        )
         screens.append(
             {
-                "id": str(node.get("id") or _slug(label, prefix="screen")),
+                "id": screen_id,
                 "title": label,
-                "purpose": str(node.get("description") or _as_dict(use_case).get("title") or description),
+                "purpose": screen_copy["purpose"],
                 "layout": _screen_layout_for_kind(kind, index=index),
-                "headline": str(_as_dict(use_case).get("title") or f"{label} workspace"),
-                "supporting_text": str(_as_dict(key_path).get("name") or description),
-                "primary_actions": primary_actions or [f"Open {label}"],
-                "modules": modules,
-                "success_state": str(
-                    _as_dict(use_case).get("postconditions")
-                    or (milestones[index]["criteria"] if index < len(milestones) else "")
-                    or "The next action and current state are obvious at a glance."
-                ),
+                "headline": screen_copy["headline"],
+                "supporting_text": screen_copy["supporting_text"],
+                "primary_actions": screen_copy["primary_actions"],
+                "modules": screen_copy["modules"],
+                "success_state": screen_copy["success_state"],
+                "variant_style": visual_style,
             }
         )
 
@@ -1804,9 +3256,9 @@ def _build_design_prototype(
         flows.append(
             {
                 "id": f"flow-{index + 1}",
-                "name": str(path.get("name") or f"Primary flow {index + 1}"),
+                "name": _flow_name_for_context(index, path.get("name"), screens),
                 "steps": steps,
-                "goal": str(path.get("goal") or screens[min(index, len(screens) - 1)].get("success_state") or ""),
+                "goal": _first_preview_text(path.get("goal")) or str(screens[min(index, len(screens) - 1)].get("success_state") or ""),
             }
         )
 
@@ -1835,8 +3287,10 @@ def _build_design_prototype(
         else "product-workspace"
     )
     density = overrides.get("density") or ("high" if kind == "operations" else "medium")
+    display_font = str(overrides.get("display_font") or _as_dict(design_tokens.get("typography")).get("heading") or "IBM Plex Sans")
+    body_font = str(overrides.get("body_font") or _as_dict(design_tokens.get("typography")).get("body") or "Noto Sans JP")
 
-    return {
+    prototype = {
         "kind": prototype_kind,
         "app_shell": {
             "layout": overrides.get("navigation_style") or _shell_layout_for_kind(kind),
@@ -1852,16 +3306,205 @@ def _build_design_prototype(
             "description": description,
             "style_name": str(_as_dict(design_tokens.get("style")).get("name") or ""),
         },
+        "visual_direction": {
+            "visual_style": visual_style,
+            "display_font": display_font,
+            "body_font": body_font,
+        },
     }
+    return _sanitize_design_prototype(prototype, kind=kind)
+
+
+def _sanitize_design_prototype(
+    prototype: dict[str, Any] | None,
+    *,
+    kind: str,
+) -> dict[str, Any]:
+    payload = _as_dict(prototype)
+    app_shell = _as_dict(payload.get("app_shell"))
+    screens = [dict(item) for item in _as_list(payload.get("screens")) if isinstance(item, dict)]
+    variant_style = str(_as_dict(payload.get("visual_direction")).get("visual_style") or "").strip().lower()
+    default_paths = [dict(item) for item in _default_key_paths_for_context(kind, variant_style)]
+    sanitized_screens: list[dict[str, Any]] = []
+
+    for index, raw in enumerate(screens):
+        screen = dict(raw)
+        screen_id = str(screen.get("id") or f"screen-{index + 1}")
+        raw_title = str(screen.get("title") or screen_id)
+        title = (
+            _preferred_operations_screen_label(screen_id=screen_id, label=raw_title, variant_style=variant_style)
+            if kind == "operations"
+            else (_design_preview_text(raw_title) or raw_title)
+        )
+        blueprint = _operations_screen_blueprint(screen_id=screen_id, label=title, variant_style=variant_style) or _screen_blueprint_for_label(title)
+        fallback_modules = [dict(item) for item in _as_list(_as_dict(blueprint).get("modules")) if isinstance(item, dict)]
+        fallback_actions = [str(item) for item in _as_list(_as_dict(blueprint).get("actions")) if str(item).strip()]
+        fallback_purpose = str(_as_dict(blueprint).get("purpose") or _default_generic_purpose(title, ""))
+        fallback_headline = str(_as_dict(blueprint).get("headline") or _default_generic_headline(title))
+        fallback_supporting = str(_as_dict(blueprint).get("supporting_text") or (default_paths[min(index, len(default_paths) - 1)].get("name") if default_paths else ""))
+        fallback_success = str(_as_dict(blueprint).get("success_state") or f"{title}で次の操作が迷わず決まる")
+
+        raw_modules = [dict(item) for item in _as_list(screen.get("modules")) if isinstance(item, dict)]
+        use_fallback_modules = _screen_modules_need_product_copy(raw_modules)
+        sanitized_modules: list[dict[str, Any]] = []
+        for module_index, module in enumerate(raw_modules if not use_fallback_modules else fallback_modules):
+            fallback_module = fallback_modules[min(module_index, len(fallback_modules) - 1)] if fallback_modules else {}
+            module_name = _preview_copy_or_fallback(
+                module.get("name"),
+                fallback=str(fallback_module.get("name") or "情報カード"),
+                max_length=48,
+            )
+            module_type = _preview_copy_or_fallback(
+                module.get("type"),
+                fallback=str(fallback_module.get("type") or "summary"),
+                max_length=24,
+            )
+            fallback_items = [str(item) for item in _as_list(fallback_module.get("items")) if str(item).strip()]
+            raw_items = [str(item) for item in _as_list(module.get("items")) if str(item).strip()]
+            candidate_items = raw_items or fallback_items
+            items = [
+                _preview_copy_or_fallback(
+                    item,
+                    fallback=fallback_items[min(item_index, len(fallback_items) - 1)] if fallback_items else "",
+                    max_length=56,
+                )
+                for item_index, item in enumerate(candidate_items[:4])
+                if _preview_copy_or_fallback(
+                    item,
+                    fallback=fallback_items[min(item_index, len(fallback_items) - 1)] if fallback_items else "",
+                    max_length=56,
+                )
+            ]
+            if items:
+                sanitized_modules.append({"name": module_name, "type": module_type, "items": items})
+        if not sanitized_modules and fallback_modules:
+            sanitized_modules = [dict(item) for item in fallback_modules]
+
+        actions = [
+            _preview_primary_action(
+                item,
+                screen={"id": screen_id},
+            )
+            for item in _as_list(screen.get("primary_actions"))[:3]
+        ]
+        actions = [item for item in actions if item]
+        if _actions_need_product_copy(actions, label=title):
+            actions = fallback_actions[:3] if fallback_actions else actions
+        if not actions:
+            actions = fallback_actions[:3] if fallback_actions else [f"{title}を開く"]
+
+        sanitized_screens.append(
+            {
+                **screen,
+                "id": screen_id,
+                "title": title,
+                "headline": _preview_copy_or_fallback(screen.get("headline"), fallback=fallback_headline, max_length=72),
+                "purpose": _preview_copy_or_fallback(screen.get("purpose"), fallback=fallback_purpose, max_length=120),
+                "supporting_text": _preview_copy_or_fallback(screen.get("supporting_text"), fallback=fallback_supporting, max_length=72),
+                "layout": _design_preview_text(screen.get("layout") or _screen_layout_for_kind(kind, index=index)),
+                "primary_actions": actions,
+                "modules": sanitized_modules,
+                "success_state": _preview_copy_or_fallback(screen.get("success_state"), fallback=fallback_success, max_length=88),
+                "variant_style": variant_style,
+            }
+        )
+
+    sanitized_flows: list[dict[str, Any]] = []
+    for index, raw in enumerate(_as_list(payload.get("flows"))):
+        flow = _as_dict(raw)
+        fallback_path = default_paths[min(index, len(default_paths) - 1)] if default_paths else {}
+        fallback_name = _flow_name_for_context(index, "", sanitized_screens)
+        fallback_steps = [str(item) for item in _as_list(fallback_path.get("steps")) if str(item).strip()]
+        raw_steps = [str(item) for item in _as_list(flow.get("steps")) if str(item).strip()]
+        steps = [
+            _preview_copy_or_fallback(
+                step,
+                fallback=fallback_steps[min(step_index, len(fallback_steps) - 1)] if fallback_steps else "",
+                max_length=48,
+            )
+            for step_index, step in enumerate((raw_steps or fallback_steps)[:5])
+            if _preview_copy_or_fallback(
+                step,
+                fallback=fallback_steps[min(step_index, len(fallback_steps) - 1)] if fallback_steps else "",
+                max_length=48,
+            )
+        ]
+        if not steps:
+            steps = fallback_steps[:4]
+        sanitized_flows.append(
+            {
+                "id": str(flow.get("id") or f"flow-{index + 1}"),
+                "name": _preview_copy_or_fallback(flow.get("name"), fallback=fallback_name, max_length=64),
+                "steps": steps,
+                "goal": _preview_copy_or_fallback(
+                    flow.get("goal"),
+                    fallback=str((sanitized_screens[min(index, len(sanitized_screens) - 1)] if sanitized_screens else {}).get("success_state") or "次の判断が明確になる"),
+                    max_length=96,
+                ),
+            }
+        )
+
+    interaction_principles = [
+        _preview_copy_or_fallback(item, fallback="", max_length=92)
+        for item in _as_list(payload.get("interaction_principles"))
+        if _preview_copy_or_fallback(item, fallback="", max_length=92)
+    ]
+    if kind == "operations" and _interaction_principles_need_product_copy(interaction_principles):
+        interaction_principles = _default_operations_interaction_principles()
+
+    if kind == "operations" and sanitized_screens:
+        primary_navigation = [
+            {
+                "id": str(screen.get("id") or f"nav-{index + 1}"),
+                "label": str(screen.get("title") or f"画面 {index + 1}"),
+                "priority": "primary" if index < 3 else "secondary",
+            }
+            for index, screen in enumerate(sanitized_screens[:4])
+        ]
+        status_badges = [str(screen.get("title") or "") for screen in sanitized_screens[:3] if str(screen.get("title") or "").strip()]
+    else:
+        primary_navigation = [dict(item) for item in _as_list(app_shell.get("primary_navigation")) if isinstance(item, dict)]
+        status_badges = [str(item) for item in _as_list(app_shell.get("status_badges")) if str(item).strip()]
+
+    return {
+        **payload,
+        "app_shell": {
+            **app_shell,
+            "primary_navigation": primary_navigation,
+            "status_badges": status_badges,
+        },
+        "screens": sanitized_screens,
+        "flows": sanitized_flows,
+        "interaction_principles": interaction_principles,
+    }
+
+
+def _infer_prototype_context_kind(prototype: dict[str, Any] | None) -> str:
+    payload = _as_dict(prototype)
+    screen_ids = {str(_as_dict(item).get("id") or "").strip().lower() for item in _as_list(payload.get("screens"))}
+    if screen_ids & {"workspace", "runs", "approvals", "artifacts", "lineage", "review"}:
+        return "operations"
+    kind = str(payload.get("kind") or "").lower()
+    if any(token in kind for token in ("store", "catalog", "checkout", "commerce")):
+        return "commerce"
+    if any(token in kind for token in ("learn", "lesson", "guided")):
+        return "learning"
+    return "generic"
 
 
 def _looks_like_prototype_html(code: str) -> bool:
     lowered = str(code or "").lower()
+    screen_count = lowered.count("data-screen-id=")
+    has_navigation_shell = "<nav" in lowered and (
+        "aria-label=\"primary navigation\"" in lowered
+        or "aria-label=\"主要ナビゲーション\"" in lowered
+        or "role=\"tablist\"" in lowered
+    )
     return (
         "<html" in lowered
         and "<main" in lowered
-        and "primary navigation" in lowered
-        and "data-screen-id" in lowered
+        and screen_count >= 1
+        and has_navigation_shell
         and "data-prototype-kind" in lowered
     )
 
@@ -1889,6 +3532,103 @@ def _extract_json_object(content: str) -> dict[str, Any] | None:
         if isinstance(payload, dict):
             return payload
     return None
+
+
+_HTML_DOCUMENT_JSON_KEYS = (
+    "html",
+    "html_document",
+    "htmlDocument",
+    "preview_html",
+    "previewHtml",
+    "prototype_html",
+    "prototypeHtml",
+    "document",
+    "markup",
+)
+
+
+def _ensure_html_head_defaults(head_html: str) -> str:
+    lower = head_html.lower()
+    enriched = head_html
+    if "<meta charset" not in lower:
+        enriched = enriched.replace("<head>", '<head><meta charset="utf-8" />', 1)
+    if "name=\"viewport\"" not in lower and "name='viewport'" not in lower:
+        enriched = enriched.replace(
+            "</head>",
+            '<meta name="viewport" content="width=device-width, initial-scale=1" /></head>',
+            1,
+        )
+    return enriched
+
+
+def _wrap_html_fragment_as_document(fragment: str) -> str:
+    text = str(fragment or "").strip()
+    if not text:
+        return ""
+    cleaned = re.sub(r"<!doctype[^>]*>", "", text, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"</?html\b[^>]*>", "", cleaned, flags=re.IGNORECASE).strip()
+    head_match = re.search(r"<head\b[^>]*>.*?</head>", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    body_match = re.search(r"<body\b[^>]*>.*?</body>", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    head_html = (
+        _ensure_html_head_defaults(head_match.group(0))
+        if head_match
+        else '<head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /></head>'
+    )
+    remainder = cleaned
+    if head_match:
+        remainder = remainder.replace(head_match.group(0), "", 1).strip()
+    body_html = body_match.group(0) if body_match else ""
+    if body_html:
+        remainder = remainder.replace(body_html, "", 1).strip()
+    if not body_html:
+        if not any(
+            marker in remainder.lower()
+            for marker in ("<main", "<nav", "<section", "<style", "<script", "data-screen-id", "role=\"tablist\"")
+        ):
+            return ""
+        body_html = f"<body>{remainder}</body>"
+    return f'<!doctype html><html lang="ja">{head_html}{body_html}</html>'
+
+
+def _extract_html_document(content: str) -> str:
+    """Extract a self-contained HTML document from LLM output."""
+    text = str(content or "").strip()
+    if not text:
+        return ""
+    # Try fenced code blocks first.
+    if "```" in text:
+        for segment in text.split("```"):
+            cleaned = segment.strip()
+            if cleaned.lower().startswith("html"):
+                cleaned = cleaned[4:].strip()
+            if cleaned.lower().startswith("<!doctype") or cleaned.lower().startswith("<html"):
+                return cleaned
+            wrapped = _wrap_html_fragment_as_document(cleaned)
+            if wrapped:
+                return wrapped
+    payload = _extract_json_object(text)
+    if isinstance(payload, dict):
+        for key in _HTML_DOCUMENT_JSON_KEYS:
+            value = payload.get(key)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            extracted = _extract_html_document(value)
+            if extracted:
+                return extracted
+    # Fall back to raw <html> extraction.
+    lower = text.lower()
+    doctype_start = lower.find("<!doctype")
+    html_start = lower.find("<html")
+    start = doctype_start if doctype_start != -1 else html_start
+    if start == -1:
+        return _wrap_html_fragment_as_document(text)
+    end = lower.rfind("</html>")
+    if end == -1:
+        html_fragment = text[start:].strip()
+        if "</body>" in html_fragment.lower():
+            return f"{html_fragment}</html>"
+        return _wrap_html_fragment_as_document(html_fragment)
+    return text[start : end + len("</html>")]
 
 
 def _llm_event_payload(result: Any, *, purpose: str, raw_content: str) -> dict[str, Any]:
@@ -2133,8 +3873,9 @@ async def _localize_research_output(
     provider_registry: ProviderRegistry | None,
     llm_runtime: LLMRuntime | None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
-    localized = dict(research)
+    localized = with_research_operator_copy(dict(research), target_language="en")
     if target_language != "ja":
+        localized = with_research_operator_copy(localized, target_language=target_language)
         localized["display_language"] = target_language
         localized["localization_status"] = "skipped"
         return localized, [], {"status": "skipped"}
@@ -2175,10 +3916,12 @@ async def _localize_research_output(
 
     payload = research_localization_payload(localized)
     if not payload:
+        localized = with_research_operator_copy(localized, target_language=target_language)
         localized["display_language"] = target_language
         localized["localization_status"] = "noop"
         return localized, [], {"status": "noop"}
     if not _provider_backed_lifecycle_available(provider_registry):
+        localized = with_research_operator_copy(localized, target_language=target_language)
         localized["display_language"] = target_language
         localized["localization_status"] = "skipped"
         return localized, [], {"status": "skipped"}
@@ -2207,6 +3950,63 @@ async def _localize_research_output(
         localized["localization_status"] = str(llm_meta.get("parse_status", "strict"))
     else:
         localized["localization_status"] = str(llm_meta.get("parse_status", "fallback"))
+    localized = with_research_operator_copy(localized, target_language=target_language)
+    localized["display_language"] = target_language
+    return localized, llm_events, llm_meta
+
+
+async def _localize_planning_output(
+    analysis: dict[str, Any],
+    *,
+    target_language: str,
+    provider_registry: ProviderRegistry | None,
+    llm_runtime: LLMRuntime | None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    localized = with_planning_operator_copy(dict(analysis), target_language="en")
+    if target_language != "ja":
+        localized = with_planning_operator_copy(localized, target_language=target_language)
+        localized["display_language"] = target_language
+        localized["localization_status"] = "skipped"
+        return localized, [], {"status": "skipped"}
+
+    payload = planning_localization_payload(localized)
+    if not payload:
+        localized = with_planning_operator_copy(localized, target_language=target_language)
+        localized["display_language"] = target_language
+        localized["localization_status"] = "noop"
+        return localized, [], {"status": "noop"}
+    if not _provider_backed_lifecycle_available(provider_registry):
+        localized = with_planning_operator_copy(localized, target_language=target_language)
+        localized["display_language"] = target_language
+        localized["localization_status"] = "skipped"
+        return localized, [], {"status": "skipped"}
+
+    translated, llm_events, llm_meta = await _research_llm_json(
+        provider_registry=provider_registry,
+        llm_runtime=llm_runtime,
+        preferred_model=_preferred_lifecycle_model("planning-localizer", provider_registry),
+        purpose="lifecycle-planning-localizer",
+        static_instruction=(
+            "Translate user-facing JSON string values into the target language. "
+            "Return JSON only. Preserve keys, arrays, ids, URLs, enum tokens, numeric values, booleans, and machine tokens."
+        ),
+        user_prompt=(
+            "Return JSON only.\n"
+            f"Target language: {target_language}\n"
+            "Translate natural-language values only. Keep product names, IDs, URLs, enum values, and architecture tokens unchanged when translation is unnatural.\n"
+            f"JSON payload: {json.dumps(payload, ensure_ascii=False)}"
+        ),
+        schema_name="planning-localization",
+        required_keys=list(payload.keys()),
+        phase="planning",
+        node_id="planning-localizer",
+    )
+    if isinstance(translated, dict):
+        localized = merge_planning_localization(localized, translated)
+        localized["localization_status"] = str(llm_meta.get("parse_status", "strict"))
+    else:
+        localized["localization_status"] = str(llm_meta.get("parse_status", "fallback"))
+    localized = with_planning_operator_copy(localized, target_language=target_language)
     localized["display_language"] = target_language
     return localized, llm_events, llm_meta
 
@@ -2292,6 +4092,10 @@ _LIFECYCLE_MODEL_STRATEGIES: dict[str, dict[str, Any]] = {
         "archetype": "portfolio and tradeoff judge",
         "candidates": ("anthropic/claude-sonnet-4-6", "openai/gpt-5-mini", "zhipu/glm-4-plus"),
     },
+    "planning-localizer": {
+        "archetype": "low-cost output localizer",
+        "candidates": ("openai/gpt-5-mini", "zhipu/glm-4-plus", "anthropic/claude-haiku-4-5-20251001"),
+    },
     "claude-designer": {
         "archetype": "premium interaction designer",
         "candidates": ("anthropic/claude-sonnet-4-6", "moonshot/kimi-k2.5", "gemini/gemini-3-pro-preview"),
@@ -2301,8 +4105,8 @@ _LIFECYCLE_MODEL_STRATEGIES: dict[str, dict[str, Any]] = {
         "candidates": ("moonshot/kimi-k2.5", "openai/gpt-5-mini", "gemini/gemini-3-pro-preview"),
     },
     "gemini-designer": {
-        "archetype": "exploratory visual systems designer",
-        "candidates": ("gemini/gemini-3-pro-preview", "moonshot/kimi-k2.5", "anthropic/claude-sonnet-4-6"),
+        "archetype": "alternate premium product designer",
+        "candidates": ("moonshot/kimi-k2.5", "gemini/gemini-3-pro-preview", "openai/gpt-5-mini"),
     },
     "design-evaluator": {
         "archetype": "design judge and rubric scorer",
@@ -2354,6 +4158,1439 @@ def _preferred_lifecycle_model(
     return candidates[0]
 
 
+def _design_variant_usage_estimate(
+    *,
+    selected_features: list[str],
+    pattern_name: str,
+    description: str,
+    prototype_overrides: dict[str, Any] | None = None,
+) -> TokenUsage:
+    feature_count = max(len(selected_features), 1)
+    descriptive_weight = max((len(pattern_name) + len(description)) // 12, 24)
+    overrides = _as_dict(prototype_overrides)
+    density = str(overrides.get("density") or "").strip().lower()
+    navigation_style = str(overrides.get("navigation_style") or "").strip().lower()
+    screen_count = len([item for item in _as_list(overrides.get("screen_labels")) if str(item).strip()])
+    principle_count = len([item for item in _as_list(overrides.get("interaction_principles")) if str(item).strip()])
+    density_in = 60 if density == "high" else 35 if density == "medium" else 15
+    density_out = 180 if density == "high" else 95 if density == "medium" else 40
+    nav_in = 25 if navigation_style == "top-nav" else 40 if navigation_style == "sidebar" else 20
+    nav_out = 30 if navigation_style == "top-nav" else 65 if navigation_style == "sidebar" else 18
+    return TokenUsage(
+        input_tokens=620 + feature_count * 130 + descriptive_weight + density_in + nav_in + screen_count * 8 + principle_count * 10,
+        output_tokens=960 + feature_count * 120 + descriptive_weight // 2 + density_out + nav_out + screen_count * 36 + principle_count * 42,
+    )
+
+
+def _design_model_ref_from_display(model_name: str) -> str:
+    lowered = str(model_name or "").strip().lower()
+    if "/" in lowered and lowered.count("/") == 1:
+        return str(model_name).strip()
+    if "claude sonnet 4.6" in lowered:
+        return "anthropic/claude-sonnet-4-6"
+    if "claude sonnet 4.5" in lowered:
+        return "anthropic/claude-sonnet-4-5"
+    if "gemini 3 pro" in lowered:
+        return "google/gemini-3-pro-preview"
+    if "kimi" in lowered:
+        return "moonshot/kimi-k2.5"
+    if "glm-4-plus" in lowered:
+        return "zhipu/glm-4-plus"
+    if "gpt-5-mini" in lowered:
+        return "openai/gpt-5-mini"
+    return ""
+
+
+def _aggregate_llm_event_metrics(events: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> tuple[TokenUsage, float]:
+    aggregated = TokenUsage()
+    estimated_cost = 0.0
+    for event in events:
+        payload = _as_dict(event)
+        usage_payload = _as_dict(payload.get("usage"))
+        usage = TokenUsage(
+            input_tokens=int(usage_payload.get("input_tokens", 0) or 0),
+            output_tokens=int(usage_payload.get("output_tokens", 0) or 0),
+            cache_read_tokens=int(usage_payload.get("cache_read_tokens", 0) or 0),
+            cache_write_tokens=int(usage_payload.get("cache_write_tokens", 0) or 0),
+            reasoning_tokens=int(usage_payload.get("reasoning_tokens", 0) or 0),
+        )
+        aggregated.input_tokens += usage.input_tokens
+        aggregated.output_tokens += usage.output_tokens
+        aggregated.cache_read_tokens += usage.cache_read_tokens
+        aggregated.cache_write_tokens += usage.cache_write_tokens
+        aggregated.reasoning_tokens += usage.reasoning_tokens
+        event_cost = float(payload.get("estimated_cost_usd", payload.get("cost_usd", 0.0)) or 0.0)
+        if event_cost <= 0.0 and usage.total_tokens > 0:
+            event_cost = estimate_cost_from_usage(
+                str(payload.get("provider", "") or ""),
+                str(payload.get("model", "") or ""),
+                usage,
+            )
+        estimated_cost += event_cost
+    return aggregated, round(estimated_cost, 3)
+
+
+def _estimate_design_variant_cost(
+    *,
+    model_name: str,
+    usage: TokenUsage,
+    model_ref: str = "",
+    cost_override: float | None = None,
+) -> float:
+    if cost_override is not None and cost_override > 0.0:
+        return round(cost_override, 3)
+    resolved_ref = model_ref or _design_model_ref_from_display(model_name)
+    provider_name, model_id = parse_model_ref(resolved_ref)
+    if provider_name and model_id:
+        return round(estimate_cost_from_usage(provider_name, model_id, usage), 3)
+    return round(((usage.input_tokens * 1.0) + (usage.output_tokens * 4.0)) / 1_000_000, 3)
+
+
+def _design_variant_voice(
+    *,
+    variant_id: str = "",
+    visual_style: str = "",
+    kind: str = "",
+) -> dict[str, str]:
+    normalized_variant = str(variant_id or "").strip().lower()
+    normalized_style = str(visual_style or "").strip().lower()
+    if normalized_variant == "gemini-designer" or normalized_style == "ivory-signal":
+        return {
+            "experience_thesis": "根拠、差分、承認条件を静かな余白で並べ、合意形成の負荷を下げる。",
+            "operational_bet": "圧迫感を抑えた判断室レイアウトで、レビュー前の読解コストを下げながら、決裁の瞬間だけ強いシグナルを出す。",
+            "handoff_note": "採用時は、余白を保った比較面、落ち着いた判断順序、決裁時だけ立ち上がるシグナルを実装条件として固定する。",
+            "selection_summary": "根拠確認と合意形成を穏やかな密度で進めやすく、レビュー負荷を下げられる。",
+            "operator_promise": "根拠を読み比べながら承認条件を固め、合意形成を急がせずに完了できる。",
+        }
+    if kind == "operations":
+        return {
+            "experience_thesis": "重要判断、停止要因、承認条件をひとつの操作盤で裁き、迷いを次の一手に変える。",
+            "operational_bet": "情報を減らすより、判断に必要な根拠と操作を同じ視野に重ね、復旧まで最短距離で回す。",
+            "handoff_note": "採用時は、高密度でも迷わない情報優先順位、強い状態コントラスト、承認理由の即読性を実装条件として固定する。",
+            "selection_summary": "重要判断と停止要因を同じ視野で扱え、承認前の運用判断が最も速い。",
+            "operator_promise": "停止理由、承認条件、成果物の系譜が横断で見え、次の介入を迷わず選べる。",
+        }
+    return {
+        "experience_thesis": "主要判断と次の一手が離れず、画面をまたいでも文脈が切れない体験を保つ。",
+        "operational_bet": "根拠確認から承認準備までを同じ導線で回し、判断コストを減らす。",
+        "handoff_note": "採用時は、主要画面、判断理由、守るべき体験をひとつの承認パケットにまとめる。",
+        "selection_summary": "主要判断、根拠、引き継ぎの整合が高い。",
+        "operator_promise": "主要判断と根拠を同じ文脈で確認しながら、次の操作へ移れる。",
+    }
+
+
+def _build_design_narrative(
+    *,
+    description: str,
+    selected_features: list[str],
+    decision_scope: dict[str, Any] | None = None,
+    prototype: dict[str, Any] | None = None,
+    provider_note: str = "",
+    overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    scope = _as_dict(decision_scope)
+    prototype_payload = _as_dict(prototype)
+    visual_style = str(_as_dict(prototype_payload.get("visual_direction")).get("visual_style") or "").strip().lower()
+    variant_id = str(_as_dict(prototype_payload.get("design_anchor")).get("variant_id") or "").strip().lower()
+    voice = _design_variant_voice(variant_id=variant_id, visual_style=visual_style, kind=_infer_prototype_context_kind(prototype_payload))
+    screens = [dict(item) for item in _as_list(prototype_payload.get("screens")) if isinstance(item, dict)]
+    override_payload = _as_dict(overrides)
+    signature_defaults = _dedupe_strings(
+        [
+            str(screen.get("headline") or screen.get("title") or "").strip()
+            for screen in screens[:3]
+            if str(screen.get("headline") or screen.get("title") or "").strip()
+        ]
+    )
+    feature_summary = ", ".join(selected_features[:3])
+    lead_thesis = (
+        str(override_payload.get("experience_thesis") or "").strip()
+        or voice["experience_thesis"]
+    )
+    operational_bet = (
+        str(override_payload.get("operational_bet") or "").strip()
+        or (
+            f"{feature_summary} を同じ運用文脈で行き来し、判断理由が次の操作から離れないようにする。"
+            if feature_summary
+            else voice["operational_bet"]
+        )
+    )
+    handoff_note = (
+        str(override_payload.get("handoff_note") or "").strip()
+        or provider_note
+        or voice["handoff_note"]
+    )
+    signature_moments = _dedupe_strings(
+        [str(item).strip() for item in _as_list(override_payload.get("signature_moments")) if str(item).strip()]
+        + signature_defaults
+    )[:4]
+    if not signature_moments:
+        signature_moments = _dedupe_strings([str(item).strip() for item in selected_features if str(item).strip()])[:3]
+    return {
+        "experience_thesis": lead_thesis[:240],
+        "operational_bet": operational_bet[:220],
+        "signature_moments": signature_moments,
+        "handoff_note": handoff_note[:220],
+    }
+
+
+def _build_design_implementation_brief(
+    *,
+    spec: str,
+    analysis: dict[str, Any] | None = None,
+    selected_features: list[str] | None = None,
+    prototype: dict[str, Any] | None = None,
+    decision_scope: dict[str, Any] | None = None,
+    plan_estimates: list[dict[str, Any]] | None = None,
+    selected_preset: str = "",
+    quality_focus: list[str] | None = None,
+    overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    def _brief_strings(value: Any, *, limit: int, max_length: int = 120) -> list[str]:
+        return _dedupe_strings(
+            [
+                text[:max_length]
+                for item in _as_list(value)
+                if (text := str(item).strip())
+            ]
+        )[:limit]
+
+    def _brief_choice_records(value: Any) -> list[dict[str, str]]:
+        normalized: list[dict[str, str]] = []
+        for item in _as_list(value):
+            payload = _as_dict(item)
+            area = str(payload.get("area") or "").strip()
+            decision = str(payload.get("decision") or "").strip()
+            rationale = str(payload.get("rationale") or "").strip()
+            if not area or not decision:
+                continue
+            normalized.append(
+                {
+                    "area": area[:48],
+                    "decision": decision[:140],
+                    "rationale": rationale[:180],
+                }
+            )
+            if len(normalized) >= 4:
+                break
+        return normalized
+
+    def _brief_agent_lanes(value: Any) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for item in _as_list(value):
+            payload = _as_dict(item)
+            role = str(payload.get("role") or "").strip()
+            remit = str(payload.get("remit") or "").strip()
+            skills = _brief_strings(payload.get("skills"), limit=4, max_length=48)
+            if not role or not remit:
+                continue
+            normalized.append(
+                {
+                    "role": role[:64],
+                    "remit": remit[:180],
+                    "skills": skills,
+                }
+            )
+            if len(normalized) >= 3:
+                break
+        return normalized
+
+    kind = _infer_product_kind(spec)
+    analysis_payload = _as_dict(analysis)
+    scope = _as_dict(decision_scope)
+    prototype_payload = _as_dict(prototype)
+    override_payload = _as_dict(overrides)
+    selected = [str(item).strip() for item in (selected_features or []) if str(item).strip()]
+    screens = [dict(item) for item in _as_list(prototype_payload.get("screens")) if isinstance(item, dict)]
+    screen_titles = [
+        str(item.get("title") or item.get("headline") or "").strip()
+        for item in screens[:4]
+        if str(item.get("title") or item.get("headline") or "").strip()
+    ]
+    flow_names = [
+        str(item.get("name") or "").strip()
+        for item in _as_list(prototype_payload.get("flows"))[:3]
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    ]
+    estimate_candidates = [dict(item) for item in _as_list(plan_estimates) if isinstance(item, dict)]
+    selected_estimate = next(
+        (
+            item for item in estimate_candidates
+            if str(item.get("preset") or "").strip() == selected_preset
+        ),
+        next(
+            (
+                item for item in estimate_candidates
+                if str(item.get("preset") or "").strip() == "standard"
+            ),
+            estimate_candidates[0] if estimate_candidates else {},
+        ),
+    )
+    agents_used = [
+        str(item).strip()
+        for item in _as_list(_as_dict(selected_estimate).get("agents_used"))
+        if str(item).strip()
+    ]
+    skills_used = [
+        str(item).strip()
+        for item in _as_list(_as_dict(selected_estimate).get("skills_used"))
+        if str(item).strip()
+    ]
+    milestones = [
+        str(_as_dict(item).get("name") or _as_dict(item).get("criteria") or "").strip()
+        for item in _as_list(analysis_payload.get("recommended_milestones"))
+        if str(_as_dict(item).get("name") or _as_dict(item).get("criteria") or "").strip()
+    ] or [
+        str(_as_dict(item).get("name") or _as_dict(item).get("criteria") or "").strip()
+        for item in _as_list(analysis_payload.get("milestones"))
+        if str(_as_dict(item).get("name") or _as_dict(item).get("criteria") or "").strip()
+    ]
+    if kind == "operations":
+        architecture_thesis = (
+            "判断根拠、承認、成果物の系譜を同じ状態遷移で扱い、各工程を独立に再開できる運用基盤として実装する。"
+        )
+        system_shape = [
+            "ライフサイクルワークスペースと工程別の主作業面を分ける",
+            "実行状態はストリーム更新とチェックポイント保存の二層で同期する",
+            "承認判断は変更履歴を残す判断パケットとして保存する",
+            "成果物の系譜を横断参照できる来歴ストアを持つ",
+        ]
+        technical_choices = [
+            {
+                "area": "画面構成",
+                "decision": "画面遷移よりワークスペース継続性を優先した状態保持型シェルにする",
+                "rationale": "調査、企画、承認を跨いでも判断文脈を失わず、差し戻し時の認知負荷を増やさないため。",
+            },
+            {
+                "area": "実行同期",
+                "decision": "工程状態とエージェント実行はストリーム更新と永続チェックポイントの二層で扱う",
+                "rationale": "長時間 run と再読込をまたいでも現在地を復元し、運用介入を安全にするため。",
+            },
+            {
+                "area": "承認と監査",
+                "decision": "承認パケット、コメント、判断履歴を同一の判断台帳に束ねる",
+                "rationale": "承認理由と差し戻し理由が UI と監査証跡で分断しないようにするため。",
+            },
+            {
+                "area": "成果物リネージ",
+                "decision": "調査からデザインまでの成果物を工程単位で参照可能にする",
+                "rationale": "なぜこの画面になったかを説明できる状態を、実装 handoff まで保つため。",
+            },
+        ]
+    else:
+        architecture_thesis = (
+            "主要ワークフローと判断根拠を同じ面で扱い、段階的に詳細を開く product workspace として構成する。"
+        )
+        system_shape = [
+            "主要タスクを起点にした workspace shell を置く",
+            "状態更新は履歴と現在値を同時に見せる",
+            "重要判断だけを approval surface で明示的に止める",
+            "モバイルでは要約先行、詳細後出しの構成にする",
+        ]
+        technical_choices = [
+            {
+                "area": "フロントエンド構成",
+                "decision": "情報密度を保ちながら折りたためる responsive workspace にする",
+                "rationale": "desktop と mobile で同じ中核フローを崩さずに見せるため。",
+            },
+            {
+                "area": "状態モデル",
+                "decision": "作業中の状態、レビュー状態、完了状態を phase contract で分ける",
+                "rationale": "空状態や差し戻し状態でも次の一手を明快にするため。",
+            },
+            {
+                "area": "実装同期",
+                "decision": "主要成果物は typed payload、可変 UI は derived preview として生成する",
+                "rationale": "表示の自由度を保ちながら、保存と handoff の整合性を守るため。",
+            },
+        ]
+
+    skill_summary = skills_used[:6] or [
+        "workflow-design",
+        "solution-architecture",
+        "accessibility",
+        "implementation-planning",
+    ]
+    base_agent_lanes = [
+        {
+            "role": "プロダクト設計レーン",
+            "remit": "勝ち筋を主要フロー、判断順、空状態まで落とし込む",
+            "skills": [item for item in skill_summary if item in {"workflow-design", "journey-mapping", "ux-research"}][:2] or ["workflow-design", "ux-research"],
+        },
+        {
+            "role": "アーキテクチャ設計レーン",
+            "remit": "phase contract、状態同期、approval 境界を定義する",
+            "skills": [item for item in skill_summary if item in {"solution-architecture", "risk-analysis", "system-design"}][:2] or ["solution-architecture", "risk-analysis"],
+        },
+        {
+            "role": "実装計画レーン",
+            "remit": "画面分割、コンポーネント責務、段階的 delivery を決める",
+            "skills": [item for item in skill_summary if item in {"frontend-implementation", "performance", "accessibility"}][:3] or ["frontend-implementation", "accessibility"],
+        },
+    ]
+    if agents_used:
+        base_agent_lanes[0]["role"] = f"{agents_used[0]} レーン"
+        if len(agents_used) > 1:
+            base_agent_lanes[1]["role"] = f"{agents_used[1]} レーン"
+        if len(agents_used) > 2:
+            base_agent_lanes[2]["role"] = f"{agents_used[2]} レーン"
+
+    delivery_slices = _dedupe_strings(
+        [
+            *screen_titles,
+            *flow_names,
+            *selected[:2],
+            *milestones[:2],
+            *[str(item) for item in (quality_focus or []) if str(item).strip()],
+            str(scope.get("lead_thesis") or "").strip(),
+        ]
+    )[:5]
+    if not delivery_slices:
+        delivery_slices = [
+            "主要ワークスペース",
+            "承認レビュー",
+            "成果物リネージ",
+        ]
+    brief = {
+        "architecture_thesis": architecture_thesis,
+        "system_shape": system_shape,
+        "technical_choices": technical_choices,
+        "agent_lanes": base_agent_lanes,
+        "delivery_slices": delivery_slices,
+    }
+    architecture_override = str(
+        override_payload.get("architecture_thesis")
+        or override_payload.get("architectureThesis")
+        or ""
+    ).strip()
+    if architecture_override:
+        brief["architecture_thesis"] = architecture_override[:240]
+    system_shape_override = _brief_strings(
+        override_payload.get("system_shape") or override_payload.get("systemShape"),
+        limit=5,
+    )
+    if system_shape_override:
+        brief["system_shape"] = system_shape_override
+    technical_override = _brief_choice_records(
+        override_payload.get("technical_choices") or override_payload.get("technicalChoices")
+    )
+    if technical_override:
+        brief["technical_choices"] = technical_override
+    lane_override = _brief_agent_lanes(
+        override_payload.get("agent_lanes") or override_payload.get("agentLanes")
+    )
+    if lane_override:
+        brief["agent_lanes"] = lane_override
+    slices_override = _brief_strings(
+        override_payload.get("delivery_slices") or override_payload.get("deliverySlices"),
+        limit=5,
+    )
+    if slices_override:
+        brief["delivery_slices"] = slices_override
+    return brief
+
+
+_PREVIEW_EXTERNAL_ASSET_PATTERN = re.compile(
+    r"""<(?:script|link|img|source|iframe)[^>]+(?:src|href)=["']https?://""",
+    re.IGNORECASE,
+)
+
+_PREVIEW_MARKETING_TERM_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("pricing", re.compile(r"\bpricing\b", re.IGNORECASE)),
+    ("waitlist", re.compile(r"\bwaitlist\b", re.IGNORECASE)),
+    ("testimonial", re.compile(r"\btestimonial(?:s)?\b", re.IGNORECASE)),
+    ("request_demo", re.compile(r"\brequest a demo\b", re.IGNORECASE)),
+    ("book_demo", re.compile(r"\bbook a demo\b", re.IGNORECASE)),
+    ("free_trial", re.compile(r"\bfree trial\b", re.IGNORECASE)),
+    ("start_free", re.compile(r"\bstart for free\b", re.IGNORECASE)),
+    ("sign_up", re.compile(r"\bsign[\s-]?up\b", re.IGNORECASE)),
+)
+
+_PREVIEW_COPY_ISSUE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("placeholder_copy", re.compile(r"\b(?:lorem ipsum|placeholder|todo|tbd|sample data)\b", re.IGNORECASE)),
+    ("internal_jargon_visible", re.compile(r"\b(?:prototype spec|prototype app|tailwind|next\.?js|app router|css grid|grid-template-columns|css custom properties|dag)\b", re.IGNORECASE)),
+    ("internal_milestone_id", re.compile(r"\b(?:ms|uc|risk|assumption|claim)-[a-z0-9-]+\b", re.IGNORECASE)),
+)
+
+_PREVIEW_ENGLISH_UI_TOKEN_PATTERN = re.compile(
+    r"\b(?:dashboard|settings|planning|approval|review queue|review|release|workspace|artifact lineage|lineage|run monitor|active run|queue|packet|policies|evidence review)\b",
+    re.IGNORECASE,
+)
+
+
+def _design_preview_visible_text(html: str) -> str:
+    cleaned = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", str(html or ""), flags=re.IGNORECASE | re.DOTALL)
+    attribute_text = re.findall(
+        r"""(?:aria-label|title|placeholder)\s*=\s*["']([^"']+)["']""",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    text_only = re.sub(r"<[^>]+>", " ", cleaned)
+    return _normalize_space(" ".join([unescape(text_only), *[unescape(item) for item in attribute_text]]))
+
+
+def _design_preview_copy_assessment(
+    html: str,
+    *,
+    marketing_terms_detected: list[str],
+) -> dict[str, Any]:
+    visible_text = _design_preview_visible_text(html)
+    issues: list[str] = []
+    samples: list[str] = []
+    for issue_id, pattern in _PREVIEW_COPY_ISSUE_PATTERNS:
+        match = pattern.search(visible_text)
+        if match:
+            issues.append(issue_id)
+            samples.append(match.group(0))
+    english_tokens = sorted(
+        {
+            _normalize_space(match.group(0)).lower()
+            for match in _PREVIEW_ENGLISH_UI_TOKEN_PATTERN.finditer(visible_text)
+            if _normalize_space(match.group(0))
+        }
+    )
+    if len(english_tokens) >= 3 and re.search(r"[\u3040-\u30ff\u3400-\u9fff]", visible_text):
+        issues.append("english_ui_drift")
+        samples.extend(english_tokens[:2])
+    score = 1.0
+    penalties = {
+        "placeholder_copy": 0.26,
+        "internal_jargon_visible": 0.22,
+        "internal_milestone_id": 0.2,
+        "english_ui_drift": 0.14,
+    }
+    for issue in issues:
+        score -= penalties.get(issue, 0.12)
+    if marketing_terms_detected:
+        score -= 0.08
+    if re.search(r"[\u3040-\u30ff\u3400-\u9fff]", visible_text):
+        score += 0.05
+    if len(visible_text) >= 220:
+        score += 0.04
+    return {
+        "copy_issues": _dedupe_strings(issues),
+        "copy_issue_examples": _dedupe_strings(samples)[:4],
+        "copy_quality_score": round(max(0.0, min(score, 1.0)), 2),
+        "visible_text_sample": visible_text[:280],
+    }
+
+
+def _design_preview_interactive_features(html: str) -> list[str]:
+    lower = str(html or "").lower()
+    features: list[str] = []
+    if any(token in lower for token in ("tablist", "tabpanel", "aria-selected", "data-tab")):
+        features.append("tabs")
+    if "accordion" in lower or "aria-expanded" in lower:
+        features.append("accordion")
+    if ":hover" in lower or "mouseenter" in lower or "mouseover" in lower:
+        features.append("hover")
+    if "transition" in lower or "animation" in lower:
+        features.append("transitions")
+    if "addeventlistener(" in lower or "onclick=" in lower:
+        features.append("js-actions")
+    if "<form" in lower:
+        features.append("forms")
+    return features
+
+
+def _design_preview_screen_count_estimate(
+    html: str,
+    *,
+    prototype: dict[str, Any] | None = None,
+) -> int:
+    lower = str(html or "").lower()
+    prototype_count = len(_as_list(_as_dict(prototype).get("screens")))
+    explicit_count = len(re.findall(r"data-screen-id\s*=", lower))
+    aria_panel_count = len(re.findall(r"tabpanel", lower))
+    return max(prototype_count, explicit_count, aria_panel_count)
+
+
+def _design_preview_surface_signals(html: str) -> list[str]:
+    lower = str(html or "").lower()
+    signals: list[str] = []
+    if "<table" in lower or 'aria-label="判断テーブル"' in lower or 'aria-label="data table"' in lower:
+        signals.append("table")
+    if "<form" in lower or "textbox" in lower or "textarea" in lower or "combobox" in lower:
+        signals.append("form")
+    if any(token in lower for token in ("metric", "kpi", "stat", "指標", "集計", "summary-card")):
+        signals.append("metrics")
+    if any(token in lower for token in ("status", "badge", "state", "進行中", "要確認", "完了", "blocked")):
+        signals.append("status")
+    return signals
+
+
+def _design_preview_workflow_signals(html: str) -> list[str]:
+    lower = str(html or "").lower()
+    signals: list[str] = []
+    if any(token in lower for token in ("approval", "承認")):
+        signals.append("approval")
+    if any(token in lower for token in ("evidence", "根拠")):
+        signals.append("evidence")
+    if any(token in lower for token in ("lineage", "系譜", "provenance")):
+        signals.append("lineage")
+    if any(token in lower for token in ("recover", "recovery", "復旧", "劣化", "degraded")):
+        signals.append("recovery")
+    if any(token in lower for token in ("operator", "運用", "workspace", "ワークスペース")):
+        signals.append("operator-workspace")
+    return signals
+
+
+def _design_preview_marketing_terms(html: str) -> list[str]:
+    lower = str(html or "").lower()
+    detected: list[str] = []
+    for label, pattern in _PREVIEW_MARKETING_TERM_PATTERNS:
+        if pattern.search(lower):
+            detected.append(label)
+    return detected
+
+
+def _design_preview_quality_score(
+    *,
+    html: str,
+    screen_count_estimate: int,
+    interactive_features: list[str],
+    surface_signals: list[str],
+    workflow_signals: list[str],
+    marketing_terms_detected: list[str],
+) -> float:
+    lower = str(html or "").lower()
+    score = 0.0
+    if "<html" in lower and "</html>" in lower:
+        score += 0.1
+    if "<style" in lower:
+        score += 0.08
+    if "<script" in lower:
+        score += 0.08
+    if not _PREVIEW_EXTERNAL_ASSET_PATTERN.search(html):
+        score += 0.06
+    if "viewport" in lower:
+        score += 0.06
+    if "@media" in lower:
+        score += 0.08
+    score += min(max(screen_count_estimate, 0), 4) * 0.03
+    score += min(len(interactive_features), 4) * 0.03
+    score += min(len(surface_signals), 4) * 0.04
+    score += min(len(workflow_signals), 5) * 0.04
+    if "<nav" in lower or "sidebar" in lower or "top-nav" in lower or "top nav" in lower:
+        score += 0.08
+    if "aria-" in lower:
+        score += 0.07
+    if marketing_terms_detected:
+        score -= 0.18
+    return round(max(0.0, min(score, 1.0)), 2)
+
+
+def _design_preview_meta(
+    preview_html: str,
+    *,
+    source: str,
+    extraction_ok: bool = False,
+    fallback_reason: str = "",
+    prototype: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    html = str(preview_html or "")
+    lower = html.lower()
+    screen_count_estimate = _design_preview_screen_count_estimate(html, prototype=prototype)
+    interactive_features = _design_preview_interactive_features(html)
+    surface_signals = _design_preview_surface_signals(html)
+    workflow_signals = _design_preview_workflow_signals(html)
+    marketing_terms_detected = _design_preview_marketing_terms(html)
+    copy_assessment = _design_preview_copy_assessment(
+        html,
+        marketing_terms_detected=marketing_terms_detected,
+    )
+    validation_issues: list[str] = []
+    if "<html" not in lower or "</html>" not in lower:
+        validation_issues.append("missing_html_document")
+    if "<style" not in lower:
+        validation_issues.append("missing_inline_style")
+    if "<script" not in lower:
+        validation_issues.append("missing_inline_script")
+    if _PREVIEW_EXTERNAL_ASSET_PATTERN.search(html):
+        validation_issues.append("external_assets_detected")
+    if "viewport" not in lower:
+        validation_issues.append("missing_viewport")
+    if "@media" not in lower:
+        validation_issues.append("missing_responsive_breakpoint")
+    if screen_count_estimate < 4:
+        validation_issues.append("insufficient_screen_count")
+    if len(interactive_features) < 1:
+        validation_issues.append("limited_interactivity")
+    if not ("<nav" in lower or "sidebar" in lower or "top-nav" in lower or "top nav" in lower):
+        validation_issues.append("missing_navigation_shell")
+    if "aria-" not in lower:
+        validation_issues.append("missing_accessibility_annotations")
+    if marketing_terms_detected:
+        validation_issues.append("marketing_surface_detected")
+    return {
+        "source": source,
+        "template_version": _DESIGN_TEMPLATE_PREVIEW_VERSION if source == "template" else None,
+        "extraction_ok": extraction_ok,
+        "validation_ok": len(validation_issues) == 0,
+        "fallback_reason": fallback_reason,
+        "html_size": len(html),
+        "screen_count_estimate": screen_count_estimate,
+        "interactive_features": interactive_features,
+        "surface_signals": surface_signals,
+        "workflow_signals": workflow_signals,
+        "marketing_terms_detected": marketing_terms_detected,
+        "copy_issues": list(_as_list(copy_assessment.get("copy_issues"))),
+        "copy_issue_examples": list(_as_list(copy_assessment.get("copy_issue_examples"))),
+        "copy_quality_score": float(copy_assessment.get("copy_quality_score", 0.0) or 0.0),
+        "quality_score": _design_preview_quality_score(
+            html=html,
+            screen_count_estimate=screen_count_estimate,
+            interactive_features=interactive_features,
+            surface_signals=surface_signals,
+            workflow_signals=workflow_signals,
+            marketing_terms_detected=marketing_terms_detected,
+        ),
+        "validation_issues": validation_issues,
+    }
+
+
+def _design_primary_workflows(prototype: dict[str, Any] | None) -> list[dict[str, Any]]:
+    workflows: list[dict[str, Any]] = []
+    for index, item in enumerate(_as_list(_as_dict(prototype).get("flows"))):
+        payload = _as_dict(item)
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            continue
+        workflows.append(
+            {
+                "id": str(payload.get("id") or f"workflow-{index + 1}"),
+                "name": name[:120],
+                "goal": str(payload.get("goal") or "").strip()[:180],
+                "steps": [
+                    str(step).strip()[:120]
+                    for step in _as_list(payload.get("steps"))
+                    if str(step).strip()
+                ][:5],
+            }
+        )
+    return workflows
+
+
+def _design_screen_specs(
+    prototype: dict[str, Any] | None,
+    prototype_spec: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    route_by_screen: dict[str, str] = {}
+    for item in _as_list(_as_dict(prototype_spec).get("routes")):
+        route = _as_dict(item)
+        screen_id = str(route.get("screen_id") or "").strip()
+        path = str(route.get("path") or "").strip()
+        if screen_id and path and screen_id not in route_by_screen:
+            route_by_screen[screen_id] = path
+    specs: list[dict[str, Any]] = []
+    for index, item in enumerate(_as_list(_as_dict(prototype).get("screens"))):
+        screen = _as_dict(item)
+        title = str(screen.get("title") or "").strip()
+        if not title:
+            continue
+        screen_id = str(screen.get("id") or f"screen-{index + 1}")
+        specs.append(
+            {
+                "id": screen_id,
+                "title": title[:120],
+                "purpose": str(screen.get("purpose") or "").strip()[:180],
+                "layout": str(screen.get("layout") or "").strip()[:64],
+                "primary_actions": [
+                    str(action).strip()[:80]
+                    for action in _as_list(screen.get("primary_actions"))
+                    if str(action).strip()
+                ][:4],
+                "module_count": len(_as_list(screen.get("modules"))),
+                "route_path": route_by_screen.get(screen_id),
+            }
+        )
+    return specs
+
+
+def _design_artifact_completeness(variant: dict[str, Any]) -> dict[str, Any]:
+    prototype = _as_dict(variant.get("prototype"))
+    prototype_spec = _as_dict(variant.get("prototype_spec"))
+    prototype_app = _as_dict(variant.get("prototype_app"))
+    implementation_brief = _as_dict(variant.get("implementation_brief"))
+    primary_workflows = _as_list(variant.get("primary_workflows"))
+    screen_specs = _as_list(variant.get("screen_specs"))
+    checks = {
+        "preview_html": bool(str(variant.get("preview_html") or "").strip()),
+        "prototype": bool(prototype),
+        "prototype_spec": bool(prototype_spec),
+        "prototype_app": bool(prototype_app),
+        "implementation_brief": bool(implementation_brief),
+        "decision_scope": bool(_as_dict(variant.get("decision_scope"))),
+        "decision_context_fingerprint": bool(str(variant.get("decision_context_fingerprint") or "").strip()),
+        "scorecard": bool(_as_dict(variant.get("scorecard"))),
+        "selection_rationale": bool(_as_dict(variant.get("selection_rationale"))),
+        "approval_packet": bool(_as_dict(variant.get("approval_packet"))),
+        "primary_workflows": bool(primary_workflows),
+        "screen_specs": bool(screen_specs),
+    }
+    present = [name for name, ok in checks.items() if ok]
+    missing = [name for name, ok in checks.items() if not ok]
+    completeness_score = round(len(present) / max(len(checks), 1), 2)
+    status = "complete" if not missing else "partial" if completeness_score >= 0.6 else "incomplete"
+    return {
+        "score": completeness_score,
+        "status": status,
+        "present": present,
+        "missing": missing,
+        "screen_count": len(_as_list(prototype.get("screens"))),
+        "workflow_count": len(primary_workflows),
+        "route_count": len(_as_list(prototype_spec.get("routes"))),
+    }
+
+
+def _design_preview_source_label(source: str) -> str:
+    normalized = str(source or "").strip().lower()
+    if normalized == "llm":
+        return "LLMプレビュー"
+    if normalized == "repaired":
+        return "再構成プレビュー"
+    return "テンプレートプレビュー"
+
+
+def _design_variant_freshness(
+    *,
+    current_fingerprint: str,
+    variant_fingerprint: str,
+    artifact_completeness: dict[str, Any],
+    preview_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    current = str(current_fingerprint or "").strip()
+    variant = str(variant_fingerprint or "").strip()
+    completeness_status = str(_as_dict(artifact_completeness).get("status") or "unknown")
+    preview_payload = _as_dict(preview_meta)
+    reasons: list[str] = []
+    if current and variant and current != variant:
+        status = "stale"
+        reasons.append("planning/research decision context changed after this design was generated")
+    elif current and variant:
+        status = "fresh"
+    else:
+        status = "unknown"
+        reasons.append("decision context fingerprint is incomplete")
+    if completeness_status != "complete":
+        reasons.append("design artifact contract is incomplete")
+    if preview_payload.get("validation_ok") is False:
+        reasons.append("design preview does not satisfy the preview contract")
+    return {
+        "status": status,
+        "can_handoff": (
+            status == "fresh"
+            and completeness_status == "complete"
+            and preview_payload.get("validation_ok") is True
+        ),
+        "current_fingerprint": current or None,
+        "variant_fingerprint": variant or None,
+        "reasons": reasons,
+    }
+
+
+def _design_scorecard_dimension(scorecard: dict[str, Any] | None, dimension_id: str) -> float:
+    for item in _as_list(_as_dict(scorecard).get("dimensions")):
+        payload = _as_dict(item)
+        if str(payload.get("id") or "") == dimension_id:
+            return float(payload.get("score", 0.0) or 0.0)
+    return 0.0
+
+
+def _design_selection_reasons(
+    *,
+    variant: dict[str, Any],
+    scorecard: dict[str, Any],
+    preview_meta: dict[str, Any],
+) -> list[str]:
+    prototype = _as_dict(variant.get("prototype"))
+    voice = _design_variant_voice(
+        variant_id=str(variant.get("id") or ""),
+        visual_style=str(_as_dict(prototype.get("visual_direction")).get("visual_style") or ""),
+        kind=_infer_prototype_context_kind(prototype),
+    )
+    reasons: list[str] = [voice["selection_summary"]]
+    if _design_scorecard_dimension(scorecard, "operator_clarity") >= 0.85:
+        reasons.append("主要判断、次の一手、状態変化を同じ視野で捉えられる。")
+    if _design_scorecard_dimension(scorecard, "evidence_traceability") >= 0.8:
+        reasons.append("根拠、承認、成果物の系譜が一貫した成果物としてつながっている。")
+    if preview_meta.get("validation_ok") is True:
+        reasons.append("プレビューが自己完結したプロダクト画面として成立している。")
+    if len(_as_list(_as_dict(variant.get("implementation_brief")).get("technical_choices"))) >= 2:
+        reasons.append("技術判断が具体化されており、開発への引き継ぎが曖昧になりにくい。")
+    if float(preview_meta.get("copy_quality_score", 0.0) or 0.0) >= 0.9:
+        reasons.append("画面文言がオペレーター向けの実製品トーンに揃っている。")
+    return _dedupe_strings(reasons)[:4]
+
+
+def _design_selection_tradeoffs(
+    *,
+    variant: dict[str, Any],
+    preview_meta: dict[str, Any],
+) -> list[str]:
+    app_shell = _as_dict(_as_dict(variant.get("prototype")).get("app_shell"))
+    density = str(app_shell.get("density") or "").lower()
+    tradeoffs: list[str] = []
+    if str(variant.get("id") or "").strip().lower() == "gemini-designer":
+        tradeoffs.append("余白を活かした比較面なので、同時に監視できる状態数は制御室型より少ない。")
+    elif density == "high":
+        tradeoffs.append("情報密度が高いため、初見ユーザー向けには視線誘導と状態強調を維持する必要がある。")
+    else:
+        tradeoffs.append("余白を優先しているため、同時監視できる情報量は制御室型より少ない。")
+    if _as_list(preview_meta.get("copy_issues")):
+        tradeoffs.append("画面文言に内部用語や混在表現が残らないよう、承認前の文言監修が必要。")
+    return _dedupe_strings(tradeoffs)[:4]
+
+
+def _design_approval_packet(
+    variant: dict[str, Any],
+    *,
+    selected: bool = False,
+    guardrails_override: list[str] | None = None,
+) -> dict[str, Any]:
+    payload = _as_dict(variant)
+    prototype = _as_dict(payload.get("prototype"))
+    voice = _design_variant_voice(
+        variant_id=str(payload.get("id") or ""),
+        visual_style=str(_as_dict(prototype.get("visual_direction")).get("visual_style") or ""),
+        kind=_infer_prototype_context_kind(prototype),
+    )
+    narrative = _as_dict(payload.get("narrative"))
+    preview_meta = _as_dict(payload.get("preview_meta"))
+    workflows = [str(item.get("name") or "").strip() for item in _as_list(payload.get("primary_workflows")) if isinstance(item, dict)]
+    screen_titles = [str(item.get("title") or "").strip() for item in _as_list(payload.get("screen_specs")) if isinstance(item, dict)]
+    must_keep = _dedupe_strings(
+        [
+            f"主要フロー「{workflows[0]}」と承認判断を同じ文脈で往復できること。" if workflows else "",
+            f"「{screen_titles[0]}」で次の一手と保留理由がひと目で分かること。" if screen_titles else "",
+            "根拠、承認、成果物の系譜を別々の導線に分断しないこと。",
+            "モバイルでも主要状態と差し戻し理由が追えること。",
+        ]
+    )[:4]
+    normalized_guardrails = [
+        _design_preview_text(item)
+        for item in _as_list(guardrails_override)
+        if str(item).strip()
+    ]
+    guardrails = _dedupe_strings(
+        normalized_guardrails
+        + [
+            "画面上に内部ID、実装用語、英語の混在コピーを出さないこと。",
+            "主要操作のコントラストとフォーカス状態を下げないこと。",
+            "承認理由、差し戻し理由、次の一手をファーストビューに残すこと。",
+            "プレビュー契約を壊す外部アセット依存を追加しないこと。",
+        ]
+    )[:4]
+    review_checklist = _dedupe_strings(
+        [
+            "主要 4 画面以上でテーブル / 指標 / 状態 / フォームが揃っている。",
+            "承認または差し戻しの理由を、その場で根拠と照合できる。",
+            "成果物の系譜と復旧導線が運用者目線で読める。",
+            "日本語コピーが製品画面として自然で、内部メモ語が見えない。",
+        ]
+    )[:4]
+    preview_source_label = _design_preview_source_label(str(preview_meta.get("source") or ""))
+    handoff_summary = (
+        f"{voice['selection_summary']} 主要 {len(screen_titles)} 画面と {len(workflows)} 本の運用フローを束ね、{preview_source_label}まで含めて承認レビューに渡せる。"
+        if screen_titles or workflows
+        else "主要画面、主要フロー、プレビュー品質までそろえた設計基準。"
+    )
+    operator_fallback = voice["operator_promise"] if selected else voice["selection_summary"]
+    operator_promise = (
+        _preview_copy_or_fallback(
+            _design_preview_text(str(narrative.get("experience_thesis") or "").strip()),
+            fallback=operator_fallback,
+            max_length=220,
+        )
+        or operator_fallback
+    )
+    return {
+        "operator_promise": operator_promise[:220],
+        "must_keep": must_keep,
+        "guardrails": guardrails,
+        "review_checklist": review_checklist,
+        "handoff_summary": handoff_summary[:220],
+    }
+
+
+def _design_selection_rationale(
+    variant: dict[str, Any],
+    *,
+    selected: bool = False,
+    summary_override: str = "",
+    reasons_override: list[str] | None = None,
+    tradeoffs_override: list[str] | None = None,
+    approval_focus_override: list[str] | None = None,
+) -> dict[str, Any]:
+    payload = _as_dict(variant)
+    prototype = _as_dict(payload.get("prototype"))
+    voice = _design_variant_voice(
+        variant_id=str(payload.get("id") or ""),
+        visual_style=str(_as_dict(prototype.get("visual_direction")).get("visual_style") or ""),
+        kind=_infer_prototype_context_kind(prototype),
+    )
+    scorecard = _as_dict(payload.get("scorecard"))
+    preview_meta = _as_dict(payload.get("preview_meta"))
+    normalized_reason_overrides = [
+        _design_preview_text(item)
+        for item in _as_list(reasons_override)
+        if str(item).strip() and not _preview_copy_needs_rewrite(item, max_length=120)
+    ]
+    normalized_tradeoff_overrides = [
+        _design_preview_text(item)
+        for item in _as_list(tradeoffs_override)
+        if str(item).strip() and not _preview_copy_needs_rewrite(item, max_length=120)
+    ]
+    normalized_focus_overrides = [
+        _design_preview_text(item)
+        for item in _as_list(approval_focus_override)
+        if str(item).strip() and not _preview_copy_needs_rewrite(item, max_length=96)
+    ]
+    reasons = _dedupe_strings(normalized_reason_overrides + _design_selection_reasons(variant=payload, scorecard=scorecard, preview_meta=preview_meta))[:4]
+    tradeoffs = _dedupe_strings(normalized_tradeoff_overrides + _design_selection_tradeoffs(variant=payload, preview_meta=preview_meta))[:4]
+    approval_focus = _dedupe_strings(
+        normalized_focus_overrides
+        + [
+            "承認理由と根拠リンクを同じ面に残す。",
+            "差し戻し時の復旧導線をプレビューと引き継ぎの両方で守る。",
+            "画面文言を運用者向けの日本語プロダクト文脈に揃える。",
+        ]
+    )[:4]
+    summary = (
+        _preview_copy_or_fallback(summary_override.strip(), fallback="", max_length=160)
+        or voice["selection_summary"]
+        or (reasons[0] if reasons else "")
+        or "主要フロー、根拠追跡、承認への引き継ぎの整合が最も高い案。"
+    )
+    confidence = round(
+        max(
+            float(payload.get("selection_score", 0.0) or 0.0),
+            float(scorecard.get("overall_score", 0.0) or 0.0),
+        ),
+        2,
+    )
+    return {
+        "summary": summary[:220],
+        "reasons": reasons,
+        "tradeoffs": tradeoffs,
+        "approval_focus": approval_focus,
+        "confidence": confidence,
+        "verdict": "selected" if selected else "candidate",
+    }
+
+
+def _design_scorecard(
+    *,
+    scores: dict[str, Any] | None,
+    primary_workflows: list[dict[str, Any]],
+    screen_specs: list[dict[str, Any]],
+    implementation_brief: dict[str, Any] | None,
+    preview_meta: dict[str, Any] | None,
+) -> dict[str, Any]:
+    score_payload = _as_dict(scores)
+    preview_payload = _as_dict(preview_meta)
+    brief = _as_dict(implementation_brief)
+    preview_quality = float(preview_payload.get("quality_score", 0.0) or 0.0)
+    copy_quality = float(preview_payload.get("copy_quality_score", 0.0) or 0.0)
+    preview_source = _design_preview_source_label(str(preview_payload.get("source") or ""))
+    interaction_count = len(_as_list(preview_payload.get("interactive_features")))
+    workflow_signal_count = len(_as_list(preview_payload.get("workflow_signals")))
+    workflow_signals = {str(item) for item in _as_list(preview_payload.get("workflow_signals")) if str(item)}
+    validation_issues = {str(item) for item in _as_list(preview_payload.get("validation_issues")) if str(item)}
+    technical_choices = _as_list(brief.get("technical_choices"))
+    system_shape = " ".join(str(item) for item in _as_list(brief.get("system_shape")) if str(item))
+    lead_screens = " / ".join(
+        str(_as_dict(item).get("title") or "").strip()
+        for item in screen_specs[:2]
+        if str(_as_dict(item).get("title") or "").strip()
+    )
+    lead_flows = " / ".join(
+        str(_as_dict(item).get("name") or "").strip()
+        for item in primary_workflows[:2]
+        if str(_as_dict(item).get("name") or "").strip()
+    )
+    evidence_traceability = min(
+        1.0,
+        0.25 * min(len(screen_specs) / 4.0, 1.0)
+        + 0.2 * min(len(primary_workflows) / 2.0, 1.0)
+        + (0.2 if "evidence" in workflow_signals else 0.0)
+        + (0.2 if "lineage" in workflow_signals else 0.0)
+        + (0.15 if brief else 0.0),
+    )
+    rework_resilience = min(
+        1.0,
+        (0.28 if "recovery" in workflow_signals else 0.0)
+        + (0.22 if "approval" in workflow_signals else 0.0)
+        + (0.2 if re.search(r"checkpoint|復旧|差し戻し|rework|recover", system_shape, re.IGNORECASE) else 0.0)
+        + 0.15 * min(len(technical_choices) / 3.0, 1.0)
+        + (0.15 if preview_payload.get("validation_ok") is True else 0.0),
+    )
+    mobile_fidelity = min(
+        1.0,
+        (0.3 if "missing_responsive_breakpoint" not in validation_issues else 0.0)
+        + 0.2 * min(len(screen_specs) / 4.0, 1.0)
+        + 0.2 * min(interaction_count / 4.0, 1.0)
+        + 0.15 * preview_quality
+        + 0.15 * copy_quality,
+    )
+    implementation_stability = min(
+        1.0,
+        0.72 * float(score_payload.get("code_quality", 0.0) or 0.0)
+        + 0.18 * min(len(technical_choices) / 4.0, 1.0)
+        + 0.1 * min(len(_as_list(brief.get("delivery_slices"))) / 4.0, 1.0),
+    )
+    accessibility_score = min(
+        1.0,
+        0.8 * float(score_payload.get("accessibility", 0.0) or 0.0)
+        + (0.12 if "missing_accessibility_annotations" not in validation_issues else 0.0)
+        + 0.08 * copy_quality,
+    )
+    dimensions = [
+        {
+            "id": "operator_clarity",
+            "label": "運用明快さ",
+            "score": round(float(score_payload.get("ux_quality", 0.0) or 0.0), 2),
+            "evidence": (
+                f"{lead_screens or f'{len(screen_specs)} 画面'}で主要判断、次の一手、状態変化を同じ視界で追える。"
+                if screen_specs
+                else "主要判断と次の一手の関係を運用者目線で整理している。"
+            ),
+        },
+        {
+            "id": "evidence_traceability",
+            "label": "根拠追跡",
+            "score": round(evidence_traceability, 2),
+            "evidence": (
+                f"{lead_flows or f'{len(primary_workflows)} フロー'}と {len(screen_specs)} 画面に根拠・承認・系譜の接点を保持。"
+            ),
+        },
+        {
+            "id": "rework_resilience",
+            "label": "差し戻し耐性",
+            "score": round(rework_resilience, 2),
+            "evidence": (
+                "差し戻し・復旧・承認の導線が同じ成果物と技術判断に乗っている。"
+                if "recovery" in workflow_signals or "approval" in workflow_signals
+                else "差し戻しや復旧の導線は追加確認が必要。"
+            ),
+        },
+        {
+            "id": "mobile_fidelity",
+            "label": "モバイル忠実度",
+            "score": round(mobile_fidelity, 2),
+            "evidence": (
+                f"{preview_source} / {preview_payload.get('screen_count_estimate') or len(screen_specs)} 画面 / "
+                f"{interaction_count} 種の操作要素 / 文言品質 {int(copy_quality * 100)}。"
+            ),
+        },
+        {
+            "id": "implementation_stability",
+            "label": "実装安定性",
+            "score": round(implementation_stability, 2),
+            "evidence": (
+                f"{len(technical_choices)} 件の技術判断と {len(_as_list(brief.get('agent_lanes')))} 本の実装レーンを保持。"
+            ),
+        },
+        {
+            "id": "accessibility",
+            "label": "アクセシビリティ",
+            "score": round(accessibility_score, 2),
+            "evidence": (
+                "ARIA 注記と状態ラベルが確認できる。"
+                if "missing_accessibility_annotations" not in validation_issues
+                else "アクセシビリティ注記と状態ラベルの追加確認が必要。"
+            ),
+        },
+    ]
+    overall = round(
+        sum(float(item.get("score", 0.0) or 0.0) for item in dimensions) / max(len(dimensions), 1),
+        2,
+    )
+    return {
+        "overall_score": overall,
+        "summary": (
+            f"{lead_screens or f'{len(screen_specs)} 画面'}を基準面に、"
+            f"{lead_flows or f'{len(primary_workflows)} フロー'}を回し、{preview_source}で整合を確認。"
+        ),
+        "dimensions": dimensions,
+    }
+
+
+def _design_variant_selection_score(variant: dict[str, Any]) -> float:
+    payload = _as_dict(variant)
+    scores = _as_dict(payload.get("scores"))
+    preview = _as_dict(payload.get("preview_meta"))
+    completeness = _as_dict(payload.get("artifact_completeness"))
+    scorecard = _as_dict(payload.get("scorecard"))
+    brief = _as_dict(payload.get("implementation_brief"))
+    preview_quality = float(preview.get("quality_score", 0.0) or 0.0)
+    copy_quality = float(preview.get("copy_quality_score", 0.0) or 0.0)
+    source = str(preview.get("source") or "")
+    validation_ok = bool(preview.get("validation_ok"))
+    copy_issue_count = len(_as_list(preview.get("copy_issues")))
+    source_bonus = (
+        0.05
+        if source == "llm" and validation_ok
+        else 0.03
+        if source == "repaired" and validation_ok
+        else 0.01
+        if validation_ok
+        else -0.08
+    )
+    marketing_penalty = 0.08 if _as_list(preview.get("marketing_terms_detected")) else 0.0
+    copy_penalty = min(copy_issue_count, 3) * 0.03
+    operator_clarity = _design_scorecard_dimension(scorecard, "operator_clarity")
+    evidence_traceability = _design_scorecard_dimension(scorecard, "evidence_traceability")
+    rework_resilience = _design_scorecard_dimension(scorecard, "rework_resilience")
+    mobile_fidelity = _design_scorecard_dimension(scorecard, "mobile_fidelity")
+    implementation_stability = _design_scorecard_dimension(scorecard, "implementation_stability")
+    accessibility_score = _design_scorecard_dimension(scorecard, "accessibility")
+    composite = (
+        0.18 * operator_clarity
+        + 0.17 * evidence_traceability
+        + 0.14 * rework_resilience
+        + 0.12 * mobile_fidelity
+        + 0.14 * implementation_stability
+        + 0.12 * accessibility_score
+        + 0.05 * preview_quality
+        + 0.04 * copy_quality
+        + 0.04 * float(completeness.get("score", 0.0) or 0.0)
+        + 0.02 * float(scorecard.get("overall_score", 0.0) or 0.0)
+        + source_bonus
+        - marketing_penalty
+        - copy_penalty
+    )
+    return round(max(0.0, min(composite, 1.0)), 4)
+
+
+def _rank_design_variants(variants: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ranked: list[dict[str, Any]] = []
+    for variant in variants:
+        enriched = dict(variant)
+        enriched["selection_score"] = _design_variant_selection_score(enriched)
+        ranked.append(enriched)
+    return sorted(
+        ranked,
+        key=lambda item: (
+            -float(item.get("selection_score", 0.0) or 0.0),
+            -float(_as_dict(item.get("scores")).get("ux_quality", 0.0) or 0.0),
+            str(item.get("model", "")),
+        ),
+    )
+
+
+def _resolve_selected_design_id(
+    variants: list[dict[str, Any]],
+    judge_selected_id: str,
+) -> str:
+    if not variants:
+        return ""
+    judge_selected = str(judge_selected_id or "").strip()
+    if not judge_selected:
+        return str(variants[0].get("id") or "")
+    preferred = next((item for item in variants if str(item.get("id") or "") == judge_selected), None)
+    if preferred is None:
+        return str(variants[0].get("id") or "")
+    top_score = float(variants[0].get("selection_score", 0.0) or 0.0)
+    preferred_score = float(preferred.get("selection_score", 0.0) or 0.0)
+    return judge_selected if top_score - preferred_score <= 0.02 else str(variants[0].get("id") or "")
+
+
+def _apply_design_judge_enrichment(
+    variants: list[dict[str, Any]],
+    *,
+    selected_design_id: str,
+    payload: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    judge_payload = _as_dict(payload)
+    winner_summary = str(judge_payload.get("winner_summary") or judge_payload.get("winnerSummary") or "").strip()
+    winner_reasons = [str(item) for item in _as_list(judge_payload.get("winner_reasons") or judge_payload.get("winnerReasons")) if str(item).strip()]
+    winner_tradeoffs = [str(item) for item in _as_list(judge_payload.get("winner_tradeoffs") or judge_payload.get("winnerTradeoffs")) if str(item).strip()]
+    approval_guardrails = [str(item) for item in _as_list(judge_payload.get("approval_guardrails") or judge_payload.get("approvalGuardrails")) if str(item).strip()]
+    enriched_variants: list[dict[str, Any]] = []
+    for variant in variants:
+        variant_payload = dict(variant)
+        is_selected = str(variant_payload.get("id") or "") == selected_design_id
+        variant_payload["selection_rationale"] = _design_selection_rationale(
+            variant_payload,
+            selected=is_selected,
+            summary_override=winner_summary if is_selected else "",
+            reasons_override=winner_reasons if is_selected else None,
+            tradeoffs_override=winner_tradeoffs if is_selected else None,
+            approval_focus_override=approval_guardrails if is_selected else None,
+        )
+        variant_payload["approval_packet"] = _design_approval_packet(
+            variant_payload,
+            selected=is_selected,
+            guardrails_override=approval_guardrails if is_selected else None,
+        )
+        enriched_variants.append(variant_payload)
+    return enriched_variants
+
+
+def _enrich_design_variant_contract(
+    variant: dict[str, Any],
+    *,
+    current_decision_context_fingerprint: str = "",
+) -> dict[str, Any]:
+    enriched = dict(variant)
+    prototype_kind = _infer_prototype_context_kind(enriched.get("prototype"))
+    prototype = _sanitize_design_prototype(_as_dict(enriched.get("prototype")), kind=prototype_kind)
+    enriched["prototype"] = prototype
+    prototype_spec = _as_dict(enriched.get("prototype_spec"))
+    preview_html = str(enriched.get("preview_html") or "")
+    preview_seed = _as_dict(enriched.get("preview_meta"))
+    preview_meta = _design_preview_meta(
+        preview_html,
+        source=str(preview_seed.get("source") or "template"),
+        extraction_ok=bool(preview_seed.get("extraction_ok")),
+        fallback_reason=str(preview_seed.get("fallback_reason") or ""),
+        prototype=prototype,
+    )
+    preview_passthrough_keys = {
+        "template_version",
+        "repaired_from_source",
+        "repair_actions",
+        "candidate_validation_ok",
+        "candidate_validation_issues",
+    }
+    for key in preview_passthrough_keys:
+        if key in preview_seed:
+            preview_meta[key] = preview_seed.get(key)
+    primary_workflows = _design_primary_workflows(prototype)
+    screen_specs = _design_screen_specs(prototype, prototype_spec)
+    enriched["preview_meta"] = preview_meta
+    enriched["primary_workflows"] = primary_workflows
+    enriched["screen_specs"] = screen_specs
+    enriched["scorecard"] = _design_scorecard(
+        scores=_as_dict(enriched.get("scores")),
+        primary_workflows=primary_workflows,
+        screen_specs=screen_specs,
+        implementation_brief=_as_dict(enriched.get("implementation_brief")),
+        preview_meta=preview_meta,
+    )
+    enriched["selection_rationale"] = _design_selection_rationale(enriched)
+    enriched["approval_packet"] = _design_approval_packet(enriched)
+    enriched["artifact_completeness"] = _design_artifact_completeness(enriched)
+    enriched["freshness"] = _design_variant_freshness(
+        current_fingerprint=current_decision_context_fingerprint or str(_as_dict(enriched.get("decision_scope")).get("fingerprint") or ""),
+        variant_fingerprint=str(enriched.get("decision_context_fingerprint") or ""),
+        artifact_completeness=_as_dict(enriched.get("artifact_completeness")),
+        preview_meta=preview_meta,
+    )
+    return enriched
+
+
+def _compile_design_preview_html(
+    variant: dict[str, Any],
+    state: dict[str, Any],
+) -> str:
+    payload = _as_dict(variant)
+    analysis = _as_dict(state.get("analysis"))
+    spec = str(state.get("spec") or payload.get("pattern_name") or "Product workspace")
+    selected_features = _selected_feature_names(state)
+    title = _preview_title(spec)
+    subtitle = str(payload.get("description") or payload.get("rationale") or payload.get("pattern_name") or title)
+    return _build_preview_html(
+        title=title,
+        subtitle=subtitle,
+        primary=str(payload.get("primary_color") or "#2563eb"),
+        accent=str(payload.get("accent_color") or "#f59e0b"),
+        features=selected_features or ["Autonomous workflow", "Approval gates", "Quality review"],
+        prototype=_as_dict(payload.get("prototype")),
+        design_tokens=_as_dict(analysis.get("design_tokens")),
+        milestones=[dict(item) for item in _as_list(state.get("milestones")) if isinstance(item, dict)],
+    )
+
+
+def _repair_design_variant_preview(
+    variant: dict[str, Any],
+    *,
+    state: dict[str, Any],
+    repair_reason: str,
+) -> dict[str, Any]:
+    payload = dict(variant)
+    prior_preview_meta = _as_dict(payload.get("preview_meta"))
+    candidate_html = str(payload.get("preview_html") or "")
+    candidate_meta = dict(prior_preview_meta)
+    payload["preview_candidate_html"] = candidate_html
+    payload["preview_candidate_meta"] = candidate_meta
+    payload["preview_html"] = _compile_design_preview_html(payload, state)
+    payload["preview_meta"] = {
+        "source": "repaired",
+        "template_version": _DESIGN_TEMPLATE_PREVIEW_VERSION,
+        "extraction_ok": bool(candidate_meta.get("extraction_ok")),
+        "fallback_reason": repair_reason,
+        "repaired_from_source": str(candidate_meta.get("source") or "unknown"),
+        "repair_actions": ["recompiled_from_canonical_spec"],
+        "candidate_validation_ok": bool(candidate_meta.get("validation_ok")),
+        "candidate_validation_issues": list(_as_list(candidate_meta.get("validation_issues"))),
+    }
+    return _enrich_design_variant_contract(
+        payload,
+        current_decision_context_fingerprint=(
+            str(_decision_context_from_state(state, compact=True).get("fingerprint") or "")
+            or str(_as_dict(payload.get("decision_scope")).get("fingerprint") or "")
+        ),
+    )
+
+
+def _design_preview_validator_handler(source_variant_id: str):
+    def handler(node_id: str, state: dict[str, Any]) -> NodeResult:
+        variant_key = f"{source_variant_id}_variant"
+        raw_variant = _as_dict(state.get(variant_key))
+        if not raw_variant:
+            return NodeResult(
+                state_patch={_node_state_key(node_id, "preview_validation"): {"status": "missing", "source_variant_id": source_variant_id}},
+                artifacts=[],
+                metrics={"validation_mode": "missing-variant"},
+            )
+        current_fingerprint = str(_decision_context_from_state(state, compact=True).get("fingerprint") or "")
+        enriched_variant = _enrich_design_variant_contract(
+            raw_variant,
+            current_decision_context_fingerprint=current_fingerprint,
+        )
+        preview_meta = _as_dict(enriched_variant.get("preview_meta"))
+        validation_issues = [str(item) for item in _as_list(preview_meta.get("validation_issues")) if str(item).strip()]
+        repaired = preview_meta.get("validation_ok") is not True
+        if repaired:
+            enriched_variant = _repair_design_variant_preview(
+                enriched_variant,
+                state=state,
+                repair_reason="preview_contract_repaired",
+            )
+        final_preview_meta = _as_dict(enriched_variant.get("preview_meta"))
+        validation_summary = {
+            "status": "repaired" if repaired else "passed",
+            "source_variant_id": source_variant_id,
+            "preview_source": final_preview_meta.get("source"),
+            "candidate_source": preview_meta.get("source"),
+            "repaired": repaired,
+            "validation_ok": bool(final_preview_meta.get("validation_ok")),
+            "issues": validation_issues,
+            "fallback_reason": final_preview_meta.get("fallback_reason"),
+        }
+        return NodeResult(
+            state_patch={
+                variant_key: enriched_variant,
+                _node_state_key(node_id, "preview_validation"): validation_summary,
+            },
+            artifacts=_artifacts(
+                {
+                    "name": f"{source_variant_id}-preview-validation",
+                    "kind": "design",
+                    **validation_summary,
+                }
+            ),
+            metrics={
+                "validation_mode": "deterministic-repair",
+                "repaired": repaired,
+            },
+        )
+
+    return handler
+
+
 def _design_variant_payload(
     *,
     node_id: str,
@@ -2370,6 +5607,18 @@ def _design_variant_payload(
     score_overrides: dict[str, Any] | None = None,
     provider_note: str = "",
     prototype_overrides: dict[str, Any] | None = None,
+    decision_context_fingerprint: str = "",
+    decision_scope: dict[str, Any] | None = None,
+    token_usage: TokenUsage | None = None,
+    cost_override: float | None = None,
+    model_ref: str = "",
+    narrative_overrides: dict[str, Any] | None = None,
+    plan_estimates: list[dict[str, Any]] | None = None,
+    selected_preset: str = "",
+    target_language: str = "ja",
+    implementation_brief_overrides: dict[str, Any] | None = None,
+    preview_html_override: str = "",
+    preview_meta_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     scores = {
         "ux_quality": round(0.78 + (0.02 if "Minimal" in pattern_name else 0.0), 2),
@@ -2382,6 +5631,12 @@ def _design_variant_payload(
             continue
         scores[score_name] = _clamp_score(score_overrides.get(score_name), default=default)
     preview_features = selected_features or ["Autonomous workflow", "Approval gates", "Quality review"]
+    usage = token_usage or _design_variant_usage_estimate(
+        selected_features=preview_features,
+        pattern_name=pattern_name,
+        description=description,
+        prototype_overrides=prototype_overrides,
+    )
     analysis_payload = _as_dict(analysis)
     prototype = _build_design_prototype(
         spec=spec,
@@ -2391,14 +5646,56 @@ def _design_variant_payload(
         description=description,
         prototype_overrides=prototype_overrides,
     )
+    prototype.setdefault("design_anchor", {})
+    prototype["design_anchor"]["variant_id"] = node_id
     design_tokens = _as_dict(analysis_payload.get("design_tokens"))
+    narrative = _build_design_narrative(
+        description=description,
+        selected_features=preview_features,
+        decision_scope=decision_scope,
+        prototype=prototype,
+        provider_note=provider_note,
+        overrides=narrative_overrides,
+    )
+    implementation_brief = _build_design_implementation_brief(
+        spec=spec,
+        analysis=analysis_payload,
+        selected_features=preview_features,
+        prototype=prototype,
+        decision_scope=decision_scope,
+        plan_estimates=plan_estimates,
+        selected_preset=selected_preset,
+        quality_focus=quality_focus,
+        overrides=implementation_brief_overrides,
+    )
+    preview_title = _preview_title(spec)
+    canonical_quality_focus = list(quality_focus or [])
+    prototype_spec = build_prototype_spec(
+        title=preview_title,
+        subtitle=description,
+        primary=primary,
+        accent=accent,
+        features=preview_features,
+        prototype=prototype,
+        design_tokens=design_tokens,
+        decision_scope=decision_scope,
+        quality_focus=canonical_quality_focus,
+    )
+    prototype_app = build_nextjs_prototype_app(
+        title=preview_title,
+        subtitle=description,
+        primary=primary,
+        accent=accent,
+        prototype_spec=prototype_spec,
+    )
+    preview_source = "llm" if preview_html_override else "template"
     variant = {
         "id": node_id,
         "model": model_name,
         "pattern_name": pattern_name,
         "description": description,
-        "preview_html": _build_preview_html(
-            title=_preview_title(spec),
+        "preview_html": preview_html_override or _build_preview_html(
+            title=preview_title,
             subtitle=description,
             primary=primary,
             accent=accent,
@@ -2406,18 +5703,84 @@ def _design_variant_payload(
             prototype=prototype,
             design_tokens=design_tokens,
         ),
+        "prototype_spec": prototype_spec,
+        "prototype_app": prototype_app,
         "prototype": prototype,
         "primary_color": primary,
         "accent_color": accent,
-        "tokens": {"in": 320 + len(preview_features) * 14, "out": 900 + len(preview_features) * 20},
-        "cost_usd": round(0.18 + len(preview_features) * 0.02, 3),
+        "tokens": {"in": usage.input_tokens, "out": usage.output_tokens},
+        "cost_usd": _estimate_design_variant_cost(
+            model_name=model_name,
+            usage=usage,
+            model_ref=model_ref,
+            cost_override=cost_override,
+        ),
         "scores": scores,
         "rationale": rationale or description,
         "quality_focus": list(quality_focus or []),
+        "narrative": narrative,
+        "implementation_brief": implementation_brief,
+        "preview_meta": {
+            "source": preview_source,
+            "template_version": _DESIGN_TEMPLATE_PREVIEW_VERSION if preview_source == "template" else None,
+            "extraction_ok": bool(preview_html_override),
+            "fallback_reason": "",
+        },
     }
+    if preview_meta_overrides:
+        variant["preview_meta"] = {
+            **_as_dict(variant.get("preview_meta")),
+            **_as_dict(preview_meta_overrides),
+        }
+    if decision_context_fingerprint:
+        variant["decision_context_fingerprint"] = decision_context_fingerprint
+    if decision_scope:
+        variant["decision_scope"] = decision_scope
     if provider_note:
         variant["provider_note"] = provider_note
-    return variant
+    localized_variant = backfill_design_localization(variant, target_language=target_language)
+    localized_quality_focus = [
+        str(item)
+        for item in _as_list(localized_variant.get("quality_focus"))
+        if str(item).strip()
+    ] or canonical_quality_focus
+    localized_prototype = _as_dict(localized_variant.get("prototype")) or prototype
+    localized_prototype_spec = build_prototype_spec(
+        title=preview_title,
+        subtitle=str(localized_variant.get("description") or description),
+        primary=primary,
+        accent=accent,
+        features=preview_features,
+        prototype=localized_prototype,
+        design_tokens=design_tokens,
+        decision_scope=decision_scope,
+        quality_focus=localized_quality_focus,
+    )
+    localized_variant["prototype_spec"] = localized_prototype_spec
+    localized_variant["prototype_app"] = build_nextjs_prototype_app(
+        title=preview_title,
+        subtitle=str(localized_variant.get("description") or description),
+        primary=primary,
+        accent=accent,
+        prototype_spec=localized_prototype_spec,
+    )
+    if preview_html_override:
+        localized_variant["preview_html"] = preview_html_override
+    else:
+        localized_variant["preview_html"] = _build_preview_html(
+            title=preview_title,
+            subtitle=str(localized_variant.get("description") or description),
+            primary=primary,
+            accent=accent,
+            features=preview_features,
+            prototype=localized_prototype,
+            design_tokens=design_tokens,
+        )
+    localized_variant["preview_meta"] = dict(_as_dict(variant.get("preview_meta")))
+    return _enrich_design_variant_contract(
+        localized_variant,
+        current_decision_context_fingerprint=decision_context_fingerprint,
+    )
 
 
 def _development_quality_snapshot(
@@ -2469,6 +5832,44 @@ def _development_quality_snapshot(
         findings.append("Add ARIA labels to actionable controls.")
     if "viewport" not in code.lower():
         findings.append("Include responsive viewport metadata for mobile quality.")
+    delivery_plan = _as_dict(state.get("delivery_plan"))
+    code_workspace = _as_dict(delivery_plan.get("code_workspace"))
+    repo_execution = _as_dict(state.get("repo_execution")) or _as_dict(delivery_plan.get("repo_execution"))
+    work_unit_results = []
+    for raw_unit in _as_list(delivery_plan.get("work_unit_contracts")):
+        unit = _as_dict(raw_unit)
+        checks = [
+            str(item).strip()
+            for item in _as_list(unit.get("acceptance_criteria"))
+            if str(item).strip()
+        ] or [
+            str(item).strip()
+            for item in _as_list(unit.get("qa_checks"))
+            if str(item).strip()
+        ]
+        scores = [_milestone_score(check, code) for check in checks[:3]]
+        score = max(scores) if scores else (1.0 if "<html" in code.lower() else 0.0)
+        work_unit_results.append(
+            {
+                "id": str(unit.get("work_package_id") or unit.get("id") or "").strip(),
+                "wave_index": int(unit.get("wave_index", 0) or 0),
+                "status": "satisfied" if score >= 0.55 else "not_satisfied",
+            }
+        )
+    repo_findings: list[str] = []
+    if code_workspace:
+        if not repo_execution:
+            repo_findings.append("Real repo execution has not completed.")
+        elif repo_execution.get("ready") is not True:
+            repo_findings.extend(
+                [
+                    str(item)
+                    for item in _as_list(repo_execution.get("errors"))
+                    if str(item).strip()
+                ]
+            )
+            if not repo_findings:
+                repo_findings.append("Real repo execution did not reach a build-ready state.")
     security_status = "pass" if not findings else "warning"
     satisfied = sum(1 for item in milestones if _as_dict(item).get("status") == "satisfied")
     blockers = [
@@ -2476,13 +5877,21 @@ def _development_quality_snapshot(
         for item in milestones
         if _as_dict(item).get("status") != "satisfied"
     ]
+    blockers.extend(
+        f"Work unit not satisfied: {item['id']}"
+        for item in work_unit_results
+        if _as_dict(item).get("status") != "satisfied"
+    )
     blockers.extend(findings)
+    blockers.extend(repo_findings)
     return {
         "milestone_results": milestones,
+        "work_unit_results": work_unit_results,
         "security_report": {
             "status": security_status,
             "findings": findings or ["No obvious unsafe DOM execution pattern was detected."],
         },
+        "repo_execution_report": repo_execution,
         "milestones_satisfied": satisfied,
         "milestones_total": len(milestones),
         "blockers": blockers,
@@ -2499,6 +5908,13 @@ def _delegation_state_key(node_id: str) -> str:
 
 def _peer_feedback_state_key(node_id: str) -> str:
     return f"{node_id}_peer_feedback"
+
+
+def _is_non_blocking_review_finding(text: Any) -> bool:
+    message = str(text or "").strip().lower()
+    if not message:
+        return False
+    return message.startswith("no obvious ") or message.startswith("no blocking ")
 
 
 def _phase_blueprint_for_node(phase: str, node_id: str) -> dict[str, Any]:
@@ -2902,13 +6318,23 @@ def default_lifecycle_project_record(
         "name": str(project_id),
         "description": "",
         "githubRepo": None,
+        "productIdentity": {
+            "companyName": "",
+            "productName": "",
+            "officialWebsite": "",
+            "officialDomains": [],
+            "aliases": [],
+            "excludedEntityNames": [],
+        },
         "spec": "",
         "autonomyLevel": "A3",
         "researchConfig": {
             "competitorUrls": [],
             "depth": "standard",
             "outputLanguage": "ja",
+            "recoveryMode": "auto",
         },
+        "researchOperatorDecision": None,
         "research": None,
         "analysis": None,
         "features": [],
@@ -2921,10 +6347,17 @@ def default_lifecycle_project_record(
         "buildCode": None,
         "buildCost": 0.0,
         "buildIteration": 0,
+        "buildDecisionFingerprint": None,
         "milestoneResults": [],
+        "deliveryPlan": None,
+        "developmentExecution": None,
+        "developmentHandoff": None,
+        "valueContract": None,
+        "outcomeTelemetryContract": None,
         "planEstimates": [],
         "selectedPreset": "standard",
         "orchestrationMode": "workflow",
+        "governanceMode": "governed",
         "phaseStatuses": _phase_statuses(),
         "deployChecks": [],
         "releases": [],
@@ -2935,6 +6368,16 @@ def default_lifecycle_project_record(
         "skillInvocations": [],
         "delegations": [],
         "phaseRuns": [],
+        "requirements": None,
+        "requirementsConfig": {
+            "earsEnabled": True,
+            "interactiveClarification": True,
+            "confidenceFloor": 0.6,
+        },
+        "reverseEngineering": None,
+        "taskDecomposition": None,
+        "dcsAnalysis": None,
+        "technicalDesign": None,
         "createdAt": now,
         "updatedAt": now,
         "savedAt": now,
@@ -3116,25 +6559,31 @@ def build_lifecycle_phase_blueprints(project_id: str) -> dict[str, Any]:
         "design": {
             "phase": "design",
             "title": "Design Jury",
-            "summary": "複数コンセプトを生成し、UX・可読性・アクセシビリティで比較する。",
+            "summary": "強く差別化された 2 つの product prototype を生成し、判断しやすい最終候補に絞る。",
             "team": [
                 _agent_blueprint(
                     "claude-designer",
                     "Concept Designer A",
-                    "情報密度を抑えた構成案を生成",
+                    "濃色で精密な control-room 案を生成",
                     skills=["ui-concepting", "visual-hierarchy"],
                 ),
                 _agent_blueprint(
-                    "openai-designer",
-                    "Concept Designer B",
-                    "運用効率の高い dashboard-first 案を生成",
-                    skills=["dashboard-design", "information-design"],
+                    "gemini-designer",
+                    "Concept Designer B (KIMI)",
+                    "KIMI K2.5 による明るく建築的な decision-studio 案を生成",
+                    skills=["responsive-design", "component-patterns", "visual-systems"],
                 ),
                 _agent_blueprint(
-                    "gemini-designer",
-                    "Concept Designer C",
-                    "モバイル適性の高い card-based 案を生成",
-                    skills=["responsive-design", "component-patterns"],
+                    "claude-preview-validator",
+                    "Preview Validator A",
+                    "Direction A の preview contract を検証し、必要なら canonical preview へ修復する",
+                    skills=["artifact-validation", "design-contract-repair"],
+                ),
+                _agent_blueprint(
+                    "gemini-preview-validator",
+                    "Preview Validator B",
+                    "Direction B の preview contract を検証し、必要なら canonical preview へ修復する",
+                    skills=["artifact-validation", "design-contract-repair"],
                 ),
                 _agent_blueprint(
                     "design-evaluator",
@@ -3148,8 +6597,9 @@ def build_lifecycle_phase_blueprints(project_id: str) -> dict[str, Any]:
                 _artifact_descriptor("design-scorecard", "design", "採点結果と比較表"),
             ],
             "quality_gates": [
-                _quality_gate("variant-diversity", "少なくとも 3 種類の設計アプローチが提示されている"),
+                _quality_gate("variant-diversity", "少なくとも 2 種類の設計アプローチが提示されている"),
                 _quality_gate("a11y-floor", "全候補に基本的なアクセシビリティ考慮がある"),
+                _quality_gate("preview-contract", "selected design の preview が contract を満たしている"),
             ],
         },
         "approval": {
@@ -3173,13 +6623,13 @@ def build_lifecycle_phase_blueprints(project_id: str) -> dict[str, Any]:
         },
         "development": {
             "phase": "development",
-            "title": "Build Mesh",
-            "summary": "設計を specialist team に分解し、統合・品質確認までを担う。",
+            "title": "Autonomous Delivery Mesh",
+            "summary": "承認済み context を dependency-aware delivery graph に展開し、衝突なく build から deploy handoff までを担う。",
             "team": [
                 _agent_blueprint(
                     "planner",
                     "Build Planner",
-                    "作業分解、担当割り当て、成功条件の定義",
+                    "作業分解、依存順、merge 順、handoff 条件を定義",
                     skills=["task-routing", "implementation-planning"],
                 ),
                 _agent_blueprint(
@@ -3223,12 +6673,22 @@ def build_lifecycle_phase_blueprints(project_id: str) -> dict[str, Any]:
             ],
             "artifacts": [
                 _artifact_descriptor("implementation-plan", "development", "実装方針と作業分解"),
+                _artifact_descriptor("goal-spec", "development", "実装ゴールと contract 注入仕様"),
+                _artifact_descriptor("delivery-plan", "development", "dependency-aware delivery graph"),
+                _artifact_descriptor("delivery-waves", "development", "dependency-based execution waves"),
+                _artifact_descriptor("work-unit-contracts", "development", "WU 単位の acceptance / QA / security contract"),
                 _artifact_descriptor("build-artifact", "development", "プレビュー可能な build"),
                 _artifact_descriptor("milestone-report", "development", "達成判定レポート"),
+                _artifact_descriptor("deploy-handoff", "development", "deploy phase に渡す handoff packet"),
             ],
             "quality_gates": [
+                _quality_gate("goal-spec", "承認済み context が goal spec と contract injection plan に分解されている"),
+                _quality_gate("delivery-graph", "依存順と merge 順が定義された delivery graph がある"),
+                _quality_gate("delivery-waves", "依存 DAG に基づく execution wave が定義されている"),
+                _quality_gate("work-unit-contracts", "各 WU が acceptance / QA / security / repair policy を持っている"),
                 _quality_gate("feature-coverage", "選択した主要機能が build に反映されている"),
                 _quality_gate("milestone-readiness", "少なくとも alpha 相当のマイルストーンが満たされている"),
+                _quality_gate("deploy-handoff", "deploy phase に渡せる handoff packet が揃っている"),
             ],
         },
         "deploy": {
@@ -3307,7 +6767,12 @@ def _quality_gate(gate_id: str, title: str) -> dict[str, Any]:
     return {"id": gate_id, "title": title}
 
 
-def build_lifecycle_workflow_definition(project_id: str, phase: str) -> dict[str, Any]:
+def build_lifecycle_workflow_definition(
+    project_id: str,
+    phase: str,
+    *,
+    project_record: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     workflow_id = f"lifecycle-{phase}-{project_id}"
     if phase == "research":
         project = {
@@ -3391,19 +6856,21 @@ def build_lifecycle_workflow_definition(project_id: str, phase: str) -> dict[str
         project = {
             "version": "1",
             "name": "lifecycle-design",
-            "description": "Design jury that compares three design directions and judges them on quality gates.",
+            "description": "Design jury that compares two elevated product directions and judges them on quality gates.",
             "agents": {
                 "claude-designer": _agent_def("design-concept-a"),
-                "openai-designer": _agent_def("design-concept-b"),
-                "gemini-designer": _agent_def("design-concept-c"),
+                "gemini-designer": _agent_def("design-concept-b"),
+                "claude-preview-validator": _agent_def("preview-contract-validator-a"),
+                "gemini-preview-validator": _agent_def("preview-contract-validator-b"),
                 "design-evaluator": _agent_def("design-judge"),
             },
             "workflow": {
                 "type": "graph",
                 "nodes": {
-                    "claude-designer": {"agent": "claude-designer", "next": ["design-evaluator"]},
-                    "openai-designer": {"agent": "openai-designer", "next": ["design-evaluator"]},
-                    "gemini-designer": {"agent": "gemini-designer", "next": ["design-evaluator"]},
+                    "claude-designer": {"agent": "claude-designer", "next": ["claude-preview-validator"]},
+                    "gemini-designer": {"agent": "gemini-designer", "next": ["gemini-preview-validator"]},
+                    "claude-preview-validator": {"agent": "claude-preview-validator", "next": ["design-evaluator"]},
+                    "gemini-preview-validator": {"agent": "gemini-preview-validator", "next": ["design-evaluator"]},
                     "design-evaluator": {
                         "agent": "design-evaluator",
                         "join_policy": "all_resolved",
@@ -3411,35 +6878,42 @@ def build_lifecycle_workflow_definition(project_id: str, phase: str) -> dict[str
                     },
                 },
             },
-            "policy": {"max_cost_usd": 1.4, "max_duration": "10m", "require_approval_above": "A3"},
+            "policy": {"max_cost_usd": 1.1, "max_duration": "8m", "require_approval_above": "A3"},
         }
     elif phase == "development":
+        development_nodes = (
+            _build_development_runtime_workflow_nodes(project_record)
+            if isinstance(project_record, dict)
+            else None
+        )
         project = {
             "version": "1",
             "name": "lifecycle-development",
-            "description": "Specialist build mesh with planning, implementation, integration, QA, security, and review.",
+            "description": "Autonomous delivery mesh with dependency planning, conflict-safe implementation, real repo execution, QA, security, and deploy handoff review.",
             "agents": {
                 "planner": _agent_def("build-planning"),
                 "frontend-builder": _agent_def("frontend-implementation", tools=["code-edit", "file-write"]),
                 "backend-builder": _agent_def("backend-implementation"),
                 "integrator": _agent_def("artifact-integration", tools=["code-edit", "file-write"]),
+                "repo-executor": _agent_def("repo-execution"),
                 "qa-engineer": _agent_def("qa-review"),
                 "security-reviewer": _agent_def("security-review"),
                 "reviewer": _agent_def("release-review"),
             },
             "workflow": {
                 "type": "graph",
-                "nodes": {
+                "nodes": development_nodes or {
                     "planner": {"agent": "planner", "next": ["frontend-builder", "backend-builder"]},
                     "frontend-builder": {"agent": "frontend-builder", "next": ["integrator"]},
                     "backend-builder": {"agent": "backend-builder", "next": ["integrator"]},
-                    "integrator": {"agent": "integrator", "join_policy": "all_resolved", "next": ["qa-engineer", "security-reviewer"]},
+                    "integrator": {"agent": "integrator", "join_policy": "all_resolved", "next": ["repo-executor"]},
+                    "repo-executor": {"agent": "repo-executor", "next": ["qa-engineer", "security-reviewer"]},
                     "qa-engineer": {"agent": "qa-engineer", "next": ["reviewer"]},
                     "security-reviewer": {"agent": "security-reviewer", "next": ["reviewer"]},
                     "reviewer": {"agent": "reviewer", "join_policy": "all_resolved", "next": "END"},
                 },
             },
-            "policy": {"max_cost_usd": 3.5, "max_duration": "20m", "require_approval_above": "A3"},
+            "policy": {"max_cost_usd": 4.2, "max_duration": "24m", "require_approval_above": "A3"},
         }
     else:
         raise ValueError(f"Unsupported lifecycle phase: {phase}")
@@ -3598,31 +7072,60 @@ def build_lifecycle_workflow_handlers(
         return _wrap_handlers({
             "claude-designer": _design_variant_handler(
                 "Claude Sonnet 4.6",
-                "Modern Minimal",
-                "Focuses on calm hierarchy and premium clarity.",
-                "#0f172a",
-                "#f97316",
-                provider_registry=provider_registry,
-                llm_runtime=llm_runtime,
-            ),
-            "openai-designer": _design_variant_handler(
-                "Kimi K2.5",
-                "Dashboard First",
-                "Optimizes for rapid UI iteration, long-context layout synthesis, and dense operator surfaces.",
-                "#0b3b2e",
-                "#10b981",
+                "Obsidian Control Atelier",
+                "A premium dark product shell with editorial hierarchy, deliberate density, and crisp operator trust cues.",
+                "#e7edf7",
+                "#f59e0b",
+                creative_brief=(
+                    "Direction A should feel like a luxury control room for product operators: dark, precise, "
+                    "architectural, and unmistakably not a generic dashboard."
+                ),
+                prototype_seed_overrides={
+                    "prototype_kind": "control-center",
+                    "navigation_style": "sidebar",
+                    "density": "high",
+                    "visual_style": "obsidian-atelier",
+                    "display_font": "IBM Plex Sans",
+                    "body_font": "IBM Plex Sans",
+                    "screen_labels": ["判断デッキ", "調査復旧", "承認ゲート", "リネージ探索"],
+                    "interaction_principles": [
+                        "Keep evidence and the next action in one scan path.",
+                        "Use contrast and calm spacing to create trust without dead space.",
+                        "Make operator interventions feel deliberate and high-signal.",
+                    ],
+                },
                 provider_registry=provider_registry,
                 llm_runtime=llm_runtime,
             ),
             "gemini-designer": _design_variant_handler(
-                "Gemini 3 Pro",
-                "Card Mosaic",
-                "Optimizes for exploratory visual systems and modular mobile scanning.",
-                "#312e81",
-                "#06b6d4",
+                "KIMI K2.5 / Direction B",
+                "Ivory Signal Gallery",
+                "A luminous product workspace with architectural pacing, bold navigation, and refined decision-focused surfaces.",
+                "#14213d",
+                "#2563eb",
+                creative_brief=(
+                    "Direction B should feel like an art-directed operations suite: brighter, more open, and more gallery-like, "
+                    "but still dense enough for real operator work. Do not drift into a marketing hero, LP, or concept landing surface."
+                ),
+                prototype_seed_overrides={
+                    "prototype_kind": "decision-studio",
+                    "navigation_style": "top-nav",
+                    "density": "medium",
+                    "visual_style": "ivory-signal",
+                    "display_font": "Avenir Next",
+                    "body_font": "Hiragino Sans",
+                    "screen_labels": ["フェーズワークスペース", "ラン台帳", "判断レビュー", "リリース準備"],
+                    "interaction_principles": [
+                        "Use asymmetry and generous framing to make dense information feel breathable.",
+                        "Let navigation and review states read like a designed editorial system.",
+                        "Keep mobile collapse graceful without losing the primary work surface.",
+                    ],
+                },
                 provider_registry=provider_registry,
                 llm_runtime=llm_runtime,
             ),
+            "claude-preview-validator": _design_preview_validator_handler("claude-designer"),
+            "gemini-preview-validator": _design_preview_validator_handler("gemini-designer"),
             "design-evaluator": lambda node_id, state: _design_evaluator_handler(
                 node_id,
                 state,
@@ -3656,6 +7159,7 @@ def build_lifecycle_workflow_handlers(
                 provider_registry=provider_registry,
                 llm_runtime=llm_runtime,
             ),
+            "repo-executor": _development_repo_executor_handler,
             "qa-engineer": _development_qa_handler,
             "security-reviewer": lambda node_id, state: _development_security_handler(
                 node_id,
@@ -3681,6 +7185,21 @@ def build_deploy_checks(project_record: dict[str, Any]) -> dict[str, Any]:
         for item in project_record.get("features") or []
         if isinstance(item, dict) and item.get("selected") is True
     )
+    delivery_plan = _as_dict(project_record.get("deliveryPlan"))
+    code_workspace = _as_dict(delivery_plan.get("code_workspace"))
+    workspace_paths = {
+        str(_as_dict(item).get("path") or "").strip()
+        for item in _as_list(code_workspace.get("files"))
+        if str(_as_dict(item).get("path") or "").strip()
+    }
+    value_contract = _as_dict(project_record.get("valueContract"))
+    outcome_telemetry_contract = _as_dict(project_record.get("outcomeTelemetryContract"))
+    required_workspace_artifacts = {
+        str(item).strip()
+        for item in _as_list(outcome_telemetry_contract.get("workspace_artifacts"))
+        if str(item).strip()
+    }
+    instrumentation_ready = bool(required_workspace_artifacts) and required_workspace_artifacts.issubset(workspace_paths)
 
     checks = [
         _deploy_check(
@@ -3722,6 +7241,24 @@ def build_deploy_checks(project_record: dict[str, Any]) -> dict[str, Any]:
             "Feature coverage",
             "pass" if selected_features > 0 and feature_count > 0 else "warning",
             "Selected feature set is reflected in the generated artifact.",
+        ),
+        _deploy_check(
+            VALUE_CONTRACT_ID,
+            "Value contract readiness",
+            "pass" if value_contract_ready(value_contract) else "fail",
+            "Release should stay tied to personas, JTBD, IA key paths, and explicit success metrics.",
+        ),
+        _deploy_check(
+            OUTCOME_TELEMETRY_CONTRACT_ID,
+            "Outcome telemetry readiness",
+            "pass" if outcome_telemetry_contract_ready(outcome_telemetry_contract) else "fail",
+            "Release should carry success metrics, kill criteria, and telemetry events into iteration.",
+        ),
+        _deploy_check(
+            "instrumentation-coverage",
+            "Instrumentation coverage",
+            "pass" if instrumentation_ready else "warning",
+            "Workspace artifacts should materialize value and telemetry contracts so release evidence is replayable.",
         ),
     ]
     score_map = {"pass": 100, "warning": 70, "fail": 30}
@@ -4026,6 +7563,46 @@ def _winning_claims(claims: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return winners or ordered[:2]
 
 
+def _claim_statement_lookup(claims: list[dict[str, Any]]) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for item in claims:
+        claim = _as_dict(item)
+        claim_id = _normalize_space(claim.get("id"))
+        statement = _first_research_text(claim.get("statement"), char_limit=220)
+        if claim_id and statement:
+            lookup[claim_id] = statement
+    return lookup
+
+
+def _resolved_winning_thesis_strings(
+    values: Any,
+    *,
+    claims: list[dict[str, Any]],
+    limit: int = 3,
+    char_limit: int = 220,
+) -> list[str]:
+    claim_lookup = _claim_statement_lookup(claims)
+    resolved: list[str] = []
+    items = _as_list(values) if isinstance(values, list) else ([values] if values else [])
+    for item in items:
+        record = _as_dict(_parse_research_structured_value(item))
+        claim_id = _normalize_space(record.get("claim_id") or record.get("id"))
+        candidate = _first_research_text(item, char_limit=char_limit)
+        if claim_id and claim_id in claim_lookup and (
+            not candidate or _looks_like_machine_token(candidate) or candidate == claim_id
+        ):
+            candidate = claim_lookup[claim_id]
+        elif candidate in claim_lookup:
+            candidate = claim_lookup[candidate]
+        candidate = _truncate_research_text(candidate, limit=char_limit)
+        if not candidate or _looks_like_machine_token(candidate) or candidate in resolved:
+            continue
+        resolved.append(candidate)
+        if len(resolved) >= limit:
+            break
+    return resolved
+
+
 def _feature_supporting_claim_ids(state: dict[str, Any], *, limit: int = 2) -> list[str]:
     research = _as_dict(state.get("research"))
     winning = [_as_dict(item) for item in _as_list(research.get("claims")) if _as_dict(item).get("status") == "accepted"]
@@ -4064,18 +7641,508 @@ def _build_feature_decisions(state: dict[str, Any], features: list[dict[str, Any
     return decisions
 
 
+def _planning_selected_or_default_features(state: dict[str, Any]) -> list[dict[str, Any]]:
+    features = [
+        _as_dict(item)
+        for item in (_as_list(state.get("feature_selections")) or _as_list(state.get("features")))
+        if _as_dict(item)
+    ]
+    return features or _default_feature_selections_for_spec(state)
+
+
+def _planning_use_cases_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
+    analysis = _as_dict(state.get("analysis"))
+    use_cases = [_as_dict(item) for item in _as_list(state.get("use_cases")) if _as_dict(item)]
+    if use_cases:
+        return use_cases
+    return [_as_dict(item) for item in _as_list(analysis.get("use_cases")) if _as_dict(item)]
+
+
+def _planning_milestones_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
+    analysis = _as_dict(state.get("analysis"))
+    milestones = [_as_dict(item) for item in _as_list(state.get("recommended_milestones")) if _as_dict(item)]
+    if milestones:
+        return milestones
+    milestones = [_as_dict(item) for item in _as_list(analysis.get("recommended_milestones")) if _as_dict(item)]
+    if milestones:
+        return milestones
+    return [_as_dict(item) for item in _as_list(_solution_bundle(state).get("recommended_milestones")) if _as_dict(item)]
+
+
+def _planning_context_payload(
+    state: dict[str, Any],
+    *,
+    features: list[dict[str, Any]] | None = None,
+    personas: list[dict[str, Any]] | None = None,
+    use_cases: list[dict[str, Any]] | None = None,
+    milestones: list[dict[str, Any]] | None = None,
+    design_tokens: dict[str, Any] | None = None,
+    business_model: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    spec = str(state.get("spec", ""))
+    kind = _infer_product_kind(spec)
+    research = _research_context(state, segment_from_spec=_segment_from_spec)
+    selected_features = [
+        str(item.get("feature", "")).strip()
+        for item in (features or _planning_selected_or_default_features(state))
+        if item.get("selected") is True and str(item.get("feature", "")).strip()
+    ]
+    persona_records = personas or _build_persona_bundle(state)[0]
+    use_case_records = use_cases or _build_story_architecture_bundle(state).get("use_cases", [])
+    milestone_records = milestones or _planning_milestones_from_state(state)
+    style = _as_dict(_as_dict(design_tokens or _solution_bundle(state).get("design_tokens")).get("style"))
+    business = _as_dict(business_model or _solution_bundle(state).get("business_model"))
+    if kind == "operations":
+        core_loop = "Turn grounded evidence into a governed plan, then carry the same decision context into design and build."
+        north_star = "Operator trust: every phase decision should remain explainable, reviewable, and recoverable."
+        experience_principles = [
+            "Keep artifact lineage visible before automation breadth.",
+            "Prefer lane-level recovery over full reruns.",
+            "Make approval and rework states explicit in the primary workspace.",
+        ]
+        delivery_principles = [
+            "Prove traceability and governance before expanding autonomous breadth.",
+            "Treat degraded lanes as local recovery problems with explicit evidence gaps.",
+            "Attach milestones to observable operator decisions, not narrative momentum.",
+        ]
+        market_notes = {
+            "opportunities": (
+                ["Enterprise and platform teams are actively evaluating governed multi-agent orchestration."]
+                if research.get("opportunities")
+                else []
+            ),
+            "threats": (
+                ["Category noise is high, so differentiation must come from lineage, approvals, and recovery quality."]
+                if research.get("threats")
+                else []
+            ),
+        }
+    elif kind == "commerce":
+        core_loop = "Help buyers compare confidently and finish checkout without hesitation."
+        north_star = "Purchase confidence: users should understand what to buy and why before checkout."
+        experience_principles = [
+            "Reduce ambiguity in comparison, pricing, and delivery.",
+            "Keep conversion-critical states visible on mobile.",
+            "Support operators with inventory and fulfillment clarity.",
+        ]
+        delivery_principles = [
+            "Protect browse-to-buy completion before merchandising breadth.",
+            "Measure hesitation around comparison and checkout states.",
+            "Keep operational readiness tied to real order-handling flows.",
+        ]
+        market_notes = {
+            "opportunities": (
+                ["Demand exists, but it should be converted through faster comparison and clearer purchase confidence."]
+                if research.get("opportunities")
+                else []
+            ),
+            "threats": (
+                ["Crowded commerce surfaces make hesitation and trust failures especially expensive."]
+                if research.get("threats")
+                else []
+            ),
+        }
+    elif kind == "learning":
+        core_loop = "Get the learner into a short, rewarding study loop that is easy to repeat."
+        north_star = "Habit confidence: the product should help the learner return tomorrow."
+        experience_principles = [
+            "Show the next achievable step immediately.",
+            "Keep guardian clarity high without overwhelming the learner.",
+            "Favor short-session confidence over feature breadth.",
+        ]
+        delivery_principles = [
+            "Ship the daily habit loop before enrichment systems.",
+            "Keep interruption recovery tightly scoped.",
+            "Tie milestones to repeatable learning behavior, not just surface completion.",
+        ]
+        market_notes = {
+            "opportunities": (
+                ["The opportunity is real only if the product proves short-session retention and repeatability."]
+                if research.get("opportunities")
+                else []
+            ),
+            "threats": (
+                ["Users will churn quickly if the first routine feels too long or too hard."]
+                if research.get("threats")
+                else []
+            ),
+        }
+    else:
+        core_loop = "Move the user through the primary value path with minimal confusion."
+        north_star = "Clarity first: users should understand the next action at every step."
+        experience_principles = [
+            "Shorten time-to-value before adding convenience layers.",
+            "Keep current status and next action visible.",
+            "Prefer progressive disclosure over breadth-first scope.",
+        ]
+        delivery_principles = [
+            "Validate the first successful workflow before expanding scope.",
+            "Keep milestones falsifiable and tightly scoped.",
+            "Treat unresolved assumptions as explicit delivery constraints.",
+        ]
+        market_notes = {
+            "opportunities": (
+                ["The opportunity should be validated through a crisp first-use success path before scope expands."]
+                if research.get("opportunities")
+                else []
+            ),
+            "threats": (
+                ["Category noise increases the penalty for ambiguous onboarding and unclear state."]
+                if research.get("threats")
+                else []
+            ),
+        }
+    return {
+        "product_kind": kind,
+        "segment": research.get("segment"),
+        "north_star": north_star,
+        "core_loop": core_loop,
+        "experience_principles": experience_principles,
+        "delivery_principles": delivery_principles,
+        "selected_feature_names": selected_features[:6],
+        "primary_personas": [
+            {
+                "name": str(_as_dict(item).get("name", "")),
+                "role": str(_as_dict(item).get("role", "")),
+            }
+            for item in persona_records[:2]
+            if _as_dict(item)
+        ],
+        "primary_use_cases": [
+            {
+                "id": str(_as_dict(item).get("id", "")),
+                "title": str(_as_dict(item).get("title", "")),
+                "priority": str(_as_dict(item).get("priority", "")),
+            }
+            for item in use_case_records[:4]
+            if _as_dict(item)
+        ],
+        "milestone_names": [
+            str(_as_dict(item).get("name", ""))
+            for item in milestone_records[:3]
+            if str(_as_dict(item).get("name", "")).strip()
+        ],
+        "research_pressures": {
+            "signals": list(research.get("user_signals", []))[:3],
+            "pain_points": list(research.get("pain_points", []))[:3],
+            "opportunities": market_notes["opportunities"],
+            "threats": market_notes["threats"],
+        },
+        "design_anchor": {
+            "style_name": str(style.get("name", "")),
+            "keywords": [str(item) for item in _as_list(style.get("keywords")) if str(item).strip()][:4],
+        },
+        "business_model_anchor": {
+            "customer_segments": [str(item) for item in _as_list(business.get("customer_segments")) if str(item).strip()][:4],
+            "value_propositions": [str(item) for item in _as_list(business.get("value_propositions")) if str(item).strip()][:3],
+        },
+    }
+
+
+def _planning_rejected_features(features: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "feature": str(item.get("feature", "")),
+            "reason": "Held for later to preserve falsifiable scope and delivery confidence.",
+            "counterarguments": ["This feature increases complexity before the first evidence loop is validated."],
+        }
+        for item in features
+        if item.get("selected") is not True and str(item.get("feature", "")).strip()
+    ]
+
+
+def _planning_scope_findings(node_id: str, features: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    findings = [
+        _finding_entry(
+            f"scope-{index + 1}",
+            title=f"Scope pressure around {item.get('feature')}",
+            challenger=node_id,
+            severity="high" if str(item.get("implementation_cost")) == "high" else "medium",
+            impact="If this remains in the first cut, the team may lose falsifiability and review speed.",
+            recommendation="Keep this out of the first release unless a research claim explicitly requires it.",
+            related_feature=str(item.get("feature", "")),
+        )
+        for index, item in enumerate(features)
+        if item.get("selected") is True and str(item.get("implementation_cost")) == "high"
+    ]
+    return findings or [
+        _finding_entry(
+            "scope-guardrail",
+            title="Protect first-release scope",
+            challenger=node_id,
+            severity="medium",
+            impact="Adding convenience features early would blur whether the core workflow is actually working.",
+            recommendation="Keep the first milestone focused on a single evidence-to-decision loop.",
+        )
+    ]
+
+
+def _planning_assumption_records(state: dict[str, Any], personas: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    research = _research_context(state, segment_from_spec=_segment_from_spec)
+    assumptions = _dedupe_strings(
+        [
+            f"{str(personas[0].get('name', 'Primary user')) if personas else 'Primary user'} will trade setup breadth for stronger control and traceability.",
+            "The first milestone can be validated before full-scale automation breadth is delivered.",
+            *(f"Research assumption: {item}" for item in research["user_signals"][:1]),
+        ]
+    )
+    return [
+        {"id": f"assumption-{index + 1}", "statement": text, "severity": "medium"}
+        for index, text in enumerate(assumptions)
+    ]
+
+
+def _planning_assumption_findings(node_id: str) -> list[dict[str, Any]]:
+    return [
+        _finding_entry(
+            "assumption-gap",
+            title="Planning relies on a narrow trust assumption",
+            challenger=node_id,
+            severity="medium",
+            impact="If users actually value speed over governance, the proposed scope may be too heavy.",
+            recommendation="Validate control-plane depth against onboarding friction in the first user loop.",
+        )
+    ]
+
+
+def _planning_negative_personas_for_state(state: dict[str, Any]) -> list[dict[str, Any]]:
+    kind = _infer_product_kind(str(state.get("spec", "")))
+    if kind == "operations":
+        return [
+            _negative_persona_entry(
+                "negative-ops-1",
+                name="Shadow Automator",
+                scenario="Runs autonomous flows without reviewing evidence or approval states.",
+                risk="Can create silent drift between plan, approval, and build.",
+                mitigation="Keep approval status and lineage visible in every primary workflow.",
+            ),
+            _negative_persona_entry(
+                "negative-ops-2",
+                name="Audit Skeptic",
+                scenario="Needs traceability to trust the system but only sees generated output.",
+                risk="Rejects autonomous adoption if artifact lineage is not first-class.",
+                mitigation="Surface claim-to-feature traceability and unresolved dissent above the fold.",
+            ),
+        ]
+    return [
+        _negative_persona_entry(
+            "negative-generic-1",
+            name="Impatient Evaluator",
+            scenario="Judges the product after one incomplete run.",
+            risk="Leaves before the core loop demonstrates value.",
+            mitigation="Make the first successful workflow obvious and measurable.",
+        )
+    ]
+
+
+def _planning_negative_persona_findings(node_id: str) -> list[dict[str, Any]]:
+    return [
+        _finding_entry(
+            "negative-persona-risk",
+            title="The plan does not naturally protect against the hardest-to-serve user",
+            challenger=node_id,
+            severity="medium",
+            impact="Without explicit handling, failure modes stay hidden until rollout.",
+            recommendation="Turn these negative personas into acceptance and instrumentation checks.",
+        )
+    ]
+
+
+def _planning_kill_criteria_for_milestones(milestones: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": f"kill-{index + 1}",
+            "milestone_id": str(item.get("id", "")),
+            "condition": f"If {str(item.get('name', 'the milestone')).strip()} cannot show observable completion evidence, stop scope expansion and re-open planning.",
+            "rationale": "Milestones must be falsifiable instead of narrative.",
+        }
+        for index, item in enumerate(milestones[:3])
+    ]
+
+
+def _planning_milestone_findings(node_id: str, milestones: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        _finding_entry(
+            f"milestone-{index + 1}",
+            title=f"Milestone {str(item.get('name', 'Milestone'))} needs a failure condition",
+            challenger=node_id,
+            severity="medium",
+            impact="A milestone without a stop condition will let the team ship momentum instead of evidence.",
+            recommendation="Add the observable failure signal next to the success criteria.",
+        )
+        for index, item in enumerate(milestones[:2])
+    ]
+
+
+def _dedupe_findings_by_title(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in findings:
+        record = _as_dict(item)
+        key = (str(record.get("title", "")).strip(), str(record.get("recommendation", "")).strip())
+        if not key[0] or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(record)
+    return deduped
+
+
+def _planning_review_defaults(
+    state: dict[str, Any],
+    *,
+    features: list[dict[str, Any]] | None = None,
+    personas: list[dict[str, Any]] | None = None,
+    milestones: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    feature_records = features or _planning_selected_or_default_features(state)
+    persona_records = personas or [
+        _as_dict(item)
+        for item in _as_list(state.get("persona_report"))
+        if _as_dict(item)
+    ]
+    milestone_records = milestones or _planning_milestones_from_state(state)
+    rejected_features = _planning_rejected_features(feature_records)
+    assumptions = _planning_assumption_records(state, persona_records)
+    negative_personas = _planning_negative_personas_for_state(state)
+    kill_criteria = _planning_kill_criteria_for_milestones(milestone_records)
+    red_team_findings = _dedupe_findings_by_title(
+        [
+            *_planning_scope_findings("scope-skeptic", feature_records),
+            *_planning_assumption_findings("assumption-auditor"),
+            *_planning_negative_persona_findings("negative-persona-challenger"),
+            *_planning_milestone_findings("milestone-falsifier", milestone_records),
+        ]
+    )
+    return {
+        "rejected_features": rejected_features,
+        "assumptions": assumptions,
+        "negative_personas": negative_personas,
+        "kill_criteria": kill_criteria,
+        "red_team_findings": red_team_findings,
+    }
+
+
+def _planning_fallback_judge_summary(
+    recommendations: list[str],
+    review_defaults: dict[str, Any],
+) -> str:
+    top_finding = _as_dict(_as_list(review_defaults.get("red_team_findings"))[0])
+    finding_title = str(top_finding.get("title", "")).strip()
+    top_recommendation = next((str(item).strip() for item in recommendations if str(item).strip()), "")
+    if finding_title and top_recommendation:
+        return f"{finding_title}. {top_recommendation}"
+    return finding_title or top_recommendation or "Keep planning tightly scoped, traceable, and falsifiable before moving into design."
+
+
+def _feature_use_case_match_score(feature_name: str, use_case: dict[str, Any]) -> int:
+    normalized_feature = feature_name.casefold()
+    feature_keywords = set(_keywords(feature_name))
+    score = 0
+    for related in _as_list(use_case.get("related_stories")):
+        related_text = str(related or "")
+        related_normalized = related_text.casefold()
+        if not related_normalized:
+            continue
+        if normalized_feature == related_normalized:
+            score += 8
+        elif normalized_feature in related_normalized or related_normalized in normalized_feature:
+            score += 5
+        overlap = feature_keywords & set(_keywords(related_text))
+        score += min(len(overlap), 3)
+    combined_text = " ".join(
+        [
+            str(use_case.get("title", "")),
+            str(use_case.get("actor", "")),
+            str(use_case.get("category", "")),
+            str(use_case.get("sub_category", "")),
+            *(str(step) for step in _as_list(use_case.get("main_flow"))),
+        ]
+    )
+    combined_normalized = combined_text.casefold()
+    if normalized_feature and normalized_feature in combined_normalized:
+        score += 4
+    score += min(len(feature_keywords & set(_keywords(combined_text))), 3)
+    return score
+
+
+def _traceability_use_case_for_feature(
+    feature_name: str,
+    use_cases: list[dict[str, Any]],
+    *,
+    fallback_index: int,
+) -> dict[str, Any]:
+    if not use_cases:
+        return {}
+    ranked = sorted(
+        enumerate(use_cases),
+        key=lambda item: (_feature_use_case_match_score(feature_name, item[1]), -item[0]),
+        reverse=True,
+    )
+    best_index, best_use_case = ranked[0]
+    if _feature_use_case_match_score(feature_name, best_use_case) > 0:
+        return best_use_case
+    return use_cases[min(fallback_index, len(use_cases) - 1)]
+
+
+def _traceability_milestone_for_use_case(
+    use_case: dict[str, Any],
+    milestones: list[dict[str, Any]],
+    *,
+    fallback_index: int,
+) -> dict[str, Any]:
+    if not milestones:
+        return {}
+    use_case_id = str(use_case.get("id", "")).strip()
+    for milestone in milestones:
+        if use_case_id and use_case_id in {str(item) for item in _as_list(milestone.get("depends_on_use_cases"))}:
+            return milestone
+    priority = str(use_case.get("priority", "should") or "should")
+    phase_hint = "alpha" if priority == "must" else "beta" if priority == "should" else "release"
+    for milestone in milestones:
+        if str(milestone.get("phase", "")) == phase_hint:
+            return milestone
+    return milestones[min(fallback_index, len(milestones) - 1)]
+
+
+def _planning_required_traceability_use_cases(
+    use_cases: list[dict[str, Any]],
+    milestones: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    milestone_use_case_ids = {
+        str(use_case_id).strip()
+        for milestone in milestones
+        for use_case_id in _as_list(milestone.get("depends_on_use_cases"))
+        if str(use_case_id).strip()
+    }
+    required: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for use_case in use_cases:
+        record = _as_dict(use_case)
+        use_case_id = str(record.get("id", "")).strip()
+        priority = str(record.get("priority", "should") or "should")
+        if not use_case_id or use_case_id in seen:
+            continue
+        if priority in {"must", "should"} or use_case_id in milestone_use_case_ids:
+            seen.add(use_case_id)
+            required.append(record)
+    return required
+
+
 def _build_traceability(state: dict[str, Any], features: list[dict[str, Any]], milestones: list[dict[str, Any]]) -> list[dict[str, Any]]:
     research = _as_dict(state.get("research"))
     claims = [_as_dict(item) for item in _as_list(research.get("claims")) if _as_dict(item)]
-    use_cases = [_as_dict(item) for item in _as_list(state.get("use_cases")) if _as_dict(item)]
+    use_cases = _planning_use_cases_from_state(state)
+    selected_features = [
+        item
+        for item in features
+        if _as_dict(item).get("selected") is True and str(_as_dict(item).get("feature", "")).strip()
+    ]
     traces: list[dict[str, Any]] = []
-    for index, item in enumerate(features):
+    for index, item in enumerate(selected_features):
         feature_name = str(item.get("feature", "")).strip()
-        if not feature_name or item.get("selected") is not True:
-            continue
         claim = claims[min(index, len(claims) - 1)] if claims else {}
-        use_case = use_cases[min(index, len(use_cases) - 1)] if use_cases else {}
-        milestone = _as_dict(milestones[min(index, len(milestones) - 1)]) if milestones else {}
+        use_case = _traceability_use_case_for_feature(feature_name, use_cases, fallback_index=index)
+        milestone = _traceability_milestone_for_use_case(use_case, milestones, fallback_index=index)
         traces.append(
             {
                 "claim_id": str(claim.get("id", "")),
@@ -4088,8 +8155,86 @@ def _build_traceability(state: dict[str, Any], features: list[dict[str, Any]], m
                 "confidence": float(claim.get("confidence", 0.72) or 0.72),
             }
         )
+    traced_use_case_ids = {
+        str(item.get("use_case_id", "")).strip()
+        for item in traces
+        if str(item.get("use_case_id", "")).strip()
+    }
+    required_use_cases = _planning_required_traceability_use_cases(use_cases, milestones)
+    for index, use_case in enumerate(required_use_cases):
+        use_case_id = str(use_case.get("id", "")).strip()
+        if not use_case_id or use_case_id in traced_use_case_ids:
+            continue
+        related_features = _use_case_related_features(use_case, selected_features) if selected_features else []
+        feature = _as_dict(related_features[0]) if related_features else (_as_dict(selected_features[0]) if selected_features else {})
+        feature_name = str(feature.get("feature", "")).strip()
+        feature_index = next(
+            (
+                feature_position
+                for feature_position, item in enumerate(selected_features)
+                if str(item.get("feature", "")).strip() == feature_name
+            ),
+            index,
+        )
+        claim = claims[min(feature_index, len(claims) - 1)] if claims else {}
+        milestone = _traceability_milestone_for_use_case(use_case, milestones, fallback_index=index)
+        traces.append(
+            {
+                "claim_id": str(claim.get("id", "")),
+                "claim": str(claim.get("statement", "")),
+                "use_case_id": use_case_id,
+                "use_case": str(use_case.get("title", "")),
+                "feature": feature_name,
+                "milestone_id": str(milestone.get("id", "")),
+                "milestone": str(milestone.get("name", "")),
+                "confidence": float(claim.get("confidence", 0.72) or 0.72),
+            }
+        )
     return traces
 
+
+def _planning_priority_rank(value: str) -> int:
+    return {"must": 0, "should": 1, "could": 2}.get(str(value or "should"), 1)
+
+
+def _plan_estimate_use_cases(use_cases: list[dict[str, Any]], preset: str) -> list[dict[str, Any]]:
+    allowed = {
+        "minimal": {"must"},
+        "standard": {"must", "should"},
+        "full": {"must", "should", "could"},
+    }.get(preset, {"must", "should"})
+    selected = [
+        use_case
+        for use_case in use_cases
+        if str(use_case.get("priority", "should") or "should") in allowed
+    ]
+    return selected or use_cases[:1]
+
+
+def _use_case_related_features(use_case: dict[str, Any], features: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    feature_index = {
+        str(item.get("feature", "")).casefold(): item
+        for item in features
+        if str(item.get("feature", "")).strip()
+    }
+    related: list[dict[str, Any]] = []
+    for story in _as_list(use_case.get("related_stories")):
+        key = str(story or "").casefold()
+        if key in feature_index:
+            related.append(feature_index[key])
+    if related:
+        return related
+    title = str(use_case.get("title", ""))
+    ranked = sorted(
+        features,
+        key=lambda item: _feature_use_case_match_score(str(item.get("feature", "")), use_case),
+        reverse=True,
+    )
+    if ranked and _feature_use_case_match_score(str(ranked[0].get("feature", "")), use_case) > 0:
+        return ranked[:2]
+    if title and features:
+        return features[:1]
+    return []
 
 def _research_packets_to_evidence(
     node_id: str,
@@ -4157,7 +8302,7 @@ def _competitor_weaknesses_from_packet(packet: dict[str, Any], spec: str) -> lis
 
 def _research_competitor_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
     spec = str(state.get("spec", ""))
-    anchor = _research_query_anchor(spec)
+    anchor = _research_query_anchor(spec, _research_identity_profile(state))
     queries = _research_remediation_queries(
         state,
         node_id=node_id,
@@ -4246,7 +8391,7 @@ def _research_competitor_handler(node_id: str, state: dict[str, Any]) -> NodeRes
 
 def _research_market_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
     spec = str(state.get("spec", ""))
-    anchor = _research_query_anchor(spec)
+    anchor = _research_query_anchor(spec, _research_identity_profile(state))
     queries = _research_remediation_queries(
         state,
         node_id=node_id,
@@ -4330,7 +8475,7 @@ def _research_market_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
 
 def _research_user_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
     spec = str(state.get("spec", ""))
-    anchor = _research_query_anchor(spec)
+    anchor = _research_query_anchor(spec, _research_identity_profile(state))
     queries = _research_remediation_queries(
         state,
         node_id=node_id,
@@ -4405,7 +8550,7 @@ def _research_user_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
 
 def _research_tech_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
     spec = str(state.get("spec", ""))
-    anchor = _research_query_anchor(spec)
+    anchor = _research_query_anchor(spec, _research_identity_profile(state))
     queries = _research_remediation_queries(
         state,
         node_id=node_id,
@@ -5405,7 +9550,12 @@ async def _research_judge_handler(
                 retained_open_questions = _dedupe_strings(retained_open_questions + llm_questions)
             open_questions = _dedupe_strings(open_questions + retained_open_questions)
             llm_winning_theses = _normalized_research_strings(
-                _as_dict(payload).get("winning_theses"),
+                _resolved_winning_thesis_strings(
+                    _as_dict(payload).get("winning_theses"),
+                    claims=claims,
+                    limit=3,
+                    char_limit=220,
+                ),
                 limit=3,
                 char_limit=220,
             )
@@ -5477,6 +9627,7 @@ async def _research_judge_handler(
             ),
             proposal_node_ids=list(_RESEARCH_PROPOSAL_NODES),
             review_node_ids=list(_RESEARCH_REVIEW_NODES),
+            identity_profile=_research_identity_profile(working_state),
         )
         judge_reasons = list(llm_meta.get("degradation_reasons", []))
         if readiness != "ready":
@@ -5516,7 +9667,10 @@ async def _research_judge_handler(
             remediation_context=remediation_context,
             readiness=readiness,
         )
-        canonical_research = dict(final_research)
+        canonical_research = with_research_operator_copy(
+            dict(final_research),
+            target_language="en",
+        )
         localized_research, localization_events, localization_meta = await _localize_research_output(
             canonical_research,
             target_language=target_language,
@@ -5621,29 +9775,8 @@ def _planning_story_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
 
 
 def _planning_feature_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
-    base_features = _feature_catalog_for_spec(state)
-    kano_features = [
-        {
-            "feature": name,
-            "category": category,
-            "user_delight": 0.95 if category == "attractive" else 0.82 if category == "one-dimensional" else 0.72,
-            "implementation_cost": cost,
-            "rationale": rationale,
-        }
-        for name, category, cost, rationale in base_features
-    ]
-    features = [
-        {
-            "feature": item["feature"],
-            "category": item["category"],
-            "selected": item["category"] != "attractive",
-            "priority": "must" if item["category"] == "must-be" else "should" if item["category"] == "one-dimensional" else "could",
-            "user_delight": item["user_delight"],
-            "implementation_cost": item["implementation_cost"],
-            "rationale": item["rationale"],
-        }
-        for item in kano_features
-    ]
+    kano_features = _default_kano_features_for_spec(state)
+    features = _default_feature_selections_for_spec(state)
     return NodeResult(
         state_patch={
             "kano_report": kano_features,
@@ -5672,6 +9805,16 @@ def _planning_synthesizer_handler(node_id: str, state: dict[str, Any]) -> NodeRe
     features = list(state.get("feature_selections", []))
     plan_estimates = list(state.get("plan_estimates_report", []))
     milestones = list(state.get("recommended_milestones", []))
+    traceability = _build_traceability(state, features, milestones)
+    planning_context = _planning_context_payload(
+        state,
+        features=features,
+        personas=list(state.get("persona_report", [])),
+        use_cases=list(state.get("use_cases", [])),
+        milestones=milestones,
+        design_tokens=_as_dict(state.get("design_tokens_report")),
+        business_model=_as_dict(state.get("business_model_report")),
+    )
     analysis = {
         "personas": list(state.get("persona_report", [])),
         "user_stories": list(state.get("story_report", [])),
@@ -5700,10 +9843,17 @@ def _planning_synthesizer_handler(node_id: str, state: dict[str, Any]) -> NodeRe
         "red_team_findings": [],
         "negative_personas": [],
         "kill_criteria": [],
-        "traceability": _build_traceability(state, features, milestones),
+        "traceability": traceability,
+        "coverage_summary": {},
+        "planning_context": planning_context,
         "model_assignments": _phase_model_assignments(list(_PLANNING_PROPOSAL_NODES) + list(_PLANNING_REVIEW_NODES)),
         "low_diversity_mode": _phase_low_diversity_mode(list(_PLANNING_PROPOSAL_NODES) + list(_PLANNING_REVIEW_NODES)),
     }
+    analysis["coverage_summary"] = _planning_coverage_summary(
+        analysis=analysis,
+        features=features,
+        plan_estimates=plan_estimates,
+    )
     planning_payload = {**analysis, "features": features, "plan_estimates": plan_estimates}
     return NodeResult(
         state_patch={
@@ -5725,37 +9875,8 @@ async def _planning_scope_skeptic_handler(
     llm_runtime: LLMRuntime | None = None,
 ) -> NodeResult:
     features = [_as_dict(item) for item in _as_list(state.get("feature_selections")) if _as_dict(item)]
-    fallback_rejected = [
-        {
-            "feature": str(item.get("feature", "")),
-            "reason": "Deferred because it adds breadth before the core evidence loop is validated.",
-            "counterarguments": ["Increases delivery surface without tightening the first milestone signal."],
-        }
-        for item in features
-        if item.get("selected") is not True and str(item.get("feature", "")).strip()
-    ]
-    fallback_findings = [
-        _finding_entry(
-            f"scope-{index + 1}",
-            title=f"Scope pressure around {item.get('feature')}",
-            challenger=node_id,
-            severity="high" if str(item.get("implementation_cost")) == "high" else "medium",
-            impact="If this remains in the first cut, the team may lose falsifiability and review speed.",
-            recommendation="Keep this out of the first release unless a research claim explicitly requires it.",
-            related_feature=str(item.get("feature", "")),
-        )
-        for index, item in enumerate(features)
-        if item.get("selected") is True and str(item.get("implementation_cost")) == "high"
-    ] or [
-        _finding_entry(
-            "scope-guardrail",
-            title="Protect first-release scope",
-            challenger=node_id,
-            severity="medium",
-            impact="Adding convenience features early would blur whether the core workflow is actually working.",
-            recommendation="Keep the first milestone focused on a single evidence-to-decision loop.",
-        )
-    ]
+    fallback_rejected = _planning_rejected_features(features)
+    fallback_findings = _planning_scope_findings(node_id, features)
     llm_events: list[dict[str, Any]] = []
     if _provider_backed_lifecycle_available(provider_registry) and features:
         payload, llm_events, _ = await _lifecycle_llm_json(
@@ -5817,27 +9938,11 @@ def _planning_assumption_auditor_handler(
 ) -> NodeResult:
     del provider_registry, llm_runtime
     personas = [_as_dict(item) for item in _as_list(state.get("persona_report")) if _as_dict(item)]
-    research = _research_context(state, segment_from_spec=_segment_from_spec)
-    assumptions = _dedupe_strings(
-        [
-            f"{str(personas[0].get('name', 'Primary user')) if personas else 'Primary user'} will trade setup breadth for stronger control and traceability.",
-            "The first milestone can be validated before full-scale automation breadth is delivered.",
-            *(f"Research assumption: {item}" for item in research["user_signals"][:1]),
-        ]
-    )
-    findings = [
-        _finding_entry(
-            "assumption-gap",
-            title="Planning relies on a narrow trust assumption",
-            challenger=node_id,
-            severity="medium",
-            impact="If users actually value speed over governance, the proposed scope may be too heavy.",
-            recommendation="Validate control-plane depth against onboarding friction in the first user loop.",
-        )
-    ]
+    assumptions = _planning_assumption_records(state, personas)
+    findings = _planning_assumption_findings(node_id)
     return NodeResult(
         state_patch={
-            _node_state_key(node_id, "assumptions"): [{"id": f"assumption-{index + 1}", "statement": text, "severity": "medium"} for index, text in enumerate(assumptions)],
+            _node_state_key(node_id, "assumptions"): assumptions,
             _node_state_key(node_id, "red_team_findings"): findings,
         },
         artifacts=_artifacts({"name": "assumption-audit", "kind": "planning", "assumptions": assumptions, "red_team_findings": findings}),
@@ -5852,44 +9957,8 @@ def _planning_negative_persona_handler(
     llm_runtime: LLMRuntime | None = None,
 ) -> NodeResult:
     del provider_registry, llm_runtime
-    kind = _infer_product_kind(str(state.get("spec", "")))
-    if kind == "operations":
-        personas = [
-            _negative_persona_entry(
-                "negative-ops-1",
-                name="Shadow Automator",
-                scenario="Runs autonomous flows without reviewing evidence or approval states.",
-                risk="Can create silent drift between plan, approval, and build.",
-                mitigation="Keep approval status and lineage visible in every primary workflow.",
-            ),
-            _negative_persona_entry(
-                "negative-ops-2",
-                name="Audit Skeptic",
-                scenario="Needs traceability to trust the system but only sees generated output.",
-                risk="Rejects autonomous adoption if artifact lineage is not first-class.",
-                mitigation="Surface claim-to-feature traceability and unresolved dissent above the fold.",
-            ),
-        ]
-    else:
-        personas = [
-            _negative_persona_entry(
-                "negative-generic-1",
-                name="Impatient Evaluator",
-                scenario="Judges the product after one incomplete run.",
-                risk="Leaves before the core loop demonstrates value.",
-                mitigation="Make the first successful workflow obvious and measurable.",
-            )
-        ]
-    findings = [
-        _finding_entry(
-            "negative-persona-risk",
-            title="The plan does not naturally protect against the hardest-to-serve user",
-            challenger=node_id,
-            severity="medium",
-            impact="Without explicit handling, failure modes stay hidden until rollout.",
-            recommendation="Turn these negative personas into acceptance and instrumentation checks.",
-        )
-    ]
+    personas = _planning_negative_personas_for_state(state)
+    findings = _planning_negative_persona_findings(node_id)
     return NodeResult(
         state_patch={
             _node_state_key(node_id, "negative_personas"): personas,
@@ -5908,26 +9977,8 @@ def _planning_milestone_falsifier_handler(
 ) -> NodeResult:
     del provider_registry, llm_runtime
     milestones = [_as_dict(item) for item in _as_list(state.get("recommended_milestones")) if _as_dict(item)]
-    kill_criteria = [
-        {
-            "id": f"kill-{index + 1}",
-            "milestone_id": str(item.get("id", "")),
-            "condition": f"If {str(item.get('name', 'the milestone')).strip()} cannot show observable completion evidence, stop scope expansion and re-open planning.",
-            "rationale": "Milestones must be falsifiable instead of narrative.",
-        }
-        for index, item in enumerate(milestones[:3])
-    ]
-    findings = [
-        _finding_entry(
-            f"milestone-{index + 1}",
-            title=f"Milestone {str(item.get('name', 'Milestone'))} needs a failure condition",
-            challenger=node_id,
-            severity="medium",
-            impact="A milestone without a stop condition will let the team ship momentum instead of evidence.",
-            recommendation="Add the observable failure signal next to the success criteria.",
-        )
-        for index, item in enumerate(milestones[:2])
-    ]
+    kill_criteria = _planning_kill_criteria_for_milestones(milestones)
+    findings = _planning_milestone_findings(node_id, milestones)
     return NodeResult(
         state_patch={
             _node_state_key(node_id, "kill_criteria"): kill_criteria,
@@ -5945,6 +9996,7 @@ async def _planning_judge_handler(
     llm_runtime: LLMRuntime | None = None,
 ) -> NodeResult:
     analysis = _as_dict(state.get("analysis"))
+    target_language = str(state.get("output_language", "ja") or "ja")
     features = [_as_dict(item) for item in _as_list(state.get("feature_selections")) if _as_dict(item)]
     milestones = [_as_dict(item) for item in _as_list(state.get("recommended_milestones")) if _as_dict(item)]
     feature_decisions = [_as_dict(item) for item in _as_list(analysis.get("feature_decisions")) if _as_dict(item)] or _build_feature_decisions(state, features)
@@ -5956,6 +10008,17 @@ async def _planning_judge_handler(
         _collect_state_lists(state, node_ids=("scope-skeptic", "assumption-auditor", "negative-persona-challenger", "milestone-falsifier"), suffix="red_team_findings")
         or _as_list(analysis.get("red_team_findings"))
     )
+    review_defaults = _planning_review_defaults(
+        state,
+        features=features,
+        personas=[_as_dict(item) for item in _as_list(analysis.get("personas")) if _as_dict(item)],
+        milestones=milestones,
+    )
+    rejected_features = rejected_features or list(review_defaults.get("rejected_features", []))
+    assumptions = assumptions or list(review_defaults.get("assumptions", []))
+    negative_personas = negative_personas or list(review_defaults.get("negative_personas", []))
+    kill_criteria = kill_criteria or list(review_defaults.get("kill_criteria", []))
+    findings = findings or list(review_defaults.get("red_team_findings", []))
     traceability = _build_traceability(state, features, milestones)
     llm_events: list[dict[str, Any]] = []
     judge_summary = ""
@@ -6010,12 +10073,13 @@ async def _planning_judge_handler(
         decision = decision_map.get(name, {})
         final_features.append({**feature, "selected": decision.get("selected", feature.get("selected")) is True})
     confidence_values = [1.0 - float(item.get("uncertainty", 0.3) or 0.3) for item in decision_map.values()] or [0.7]
+    final_plan_estimates = list(state.get("plan_estimates_report", []))
     final_analysis = {
         **analysis,
         "feature_decisions": list(decision_map.values()),
         "rejected_features": list(rejected_map.values()),
         "assumptions": assumptions,
-        "red_team_findings": findings,
+        "red_team_findings": _dedupe_findings_by_title([_as_dict(item) for item in findings if _as_dict(item)]),
         "negative_personas": negative_personas,
         "kill_criteria": kill_criteria,
         "traceability": traceability,
@@ -6028,7 +10092,33 @@ async def _planning_judge_handler(
         "model_assignments": _phase_model_assignments(list(_PLANNING_PROPOSAL_NODES) + list(_PLANNING_REVIEW_NODES)),
         "low_diversity_mode": _phase_low_diversity_mode(list(_PLANNING_PROPOSAL_NODES) + list(_PLANNING_REVIEW_NODES)),
     }
-    final_plan_estimates = list(state.get("plan_estimates_report", []))
+    final_analysis["planning_context"] = _planning_context_payload(
+        state,
+        features=final_features,
+        personas=[_as_dict(item) for item in _as_list(final_analysis.get("personas")) if _as_dict(item)],
+        use_cases=[_as_dict(item) for item in _as_list(final_analysis.get("use_cases")) if _as_dict(item)],
+        milestones=milestones,
+        design_tokens=_as_dict(final_analysis.get("design_tokens")),
+        business_model=_as_dict(final_analysis.get("business_model")),
+    )
+    final_analysis["coverage_summary"] = _planning_coverage_summary(
+        analysis=final_analysis,
+        features=final_features,
+        plan_estimates=final_plan_estimates,
+    )
+    canonical_analysis = with_planning_operator_copy(dict(final_analysis), target_language="en")
+    localized_analysis, localization_events, _ = await _localize_planning_output(
+        canonical_analysis,
+        target_language=target_language,
+        provider_registry=provider_registry,
+        llm_runtime=llm_runtime,
+    )
+    final_analysis = {
+        **localized_analysis,
+        "canonical": canonical_analysis,
+        "localized": dict(localized_analysis),
+    }
+    llm_events.extend(localization_events)
     planning_payload = {**final_analysis, "features": final_features, "plan_estimates": final_plan_estimates}
     return NodeResult(
         state_patch={
@@ -6044,12 +10134,33 @@ async def _planning_judge_handler(
     )
 
 
+_DISTILLED_FRONTEND_AESTHETICS = (
+    "Avoid generic AI-generated UI. Choose a distinctive product aesthetic with strong typography, "
+    "cohesive design tokens, layered backgrounds, and a clear visual point of view. "
+    "Do not use landing-page tropes, weak hero sections, or safe filler dashboards. "
+    "Favor memorable, production-grade product surfaces that feel closer to Linear, Stripe, or Vercel in craft."
+)
+
+
+_PRODUCT_PROTOTYPE_GUARDRAILS = (
+    "This is the product itself, not a marketing site. "
+    "Return application shells, task flows, approval/review surfaces, lineage or evidence views, "
+    "status-heavy operator screens, and at least one degraded or blocked state. "
+    "Do not return pricing sections, waitlists, testimonial carousels, or hero-only compositions. "
+    "screen_labels must be short strings naming real in-product screens, never objects or section specs. "
+    "navigation_style must be sidebar or top-nav. density must be low, medium, or high. "
+    "visual_style must be obsidian-atelier, ivory-signal, or balanced-product."
+)
+
+
 def _design_variant_handler(
     model_name: str,
     pattern_name: str,
     description: str,
     primary: str,
     accent: str,
+    creative_brief: str = "",
+    prototype_seed_overrides: dict[str, Any] | None = None,
     *,
     provider_registry: ProviderRegistry | None = None,
     llm_runtime: LLMRuntime | None = None,
@@ -6057,6 +10168,8 @@ def _design_variant_handler(
     def handler(node_id: str, state: dict[str, Any]) -> NodeResult:
         selected_features = _selected_feature_names(state)
         spec = str(state.get("spec", ""))
+        decision_context = _decision_context_from_state(state, compact=True)
+        decision_scope = _decision_scope_for_phase(state, phase="design")
         plan = {
             "phase": "design",
             "node_id": node_id,
@@ -6080,6 +10193,13 @@ def _design_variant_handler(
             spec=spec,
             analysis=_as_dict(state.get("analysis")),
             rationale=description,
+            prototype_overrides=prototype_seed_overrides,
+            decision_context_fingerprint=str(decision_context.get("fingerprint") or ""),
+            decision_scope=decision_scope,
+            model_ref=_preferred_lifecycle_model(node_id, provider_registry),
+            plan_estimates=[dict(item) for item in _as_list(state.get("planEstimates")) if isinstance(item, dict)],
+            selected_preset=str(state.get("selectedPreset") or ""),
+            target_language=str(_as_dict(state.get("researchConfig")).get("outputLanguage") or "ja"),
         )
         return NodeResult(
             state_patch={
@@ -6101,6 +10221,9 @@ def _design_variant_handler(
         analysis = _as_dict(state.get("analysis"))
         personas = _as_list(analysis.get("personas"))
         design_tokens = _as_dict(analysis.get("design_tokens"))
+        planning_context = _as_dict(analysis.get("planning_context"))
+        decision_context = _decision_context_from_state(state, compact=True)
+        decision_scope = _decision_scope_for_phase(state, phase="design")
         plan, plan_events = await _plan_node_collaboration(
             phase="design",
             node_id=node_id,
@@ -6114,12 +10237,27 @@ def _design_variant_handler(
             "Return a JSON object with keys: "
             "pattern_name, description, primary_color, accent_color, rationale, "
             "quality_focus, scores, and optional prototype_kind, navigation_style, density, "
-            "screen_labels, interaction_principles.\n"
+            "screen_labels, interaction_principles, visual_style, display_font, body_font, "
+            "experience_thesis, operational_bet, signature_moments, handoff_note, implementation_brief.\n"
             "The scores object must include ux_quality, code_quality, performance, accessibility as 0-1 floats.\n"
+            "screen_labels must be 3-4 short strings such as 'Run Ledger' or 'Approval Gate'. Do not return objects.\n"
+            "signature_moments must be 2-4 short strings describing memorable operator moments.\n"
+            "implementation_brief must be an object with keys: architecture_thesis, system_shape, technical_choices, agent_lanes, delivery_slices.\n"
+            "architecture_thesis must be 1 sentence in Japanese explaining the system shape behind this direction.\n"
+            "system_shape must be 3-5 short Japanese strings naming structural decisions.\n"
+            "technical_choices must be 3-4 objects with keys area, decision, rationale.\n"
+            "agent_lanes must be 2-3 objects with keys role, remit, skills.\n"
+            "delivery_slices must be 3-5 short Japanese strings naming the build slices to carry into implementation.\n"
+            "Every concept must describe the actual product UI, not an LP, launch page, hero, pricing page, or signup flow.\n"
+            "All user-facing labels, screen names, actions, and short copy should be written in Japanese.\n"
+            "The two directions must differ in workflow rhythm, information density, and operator ergonomics, not just color.\n"
             f"Current design theme anchor: {pattern_name} / {description}\n"
+            f"Creative brief: {creative_brief or description}\n"
             f"Product spec: {spec}\n"
             f"Selected features: {selected_features}\n"
             f"Primary persona summary: {personas[:2]}\n"
+            f"Planning context: {planning_context}\n"
+            f"Decision context: {decision_context}\n"
             f"Design tokens: {design_tokens}\n"
             f"IA analysis: {_as_dict(analysis.get('ia_analysis'))}\n"
             f"Use cases: {_as_list(analysis.get('use_cases'))[:3]}\n"
@@ -6127,9 +10265,14 @@ def _design_variant_handler(
             f"Selected skills: {plan.get('selected_skills')}\n"
             f"Quality targets: {plan.get('quality_targets')}\n"
             f"Delegation plan: {plan.get('delegations')}\n"
+            f"{_DISTILLED_FRONTEND_AESTHETICS}\n"
+            f"{_PRODUCT_PROTOTYPE_GUARDRAILS}\n"
             "Bias toward clarity, mobile resilience, accessibility, and differentiation. "
-            "Treat this as a product prototype brief, not a marketing landing page. "
-            "Prefer app shells, task flows, and operational screens over hero-led storytelling."
+            "Prefer app shells, task flows, and operational screens over hero-led storytelling. "
+            "Use design tokens intentionally and make the interface feel authored rather than generated. "
+            "Force the output toward concrete workflow screens, data-dense review surfaces, and recoverable states. "
+            "The lead thesis in the decision context must be visible in the interface behavior, not merely repeated as copy. "
+            "Show the product's winning path through approval ergonomics, evidence visibility, and handoff readiness."
         )
         proposal, llm_events, _ = await _lifecycle_llm_json(
             provider_registry=provider_registry,
@@ -6138,7 +10281,8 @@ def _design_variant_handler(
             purpose=f"lifecycle-design-{node_id}",
             static_instruction=(
                 "You are a principal product designer improving a lifecycle artifact. "
-                "Return JSON only and optimize for operator trust, visual clarity, accessibility, and strong differentiation."
+                "Return JSON only and optimize for operator trust, visual clarity, accessibility, strong differentiation, "
+                "and memorable product craft."
             ),
             user_prompt=proposal_prompt,
             phase="design",
@@ -6148,10 +10292,19 @@ def _design_variant_handler(
             "Critique and improve this design concept. Return JSON only with the same keys "
             "plus optional provider_note.\n"
             f"Original concept: {proposal or {'pattern_name': pattern_name, 'description': description}}\n"
+            f"Creative brief: {creative_brief or description}\n"
             f"Selected features: {selected_features}\n"
+            f"Planning context: {planning_context}\n"
+            f"Decision context: {decision_context}\n"
             f"IA analysis: {_as_dict(analysis.get('ia_analysis'))}\n"
+            f"{_DISTILLED_FRONTEND_AESTHETICS}\n"
+            f"{_PRODUCT_PROTOTYPE_GUARDRAILS}\n"
             "Raise the quality bar on hierarchy, contrast, responsiveness, decision support, and prototype fidelity. "
-            "Avoid landing-page hero compositions."
+            "Increase aesthetic conviction and remove any trace of landing-page hero composition. "
+            "If any field drifts into prose-heavy metadata, collapse it back to short valid enum values and in-product screen names. "
+            "Strengthen how the winning thesis shows up in workflow structure, trust cues, and handoff readiness. "
+            "Keep user-facing copy in Japanese and make the result feel like a production product workspace, not a concept page. "
+            "The implementation_brief must stay concrete enough for solution architecture and implementation planning to act on."
         )
         refined, critique_events, _ = await _lifecycle_llm_json(
             provider_registry=provider_registry,
@@ -6196,6 +10349,115 @@ def _design_variant_handler(
                 if str(item).strip()
             ]
         )
+        # ── LLM-generated preview HTML ──────────────────────────────
+        preview_html_override = ""
+        preview_meta_override: dict[str, Any] = {
+            "source": "template",
+            "extraction_ok": False,
+            "fallback_reason": "template_preview_used",
+        }
+        resolved_primary = _color_or(payload.get("primary_color"), primary)
+        resolved_accent = _color_or(payload.get("accent_color"), accent)
+        resolved_pattern = str(payload.get("pattern_name") or pattern_name)
+        resolved_description = str(payload.get("description") or description)
+        screen_labels_hint = [str(item) for item in _as_list(payload.get("screen_labels")) if str(item).strip()]
+        if not screen_labels_hint:
+            screen_labels_hint = [str(item) for item in _as_list((prototype_seed_overrides or {}).get("screen_labels")) if str(item).strip()]
+        preview_prompt = (
+            "Generate a COMPLETE, self-contained HTML document for an interactive product prototype.\n"
+            "The output MUST be a single HTML file (<!doctype html>…</html>) that works inside an iframe.\n"
+            "Include all CSS in a <style> tag and all JavaScript in a <script> tag.\n\n"
+            "REQUIREMENTS:\n"
+            "1. Product workspace UI — NOT a landing page, NOT a marketing hero, NOT a signup flow.\n"
+            "2. Sidebar or top-nav shell with working navigation that switches between screens via JS.\n"
+            "3. At least 4 screens with distinct content: data tables, metric cards, status lists, form sections, charts (use CSS/SVG).\n"
+            "4. Interactive elements: tab switching, accordion/collapsible sections, hover effects, active states, transitions.\n"
+            "5. Realistic mock data in Japanese — use actual domain-specific content, not lorem ipsum.\n"
+            "6. Responsive: works on desktop (1200px+), tablet (768px), and mobile (375px).\n"
+            "7. Polished product craft: decisive typography, disciplined spacing, layered panels, and stateful controls.\n"
+            "8. Commit to one visual direction. Avoid decorative glassmorphism unless the concept explicitly requires it.\n"
+            "9. Status badges, progress indicators, approval states, and blocked/degraded cues where appropriate.\n"
+            "10. Avoid raw milestone ids, implementation jargon, English UI copy, and concept-note prose inside the product UI.\n"
+            "11. Include evidence/approval/lineage/recovery surfaces when the product context calls for them.\n"
+            "12. Rich enough to feel production-grade; do not pad with repetitive filler just to increase line count.\n\n"
+            "COPY AND VISUAL QUALITY:\n"
+            "  - Visible labels must read like a real Japanese in-product workspace, not a design critique or implementation memo.\n"
+            "  - Never show tokens such as ms-alpha, uc-ops-001, DAG, prototype app, prototype spec, App Router, Next.js, Tailwind, or CSS terminology.\n"
+            "  - Use typography, spacing rhythm, contrast, and panel hierarchy intentionally so the product feels authored rather than generic.\n"
+            "  - Dense variants should feel decisive and readable; spacious variants should feel calm without becoming empty or passive.\n"
+            "  - The most important actions and blocked states must be obvious above the fold.\n\n"
+            f"DESIGN DIRECTION:\n"
+            f"  Pattern: {resolved_pattern}\n"
+            f"  Description: {resolved_description}\n"
+            f"  Primary color: {resolved_primary}\n"
+            f"  Accent color: {resolved_accent}\n"
+            f"  Creative brief: {creative_brief or resolved_description}\n\n"
+            f"PRODUCT CONTEXT:\n"
+            f"  Spec: {spec}\n"
+            f"  Selected features: {selected_features}\n"
+            f"  Screen labels: {screen_labels_hint or ['Dashboard', 'Detail View', 'Review Gate', 'Settings']}\n"
+            f"  Personas: {[str(p.get('name', '')) + ': ' + str(p.get('role', '')) for p in personas[:2]]}\n"
+            f"  Use cases: {[str(uc.get('title', '')) for uc in _as_list(analysis.get('use_cases'))[:3]]}\n"
+            f"  Decision context: {decision_context}\n\n"
+            "QUALITY BAR:\n"
+            "  - The result must read like a real operator product, not a generated concept page.\n"
+            "  - Use Japanese labels that sound like in-product controls and workflow surfaces.\n"
+            "  - Make the winning thesis visible through layout, flows, and state handling, not marketing copy.\n"
+            "  - If you include diagrams or graphs, they must support an operational task, not decorate the page.\n\n"
+            "OUTPUT CONTRACT:\n"
+            "  - Return ONLY one complete HTML document.\n"
+            "  - The first line must be <!DOCTYPE html>.\n"
+            "  - Include <html lang=\"ja\">, <head>, <meta charset>, <meta name=\"viewport\">, and <body>.\n"
+            "  - No markdown fencing, no explanation, no JSON wrapper."
+        )
+        try:
+            _, preview_events, preview_raw = await _lifecycle_llm_json(
+                provider_registry=provider_registry,
+                llm_runtime=llm_runtime,
+                preferred_model=_preferred_lifecycle_model(node_id, provider_registry),
+                purpose=f"lifecycle-design-{node_id}-preview-html",
+                static_instruction=(
+                    "You are an elite frontend engineer and product designer. "
+                    "Generate production-quality HTML prototypes with rich interactivity, "
+                    "polished visual design, and realistic Japanese content. "
+                    "The result must feel like a real operator workspace with deliberate typography, contrast, and hierarchy. "
+                    "Do not expose internal IDs, implementation jargon, or concept-note prose in visible UI. "
+                    "Return ONLY one valid HTML document that starts with <!DOCTYPE html>. "
+                    "No JSON. No markdown."
+                ),
+                user_prompt=preview_prompt,
+                phase="design",
+                node_id=node_id,
+            )
+            llm_events.extend(preview_events)
+            extracted = _extract_html_document(preview_raw)
+            if extracted and len(extracted) > 500:
+                preview_html_override = extracted
+                preview_meta_override = {
+                    "source": "llm",
+                    "extraction_ok": True,
+                    "fallback_reason": "",
+                }
+            elif extracted:
+                preview_meta_override = {
+                    "source": "template",
+                    "extraction_ok": True,
+                    "fallback_reason": "extracted_html_too_short",
+                }
+            else:
+                preview_meta_override = {
+                    "source": "template",
+                    "extraction_ok": False,
+                    "fallback_reason": "html_extraction_failed",
+                }
+        except Exception:
+            preview_meta_override = {
+                "source": "template",
+                "extraction_ok": False,
+                "fallback_reason": "preview_generation_failed",
+            }
+        # ────────────────────────────────────────────────────────────
+        variant_usage, variant_cost = _aggregate_llm_event_metrics([*plan_events, *llm_events, *critique_events])
         variant = _design_variant_payload(
             node_id=node_id,
             model_name=model_name,
@@ -6216,6 +10478,10 @@ def _design_variant_handler(
                 [str(item) for item in _as_list(payload.get("quality_focus")) if str(item).strip()] + peer_recommendations
             ),
             score_overrides=_as_dict(payload.get("scores")),
+            prototype_overrides=_merge_prototype_overrides(
+                prototype_seed_overrides,
+                _prototype_overrides_from_payload(payload),
+            ),
             provider_note=_dedupe_strings(
                 [
                     str(payload.get("provider_note") or ""),
@@ -6227,8 +10493,27 @@ def _design_variant_handler(
                     *[str(_as_dict(item).get("summary", "")) for item in peer_feedback if isinstance(item, dict)],
                 ]
             ) else "",
-            prototype_overrides=_prototype_overrides_from_payload(payload),
+            decision_context_fingerprint=str(decision_context.get("fingerprint") or ""),
+            decision_scope=decision_scope,
+            token_usage=variant_usage,
+            cost_override=variant_cost,
+            model_ref=_preferred_lifecycle_model(node_id, provider_registry),
+            narrative_overrides={
+                "experience_thesis": payload.get("experience_thesis"),
+                "operational_bet": payload.get("operational_bet"),
+                "signature_moments": payload.get("signature_moments"),
+                "handoff_note": payload.get("handoff_note"),
+            },
+            implementation_brief_overrides=_as_dict(
+                payload.get("implementation_brief") or payload.get("implementationBrief")
+            ),
+            plan_estimates=[dict(item) for item in _as_list(state.get("planEstimates")) if isinstance(item, dict)],
+            selected_preset=str(state.get("selectedPreset") or ""),
+            target_language=str(_as_dict(state.get("researchConfig")).get("outputLanguage") or "ja"),
+            preview_html_override=preview_html_override,
+            preview_meta_overrides=preview_meta_override,
         )
+        all_llm_events = [*plan_events, *llm_events, *critique_events]
         return NodeResult(
             state_patch={
                 f"{node_id}_variant": variant,
@@ -6248,7 +10533,7 @@ def _design_variant_handler(
                     for item in delegations
                 ],
             ),
-            llm_events=[*plan_events, *llm_events, *critique_events],
+            llm_events=all_llm_events,
             metrics={"design_mode": "provider-backed-autonomous"},
         )
 
@@ -6274,9 +10559,10 @@ def _design_evaluator_handler(
         for item in value
         if isinstance(item, dict)
     ]
-    ordered = sorted(variants, key=lambda item: (-float(_as_dict(item).get("scores", {}).get("ux_quality", 0)), str(item.get("model", ""))))
+    ordered = _rank_design_variants(variants)
 
     async def autonomous() -> NodeResult:
+        decision_context = _decision_context_from_state(state, compact=True)
         plan, plan_events = await _plan_node_collaboration(
             phase="design",
             node_id=node_id,
@@ -6287,10 +10573,17 @@ def _design_evaluator_handler(
         )
         evaluation_prompt = (
             "Evaluate these design variants and rank them for product quality.\n"
-            "Return JSON only with keys ranking, selected_design_id, score_adjustments, critique.\n"
+            "Return JSON only with keys ranking, selected_design_id, score_adjustments, critique, winner_summary, winner_reasons, winner_tradeoffs, approval_guardrails.\n"
             f"Variants: {ordered}\n"
             f"Peer feedback: {peer_feedback}\n"
+            f"Decision context: {decision_context}\n"
             f"Selected skills: {plan.get('selected_skills')}\n"
+            "Use preview_meta.quality_score, preview_meta.copy_quality_score, preview_meta.source, scorecard evidence, workflow coverage, and implementation_brief quality in your judgement.\n"
+            "Prefer variants that are product-grade workspaces with validated preview quality, strong workflow fidelity, and credible handoff readiness.\n"
+            "Penalize variants that feel templated, marketing-like, shallow in workflow coverage, or weak in Japanese in-product copy.\n"
+            "winner_reasons should be 2-4 concrete reasons phrased for an approval packet.\n"
+            "winner_tradeoffs should be 1-3 explicit costs or risks of the winning direction.\n"
+            "approval_guardrails should be 2-4 non-negotiable constraints that implementation must preserve.\n"
             "score_adjustments must be an object keyed by variant id with optional ux_quality, code_quality, performance, accessibility overrides."
         )
         payload, llm_events, _ = await _lifecycle_llm_json(
@@ -6300,7 +10593,8 @@ def _design_evaluator_handler(
             purpose="lifecycle-design-judge",
             static_instruction=(
                 "You are a principal design judge. Return JSON only. "
-                "Prefer variants that are differentiated, accessible, responsive, and clearly aligned with the selected product scope."
+                "Prefer variants that are differentiated, accessible, responsive, product-grade, "
+                "and clearly aligned with the selected product scope."
             ),
             user_prompt=evaluation_prompt,
             phase="design",
@@ -6338,11 +10632,16 @@ def _design_evaluator_handler(
                 variant["scores"] = variant_scores
             adjusted.append(variant)
         adjusted.extend(by_id.values())
-        adjusted = sorted(
+        adjusted = _rank_design_variants(adjusted)
+        selected_design_id = _resolve_selected_design_id(
             adjusted,
-            key=lambda item: (-float(_as_dict(item).get("scores", {}).get("ux_quality", 0)), str(item.get("model", ""))),
+            str(payload.get("selected_design_id") or ""),
         )
-        selected_design_id = str(payload.get("selected_design_id") or adjusted[0].get("id", "") if adjusted else "")
+        adjusted = _apply_design_judge_enrichment(
+            adjusted,
+            selected_design_id=selected_design_id,
+            payload=payload,
+        )
         critique = [str(item) for item in _as_list(payload.get("critique")) if str(item).strip()]
         design_payload = {
             "variants": adjusted,
@@ -6377,6 +10676,1869 @@ def _design_evaluator_handler(
         metrics={"design_mode": "deterministic-reference"},
     )
 
+def _selected_plan_estimate_from_state(state: dict[str, Any]) -> dict[str, Any]:
+    estimates = [_as_dict(item) for item in _as_list(state.get("planEstimates")) if _as_dict(item)]
+    if not estimates:
+        return {}
+    selected_preset = str(state.get("selectedPreset") or "standard")
+    for preset_name in (selected_preset, "standard", "full", "minimal"):
+        matched = next((item for item in estimates if str(item.get("preset", "")) == preset_name), None)
+        if matched is not None:
+            return matched
+    return estimates[0]
+
+
+def _development_agent_id_from_values(*values: Any) -> str:
+    combined = " ".join(str(value or "") for value in values).lower()
+    if any(token in combined for token in ("security", "safe", "policy", "threat")):
+        return "security-reviewer"
+    if any(token in combined for token in ("review", "release", "handoff", "sign-off")):
+        return "reviewer"
+    if any(token in combined for token in ("qa", "test", "acceptance", "verification", "quality")):
+        return "qa-engineer"
+    if any(token in combined for token in ("integrat", "merge", "compose", "shell", "routing")):
+        return "integrator"
+    if any(token in combined for token in ("backend", "api", "domain", "state", "schema", "model", "service")):
+        return "backend-builder"
+    return "frontend-builder"
+
+
+def _selected_feature_records(state: dict[str, Any]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for raw_item in state.get("features", []) or state.get("selected_features", []) or []:
+        if not isinstance(raw_item, dict) or raw_item.get("selected", True) is False:
+            continue
+        feature_name = str(
+            raw_item.get("feature")
+            or raw_item.get("name")
+            or raw_item.get("title")
+            or ""
+        ).strip()
+        feature_id = str(raw_item.get("id") or "").strip()
+        if not feature_name and not feature_id:
+            continue
+        records.append(
+            {
+                "id": feature_id or _slug(feature_name or f"feature-{len(records) + 1}", prefix="feature"),
+                "name": feature_name or feature_id,
+                "acceptance_criteria": [
+                    str(item).strip()
+                    for item in _as_list(raw_item.get("acceptance_criteria") or raw_item.get("acceptanceCriteria"))
+                    if str(item).strip()
+                ],
+            }
+        )
+    return records
+
+
+def _development_text_matches(text: Any, subject: Any) -> bool:
+    lhs = str(text or "").strip().lower()
+    rhs = str(subject or "").strip().lower()
+    if not lhs or not rhs:
+        return False
+    if rhs in lhs:
+        return True
+    rhs_tokens = [
+        token
+        for token in rhs.replace("/", " ").replace("-", " ").split()
+        if len(token) >= 3
+    ]
+    if not rhs_tokens:
+        return False
+    return sum(1 for token in rhs_tokens if token in lhs) >= max(1, min(2, len(rhs_tokens)))
+
+
+def _development_task_rows(task_decomposition: dict[str, Any] | None) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for raw_item in _as_list(_as_dict(task_decomposition).get("tasks")):
+        item = _as_dict(raw_item)
+        task_id = str(item.get("id") or "").strip()
+        if not task_id:
+            continue
+        rows.append(
+            {
+                "id": task_id,
+                "title": str(item.get("title") or f"Task {len(rows) + 1}").strip(),
+                "description": str(item.get("description") or "").strip(),
+                "phase": str(item.get("phase") or "").strip(),
+                "depends_on": [
+                    str(dep).strip()
+                    for dep in _as_list(item.get("dependsOn") or item.get("depends_on"))
+                    if str(dep).strip()
+                ],
+                "effort_hours": float(item.get("effortHours") or item.get("effort_hours") or 0.0),
+                "priority": str(item.get("priority") or "should").strip() or "should",
+                "feature_id": str(item.get("featureId") or item.get("feature_id") or "").strip() or None,
+                "requirement_id": str(item.get("requirementId") or item.get("requirement_id") or "").strip() or None,
+                "milestone_id": str(item.get("milestoneId") or item.get("milestone_id") or "").strip() or None,
+            }
+        )
+    return rows
+
+
+def _development_plan_estimate_lookup(plan_estimate: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    for raw_item in _as_list(_as_dict(plan_estimate).get("wbs")):
+        item = _as_dict(raw_item)
+        item_id = str(item.get("id") or "").strip()
+        if item_id:
+            lookup[item_id] = item
+    return lookup
+
+
+def _development_goal_spec(
+    *,
+    state: dict[str, Any],
+    selected_features: list[str],
+    requirements: dict[str, Any] | None,
+    task_rows: list[dict[str, Any]],
+    value_contract: dict[str, Any] | None,
+    outcome_telemetry_contract: dict[str, Any] | None,
+) -> dict[str, Any]:
+    requirement_rows = [
+        _as_dict(item)
+        for item in _as_list(_as_dict(requirements).get("requirements"))
+        if _as_dict(item)
+    ]
+    milestones = [
+        _as_dict(item)
+        for item in _as_list(state.get("milestones"))
+        if _as_dict(item)
+    ]
+    planning_analysis = _as_dict(state.get("analysis"))
+    return {
+        "objective": (
+            "Decompose the approved product goal into dependency-ordered work units that remain compliant with "
+            "design tokens, access policy, audit / operability, development standards, the value contract, and the "
+            "outcome telemetry contract."
+        ),
+        "selected_features": [str(item) for item in selected_features if str(item).strip()],
+        "requirement_ids": [
+            str(item.get("id") or "").strip()
+            for item in requirement_rows
+            if str(item.get("id") or "").strip()
+        ],
+        "task_ids": [str(item.get("id") or "").strip() for item in task_rows if str(item.get("id") or "").strip()],
+        "milestone_ids": [
+            str(item.get("id") or "").strip()
+            for item in milestones
+            if str(item.get("id") or "").strip()
+        ],
+        "quality_targets": _phase_quality_targets("development"),
+        "contract_injection": list(REQUIRED_DELIVERY_CONTRACT_IDS),
+        "value_contract_summary": _ns(_as_dict(value_contract).get("summary")),
+        "value_metric_ids": [
+            str(_as_dict(item).get("id") or "").strip()
+            for item in _as_list(_as_dict(value_contract).get("success_metrics"))
+            if str(_as_dict(item).get("id") or "").strip()
+        ],
+        "telemetry_event_ids": [
+            str(_as_dict(item).get("id") or "").strip()
+            for item in _as_list(_as_dict(outcome_telemetry_contract).get("telemetry_events"))
+            if str(_as_dict(item).get("id") or "").strip()
+        ],
+        "role_names": [
+            str(_as_dict(item).get("name") or "").strip()
+            for item in _as_list(planning_analysis.get("roles"))
+            if str(_as_dict(item).get("name") or "").strip()
+        ],
+        "completion_signal": (
+            "Each work unit clears embedded QA/security checks, each wave closes locally, and the final build passes "
+            "repo execution plus deploy handoff."
+        ),
+    }
+
+
+def _development_wave_plan(work_packages: list[dict[str, Any]]) -> dict[str, Any]:
+    package_lookup = {
+        str(_as_dict(item).get("id") or "").strip(): _as_dict(item)
+        for item in work_packages
+        if str(_as_dict(item).get("id") or "").strip()
+    }
+    missing_dependencies = sorted(
+        {
+            str(dep).strip()
+            for item in package_lookup.values()
+            for dep in _as_list(item.get("depends_on"))
+            if str(dep).strip() and str(dep).strip() not in package_lookup
+        }
+    )
+    scheduler = WorkflowScheduler(max_scheduled_tasks=max(32, len(package_lookup) + 4))
+    for index, item in enumerate(package_lookup.values()):
+        scheduler.enqueue(
+            WorkflowTask(
+                id=str(item.get("id") or ""),
+                workflow_id="lifecycle-development",
+                tenant_id="default",
+                priority=min(int(item.get("start_day", index) or index), 9),
+                dependencies={
+                    str(dep).strip()
+                    for dep in _as_list(item.get("depends_on"))
+                    if str(dep).strip()
+                },
+            )
+        )
+    try:
+        computed_waves = scheduler.compute_waves()
+    except SchedulerDependencyError as exc:
+        details = getattr(exc, "details", {}) or {}
+        return {
+            "status": "invalid",
+            "wave_count": 0,
+            "waves": [],
+            "wave_index_by_id": {},
+            "unknown_dependencies": sorted(
+                {
+                    *missing_dependencies,
+                    *[
+                        str(dep).strip()
+                        for dep in _as_list(details.get("missing_dependencies"))
+                        if str(dep).strip()
+                    ],
+                }
+            ),
+            "has_cycles": bool(_as_list(details.get("remaining_tasks"))),
+        }
+
+    wave_index_by_id: dict[str, int] = {}
+    waves: list[dict[str, Any]] = []
+    for wave_index, wave in enumerate(computed_waves):
+        unit_ids = [str(item.id) for item in wave if str(item.id).strip()]
+        for unit_id in unit_ids:
+            wave_index_by_id[unit_id] = wave_index
+        lane_ids = _dedupe_strings(
+            [
+                str(_as_dict(package_lookup.get(unit_id)).get("lane") or "").strip()
+                for unit_id in unit_ids
+                if str(_as_dict(package_lookup.get(unit_id)).get("lane") or "").strip()
+            ]
+        )
+        waves.append(
+            {
+                "wave_index": wave_index,
+                "work_unit_ids": unit_ids,
+                "lane_ids": lane_ids,
+                "entry_criteria": (
+                    ["Approved goal spec and contracts are injected before coding begins."]
+                    if wave_index == 0
+                    else ["All dependencies from earlier waves are complete and locally verified."]
+                ),
+                "exit_criteria": [
+                    "Each work unit clears embedded QA and security checks.",
+                    "Wave-local merge conflicts are resolved before the next wave starts.",
+                ],
+            }
+        )
+    return {
+        "status": "ready",
+        "wave_count": len(waves),
+        "waves": waves,
+        "wave_index_by_id": wave_index_by_id,
+        "unknown_dependencies": missing_dependencies,
+        "has_cycles": False,
+    }
+
+
+def _development_dependency_analysis(
+    *,
+    work_packages: list[dict[str, Any]],
+    technical_design: dict[str, Any] | None,
+    wave_plan: dict[str, Any],
+) -> dict[str, Any]:
+    nodes = [
+        {
+            "id": str(_as_dict(item).get("id") or "").strip(),
+            "title": str(_as_dict(item).get("title") or "").strip(),
+            "lane": str(_as_dict(item).get("lane") or "").strip(),
+            "depends_on": [
+                str(dep).strip()
+                for dep in _as_list(_as_dict(item).get("depends_on"))
+                if str(dep).strip()
+            ],
+        }
+        for item in work_packages
+        if str(_as_dict(item).get("id") or "").strip()
+    ]
+    edges = [
+        {
+            "source": str(dep).strip(),
+            "target": str(_as_dict(item).get("id") or "").strip(),
+            "reason": "task_dependency",
+        }
+        for item in work_packages
+        if str(_as_dict(item).get("id") or "").strip()
+        for dep in _as_list(_as_dict(item).get("depends_on"))
+        if str(dep).strip()
+    ]
+    component_graph = _as_dict(_as_dict(technical_design).get("componentDependencyGraph"))
+    component_edges = [
+        {
+            "source": str(source).strip(),
+            "target": str(target).strip(),
+            "reason": "technical_design_component",
+        }
+        for source, targets in component_graph.items()
+        for target in _as_list(targets)
+        if str(source).strip() and str(target).strip()
+    ]
+    return {
+        "work_packages": nodes,
+        "edges": edges,
+        "component_edges": component_edges,
+        "unknown_dependencies": [
+            str(item)
+            for item in _as_list(_as_dict(wave_plan).get("unknown_dependencies"))
+            if str(item).strip()
+        ],
+        "has_cycles": _as_dict(wave_plan).get("has_cycles") is True,
+        "wave_count": int(_as_dict(wave_plan).get("wave_count", 0) or 0),
+    }
+
+
+def _development_work_unit_contracts(
+    *,
+    state: dict[str, Any],
+    work_packages: list[dict[str, Any]],
+    requirements: dict[str, Any] | None,
+    technical_design: dict[str, Any] | None,
+    selected_design: dict[str, Any],
+    wave_plan: dict[str, Any],
+    value_contract: dict[str, Any] | None,
+    outcome_telemetry_contract: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    requirement_rows = {
+        str(_as_dict(item).get("id") or "").strip(): _as_dict(item)
+        for item in _as_list(_as_dict(requirements).get("requirements"))
+        if str(_as_dict(item).get("id") or "").strip()
+    }
+    milestone_rows = {
+        str(_as_dict(item).get("id") or "").strip(): _as_dict(item)
+        for item in _as_list(state.get("milestones"))
+        if str(_as_dict(item).get("id") or "").strip()
+    }
+    feature_rows = {
+        str(item.get("id") or "").strip(): item
+        for item in _selected_feature_records(state)
+        if str(item.get("id") or "").strip()
+    }
+    selected_feature_names = [str(item.get("name") or "").strip() for item in feature_rows.values() if str(item.get("name") or "").strip()]
+    routes = [
+        _as_dict(item)
+        for item in _as_list(_as_dict(selected_design.get("prototype_spec")).get("routes"))
+        if _as_dict(item)
+    ]
+    api_rows = [
+        _as_dict(item)
+        for item in _as_list(_as_dict(technical_design).get("apiSpecification"))
+        if _as_dict(item)
+    ]
+    component_graph = _as_dict(_as_dict(technical_design).get("componentDependencyGraph"))
+    component_names = _dedupe_strings(
+        [str(source).strip() for source in component_graph]
+        + [
+            str(target).strip()
+            for targets in component_graph.values()
+            for target in _as_list(targets)
+            if str(target).strip()
+        ]
+    )
+    wave_index_by_id = _as_dict(wave_plan).get("wave_index_by_id") or {}
+    protected_api = [item for item in api_rows if item.get("authRequired", True) is True]
+    value_metric_rows = [
+        _as_dict(item)
+        for item in _as_list(_as_dict(value_contract).get("success_metrics"))
+        if _as_dict(item)
+    ]
+    telemetry_event_rows = [
+        _as_dict(item)
+        for item in _as_list(_as_dict(outcome_telemetry_contract).get("telemetry_events"))
+        if _as_dict(item)
+    ]
+
+    contracts: list[dict[str, Any]] = []
+    for item in work_packages:
+        package = _as_dict(item)
+        package_id = str(package.get("id") or "").strip()
+        if not package_id:
+            continue
+        title = str(package.get("title") or package_id).strip()
+        summary_text = " ".join(
+            [
+                title,
+                str(package.get("summary") or "").strip(),
+                *[
+                    str(feature_name)
+                    for feature_name in _as_list(package.get("feature_names"))
+                    if str(feature_name).strip()
+                ],
+            ]
+        )
+        feature_id = str(package.get("source_feature_id") or "").strip()
+        requirement_ids = [
+            str(item).strip()
+            for item in _as_list(package.get("requirement_ids"))
+            if str(item).strip()
+        ]
+        milestone_id = str(package.get("milestone_id") or "").strip()
+        requirement_row = _as_dict(requirement_rows.get(requirement_ids[0])) if requirement_ids else {}
+        milestone_row = _as_dict(milestone_rows.get(milestone_id))
+        feature_row = _as_dict(feature_rows.get(feature_id))
+        matched_routes = [
+            str(route.get("path") or "").strip()
+            for route in routes
+            if str(route.get("path") or "").strip()
+            and _development_text_matches(
+                " ".join(
+                    [
+                        str(route.get("path") or ""),
+                        str(route.get("title") or ""),
+                        str(route.get("screen_id") or ""),
+                    ]
+                ),
+                summary_text,
+            )
+        ]
+        matched_api = [
+            {
+                "method": str(api_item.get("method") or "GET").strip(),
+                "path": str(api_item.get("path") or "").strip(),
+                "authRequired": bool(api_item.get("authRequired", True)),
+            }
+            for api_item in api_rows
+            if str(api_item.get("path") or "").strip()
+            and _development_text_matches(
+                " ".join([str(api_item.get("path") or ""), str(api_item.get("description") or "")]),
+                summary_text,
+            )
+        ]
+        matched_components = [
+            component
+            for component in component_names
+            if _development_text_matches(summary_text, component)
+        ]
+        feature_names = _dedupe_strings(
+            [str(feature_row.get("name") or "").strip()]
+            + [
+                str(item).strip()
+                for item in _as_list(package.get("feature_names"))
+                if str(item).strip()
+            ]
+        )
+        acceptance_criteria = _dedupe_strings(
+            [
+                str(item).strip()
+                for item in _as_list(package.get("acceptance_criteria"))
+                if str(item).strip()
+            ]
+            + [
+                str(item).strip()
+                for item in _as_list(requirement_row.get("acceptanceCriteria"))
+                if str(item).strip()
+            ]
+            + [
+                str(feature_row.get("acceptance_criteria")[0]).strip()
+                if _as_list(feature_row.get("acceptance_criteria"))
+                else ""
+            ]
+            + [str(milestone_row.get("criteria") or "").strip()]
+        )
+        qa_checks = _dedupe_strings(
+            acceptance_criteria[:3]
+            + [
+                f"Verify route bindings for {matched_routes[0]}" if matched_routes else "",
+                (
+                    f"Confirm milestone {str(milestone_row.get('name') or milestone_id).strip()} remains satisfied"
+                    if milestone_row
+                    else ""
+                ),
+            ]
+        )
+        security_checks = _dedupe_strings(
+            [
+                (
+                    "Preserve authRequired truth and access-policy boundaries for protected API paths."
+                    if matched_api or protected_api
+                    else "Avoid unsafe DOM and permission regressions in this work unit."
+                ),
+                (
+                    "Keep audit / operability events attached to approval and release-significant flows."
+                    if matched_api or milestone_row
+                    else "Do not bypass audit / operability expectations during implementation."
+                ),
+            ]
+        )
+        integration_checks = _dedupe_strings(
+            [
+                (
+                    f"Merge after {', '.join(str(dep).strip() for dep in _as_list(package.get('depends_on')) if str(dep).strip())}"
+                    if _as_list(package.get("depends_on"))
+                    else "Can merge within the current wave once local checks pass."
+                ),
+                "Respect lane ownership, shared shell rules, and contract artifacts before integration.",
+            ]
+        )
+        value_targets = [
+            {
+                "metric_id": str(metric.get("id") or "").strip(),
+                "metric_name": str(metric.get("name") or "").strip(),
+            }
+            for metric in value_metric_rows
+            if str(metric.get("id") or "").strip()
+            and _development_text_matches(
+                summary_text,
+                " ".join([str(metric.get("name") or ""), str(metric.get("signal") or "")]),
+            )
+        ] or [
+            {
+                "metric_id": str(metric.get("id") or "").strip(),
+                "metric_name": str(metric.get("name") or "").strip(),
+            }
+            for metric in value_metric_rows[:2]
+            if str(metric.get("id") or "").strip()
+        ]
+        telemetry_events = [
+            {
+                "id": str(event.get("id") or "").strip(),
+                "name": str(event.get("name") or "").strip(),
+            }
+            for event in telemetry_event_rows
+            if str(event.get("id") or "").strip()
+            and _development_text_matches(
+                summary_text,
+                " ".join([str(event.get("name") or ""), str(event.get("purpose") or "")]),
+            )
+        ] or [
+            {
+                "id": str(event.get("id") or "").strip(),
+                "name": str(event.get("name") or "").strip(),
+            }
+            for event in telemetry_event_rows[:2]
+            if str(event.get("id") or "").strip()
+        ]
+        contracts.append(
+            {
+                "id": f"wu-{_slug(package_id, prefix='wu')}",
+                "work_package_id": package_id,
+                "title": title,
+                "lane": str(package.get("lane") or "").strip(),
+                "wave_index": int(wave_index_by_id.get(package_id, 0) or 0),
+                "depends_on": [
+                    str(dep).strip()
+                    for dep in _as_list(package.get("depends_on"))
+                    if str(dep).strip()
+                ],
+                "feature_ids": [feature_id] if feature_id else [],
+                "feature_names": feature_names or [
+                    item for item in selected_feature_names if _development_text_matches(summary_text, item)
+                ],
+                "requirement_ids": requirement_ids,
+                "milestone_ids": [milestone_id] if milestone_id else [],
+                "route_paths": matched_routes,
+                "api_surface": matched_api,
+                "component_dependencies": matched_components,
+                "deliverables": [
+                    str(deliverable).strip()
+                    for deliverable in _as_list(package.get("deliverables"))
+                    if str(deliverable).strip()
+                ],
+                "acceptance_criteria": acceptance_criteria,
+                "required_contracts": list(REQUIRED_DELIVERY_CONTRACT_IDS),
+                "qa_checks": qa_checks,
+                "security_checks": security_checks,
+                "integration_checks": integration_checks,
+                "value_targets": value_targets,
+                "telemetry_events": telemetry_events,
+                "repair_policy": {
+                    "builder_failure": "retry_same_work_unit",
+                    "qa_failure": "retry_same_work_unit",
+                    "security_failure": "retry_same_work_unit",
+                    "shared_conflict": "replan_current_wave_only",
+                },
+                "gate_owners": {
+                    "builder": str(package.get("lane") or "").strip(),
+                    "qa": "qa-engineer",
+                    "security": "security-reviewer",
+                    "review": "reviewer",
+                },
+                "status": str(package.get("status") or "planned").strip() or "planned",
+            }
+        )
+    return contracts
+
+
+def _development_shift_left_plan(
+    *,
+    work_unit_contracts: list[dict[str, Any]],
+    waves: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "mode": "work_unit_micro_loop",
+        "principles": [
+            "Each work unit starts with contract injection before code changes begin.",
+            "QA and security checks run at the work-unit boundary instead of only at release time.",
+            "Builder, QA, and security failures return to the same work unit unless a shared conflict forces wave-level replanning.",
+            "Integrator and reviewer close at wave exits and final release readiness, not as the only quality gate.",
+        ],
+        "work_unit_count": len(work_unit_contracts),
+        "wave_count": len(waves),
+        "qa_placement": "embedded_per_work_unit",
+        "security_placement": "embedded_per_work_unit",
+        "review_placement": "wave_exit_and_final_release",
+    }
+
+
+def _build_development_topology(
+    *,
+    state: dict[str, Any],
+    selected_design: dict[str, Any],
+    selected_features: list[str],
+    requirements: dict[str, Any] | None,
+    technical_design: dict[str, Any] | None,
+    work_packages: list[dict[str, Any]],
+    lanes: list[dict[str, Any]],
+    value_contract: dict[str, Any] | None,
+    outcome_telemetry_contract: dict[str, Any] | None,
+) -> dict[str, Any]:
+    work_packages = [dict(item) for item in work_packages if isinstance(item, dict)]
+    critical_path = _development_critical_path(work_packages)
+    critical_lookup = set(critical_path)
+    for package in work_packages:
+        package["is_critical"] = str(package.get("id", "")) in critical_lookup
+
+    wave_plan = _development_wave_plan(work_packages)
+    goal_spec = _development_goal_spec(
+        state=state,
+        selected_features=selected_features,
+        requirements=requirements,
+        task_rows=_development_task_rows(state.get("taskDecomposition")),
+        value_contract=value_contract,
+        outcome_telemetry_contract=outcome_telemetry_contract,
+    )
+    dependency_analysis = _development_dependency_analysis(
+        work_packages=work_packages,
+        technical_design=technical_design,
+        wave_plan=wave_plan,
+    )
+    work_unit_contracts = _development_work_unit_contracts(
+        state=state,
+        work_packages=work_packages,
+        requirements=requirements,
+        technical_design=technical_design,
+        selected_design=selected_design,
+        wave_plan=wave_plan,
+        value_contract=value_contract,
+        outcome_telemetry_contract=outcome_telemetry_contract,
+    )
+    shift_left_plan = _development_shift_left_plan(
+        work_unit_contracts=work_unit_contracts,
+        waves=[dict(item) for item in _as_list(wave_plan.get("waves")) if isinstance(item, dict)],
+    )
+    implementation_brief = _as_dict(selected_design.get("implementation_brief"))
+    lane_lookup = {str(item.get("agent", "")): item for item in lanes}
+    gantt = [
+        {
+            "work_package_id": str(package.get("id", "")),
+            "lane": str(package.get("lane", "")),
+            "start_day": int(package.get("start_day", 0) or 0),
+            "duration_days": int(package.get("duration_days", 1) or 1),
+            "depends_on": [str(dep) for dep in _as_list(package.get("depends_on")) if str(dep).strip()],
+            "is_critical": bool(package.get("is_critical")),
+            "wave_index": int(_as_dict(wave_plan.get("wave_index_by_id")).get(str(package.get("id", "")), 0) or 0),
+        }
+        for package in sorted(
+            work_packages,
+            key=lambda item: (
+                int(item.get("start_day", 0) or 0),
+                int(item.get("duration_days", 1) or 1),
+                str(item.get("id", "")),
+            ),
+        )
+    ]
+    merge_strategy = {
+        "integration_order": [
+            str(item.get("id", ""))
+            for item in sorted(
+                work_packages,
+                key=lambda package: (
+                    int(_as_dict(lane_lookup.get(str(package.get("lane", "")))).get("merge_order", 99) or 99),
+                    int(_as_dict(wave_plan.get("wave_index_by_id")).get(str(package.get("id", "")), 0) or 0),
+                    int(package.get("start_day", 0) or 0),
+                    str(package.get("id", "")),
+                ),
+            )
+        ],
+        "conflict_prevention": _dedupe_strings(
+            [
+                guard
+                for lane in lanes
+                for guard in _as_list(_as_dict(lane).get("conflict_guards"))
+                if str(guard).strip()
+            ]
+            + [
+                "Builder failures return to the same work unit before any phase-wide replanning.",
+                "Shared shell, routing, and contract conflicts are resolved at wave exit before the next wave unlocks.",
+                "Reviewer closes deploy handoff only after wave-local QA and security checks are complete.",
+            ]
+        ),
+        "shared_touchpoints": _dedupe_strings(
+            [str(item) for item in _as_list(implementation_brief.get("delivery_slices")) if str(item).strip()]
+            + [str(feature) for feature in selected_features[:3]]
+        ),
+    }
+    return {
+        "work_packages": work_packages,
+        "critical_path": critical_path,
+        "gantt": gantt,
+        "merge_strategy": merge_strategy,
+        "goal_spec": goal_spec,
+        "dependency_analysis": dependency_analysis,
+        "waves": [dict(item) for item in _as_list(wave_plan.get("waves")) if isinstance(item, dict)],
+        "wave_count": int(wave_plan.get("wave_count", 0) or 0),
+        "work_unit_contracts": work_unit_contracts,
+        "shift_left_plan": shift_left_plan,
+        "value_contract": _as_dict(value_contract),
+        "outcome_telemetry_contract": _as_dict(outcome_telemetry_contract),
+    }
+
+
+_DEVELOPMENT_IMPLEMENTATION_AGENTS = frozenset(
+    {"frontend-builder", "backend-builder", "integrator"}
+)
+
+
+def _development_work_unit_node_id(wave_index: int, work_unit_id: str) -> str:
+    return f"wave-{wave_index}-wu-{_slug(work_unit_id, prefix='wu')}"
+
+
+def _development_wave_gate_node_id(
+    wave_index: int,
+    agent_id: str,
+    *,
+    final_wave_index: int,
+) -> str:
+    if wave_index == final_wave_index and agent_id in {
+        "integrator",
+        "repo-executor",
+        "qa-engineer",
+        "security-reviewer",
+        "reviewer",
+    }:
+        return agent_id
+    return f"wave-{wave_index}-{agent_id}"
+
+
+def _development_runtime_graph(delivery_plan: dict[str, Any]) -> dict[str, Any]:
+    work_unit_lookup = {
+        str(_as_dict(item).get("work_package_id") or _as_dict(item).get("id") or "").strip(): _as_dict(item)
+        for item in _as_list(delivery_plan.get("work_unit_contracts"))
+        if str(_as_dict(item).get("work_package_id") or _as_dict(item).get("id") or "").strip()
+    }
+    ordered_waves = [
+        _as_dict(item)
+        for item in sorted(
+            _as_list(delivery_plan.get("waves")),
+            key=lambda entry: int(_as_dict(entry).get("wave_index", 0) or 0),
+        )
+        if _as_dict(item)
+    ]
+    if not ordered_waves and work_unit_lookup:
+        ordered_waves = [
+            {
+                "wave_index": 0,
+                "work_unit_ids": list(work_unit_lookup.keys()),
+                "lane_ids": _dedupe_strings(
+                    [
+                        str(_as_dict(unit).get("lane") or "").strip()
+                        for unit in work_unit_lookup.values()
+                        if str(_as_dict(unit).get("lane") or "").strip()
+                    ]
+                ),
+            }
+        ]
+    if not ordered_waves:
+        return {
+            "mode": "fixed_lane_fallback",
+            "node_count": 0,
+            "work_unit_node_count": 0,
+            "nodes": {},
+            "runtime_assignments": [],
+        }
+
+    nodes: dict[str, dict[str, Any]] = {"planner": {"agent": "planner", "next": []}}
+    assignments: list[dict[str, Any]] = [
+        {
+            "node_id": "planner",
+            "agent": "planner",
+            "stage": "planner",
+            "wave_index": None,
+            "work_unit_ids": [],
+            "focus_work_unit_ids": [],
+            "lane_ids": [],
+        }
+    ]
+    previous_exit = "planner"
+    cumulative_unit_ids: list[str] = []
+    cumulative_skipped_ids: list[str] = []
+    final_wave_index = int(ordered_waves[-1].get("wave_index", len(ordered_waves) - 1) or 0)
+    work_unit_node_count = 0
+
+    for raw_wave in ordered_waves:
+        wave_index = int(raw_wave.get("wave_index", 0) or 0)
+        current_unit_ids = [
+            str(item).strip()
+            for item in _as_list(raw_wave.get("work_unit_ids"))
+            if str(item).strip()
+        ]
+        cumulative_unit_ids = _dedupe_strings([*cumulative_unit_ids, *current_unit_ids])
+        work_unit_node_ids: list[str] = []
+        current_lane_ids: list[str] = []
+        current_skipped_ids: list[str] = []
+
+        for unit_id in current_unit_ids:
+            unit = _as_dict(work_unit_lookup.get(unit_id))
+            lane_id = str(unit.get("lane") or "").strip()
+            if lane_id not in _DEVELOPMENT_IMPLEMENTATION_AGENTS:
+                current_skipped_ids.append(unit_id)
+                continue
+            current_lane_ids = _dedupe_strings([*current_lane_ids, lane_id])
+            node_id = _development_work_unit_node_id(wave_index, unit_id)
+            nodes[node_id] = {"agent": lane_id, "next": []}
+            assignments.append(
+                {
+                    "node_id": node_id,
+                    "agent": lane_id,
+                    "stage": "work_unit",
+                    "wave_index": wave_index,
+                    "work_unit_ids": [unit_id],
+                    "focus_work_unit_ids": [unit_id],
+                    "lane_ids": [lane_id],
+                }
+            )
+            work_unit_node_ids.append(node_id)
+            work_unit_node_count += 1
+
+        cumulative_skipped_ids = _dedupe_strings([*cumulative_skipped_ids, *current_skipped_ids])
+        integrator_id = _development_wave_gate_node_id(
+            wave_index,
+            "integrator",
+            final_wave_index=final_wave_index,
+        )
+        repo_executor_id = _development_wave_gate_node_id(
+            wave_index,
+            "repo-executor",
+            final_wave_index=final_wave_index,
+        )
+        qa_id = _development_wave_gate_node_id(
+            wave_index,
+            "qa-engineer",
+            final_wave_index=final_wave_index,
+        )
+        security_id = _development_wave_gate_node_id(
+            wave_index,
+            "security-reviewer",
+            final_wave_index=final_wave_index,
+        )
+        reviewer_id = _development_wave_gate_node_id(
+            wave_index,
+            "reviewer",
+            final_wave_index=final_wave_index,
+        )
+        if work_unit_node_ids:
+            nodes[previous_exit]["next"] = list(work_unit_node_ids)
+            for node_id in work_unit_node_ids:
+                nodes[node_id]["next"] = [integrator_id]
+        else:
+            nodes[previous_exit]["next"] = [integrator_id]
+        nodes[integrator_id] = {"agent": "integrator", "next": [repo_executor_id]}
+        nodes[repo_executor_id] = {"agent": "repo-executor", "next": [qa_id, security_id]}
+        nodes[qa_id] = {"agent": "qa-engineer", "next": [reviewer_id]}
+        nodes[security_id] = {"agent": "security-reviewer", "next": [reviewer_id]}
+        nodes[reviewer_id] = {"agent": "reviewer", "next": "END" if wave_index == final_wave_index else []}
+
+        gate_work_unit_ids = list(cumulative_unit_ids)
+        focus_work_unit_ids = list(current_unit_ids or cumulative_unit_ids)
+        gate_lane_ids = _dedupe_strings(
+            [
+                str(_as_dict(work_unit_lookup.get(unit_id)).get("lane") or "").strip()
+                for unit_id in gate_work_unit_ids
+                if str(_as_dict(work_unit_lookup.get(unit_id)).get("lane") or "").strip()
+            ]
+        )
+        for node_id, agent_id, stage in (
+            (integrator_id, "integrator", "wave_integrator" if wave_index != final_wave_index else "final_integrator"),
+            (repo_executor_id, "repo-executor", "wave_repo_execution" if wave_index != final_wave_index else "final_repo_execution"),
+            (qa_id, "qa-engineer", "wave_qa" if wave_index != final_wave_index else "final_qa"),
+            (security_id, "security-reviewer", "wave_security" if wave_index != final_wave_index else "final_security"),
+            (reviewer_id, "reviewer", "wave_review" if wave_index != final_wave_index else "final_review"),
+        ):
+            assignments.append(
+                {
+                    "node_id": node_id,
+                    "agent": agent_id,
+                    "stage": stage,
+                    "wave_index": wave_index,
+                    "work_unit_ids": gate_work_unit_ids,
+                    "focus_work_unit_ids": focus_work_unit_ids,
+                    "lane_ids": gate_lane_ids,
+                    "skipped_work_unit_ids": list(cumulative_skipped_ids),
+                }
+            )
+        previous_exit = reviewer_id
+
+    if previous_exit in nodes and nodes[previous_exit].get("next") == []:
+        nodes[previous_exit]["next"] = "END"
+    return {
+        "mode": "wave_runtime_graph",
+        "node_count": len(nodes),
+        "work_unit_node_count": work_unit_node_count,
+        "nodes": nodes,
+        "runtime_assignments": assignments,
+    }
+
+
+def _stable_json_fingerprint(payload: Any) -> str:
+    try:
+        serialized = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    except TypeError:
+        serialized = str(payload)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _development_delivery_topology_frame(delivery_plan: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "execution_mode": str(delivery_plan.get("execution_mode") or ""),
+        "topology_mode": str(delivery_plan.get("topology_mode") or ""),
+        "selected_preset": str(delivery_plan.get("selected_preset") or ""),
+        "source_plan_preset": str(delivery_plan.get("source_plan_preset") or ""),
+        "goal_spec": _as_dict(delivery_plan.get("goal_spec")),
+        "dependency_analysis": _as_dict(delivery_plan.get("dependency_analysis")),
+        "lanes": [dict(item) for item in _as_list(delivery_plan.get("lanes")) if isinstance(item, dict)],
+        "work_packages": [dict(item) for item in _as_list(delivery_plan.get("work_packages")) if isinstance(item, dict)],
+        "waves": [dict(item) for item in _as_list(delivery_plan.get("waves")) if isinstance(item, dict)],
+        "work_unit_contracts": [
+            dict(item) for item in _as_list(delivery_plan.get("work_unit_contracts")) if isinstance(item, dict)
+        ],
+        "shift_left_plan": _as_dict(delivery_plan.get("shift_left_plan")),
+        "value_contract": _as_dict(delivery_plan.get("value_contract")),
+        "outcome_telemetry_contract": _as_dict(delivery_plan.get("outcome_telemetry_contract")),
+        "critical_path": [str(item) for item in _as_list(delivery_plan.get("critical_path")) if str(item).strip()],
+        "merge_strategy": _as_dict(delivery_plan.get("merge_strategy")),
+    }
+
+
+def _annotate_development_delivery_plan_lineage(
+    delivery_plan: dict[str, Any],
+    *,
+    decision_context_fingerprint: str,
+) -> dict[str, Any]:
+    annotated = dict(delivery_plan)
+    runtime_graph = _as_dict(annotated.get("runtime_graph")) or _development_runtime_graph(annotated)
+    annotated["runtime_graph"] = runtime_graph
+    annotated["decision_context_fingerprint"] = str(
+        decision_context_fingerprint or annotated.get("decision_context_fingerprint") or ""
+    )
+    topology_fingerprint = _stable_json_fingerprint(
+        {
+            "decision_context_fingerprint": annotated["decision_context_fingerprint"],
+            "topology": _development_delivery_topology_frame(annotated),
+        }
+    )
+    annotated["topology_fingerprint"] = topology_fingerprint
+    annotated["runtime_graph_fingerprint"] = _stable_json_fingerprint(
+        {
+            "topology_fingerprint": topology_fingerprint,
+            "runtime_graph": runtime_graph,
+        }
+    )
+    return annotated
+
+
+def _development_runtime_node_context(node_id: str, state: dict[str, Any]) -> dict[str, Any]:
+    delivery_plan = _as_dict(state.get("delivery_plan"))
+    runtime_graph = _as_dict(delivery_plan.get("runtime_graph")) or _development_runtime_graph(delivery_plan)
+    for raw_assignment in _as_list(runtime_graph.get("runtime_assignments")):
+        assignment = _as_dict(raw_assignment)
+        if str(assignment.get("node_id") or "") == node_id:
+            return assignment
+    return {
+        "node_id": node_id,
+        "agent": node_id,
+        "stage": "legacy_static",
+        "wave_index": None,
+        "work_unit_ids": [],
+        "focus_work_unit_ids": [],
+        "lane_ids": [],
+    }
+
+
+def _development_execution_bucket(state: dict[str, Any], bucket_name: str) -> dict[str, Any]:
+    return {
+        str(key): _as_dict(value)
+        for key, value in _as_dict(_as_dict(state.get("development_execution")).get(bucket_name)).items()
+        if str(key).strip()
+    }
+
+
+def _updated_development_execution(
+    state: dict[str, Any],
+    bucket_name: str,
+    node_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    execution = dict(_as_dict(state.get("development_execution")))
+    bucket = _development_execution_bucket(state, bucket_name)
+    bucket[node_id] = dict(payload)
+    execution[bucket_name] = bucket
+    return execution
+
+
+def _aggregate_frontend_bundle(state: dict[str, Any]) -> dict[str, Any]:
+    entries = list(_development_execution_bucket(state, "frontend_bundles").values())
+    if not entries:
+        return _as_dict(state.get("frontend_bundle"))
+    latest = entries[-1]
+    return {
+        "sections": _dedupe_strings(
+            [str(item) for entry in entries for item in _as_list(_as_dict(entry).get("sections")) if str(item).strip()]
+        ),
+        "feature_cards": _dedupe_strings(
+            [str(item) for entry in entries for item in _as_list(_as_dict(entry).get("feature_cards")) if str(item).strip()]
+        ),
+        "css_tokens": _as_dict(latest.get("css_tokens")),
+        "interaction_notes": _dedupe_strings(
+            [
+                str(item)
+                for entry in entries
+                for item in _as_list(_as_dict(entry).get("interaction_notes"))
+                if str(item).strip()
+            ]
+        ),
+        "decision_scope": _as_dict(latest.get("decision_scope")),
+        "decision_context_fingerprint": str(latest.get("decision_context_fingerprint") or ""),
+        "assigned_packages": [
+            dict(item)
+            for entry in entries
+            for item in _as_list(_as_dict(entry).get("assigned_packages"))
+            if isinstance(item, dict)
+        ],
+        "assigned_work_units": [
+            dict(item)
+            for entry in entries
+            for item in _as_list(_as_dict(entry).get("assigned_work_units"))
+            if isinstance(item, dict)
+        ],
+        "wave_plan": [dict(item) for item in _as_list(latest.get("wave_plan")) if isinstance(item, dict)],
+        "shift_left_plan": _as_dict(latest.get("shift_left_plan")),
+    }
+
+
+def _aggregate_backend_bundle(state: dict[str, Any]) -> dict[str, Any]:
+    entries = list(_development_execution_bucket(state, "backend_bundles").values())
+    if not entries:
+        return _as_dict(state.get("backend_bundle"))
+    latest = entries[-1]
+    return {
+        "entities": [
+            dict(item)
+            for entry in entries
+            for item in _as_list(_as_dict(entry).get("entities"))
+            if isinstance(item, dict)
+        ],
+        "api_endpoints": [
+            dict(item)
+            for entry in entries
+            for item in _as_list(_as_dict(entry).get("api_endpoints"))
+            if isinstance(item, dict)
+        ],
+        "automation_notes": _dedupe_strings(
+            [str(item) for entry in entries for item in _as_list(_as_dict(entry).get("automation_notes")) if str(item).strip()]
+        ),
+        "exposed_capabilities": _dedupe_strings(
+            [
+                str(item)
+                for entry in entries
+                for item in _as_list(_as_dict(entry).get("exposed_capabilities"))
+                if str(item).strip()
+            ]
+        ),
+        "decision_scope": _as_dict(latest.get("decision_scope")),
+        "decision_context_fingerprint": str(latest.get("decision_context_fingerprint") or ""),
+        "assigned_packages": [
+            dict(item)
+            for entry in entries
+            for item in _as_list(_as_dict(entry).get("assigned_packages"))
+            if isinstance(item, dict)
+        ],
+        "assigned_work_units": [
+            dict(item)
+            for entry in entries
+            for item in _as_list(_as_dict(entry).get("assigned_work_units"))
+            if isinstance(item, dict)
+        ],
+        "wave_plan": [dict(item) for item in _as_list(latest.get("wave_plan")) if isinstance(item, dict)],
+        "shift_left_plan": _as_dict(latest.get("shift_left_plan")),
+    }
+
+
+def _aggregate_qa_report(state: dict[str, Any]) -> dict[str, Any]:
+    entries = list(_development_execution_bucket(state, "qa_reports").values())
+    if not entries:
+        return _as_dict(state.get("qa_report"))
+    latest = entries[-1]
+    work_unit_lookup: dict[str, dict[str, Any]] = {}
+    wave_lookup: dict[int, dict[str, Any]] = {}
+    for entry in entries:
+        for item in _as_list(_as_dict(entry).get("work_unit_results")):
+            result = _as_dict(item)
+            result_id = str(result.get("id") or "").strip()
+            if result_id:
+                work_unit_lookup[result_id] = result
+        for item in _as_list(_as_dict(entry).get("wave_results")):
+            result = _as_dict(item)
+            wave_lookup[int(result.get("wave_index", 0) or 0)] = result
+    return {
+        "milestone_results": [dict(item) for item in _as_list(latest.get("milestone_results")) if isinstance(item, dict)],
+        "work_unit_results": list(work_unit_lookup.values()),
+        "wave_results": [wave_lookup[key] for key in sorted(wave_lookup)],
+    }
+
+
+def _aggregate_security_report(state: dict[str, Any]) -> dict[str, Any]:
+    entries = list(_development_execution_bucket(state, "security_reports").values())
+    if not entries:
+        return _as_dict(state.get("security_report"))
+    latest = entries[-1]
+    work_unit_lookup: dict[str, dict[str, Any]] = {}
+    blockers: list[str] = []
+    findings: list[str] = []
+    recommendations: list[str] = []
+    for entry in entries:
+        blockers = _dedupe_strings(
+            blockers + [str(item) for item in _as_list(_as_dict(entry).get("blockers")) if str(item).strip()]
+        )
+        findings = _dedupe_strings(
+            findings + [str(item) for item in _as_list(_as_dict(entry).get("findings")) if str(item).strip()]
+        )
+        recommendations = _dedupe_strings(
+            recommendations + [str(item) for item in _as_list(_as_dict(entry).get("recommendations")) if str(item).strip()]
+        )
+        for item in _as_list(_as_dict(entry).get("work_unit_results")):
+            result = _as_dict(item)
+            result_id = str(result.get("id") or "").strip()
+            if result_id:
+                work_unit_lookup[result_id] = result
+    return {
+        "status": "pass" if not blockers and str(latest.get("status") or "pass") == "pass" else "warning",
+        "findings": findings,
+        "blockers": blockers,
+        "recommendations": recommendations,
+        "work_unit_results": list(work_unit_lookup.values()),
+    }
+
+
+def _stabilize_development_work_packages(
+    reference_packages: list[dict[str, Any]],
+    candidate_packages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    candidate_lookup = {
+        str(_as_dict(item).get("id") or "").strip(): _as_dict(item)
+        for item in candidate_packages
+        if str(_as_dict(item).get("id") or "").strip()
+    }
+    stabilized: list[dict[str, Any]] = []
+    for reference in reference_packages:
+        reference_row = dict(reference)
+        candidate = _as_dict(candidate_lookup.get(str(reference_row.get("id") or "").strip()))
+        if not candidate:
+            stabilized.append(reference_row)
+            continue
+        stabilized.append(
+            {
+                **reference_row,
+                "title": str(candidate.get("title") or reference_row.get("title") or ""),
+                "summary": str(
+                    candidate.get("summary")
+                    or candidate.get("description")
+                    or reference_row.get("summary")
+                    or ""
+                ),
+                "deliverables": _dedupe_strings(
+                    [
+                        str(item)
+                        for item in (
+                            _as_list(candidate.get("deliverables"))
+                            or _as_list(reference_row.get("deliverables"))
+                        )
+                        if str(item).strip()
+                    ]
+                ),
+                "acceptance_criteria": _dedupe_strings(
+                    [
+                        str(item)
+                        for item in (
+                            _as_list(candidate.get("acceptance_criteria"))
+                            or _as_list(reference_row.get("acceptance_criteria"))
+                        )
+                        if str(item).strip()
+                    ]
+                ),
+                "status": str(candidate.get("status") or reference_row.get("status") or "planned"),
+            }
+        )
+    return stabilized
+
+
+def _build_development_runtime_workflow_nodes(project_record: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(project_record, dict):
+        return None
+    state = dict(project_record)
+    if "delivery_plan" not in state and isinstance(project_record.get("deliveryPlan"), dict):
+        state["delivery_plan"] = dict(_as_dict(project_record.get("deliveryPlan")))
+    selected_design = _as_dict(state.get("selected_design")) or _selected_design_from_state(state)
+    if not selected_design:
+        return None
+    delivery_plan = _as_dict(state.get("delivery_plan"))
+    fresh_delivery_plan = _build_development_delivery_plan(
+        state,
+        selected_design=selected_design,
+        implementation_plan=_as_dict(state.get("implementation_plan")),
+    )
+    if delivery_plan:
+        if (
+            str(delivery_plan.get("topology_fingerprint") or "").strip()
+            != str(fresh_delivery_plan.get("topology_fingerprint") or "").strip()
+            or str(delivery_plan.get("runtime_graph_fingerprint") or "").strip()
+            != str(fresh_delivery_plan.get("runtime_graph_fingerprint") or "").strip()
+        ):
+            delivery_plan = fresh_delivery_plan
+    else:
+        delivery_plan = fresh_delivery_plan
+    runtime_graph = _as_dict(delivery_plan.get("runtime_graph")) or _development_runtime_graph(delivery_plan)
+    nodes = _as_dict(runtime_graph.get("nodes"))
+    return nodes or None
+
+
+def _development_lane_defaults(agent_id: str) -> dict[str, Any]:
+    defaults = {
+        "frontend-builder": {
+            "label": "Frontend Builder",
+            "remit": "主要画面、操作導線、レスポンシブ UI を実装する",
+            "skills": ["responsive-ui", "component-composition"],
+            "owned_surfaces": ["workspace shell", "screen surfaces", "interaction flow"],
+            "conflict_guards": [
+                "UI shell と interaction surface は frontend-builder が単独で編集する",
+                "API binding は backend contract が確定してから接続する",
+            ],
+            "merge_order": 1,
+        },
+        "backend-builder": {
+            "label": "Backend Builder",
+            "remit": "状態モデル、API 契約、ドメイン振る舞いを固める",
+            "skills": ["api-design", "domain-modeling"],
+            "owned_surfaces": ["domain model", "state contract", "integration API"],
+            "conflict_guards": [
+                "shared state keys と API contract は backend-builder が唯一の変更権を持つ",
+                "schema 変更は integrator に公開してから UI 側へ展開する",
+            ],
+            "merge_order": 2,
+        },
+        "integrator": {
+            "label": "Integrator",
+            "remit": "共有 shell、routing、build artifact を統合し衝突を解消する",
+            "skills": ["integration", "artifact-assembly"],
+            "owned_surfaces": ["app shell", "routing", "shared composition"],
+            "conflict_guards": [
+                "shared shell と routing は integrator 経由でのみ merge する",
+                "lane 間の共有 touchpoint は integrator が一本化する",
+            ],
+            "merge_order": 3,
+        },
+        "qa-engineer": {
+            "label": "QA Engineer",
+            "remit": "マイルストーンと受け入れ条件を検証する",
+            "skills": ["acceptance-testing", "quality-assurance"],
+            "owned_surfaces": ["acceptance gates", "milestone checks"],
+            "conflict_guards": [
+                "受け入れ条件は QA 承認なしに緩めない",
+                "未達マイルストーンは reviewer に渡す前に明示する",
+            ],
+            "merge_order": 4,
+        },
+        "security-reviewer": {
+            "label": "Security Reviewer",
+            "remit": "安全性、unsafe DOM、運用リスクを精査する",
+            "skills": ["security-review", "safety-review"],
+            "owned_surfaces": ["security posture", "unsafe DOM checks"],
+            "conflict_guards": [
+                "unsafe DOM / policy regressions は security-reviewer の sign-off 前に release に載せない",
+            ],
+            "merge_order": 5,
+        },
+        "reviewer": {
+            "label": "Release Reviewer",
+            "remit": "delivery graph の完了と deploy handoff を確定する",
+            "skills": ["delivery-review", "release-management"],
+            "owned_surfaces": ["release candidate", "deploy handoff"],
+            "conflict_guards": [
+                "deploy handoff と operator checklist は reviewer が一本化する",
+            ],
+            "merge_order": 6,
+        },
+    }
+    return dict(defaults.get(agent_id, defaults["frontend-builder"]))
+
+
+def _build_development_lanes(selected_design: dict[str, Any]) -> list[dict[str, Any]]:
+    implementation_brief = _as_dict(selected_design.get("implementation_brief"))
+    lanes_by_agent: dict[str, dict[str, Any]] = {}
+    for raw_lane in _as_list(implementation_brief.get("agent_lanes")):
+        lane = _as_dict(raw_lane)
+        role = str(lane.get("role") or "")
+        remit = str(lane.get("remit") or "")
+        skills = [str(item) for item in _as_list(lane.get("skills")) if str(item).strip()]
+        agent_id = _development_agent_id_from_values(role, remit, " ".join(skills))
+        defaults = _development_lane_defaults(agent_id)
+        lanes_by_agent[agent_id] = {
+            "agent": agent_id,
+            "label": role or defaults["label"],
+            "remit": remit or defaults["remit"],
+            "skills": _dedupe_strings(skills or defaults["skills"]),
+            "owned_surfaces": list(defaults["owned_surfaces"]),
+            "conflict_guards": list(defaults["conflict_guards"]),
+            "merge_order": int(defaults["merge_order"]),
+        }
+    for agent_id in (
+        "frontend-builder",
+        "backend-builder",
+        "integrator",
+        "qa-engineer",
+        "security-reviewer",
+        "reviewer",
+    ):
+        if agent_id not in lanes_by_agent:
+            defaults = _development_lane_defaults(agent_id)
+            lanes_by_agent[agent_id] = {
+                "agent": agent_id,
+                "label": defaults["label"],
+                "remit": defaults["remit"],
+                "skills": list(defaults["skills"]),
+                "owned_surfaces": list(defaults["owned_surfaces"]),
+                "conflict_guards": list(defaults["conflict_guards"]),
+                "merge_order": int(defaults["merge_order"]),
+            }
+    return sorted(lanes_by_agent.values(), key=lambda item: (int(item.get("merge_order", 99)), str(item.get("agent", ""))))
+
+
+def _development_critical_path(work_packages: list[dict[str, Any]]) -> list[str]:
+    by_id = {str(item.get("id", "")): item for item in work_packages if str(item.get("id", "")).strip()}
+    memo: dict[str, tuple[int, list[str]]] = {}
+    visiting: set[str] = set()
+
+    def _resolve(package_id: str) -> tuple[int, list[str]]:
+        if package_id in memo:
+            return memo[package_id]
+        package = by_id.get(package_id)
+        if package is None:
+            return 0, []
+        if package_id in visiting:
+            duration = max(1, int(package.get("duration_days", 1) or 1))
+            return duration, [package_id]
+        visiting.add(package_id)
+        best_duration = 0
+        best_path: list[str] = []
+        for dependency_id in [str(item) for item in _as_list(package.get("depends_on")) if str(item) in by_id]:
+            dependency_duration, dependency_path = _resolve(dependency_id)
+            if dependency_duration > best_duration:
+                best_duration = dependency_duration
+                best_path = dependency_path
+        visiting.discard(package_id)
+        total_duration = best_duration + max(1, int(package.get("duration_days", 1) or 1))
+        resolved = (total_duration, [*best_path, package_id])
+        memo[package_id] = resolved
+        return resolved
+
+    longest_duration = 0
+    longest_path: list[str] = []
+    for package_id in by_id:
+        duration, path = _resolve(package_id)
+        if duration > longest_duration:
+            longest_duration = duration
+            longest_path = path
+    return longest_path
+
+
+def _fallback_development_work_packages(
+    *,
+    selected_features: list[str],
+    selected_design: dict[str, Any],
+) -> list[dict[str, Any]]:
+    implementation_brief = _as_dict(selected_design.get("implementation_brief"))
+    slices = [str(item) for item in _as_list(implementation_brief.get("delivery_slices")) if str(item).strip()]
+    package_specs = [
+        ("pkg-ui-shell", "frontend-builder", slices[0] if slices else "フェーズナビゲーションと主要画面 shell", [], 0, 2),
+        ("pkg-domain-contract", "backend-builder", slices[1] if len(slices) > 1 else "状態同期と domain contract", ["pkg-ui-shell"], 1, 2),
+        ("pkg-integration", "integrator", slices[2] if len(slices) > 2 else "統合 build と shared routing", ["pkg-ui-shell", "pkg-domain-contract"], 3, 1),
+        ("pkg-quality", "qa-engineer", slices[3] if len(slices) > 3 else "マイルストーン検証とレビュー準備", ["pkg-integration"], 4, 1),
+    ]
+    feature_summary = _dedupe_strings(selected_features)[:3]
+    work_packages: list[dict[str, Any]] = []
+    for package_id, lane_id, title, depends_on, start_day, duration_days in package_specs:
+        defaults = _development_lane_defaults(lane_id)
+        work_packages.append(
+            {
+                "id": package_id,
+                "title": title,
+                "lane": lane_id,
+                "summary": f"{defaults['label']} が {title} を担当し、共有面の衝突を避けながら完了させる。",
+                "depends_on": depends_on,
+                "start_day": start_day,
+                "duration_days": duration_days,
+                "deliverables": [title],
+                "acceptance_criteria": feature_summary or ["選択済み機能が build に反映されている"],
+                "owned_surfaces": list(defaults["owned_surfaces"]),
+                "source_epic": None,
+                "status": "planned",
+            }
+        )
+    return work_packages
+
+
+def _build_development_delivery_plan(
+    state: dict[str, Any],
+    *,
+    selected_design: dict[str, Any],
+    implementation_plan: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    decision_context_fingerprint = str(_decision_context_from_state(state, compact=True).get("fingerprint") or "")
+    selected_features = _selected_feature_names(state)
+    value_contract = _as_dict(state.get("valueContract"))
+    outcome_telemetry_contract = _as_dict(state.get("outcomeTelemetryContract"))
+    requirements = normalize_requirements_bundle(_as_dict(state.get("requirements")))
+    task_decomposition = normalize_task_decomposition(_as_dict(state.get("taskDecomposition")))
+    dcs_analysis = normalize_dcs_analysis(_as_dict(state.get("dcsAnalysis")))
+    technical_design = normalize_technical_design_bundle(_as_dict(state.get("technicalDesign")))
+    reverse_engineering = normalize_reverse_engineering_result(_as_dict(state.get("reverseEngineering")))
+    lanes = _build_development_lanes(selected_design)
+    plan_estimate = _selected_plan_estimate_from_state(state)
+    wbs_lookup = _development_plan_estimate_lookup(plan_estimate)
+    task_rows = _development_task_rows(task_decomposition)
+    requirement_rows = {
+        str(_as_dict(item).get("id") or "").strip(): _as_dict(item)
+        for item in _as_list(_as_dict(requirements).get("requirements"))
+        if str(_as_dict(item).get("id") or "").strip()
+    }
+    milestone_rows = {
+        str(_as_dict(item).get("id") or "").strip(): _as_dict(item)
+        for item in _as_list(state.get("milestones"))
+        if str(_as_dict(item).get("id") or "").strip()
+    }
+    feature_rows = {
+        str(item.get("id") or "").strip(): item
+        for item in _selected_feature_records(state)
+        if str(item.get("id") or "").strip()
+    }
+    work_packages: list[dict[str, Any]] = []
+    for task in task_rows:
+        package_id = str(task.get("id") or f"pkg-{len(work_packages) + 1}")
+        estimate = _as_dict(wbs_lookup.get(package_id))
+        lane_id = _development_agent_id_from_values(
+            estimate.get("assignee"),
+            estimate.get("assignee_type"),
+            " ".join(str(skill) for skill in _as_list(estimate.get("skills"))),
+            task.get("title"),
+            task.get("description"),
+            task.get("phase"),
+            task.get("feature_id"),
+        )
+        defaults = _development_lane_defaults(lane_id)
+        lane = next(
+            (item for item in lanes if str(_as_dict(item).get("agent") or "") == lane_id),
+            {
+                "agent": lane_id,
+                "label": defaults["label"],
+                "remit": defaults["remit"],
+                "skills": list(defaults["skills"]),
+                "owned_surfaces": list(defaults["owned_surfaces"]),
+                "conflict_guards": list(defaults["conflict_guards"]),
+                "merge_order": int(defaults["merge_order"]),
+            },
+        )
+        requirement_row = _as_dict(requirement_rows.get(str(task.get("requirement_id") or "")))
+        milestone_row = _as_dict(milestone_rows.get(str(task.get("milestone_id") or "")))
+        feature_row = _as_dict(feature_rows.get(str(task.get("feature_id") or "")))
+        work_packages.append(
+            {
+                "id": package_id,
+                "title": str(task.get("title") or estimate.get("title") or f"Work package {len(work_packages) + 1}"),
+                "lane": lane_id,
+                "summary": str(task.get("description") or estimate.get("description") or lane.get("remit") or defaults["remit"]),
+                "depends_on": [str(dep) for dep in _as_list(task.get("depends_on")) if str(dep).strip()],
+                "start_day": max(0, int(estimate.get("start_day", 0) or 0)),
+                "duration_days": max(
+                    1,
+                    int(
+                        estimate.get("duration_days")
+                        or max(1, math.ceil(float(task.get("effort_hours", 0.0) or 0.0) / 8.0))
+                        or 1
+                    ),
+                ),
+                "deliverables": _dedupe_strings(
+                    [str(task.get("title") or ""), str(feature_row.get("name") or "")]
+                    + [str(skill) for skill in _as_list(estimate.get("skills")) if str(skill).strip()]
+                ),
+                "acceptance_criteria": _dedupe_strings(
+                    [str(task.get("description") or "")]
+                    + [str(item).strip() for item in _as_list(requirement_row.get("acceptanceCriteria")) if str(item).strip()]
+                    + [str(milestone_row.get("criteria") or "").strip()]
+                ),
+                "owned_surfaces": list(lane.get("owned_surfaces", defaults["owned_surfaces"])),
+                "source_epic": str(estimate.get("epic_id") or estimate.get("epicId") or "") or None,
+                "source_task_id": package_id,
+                "source_feature_id": str(task.get("feature_id") or "") or None,
+                "feature_names": _dedupe_strings([str(feature_row.get("name") or "").strip()]),
+                "requirement_ids": [str(task.get("requirement_id") or "").strip()] if str(task.get("requirement_id") or "").strip() else [],
+                "milestone_id": str(task.get("milestone_id") or "").strip() or None,
+                "priority": str(task.get("priority") or "should"),
+                "status": "planned",
+            }
+        )
+    if not work_packages:
+        for raw_item in _as_list(plan_estimate.get("wbs")):
+            item = _as_dict(raw_item)
+            package_id = str(item.get("id") or f"pkg-{len(work_packages) + 1}")
+            lane_id = _development_agent_id_from_values(
+                item.get("assignee"),
+                item.get("assignee_type"),
+                " ".join(str(skill) for skill in _as_list(item.get("skills"))),
+                item.get("title"),
+                item.get("description"),
+            )
+            defaults = _development_lane_defaults(lane_id)
+            lane = next(
+                (entry for entry in lanes if str(_as_dict(entry).get("agent") or "") == lane_id),
+                {
+                    "agent": lane_id,
+                    "label": defaults["label"],
+                    "remit": defaults["remit"],
+                    "skills": list(defaults["skills"]),
+                    "owned_surfaces": list(defaults["owned_surfaces"]),
+                    "conflict_guards": list(defaults["conflict_guards"]),
+                    "merge_order": int(defaults["merge_order"]),
+                },
+            )
+            work_packages.append(
+                {
+                    "id": package_id,
+                    "title": str(item.get("title") or f"Work package {len(work_packages) + 1}"),
+                    "lane": lane_id,
+                    "summary": str(item.get("description") or lane.get("remit") or defaults["remit"]),
+                    "depends_on": [str(dep) for dep in _as_list(item.get("depends_on")) if str(dep).strip()],
+                    "start_day": max(0, int(item.get("start_day", 0) or 0)),
+                    "duration_days": max(1, int(item.get("duration_days", 1) or 1)),
+                    "deliverables": _dedupe_strings(
+                        [str(item.get("title") or "")]
+                        + [str(skill) for skill in _as_list(item.get("skills")) if str(skill).strip()]
+                    ),
+                    "acceptance_criteria": _dedupe_strings(
+                        [str(item.get("description") or "")]
+                        + [
+                            str(milestone.get("criteria") or "")
+                            for milestone in _as_list(state.get("milestones"))[:2]
+                            if isinstance(milestone, dict)
+                        ]
+                    ),
+                    "owned_surfaces": list(lane.get("owned_surfaces", defaults["owned_surfaces"])),
+                    "source_epic": str(item.get("epic_id") or "") or None,
+                    "status": "planned",
+                }
+            )
+    if not work_packages:
+        work_packages = _fallback_development_work_packages(
+            selected_features=selected_features,
+            selected_design=selected_design,
+        )
+
+    topology = _build_development_topology(
+        state=state,
+        selected_design=selected_design,
+        selected_features=selected_features,
+        requirements=requirements,
+        technical_design=technical_design,
+        work_packages=work_packages,
+        lanes=lanes,
+        value_contract=value_contract,
+        outcome_telemetry_contract=outcome_telemetry_contract,
+    )
+    runtime_graph = _development_runtime_graph(topology)
+    code_workspace = build_development_code_workspace(
+        spec=str(state.get("spec") or ""),
+        selected_features=selected_features,
+        selected_design=selected_design,
+        requirements=requirements,
+        task_decomposition=task_decomposition,
+        technical_design=technical_design,
+        reverse_engineering=reverse_engineering,
+        planning_analysis=_as_dict(state.get("analysis")),
+        milestones=[dict(item) for item in _as_list(state.get("milestones")) if isinstance(item, dict)],
+        goal_spec=_as_dict(topology.get("goal_spec")),
+        dependency_analysis=_as_dict(topology.get("dependency_analysis")),
+        work_unit_contracts=[dict(item) for item in _as_list(topology.get("work_unit_contracts")) if isinstance(item, dict)],
+        waves=[dict(item) for item in _as_list(topology.get("waves")) if isinstance(item, dict)],
+        critical_path=[str(item) for item in _as_list(topology.get("critical_path")) if str(item).strip()],
+        shift_left_plan=_as_dict(topology.get("shift_left_plan")),
+        value_contract=value_contract,
+        outcome_telemetry_contract=outcome_telemetry_contract,
+    )
+    spec_audit = build_development_spec_audit(
+        selected_features=selected_features,
+        requirements=requirements,
+        task_decomposition=task_decomposition,
+        dcs_analysis=dcs_analysis,
+        technical_design=technical_design,
+        reverse_engineering=reverse_engineering,
+        code_workspace=code_workspace,
+        selected_design=selected_design,
+        planning_analysis=_as_dict(state.get("analysis")),
+        delivery_plan_context=topology,
+        value_contract=value_contract,
+        outcome_telemetry_contract=outcome_telemetry_contract,
+    )
+    delivery_plan = {
+        "execution_mode": "autonomous_repo_delivery",
+        "topology_mode": "work_unit_wave_mesh",
+        "summary": (
+            "Approved planning/design context を goal spec -> dependency DAG -> execution waves -> work-unit contracts に展開し、"
+            " 各 work unit で shift-left QA / security を回しながら build から deploy handoff まで閉じる。"
+            " requirements / task DAG / technical design / code workspace を正本として扱う。"
+        ),
+        "selected_preset": str(state.get("selectedPreset") or plan_estimate.get("preset") or "standard"),
+        "source_plan_preset": str(plan_estimate.get("preset") or state.get("selectedPreset") or "standard"),
+        "success_definition": str(
+            _as_dict(implementation_plan).get("success_definition")
+            or "各 work unit が局所的に検証され、wave ごとに閉じたうえで主要機能が統合 build と deploy handoff に反映されていること。"
+        ),
+        "lanes": lanes,
+        **topology,
+        "runtime_graph": runtime_graph,
+        "spec_audit": spec_audit,
+        "code_workspace": code_workspace,
+        "value_contract": value_contract,
+        "outcome_telemetry_contract": outcome_telemetry_contract,
+    }
+    return _annotate_development_delivery_plan_lineage(
+        delivery_plan,
+        decision_context_fingerprint=decision_context_fingerprint,
+    )
+
+
+def _build_development_handoff(
+    *,
+    state: dict[str, Any],
+    delivery_plan: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    spec_audit = _as_dict(delivery_plan.get("spec_audit"))
+    code_workspace = _as_dict(delivery_plan.get("code_workspace"))
+    workspace_paths = {
+        str(_as_dict(item).get("path") or "").strip()
+        for item in _as_list(code_workspace.get("files"))
+        if str(_as_dict(item).get("path") or "").strip()
+    }
+    repo_execution = _as_dict(delivery_plan.get("repo_execution")) or _as_dict(snapshot.get("repo_execution_report"))
+    security_report = _as_dict(snapshot.get("security_report"))
+    workspace_summary = _as_dict(code_workspace.get("artifact_summary"))
+    milestone_results = [_as_dict(item) for item in _as_list(snapshot.get("milestone_results")) if _as_dict(item)]
+    work_unit_contracts = [_as_dict(item) for item in _as_list(delivery_plan.get("work_unit_contracts")) if _as_dict(item)]
+    waves = [_as_dict(item) for item in _as_list(delivery_plan.get("waves")) if _as_dict(item)]
+    shift_left_plan = _as_dict(delivery_plan.get("shift_left_plan"))
+    value_contract = _as_dict(delivery_plan.get("value_contract") or state.get("valueContract"))
+    outcome_telemetry_contract = _as_dict(
+        delivery_plan.get("outcome_telemetry_contract") or state.get("outcomeTelemetryContract")
+    )
+    execution = _as_dict(state.get("development_execution"))
+    qa_wave_results = [
+        _as_dict(item)
+        for item in _as_list(snapshot.get("wave_results"))
+        if _as_dict(item)
+    ] or [
+        _as_dict(item)
+        for item in _as_list(_as_dict(state.get("qa_report")).get("wave_results"))
+        if _as_dict(item)
+    ]
+    wave_review_rows = [
+        _as_dict(item)
+        for item in _as_dict(execution.get("reviews")).values()
+        if _as_dict(item)
+        and int(_as_dict(item).get("wave_index", -1) or -1) >= 0
+        and _as_dict(item).get("ready") is not None
+    ]
+    ready_wave_indices = {
+        int(item.get("wave_index", -1) or -1)
+        for item in wave_review_rows
+        if item.get("ready") is True
+    }
+    non_final_wave_count = max(0, len(waves) - 1)
+    wave_exit_ready = non_final_wave_count == 0 or len(ready_wave_indices) >= non_final_wave_count
+    blocked_work_unit_ids = _dedupe_strings(
+        [
+            str(_as_dict(item).get("id") or "").strip()
+            for item in _as_list(snapshot.get("work_unit_results"))
+            if str(_as_dict(item).get("status") or "") not in {"satisfied", "pass"}
+            and str(_as_dict(item).get("id") or "").strip()
+        ]
+    )
+    qa_wave_ready = (
+        all(str(item.get("status") or "") == "satisfied" for item in qa_wave_results)
+        if qa_wave_results
+        else not blocked_work_unit_ids
+    )
+    security_blockers = [
+        str(item)
+        for item in _as_list(security_report.get("blockers"))
+        if str(item).strip() and not _is_non_blocking_review_finding(item)
+    ]
+    if not security_blockers and str(security_report.get("status") or "") != "pass":
+        security_blockers = [
+            str(item)
+            for item in _as_list(security_report.get("findings"))
+            if str(item).strip() and not str(item).startswith("No obvious")
+        ]
+    blocker_strings = _dedupe_strings(
+        [
+            str(item)
+            for item in _as_list(snapshot.get("blockers"))
+            if str(item).strip() and not _is_non_blocking_review_finding(item)
+        ]
+        + security_blockers
+        + [
+            str(_as_dict(item).get("title") or "")
+            for item in _as_list(spec_audit.get("unresolved_gaps"))
+            if str(_as_dict(item).get("severity") or "") in {"critical", "high"}
+            and str(_as_dict(item).get("title") or "").strip()
+        ]
+        + [
+            str(item)
+            for item in _as_list(repo_execution.get("errors"))
+            if str(item).strip()
+        ]
+        + (["Not every execution wave has closed with a ready wave-exit review."] if not wave_exit_ready else [])
+        + (["At least one execution wave still fails its QA exit criteria."] if not qa_wave_ready else [])
+    )
+    blockers: list[BlockingIssue] = [
+        {
+            "id": f"blocker-{idx}",
+            "severity": "critical" if idx < len(_as_list(snapshot.get("blockers"))) + len(security_blockers) else "major",
+            "description": desc,
+            "source_phase": "development",
+        }
+        for idx, desc in enumerate(blocker_strings)
+    ]
+    satisfied = sum(1 for item in milestone_results if str(item.get("status", "")) == "satisfied")
+    total = len(milestone_results)
+    repo_ready = repo_execution.get("ready") is True
+    readiness_status = (
+        "ready_for_deploy"
+        if not blockers and repo_ready and total > 0 and satisfied == total and wave_exit_ready and qa_wave_ready
+        else "needs_rework"
+    )
+    operator_summary = (
+        "全 work package が依存順どおり統合され、repo/worktree 実行まで通過したので deploy phase がそのまま release gate を実行できる状態です。"
+        if readiness_status == "ready_for_deploy"
+        else "未解決 blocker または repo execution failure が残っているため、deploy へ渡す前に development mesh で再ループが必要です。"
+    )
+    review_focus_raw = _dedupe_strings(
+        [
+            str(item)
+            for item in _as_list(
+                _as_dict(_as_dict(_selected_design_from_state(state)).get("approval_packet")).get("review_checklist")
+            )
+            if str(item).strip()
+        ]
+        + [str(item.get("name") or "") for item in milestone_results if str(item.get("status", "")) != "satisfied"]
+    )
+    review_focus: list[ReviewFocusItem] = [
+        {"area": "review", "description": desc, "priority": "high" if idx == 0 else "medium"}
+        for idx, desc in enumerate(review_focus_raw)
+    ]
+    deploy_checklist: list[ChecklistItem] = [
+        {"id": "critical-path-integrated", "label": "critical path の全 package が統合済みである", "category": "integration", "required": True},
+        {"id": "milestones-satisfied", "label": f"マイルストーン {satisfied}/{total} 件が満たされている", "category": "quality", "required": True},
+        {"id": "shell-routing-merged", "label": "shared shell と routing の merge が integrator 経由で一本化されている", "category": "integration", "required": True},
+        {"id": "security-findings-resolved", "label": "security review の blocking finding が解消されている", "category": "security", "required": True},
+        {"id": "spec-audit-closed", "label": "requirements / task DAG / technical design の spec audit が閉じている", "category": "quality", "required": True},
+        {"id": "goal-spec-attached", "label": "goal spec / wave plan / work-unit contracts が handoff に添付されている", "category": "readiness", "required": True},
+        {"id": "value-contracts-attached", "label": "value contract と outcome telemetry contract が deploy handoff に添付されている", "category": "readiness", "required": True},
+        {"id": "shift-left-complete", "label": "shift-left QA / security が work-unit 単位で完了している", "category": "security", "required": True},
+        {"id": "wave-exits-ready", "label": "各 execution wave が ready 状態で close されている", "category": "readiness", "required": True},
+        {"id": "workspace-package-tree", "label": "code workspace の package tree と route binding が handoff に含まれている", "category": "integration", "required": True},
+        {"id": "design-token-contracts", "label": "design token / access-control / operability contract が workspace に含まれている", "category": "quality", "required": False},
+        {"id": "development-standards", "label": "標準開発ルールとコーディング規約が workspace に含まれている", "category": "quality", "required": False},
+        {"id": "repo-execution-passed", "label": "materialized repo/worktree で install / build / test が成功している", "category": "readiness", "required": True},
+    ] + [
+        {"id": f"review-focus-{idx}", "label": desc, "category": "review", "required": False}
+        for idx, desc in enumerate(review_focus_raw[:2])
+    ]
+    work_package_count = len(_as_list(delivery_plan.get("work_packages")))
+    critical_path_items = _as_list(delivery_plan.get("critical_path"))
+    design_token_present = "present" if "app/lib/design-tokens.ts" in workspace_paths and "docs/spec/design-system.md" in workspace_paths else "missing"
+    dev_standards_present = "present" if "app/lib/development-standards.ts" in workspace_paths and "docs/spec/development-standards.md" in workspace_paths else "missing"
+    access_policy_present = "present" if "server/contracts/access-policy.ts" in workspace_paths and "docs/spec/access-control.md" in workspace_paths else "missing"
+    operability_present = "present" if "server/contracts/audit-events.ts" in workspace_paths and "docs/spec/operability.md" in workspace_paths else "missing"
+    value_contract_present = "present" if "app/lib/value-contract.ts" in workspace_paths and "docs/spec/value-contract.md" in workspace_paths else "missing"
+    telemetry_contract_present = "present" if "server/contracts/outcome-telemetry.ts" in workspace_paths and "docs/spec/outcome-telemetry.md" in workspace_paths else "missing"
+    evidence: list[EvidenceItem] = [
+        {"category": "work_package", "label": "完了 work package", "value": work_package_count, "unit": "count"},
+    ] + [
+        {"category": "milestone", "label": f"{item.get('name', 'Milestone')} を満たした", "value": str(item.get("name", "Milestone")), "unit": "id"}
+        for item in milestone_results
+        if str(item.get("status", "")) == "satisfied"
+    ] + ([
+        {"category": "critical_path", "label": "critical path", "value": " → ".join(str(item) for item in critical_path_items), "unit": "path"},
+    ] if critical_path_items else []) + [
+        {"category": "execution", "label": "execution waves", "value": len(waves), "unit": "count"},
+        {"category": "execution", "label": "work-unit contracts", "value": len(work_unit_contracts), "unit": "count"},
+        {"category": "execution", "label": "ready wave exits", "value": f"{len(ready_wave_indices)}/{non_final_wave_count}" if non_final_wave_count > 0 else "single-wave flow", "unit": "count"},
+        {"category": "execution", "label": "shift-left mode", "value": str(shift_left_plan.get("mode") or "unknown"), "unit": "id"},
+        {"category": "file", "label": "workspace files", "value": int(workspace_summary.get("file_count", 0) or 0), "unit": "count"},
+        {"category": "package", "label": "workspace packages", "value": int(workspace_summary.get("package_count", 0) or 0), "unit": "count"},
+        {"category": "route", "label": "route bindings", "value": int(workspace_summary.get("route_binding_count", 0) or 0), "unit": "count"},
+        {"category": "contract", "label": "design token contract", "value": design_token_present, "unit": "id"},
+        {"category": "contract", "label": "development standards", "value": dev_standards_present, "unit": "id"},
+        {"category": "contract", "label": "access policy", "value": access_policy_present, "unit": "id"},
+        {"category": "contract", "label": "operability contract", "value": operability_present, "unit": "id"},
+        {"category": "contract", "label": "value contract", "value": value_contract_present, "unit": "id"},
+        {"category": "contract", "label": "telemetry contract", "value": telemetry_contract_present, "unit": "id"},
+        {"category": "contract", "label": "value metrics", "value": len(_as_list(value_contract.get("success_metrics"))), "unit": "count"},
+        {"category": "contract", "label": "telemetry events", "value": len(_as_list(outcome_telemetry_contract.get("telemetry_events"))), "unit": "count"},
+        {"category": "execution", "label": "topology fingerprint", "value": str(delivery_plan.get("topology_fingerprint") or "missing"), "unit": "id"},
+        {"category": "execution", "label": "runtime graph fingerprint", "value": str(delivery_plan.get("runtime_graph_fingerprint") or "missing"), "unit": "id"},
+        {"category": "execution", "label": "spec audit", "value": str(spec_audit.get("status") or "unknown"), "unit": "id"},
+        {"category": "execution", "label": "repo execution", "value": str(repo_execution.get("mode") or "unknown"), "unit": "id"},
+        {"category": "execution", "label": "repo build", "value": str(_as_dict(repo_execution.get("build")).get("status") or "unknown"), "unit": "id"},
+        {"category": "execution", "label": "repo test", "value": str(_as_dict(repo_execution.get("test")).get("status") or "skipped"), "unit": "id"},
+    ]
+    return {
+        "readiness_status": readiness_status,
+        "release_candidate": "Approved context を反映した release-reviewable build candidate",
+        "operator_summary": operator_summary,
+        "deploy_checklist": deploy_checklist,
+        "evidence": evidence,
+        "blocking_issues": blockers,
+        "review_focus": review_focus,
+        "topology_fingerprint": str(delivery_plan.get("topology_fingerprint") or ""),
+        "runtime_graph_fingerprint": str(delivery_plan.get("runtime_graph_fingerprint") or ""),
+        "wave_exit_ready": wave_exit_ready,
+        "ready_wave_count": len(ready_wave_indices),
+        "non_final_wave_count": non_final_wave_count,
+        "blocked_work_unit_ids": blocked_work_unit_ids,
+    }
+
 
 def _development_planner_handler(
     node_id: str,
@@ -6386,17 +12548,74 @@ def _development_planner_handler(
     llm_runtime: LLMRuntime | None = None,
 ) -> NodeResult:
     selected_features = _selected_feature_names(state)
+    planning_context = _as_dict(_as_dict(state.get("analysis")).get("planning_context"))
+    selected_design = _as_dict(state.get("selected_design")) or _selected_design_from_state(state)
+    selected_plan_estimate = _selected_plan_estimate_from_state(state)
+    decision_context = _decision_context_from_state(state, compact=True)
+    decision_scope = _decision_scope_for_phase(state, phase="development")
     workstreams = [
-        {"agent": "frontend-builder", "focus": "UI shell and interaction layout", "skills": ["responsive-ui", "component-composition"]},
-        {"agent": "backend-builder", "focus": "Domain model and data contract", "skills": ["api-design", "state-modeling"]},
+        {
+            "agent": "frontend-builder",
+            "focus": "UI shell and interaction layout",
+            "skills": ["responsive-ui", "component-composition"],
+            "depends_on": [],
+        },
+        {
+            "agent": "backend-builder",
+            "focus": "Domain model and data contract",
+            "skills": ["api-design", "state-modeling"],
+            "depends_on": [],
+        },
+        {
+            "agent": "integrator",
+            "focus": "Shared shell, merge order, and release-reviewable build assembly",
+            "skills": ["integration", "artifact-assembly"],
+            "depends_on": ["frontend-builder", "backend-builder"],
+        },
+        {
+            "agent": "repo-executor",
+            "focus": "Materialize the code workspace into a real repo or detached worktree and verify install/build/test",
+            "skills": ["repo-materialization", "build-verification"],
+            "depends_on": ["integrator"],
+        },
     ]
     if state.get("milestones"):
-        workstreams.append({"agent": "qa-engineer", "focus": "Milestone verification", "skills": ["acceptance-testing"]})
+        workstreams.append(
+            {
+                "agent": "qa-engineer",
+                "focus": "Milestone verification",
+                "skills": ["acceptance-testing"],
+                "depends_on": ["repo-executor"],
+            }
+        )
+    workstreams.extend(
+        [
+            {
+                "agent": "security-reviewer",
+                "focus": "Security and unsafe DOM review",
+                "skills": ["security-review", "safety-review"],
+                "depends_on": ["repo-executor"],
+            },
+            {
+                "agent": "reviewer",
+                "focus": "Deploy handoff and final release-readiness review",
+                "skills": ["delivery-review", "release-management"],
+                "depends_on": ["qa-engineer", "security-reviewer"],
+            },
+        ]
+    )
     plan = {
         "selected_features": selected_features,
         "workstreams": workstreams,
-        "success_definition": "Selected design plus must-have features are visible in a release-reviewable build artifact.",
+        "success_definition": "Selected design plus must-have features are visible in a release-reviewable build artifact with a deploy-ready handoff packet.",
+        "decision_scope": decision_scope,
+        "source_plan_preset": str(selected_plan_estimate.get("preset") or state.get("selectedPreset") or "standard"),
     }
+    delivery_plan = _build_development_delivery_plan(
+        state,
+        selected_design=selected_design,
+        implementation_plan=plan,
+    )
     if _provider_backed_lifecycle_available(provider_registry):
         async def autonomous() -> NodeResult:
             collaboration_plan, plan_events = await _plan_node_collaboration(
@@ -6414,14 +12633,19 @@ def _development_planner_handler(
                 purpose="lifecycle-development-plan",
                 static_instruction=(
                     "You are an autonomous build planner. Return JSON only. "
-                    "Create a concise but high-quality implementation plan grounded in the provided design and milestones."
+                    "Create a concise but high-quality autonomous delivery plan grounded in the provided design, WBS, and milestones. "
+                    "You must preserve dependency ordering, anti-conflict lane ownership, and deploy handoff readiness."
                 ),
                 user_prompt=(
-                    "Return JSON with keys selected_features, workstreams, success_definition.\n"
+                    "Return JSON with keys selected_features, workstreams, success_definition, delivery_plan.\n"
                     f"Spec: {state.get('spec')}\n"
                     f"Selected features: {selected_features}\n"
+                    f"Planning context: {planning_context}\n"
+                    f"Decision context: {decision_context}\n"
                     f"Milestones: {state.get('milestones')}\n"
                     f"Selected design: {state.get('selected_design') or state.get('design')}\n"
+                    f"Selected plan estimate: {selected_plan_estimate}\n"
+                    f"Baseline delivery plan: {delivery_plan}\n"
                     f"Skill plan: {collaboration_plan}\n"
                 ),
                 phase="development",
@@ -6431,11 +12655,13 @@ def _development_planner_handler(
                 return NodeResult(
                     state_patch={
                         "implementation_plan": plan,
+                        "delivery_plan": delivery_plan,
                         _skill_plan_state_key(node_id): collaboration_plan,
                         _delegation_state_key(node_id): [],
                     },
                     artifacts=_artifacts(
                         {"name": "implementation-plan", "kind": "development", **plan},
+                        {"name": "delivery-plan", "kind": "development", **delivery_plan},
                         {"name": f"{node_id}-skill-plan", "kind": "skill-plan", **collaboration_plan},
                     ),
                     metrics={"development_mode": "provider-backed-fallback"},
@@ -6445,15 +12671,107 @@ def _development_planner_handler(
                 "selected_features": [str(item) for item in _as_list(payload.get("selected_features")) if str(item).strip()] or selected_features,
                 "workstreams": [dict(item) for item in _as_list(payload.get("workstreams")) if isinstance(item, dict)] or workstreams,
                 "success_definition": str(payload.get("success_definition") or plan["success_definition"]),
+                "decision_scope": decision_scope,
+                "source_plan_preset": str(selected_plan_estimate.get("preset") or state.get("selectedPreset") or "standard"),
             }
+            llm_delivery_plan = _as_dict(payload.get("delivery_plan"))
+            finalized_delivery_plan = _build_development_delivery_plan(
+                {
+                    **state,
+                    "selected_design": selected_design,
+                },
+                selected_design=selected_design,
+                implementation_plan=llm_plan,
+            )
+            if llm_delivery_plan:
+                finalized_delivery_plan.update(
+                    {
+                        "summary": str(llm_delivery_plan.get("summary") or finalized_delivery_plan.get("summary")),
+                        "success_definition": str(llm_delivery_plan.get("success_definition") or llm_plan["success_definition"]),
+                    }
+                )
+                if _as_list(llm_delivery_plan.get("work_packages")):
+                    finalized_delivery_plan["work_packages"] = _stabilize_development_work_packages(
+                        [
+                            dict(item)
+                            for item in _as_list(finalized_delivery_plan.get("work_packages"))
+                            if isinstance(item, dict)
+                        ],
+                        [
+                            {
+                                **dict(item),
+                                "status": str(_as_dict(item).get("status") or "planned"),
+                            }
+                            for item in _as_list(llm_delivery_plan.get("work_packages"))
+                            if isinstance(item, dict)
+                        ],
+                    )
+                    topology = _build_development_topology(
+                        state={
+                            **state,
+                            "selected_design": selected_design,
+                        },
+                        selected_design=selected_design,
+                        selected_features=llm_plan["selected_features"],
+                        requirements=normalize_requirements_bundle(_as_dict(state.get("requirements"))),
+                        technical_design=normalize_technical_design_bundle(_as_dict(state.get("technicalDesign"))),
+                        work_packages=[
+                            dict(item)
+                            for item in finalized_delivery_plan["work_packages"]
+                            if isinstance(item, dict)
+                        ],
+                        lanes=[
+                            dict(item)
+                            for item in _as_list(finalized_delivery_plan.get("lanes"))
+                            if isinstance(item, dict)
+                        ] or _build_development_lanes(selected_design),
+                    )
+                    refreshed_code_workspace = build_development_code_workspace(
+                        spec=str(state.get("spec") or ""),
+                        selected_features=llm_plan["selected_features"],
+                        selected_design=selected_design,
+                        requirements=normalize_requirements_bundle(_as_dict(state.get("requirements"))),
+                        task_decomposition=normalize_task_decomposition(_as_dict(state.get("taskDecomposition"))),
+                        technical_design=normalize_technical_design_bundle(_as_dict(state.get("technicalDesign"))),
+                        reverse_engineering=normalize_reverse_engineering_result(_as_dict(state.get("reverseEngineering"))),
+                        planning_analysis=_as_dict(state.get("analysis")),
+                        milestones=[dict(item) for item in _as_list(state.get("milestones")) if isinstance(item, dict)],
+                        goal_spec=_as_dict(topology.get("goal_spec")),
+                        dependency_analysis=_as_dict(topology.get("dependency_analysis")),
+                        work_unit_contracts=[dict(item) for item in _as_list(topology.get("work_unit_contracts")) if isinstance(item, dict)],
+                        waves=[dict(item) for item in _as_list(topology.get("waves")) if isinstance(item, dict)],
+                        critical_path=[str(item) for item in _as_list(topology.get("critical_path")) if str(item).strip()],
+                        shift_left_plan=_as_dict(topology.get("shift_left_plan")),
+                    )
+                    refreshed_spec_audit = build_development_spec_audit(
+                        selected_features=llm_plan["selected_features"],
+                        requirements=normalize_requirements_bundle(_as_dict(state.get("requirements"))),
+                        task_decomposition=normalize_task_decomposition(_as_dict(state.get("taskDecomposition"))),
+                        dcs_analysis=normalize_dcs_analysis(_as_dict(state.get("dcsAnalysis"))),
+                        technical_design=normalize_technical_design_bundle(_as_dict(state.get("technicalDesign"))),
+                        reverse_engineering=normalize_reverse_engineering_result(_as_dict(state.get("reverseEngineering"))),
+                        code_workspace=refreshed_code_workspace,
+                        selected_design=selected_design,
+                        planning_analysis=_as_dict(state.get("analysis")),
+                        delivery_plan_context=topology,
+                    )
+                    finalized_delivery_plan.update(topology)
+                    finalized_delivery_plan["code_workspace"] = refreshed_code_workspace
+                    finalized_delivery_plan["spec_audit"] = refreshed_spec_audit
+                    finalized_delivery_plan = _annotate_development_delivery_plan_lineage(
+                        finalized_delivery_plan,
+                        decision_context_fingerprint=str(decision_context.get("fingerprint") or ""),
+                    )
             return NodeResult(
                 state_patch={
                     "implementation_plan": llm_plan,
+                    "delivery_plan": finalized_delivery_plan,
                     _skill_plan_state_key(node_id): collaboration_plan,
                     _delegation_state_key(node_id): [],
                 },
                 artifacts=_artifacts(
                     {"name": "implementation-plan", "kind": "development", **llm_plan},
+                    {"name": "delivery-plan", "kind": "development", **finalized_delivery_plan},
                     {"name": f"{node_id}-skill-plan", "kind": "skill-plan", **collaboration_plan},
                 ),
                 metrics={"development_mode": "provider-backed-autonomous"},
@@ -6464,21 +12782,25 @@ def _development_planner_handler(
     return NodeResult(
         state_patch={
             "implementation_plan": plan,
+            "delivery_plan": delivery_plan,
             _skill_plan_state_key(node_id): {
                 "phase": "development",
                 "node_id": node_id,
                 "agent_label": "Build Planner",
-                "objective": "Break delivery into the highest-leverage workstreams.",
+                "objective": "Break delivery into dependency-aware, conflict-safe workstreams.",
                 "candidate_skills": ["task-routing", "implementation-planning"],
                 "selected_skills": ["task-routing", "implementation-planning"],
                 "quality_targets": _phase_quality_targets("development"),
                 "delegations": [],
                 "mode": "deterministic-reference",
-                "execution_note": "Route work first, delegate review later.",
+                "execution_note": "Use planning WBS and design lanes to build a delivery graph before coding starts.",
             },
             _delegation_state_key(node_id): [],
         },
-        artifacts=_artifacts({"name": "implementation-plan", "kind": "development", **plan}),
+        artifacts=_artifacts(
+            {"name": "implementation-plan", "kind": "development", **plan},
+            {"name": "delivery-plan", "kind": "development", **delivery_plan},
+        ),
     )
 
 
@@ -6490,8 +12812,17 @@ def _development_frontend_handler(
     llm_runtime: LLMRuntime | None = None,
 ) -> NodeResult:
     selected_features = _selected_feature_names(state)
+    node_context = _development_runtime_node_context(node_id, state)
+    focus_work_unit_ids = {
+        str(item).strip()
+        for item in _as_list(node_context.get("focus_work_unit_ids"))
+        if str(item).strip()
+    }
     analysis = _as_dict(state.get("analysis"))
+    planning_context = _as_dict(analysis.get("planning_context"))
     selected_design = _as_dict(state.get("selected_design")) or _selected_design_from_state(state)
+    decision_context = _decision_context_from_state(state, compact=True)
+    decision_scope = _decision_scope_for_phase(state, phase="development", selected_design=selected_design)
     prototype = _as_dict(selected_design.get("prototype")) or _build_design_prototype(
         spec=str(state.get("spec", "")),
         analysis=analysis,
@@ -6500,6 +12831,42 @@ def _development_frontend_handler(
         description=str(selected_design.get("description") or "Build-ready product prototype"),
     )
     prototype_screens = [dict(item) for item in _as_list(prototype.get("screens")) if isinstance(item, dict)]
+    delivery_plan = _as_dict(state.get("delivery_plan"))
+    assigned_packages = [
+        dict(item)
+        for item in _as_list(delivery_plan.get("work_packages"))
+        if isinstance(item, dict)
+        and str(item.get("lane", "")) == "frontend-builder"
+        and (
+            not focus_work_unit_ids
+            or str(item.get("id") or "").strip() in focus_work_unit_ids
+        )
+    ]
+    assigned_work_units = [
+        dict(item)
+        for item in _as_list(delivery_plan.get("work_unit_contracts"))
+        if isinstance(item, dict)
+        and str(item.get("lane", "")) == "frontend-builder"
+        and (
+            not focus_work_unit_ids
+            or str(item.get("work_package_id") or item.get("id") or "").strip() in focus_work_unit_ids
+        )
+    ]
+    wave_rows = [
+        dict(item)
+        for item in _as_list(delivery_plan.get("waves"))
+        if isinstance(item, dict)
+        and (
+            (
+                node_context.get("wave_index") is not None
+                and int(item.get("wave_index", -1) or -1) == int(node_context.get("wave_index", -2) or -2)
+            )
+            or any(
+                str(unit.get("work_package_id") or "").strip() in set(_as_list(item.get("work_unit_ids")))
+                for unit in assigned_work_units
+            )
+        )
+    ]
     sections = [
         str(screen.get("id") or f"screen-{index + 1}")
         for index, screen in enumerate(prototype_screens[:4])
@@ -6525,7 +12892,21 @@ def _development_frontend_handler(
             "layout": str(_as_dict(prototype.get("app_shell")).get("layout") or "sidebar"),
         },
         "interaction_notes": interaction_notes,
+        "decision_scope": decision_scope,
+        "decision_context_fingerprint": str(decision_context.get("fingerprint") or ""),
+        "assigned_packages": assigned_packages,
+        "assigned_work_units": assigned_work_units,
+        "wave_plan": wave_rows,
+        "shift_left_plan": _as_dict(delivery_plan.get("shift_left_plan")),
+        "runtime_node": node_context,
     }
+
+    def _patched_frontend_state(bundle_payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        execution = _updated_development_execution(state, "frontend_bundles", node_id, bundle_payload)
+        aggregate_state = {**state, "development_execution": execution}
+        aggregate_bundle = _aggregate_frontend_bundle(aggregate_state)
+        return execution, aggregate_bundle
+
     if _provider_backed_lifecycle_available(provider_registry):
         async def autonomous() -> NodeResult:
             collaboration_plan, plan_events = await _plan_node_collaboration(
@@ -6543,24 +12924,37 @@ def _development_frontend_handler(
                 purpose="lifecycle-development-frontend-plan",
                 static_instruction=(
                     "You are a principal frontend architect. Return JSON only. "
-                    "Produce a UI composition plan that is differentiated, accessible, and mobile-safe."
+                    "Produce a UI composition plan that is differentiated, accessible, mobile-safe, "
+                    "and compliant with the approved design tokens and development standards. "
+                    "Do not rely on hard-coded brand presentation values."
                 ),
                 user_prompt=(
                     "Return JSON with keys sections, feature_cards, css_tokens, interaction_notes.\n"
                     f"Spec: {state.get('spec')}\n"
                     f"Selected features: {selected_features}\n"
+                    f"Planning context: {planning_context}\n"
+                    f"Design tokens: {_as_dict(_as_dict(state.get('analysis')).get('design_tokens'))}\n"
+                    f"Roles: {_as_list(_as_dict(state.get('analysis')).get('roles'))}\n"
+                    f"Decision context: {decision_context}\n"
                     f"Design prototype: {prototype}\n"
+                    f"Assigned delivery packages: {assigned_packages}\n"
+                    f"Assigned work-unit contracts: {assigned_work_units}\n"
+                    f"Wave plan: {wave_rows}\n"
+                    f"Shift-left plan: {_as_dict(delivery_plan.get('shift_left_plan'))}\n"
                     f"Design context: {state.get('selected_design') or state.get('design')}\n"
                     f"Skill plan: {collaboration_plan}\n"
-                    "Bias toward application/workspace surfaces. Do not collapse the layout into a landing page."
+                    "Bias toward application/workspace surfaces. Do not collapse the layout into a landing page. "
+                    "Process work in dependency order, keep repairs local to the same work unit when possible, "
+                    "and keep the output compliant with approved tokens, auth-facing surfaces, and coding rules."
                 ),
                 phase="development",
                 node_id=node_id,
             )
             if not isinstance(llm_payload, dict):
+                execution, aggregate_bundle = _patched_frontend_state(payload)
                 return NodeResult(
                     state_patch={
-                        "frontend_bundle": payload,
+                        "frontend_bundle": aggregate_bundle,
                         _skill_plan_state_key(node_id): collaboration_plan,
                         _delegation_state_key(node_id): [],
                     },
@@ -6572,10 +12966,18 @@ def _development_frontend_handler(
                 "feature_cards": [str(item) for item in _as_list(llm_payload.get("feature_cards")) if str(item).strip()] or cards,
                 "css_tokens": _as_dict(llm_payload.get("css_tokens")) or payload["css_tokens"],
                 "interaction_notes": [str(item) for item in _as_list(llm_payload.get("interaction_notes")) if str(item).strip()],
+                "decision_scope": decision_scope,
+                "decision_context_fingerprint": str(decision_context.get("fingerprint") or ""),
+                "assigned_packages": assigned_packages,
+                "assigned_work_units": assigned_work_units,
+                "wave_plan": wave_rows,
+                "shift_left_plan": _as_dict(delivery_plan.get("shift_left_plan")),
+                "runtime_node": node_context,
             }
+            execution, aggregate_bundle = _patched_frontend_state(llm_bundle)
             return NodeResult(
                 state_patch={
-                    "frontend_bundle": llm_bundle,
+                    "frontend_bundle": aggregate_bundle,
                     _skill_plan_state_key(node_id): collaboration_plan,
                     _delegation_state_key(node_id): [],
                 },
@@ -6584,9 +12986,10 @@ def _development_frontend_handler(
             )
 
         return autonomous()
+    execution, aggregate_bundle = _patched_frontend_state(payload)
     return NodeResult(
         state_patch={
-            "frontend_bundle": payload,
+            "frontend_bundle": aggregate_bundle,
             _skill_plan_state_key(node_id): {
                 "phase": "development",
                 "node_id": node_id,
@@ -6612,17 +13015,96 @@ def _development_backend_handler(
     llm_runtime: LLMRuntime | None = None,
 ) -> NodeResult:
     selected_features = _selected_feature_names(state)
+    node_context = _development_runtime_node_context(node_id, state)
+    focus_work_unit_ids = {
+        str(item).strip()
+        for item in _as_list(node_context.get("focus_work_unit_ids"))
+        if str(item).strip()
+    }
+    planning_context = _as_dict(_as_dict(state.get("analysis")).get("planning_context"))
+    delivery_plan = _as_dict(state.get("delivery_plan"))
+    assigned_packages = [
+        dict(item)
+        for item in _as_list(delivery_plan.get("work_packages"))
+        if isinstance(item, dict)
+        and str(item.get("lane", "")) == "backend-builder"
+        and (
+            not focus_work_unit_ids
+            or str(item.get("id") or "").strip() in focus_work_unit_ids
+        )
+    ]
+    assigned_work_units = [
+        dict(item)
+        for item in _as_list(delivery_plan.get("work_unit_contracts"))
+        if isinstance(item, dict)
+        and str(item.get("lane", "")) == "backend-builder"
+        and (
+            not focus_work_unit_ids
+            or str(item.get("work_package_id") or item.get("id") or "").strip() in focus_work_unit_ids
+        )
+    ]
+    wave_rows = [
+        dict(item)
+        for item in _as_list(delivery_plan.get("waves"))
+        if isinstance(item, dict)
+        and (
+            (
+                node_context.get("wave_index") is not None
+                and int(item.get("wave_index", -1) or -1) == int(node_context.get("wave_index", -2) or -2)
+            )
+            or any(
+                str(unit.get("work_package_id") or "").strip() in set(_as_list(item.get("work_unit_ids")))
+                for unit in assigned_work_units
+            )
+        )
+    ]
+    decision_context = _decision_context_from_state(state, compact=True)
+    decision_scope = _decision_scope_for_phase(state, phase="development")
     payload = {
         "entities": [
             {"name": "LifecycleProject", "fields": ["phaseStatuses", "artifacts", "releases", "feedbackItems"]},
             {"name": "PhaseArtifact", "fields": ["phase", "kind", "summary", "createdAt"]},
+        ],
+        "api_endpoints": [
+            {
+                "method": "GET",
+                "path": "/api/control-plane",
+                "description": "Return the delivery control-plane snapshot for route bindings and lane status.",
+                "authRequired": True,
+            },
+            {
+                "method": "POST",
+                "path": "/api/approval/decision",
+                "description": "Persist the operator approval or rework decision for the current milestone packet.",
+                "authRequired": True,
+            },
+            {
+                "method": "POST",
+                "path": "/api/releases/promote",
+                "description": "Promote the validated build into the deploy handoff once gates pass.",
+                "authRequired": True,
+            },
         ],
         "automation_notes": [
             "Persist project record as control-plane surface record.",
             "Derive release gates from build artifact checks.",
         ],
         "exposed_capabilities": selected_features,
+        "decision_scope": decision_scope,
+        "decision_context_fingerprint": str(decision_context.get("fingerprint") or ""),
+        "assigned_packages": assigned_packages,
+        "assigned_work_units": assigned_work_units,
+        "wave_plan": wave_rows,
+        "shift_left_plan": _as_dict(delivery_plan.get("shift_left_plan")),
+        "runtime_node": node_context,
     }
+
+    def _patched_backend_state(bundle_payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        execution = _updated_development_execution(state, "backend_bundles", node_id, bundle_payload)
+        aggregate_state = {**state, "development_execution": execution}
+        aggregate_bundle = _aggregate_backend_bundle(aggregate_state)
+        return execution, aggregate_bundle
+
     if _provider_backed_lifecycle_available(provider_registry):
         async def autonomous() -> NodeResult:
             collaboration_plan, plan_events = await _plan_node_collaboration(
@@ -6640,22 +13122,34 @@ def _development_backend_handler(
                 purpose="lifecycle-development-backend-plan",
                 static_instruction=(
                     "You are a principal backend architect. Return JSON only. "
-                    "Design a durable domain model and execution contract for the requested product."
+                    "Design a durable domain model and execution contract for the requested product. "
+                    "Preserve access policy, authRequired truth, auditability, and explicit development standards."
                 ),
                 user_prompt=(
                     "Return JSON with keys entities, automation_notes, exposed_capabilities, api_endpoints.\n"
                     f"Spec: {state.get('spec')}\n"
                     f"Selected features: {selected_features}\n"
+                    f"Planning context: {planning_context}\n"
+                    f"Roles: {_as_list(_as_dict(state.get('analysis')).get('roles'))}\n"
+                    f"Design tokens: {_as_dict(_as_dict(state.get('analysis')).get('design_tokens'))}\n"
+                    f"Decision context: {decision_context}\n"
                     f"Milestones: {state.get('milestones')}\n"
+                    f"Assigned delivery packages: {assigned_packages}\n"
+                    f"Assigned work-unit contracts: {assigned_work_units}\n"
+                    f"Wave plan: {wave_rows}\n"
+                    f"Shift-left plan: {_as_dict(delivery_plan.get('shift_left_plan'))}\n"
                     f"Skill plan: {collaboration_plan}\n"
+                    "Process work in dependency order and keep failures local to the same work unit before asking for broader replanning.\n"
+                    "Protected endpoints must keep authRequired markers and remain consistent with the access policy contract.\n"
                 ),
                 phase="development",
                 node_id=node_id,
             )
             if not isinstance(llm_payload, dict):
+                execution, aggregate_bundle = _patched_backend_state(payload)
                 return NodeResult(
                     state_patch={
-                        "backend_bundle": payload,
+                        "backend_bundle": aggregate_bundle,
                         _skill_plan_state_key(node_id): collaboration_plan,
                         _delegation_state_key(node_id): [],
                     },
@@ -6667,10 +13161,18 @@ def _development_backend_handler(
                 "automation_notes": [str(item) for item in _as_list(llm_payload.get("automation_notes")) if str(item).strip()] or payload["automation_notes"],
                 "exposed_capabilities": [str(item) for item in _as_list(llm_payload.get("exposed_capabilities")) if str(item).strip()] or selected_features,
                 "api_endpoints": [dict(item) for item in _as_list(llm_payload.get("api_endpoints")) if isinstance(item, dict)],
+                "decision_scope": decision_scope,
+                "decision_context_fingerprint": str(decision_context.get("fingerprint") or ""),
+                "assigned_packages": assigned_packages,
+                "assigned_work_units": assigned_work_units,
+                "wave_plan": wave_rows,
+                "shift_left_plan": _as_dict(delivery_plan.get("shift_left_plan")),
+                "runtime_node": node_context,
             }
+            execution, aggregate_bundle = _patched_backend_state(llm_bundle)
             return NodeResult(
                 state_patch={
-                    "backend_bundle": llm_bundle,
+                    "backend_bundle": aggregate_bundle,
                     _skill_plan_state_key(node_id): collaboration_plan,
                     _delegation_state_key(node_id): [],
                 },
@@ -6679,9 +13181,10 @@ def _development_backend_handler(
             )
 
         return autonomous()
+    execution, aggregate_bundle = _patched_backend_state(payload)
     return NodeResult(
         state_patch={
-            "backend_bundle": payload,
+            "backend_bundle": aggregate_bundle,
             _skill_plan_state_key(node_id): {
                 "phase": "development",
                 "node_id": node_id,
@@ -6706,9 +13209,13 @@ def _development_integrator_handler(
     provider_registry: ProviderRegistry | None = None,
     llm_runtime: LLMRuntime | None = None,
 ) -> NodeResult:
+    node_context = _development_runtime_node_context(node_id, state)
     analysis = _as_dict(state.get("analysis"))
+    planning_context = _as_dict(analysis.get("planning_context"))
     selected_design = _as_dict(state.get("selected_design")) or _selected_design_from_state(state)
     selected_features = _selected_feature_names(state)
+    decision_context = _decision_context_from_state(state, compact=True)
+    decision_scope = _decision_scope_for_phase(state, phase="development", selected_design=selected_design)
     prototype = _as_dict(selected_design.get("prototype")) or _build_design_prototype(
         spec=str(state.get("spec", "")),
         analysis=analysis,
@@ -6717,12 +13224,15 @@ def _development_integrator_handler(
         description=str(selected_design.get("description") or "Integrated build artifact"),
     )
     design_tokens = _as_dict(analysis.get("design_tokens"))
+    delivery_plan = _as_dict(state.get("delivery_plan"))
+    frontend_bundle = _aggregate_frontend_bundle(state)
+    backend_bundle = _aggregate_backend_bundle(state)
     primary_color = _color_or(selected_design.get("primary_color"), _color_or(_as_dict(design_tokens.get("colors")).get("primary"), "#0f172a"))
     accent_color = _color_or(selected_design.get("accent_color"), _color_or(_as_dict(design_tokens.get("colors")).get("cta"), "#10b981"))
-    feature_cards = _as_dict(state.get("frontend_bundle")).get("feature_cards", [])
-    frontend_sections = _as_dict(state.get("frontend_bundle")).get("sections", [])
-    interaction_notes = [str(item) for item in _as_list(_as_dict(state.get("frontend_bundle")).get("interaction_notes")) if str(item).strip()]
-    backend_entities = _as_dict(state.get("backend_bundle")).get("entities", [])
+    feature_cards = _as_list(frontend_bundle.get("feature_cards"))
+    frontend_sections = _as_list(frontend_bundle.get("sections"))
+    interaction_notes = [str(item) for item in _as_list(frontend_bundle.get("interaction_notes")) if str(item).strip()]
+    backend_entities = _as_list(backend_bundle.get("entities"))
     code = _build_preview_html(
         title=_preview_title(str(state.get("spec", ""))),
         subtitle=str(selected_design.get("description") or "Integrated build artifact aligned to the selected prototype."),
@@ -6741,7 +13251,49 @@ def _development_integrator_handler(
         "code": code,
         "build_sections": frontend_sections or [str(screen.get("id") or "") for screen in _as_list(prototype.get("screens")) if isinstance(screen, dict)],
         "prototype": prototype,
+        "decision_scope": decision_scope,
+        "decision_context_fingerprint": str(decision_context.get("fingerprint") or ""),
+        "delivery_plan": delivery_plan,
+        "runtime_node": node_context,
     }
+
+    def _updated_delivery_plan() -> dict[str, Any]:
+        refined_code_workspace = refine_development_code_workspace(
+            code_workspace=_as_dict(delivery_plan.get("code_workspace")),
+            spec=str(state.get("spec") or ""),
+            selected_features=selected_features,
+            selected_design=selected_design,
+            frontend_bundle=frontend_bundle,
+            backend_bundle=backend_bundle,
+            delivery_plan=delivery_plan,
+            milestones=[dict(item) for item in _as_list(state.get("milestones")) if isinstance(item, dict)],
+            technical_design=normalize_technical_design_bundle(_as_dict(state.get("technicalDesign"))),
+            planning_analysis=_as_dict(state.get("analysis")),
+        )
+        refreshed_spec_audit = build_development_spec_audit(
+            selected_features=selected_features,
+            requirements=normalize_requirements_bundle(_as_dict(state.get("requirements"))),
+            task_decomposition=normalize_task_decomposition(_as_dict(state.get("taskDecomposition"))),
+            dcs_analysis=normalize_dcs_analysis(_as_dict(state.get("dcsAnalysis"))),
+            technical_design=normalize_technical_design_bundle(_as_dict(state.get("technicalDesign"))),
+            reverse_engineering=normalize_reverse_engineering_result(_as_dict(state.get("reverseEngineering"))),
+            code_workspace=refined_code_workspace,
+            selected_design=selected_design,
+            planning_analysis=_as_dict(state.get("analysis")),
+            delivery_plan_context=delivery_plan,
+        )
+        updated_plan = dict(delivery_plan)
+        updated_plan["code_workspace"] = refined_code_workspace
+        updated_plan["spec_audit"] = refreshed_spec_audit
+        return _annotate_development_delivery_plan_lineage(
+            updated_plan,
+            decision_context_fingerprint=str(decision_context.get("fingerprint") or ""),
+        )
+
+    def _patched_integrated_state(integrated_payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        execution = _updated_development_execution(state, "integrated_builds", node_id, integrated_payload)
+        return execution, integrated_payload
+
     if _provider_backed_lifecycle_available(provider_registry):
         async def autonomous() -> NodeResult:
             collaboration_plan, plan_events = await _plan_node_collaboration(
@@ -6760,20 +13312,27 @@ def _development_integrator_handler(
                 static_instruction=(
                     "You are an autonomous product engineer. Return JSON only. "
                     "Produce a single-file HTML app with embedded CSS and JS, strong accessibility, responsive behavior, "
-                    "and product-prototype fidelity."
+                    "and product-prototype fidelity. The build must remain compliant with design tokens, access policy, "
+                    "audit / operability contracts, and the standard development rules."
                 ),
                 user_prompt=(
                     "Return JSON with keys code, build_sections, implementation_notes.\n"
                     f"Spec: {state.get('spec')}\n"
+                    f"Planning context: {planning_context}\n"
+                    f"Design tokens: {_as_dict(_as_dict(state.get('analysis')).get('design_tokens'))}\n"
+                    f"Roles: {_as_list(_as_dict(state.get('analysis')).get('roles'))}\n"
+                    f"Decision context: {decision_context}\n"
                     f"Selected design: {selected_design}\n"
                     f"Prototype blueprint: {prototype}\n"
-                    f"Frontend bundle: {_as_dict(state.get('frontend_bundle'))}\n"
-                    f"Backend bundle: {_as_dict(state.get('backend_bundle'))}\n"
+                    f"Delivery plan: {delivery_plan}\n"
+                    f"Frontend bundle: {frontend_bundle}\n"
+                    f"Backend bundle: {backend_bundle}\n"
                     f"Milestones: {state.get('milestones')}\n"
                     f"Skill plan: {collaboration_plan}\n"
                     "The code must be previewable HTML, include <main>, aria labels for primary actions, "
                     "a viewport meta tag, real application navigation, and multiple prototype screen surfaces. "
-                    "Do not return a landing page or hero-only layout."
+                    "Do not return a landing page or hero-only layout. "
+                    "Do not introduce one-off visual tokens or bypass the access / audit contracts."
                 ),
                 phase="development",
                 node_id=node_id,
@@ -6781,11 +13340,23 @@ def _development_integrator_handler(
             llm_code = str(_as_dict(llm_payload).get("code") or "")
             llm_sections = [str(item) for item in _as_list(_as_dict(llm_payload).get("build_sections")) if str(item).strip()] or frontend_sections
             integrated_code = llm_code if _looks_like_prototype_html(llm_code) else code
-            integrated_payload = {"code": integrated_code, "build_sections": llm_sections, "prototype": prototype}
+            updated_delivery_plan = _updated_delivery_plan()
+            integrated_payload = {
+                "code": integrated_code,
+                "build_sections": llm_sections,
+                "prototype": prototype,
+                "decision_scope": decision_scope,
+                "decision_context_fingerprint": str(decision_context.get("fingerprint") or ""),
+                "delivery_plan": updated_delivery_plan,
+                "runtime_node": node_context,
+            }
+            execution, integrated_payload = _patched_integrated_state(integrated_payload)
             return NodeResult(
                 state_patch={
                     "integrated_build": integrated_payload,
                     "code": integrated_code,
+                    "delivery_plan": updated_delivery_plan,
+                    "development_execution": execution,
                     _skill_plan_state_key(node_id): collaboration_plan,
                     _delegation_state_key(node_id): [],
                 },
@@ -6795,10 +13366,15 @@ def _development_integrator_handler(
             )
 
         return autonomous()
+    updated_delivery_plan = _updated_delivery_plan()
+    payload["delivery_plan"] = updated_delivery_plan
+    execution, payload = _patched_integrated_state(payload)
     return NodeResult(
         state_patch={
             "integrated_build": payload,
             "code": code,
+            "delivery_plan": updated_delivery_plan,
+            "development_execution": execution,
             _skill_plan_state_key(node_id): {
                 "phase": "development",
                 "node_id": node_id,
@@ -6817,9 +13393,126 @@ def _development_integrator_handler(
     )
 
 
+def _development_repo_executor_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
+    node_context = _development_runtime_node_context(node_id, state)
+    delivery_plan = _as_dict(state.get("delivery_plan"))
+    code_workspace = _as_dict(delivery_plan.get("code_workspace"))
+    spec_audit = _as_dict(delivery_plan.get("spec_audit"))
+    project_key = _slug(str(state.get("project_key") or state.get("slug") or state.get("spec") or "project"), prefix="project")
+    if not code_workspace:
+        repo_execution = {
+            "mode": "unavailable",
+            "workspace_path": "",
+            "worktree_path": None,
+            "repo_root": None,
+            "materialized_file_count": 0,
+            "install": {"status": "skipped", "command": "", "exit_code": None, "duration_ms": 0, "stdout_tail": "", "stderr_tail": ""},
+            "build": {"status": "skipped", "command": "", "exit_code": None, "duration_ms": 0, "stdout_tail": "", "stderr_tail": ""},
+            "test": {"status": "skipped", "command": "", "exit_code": None, "duration_ms": 0, "stdout_tail": "", "stderr_tail": ""},
+            "ready": False,
+            "errors": ["Code workspace is missing; repo execution cannot start."],
+        }
+    elif str(spec_audit.get("status") or "") != "ready_for_autonomous_build":
+        repo_execution = {
+            "mode": "blocked_by_spec_audit",
+            "workspace_path": "",
+            "worktree_path": None,
+            "repo_root": None,
+            "materialized_file_count": 0,
+            "install": {"status": "skipped", "command": "", "exit_code": None, "duration_ms": 0, "stdout_tail": "", "stderr_tail": ""},
+            "build": {"status": "skipped", "command": "", "exit_code": None, "duration_ms": 0, "stdout_tail": "", "stderr_tail": ""},
+            "test": {"status": "skipped", "command": "", "exit_code": None, "duration_ms": 0, "stdout_tail": "", "stderr_tail": ""},
+            "ready": False,
+            "errors": [
+                "Spec audit is not closed; repo execution was blocked.",
+                *[
+                    str(_as_dict(item).get("title") or "")
+                    for item in _as_list(spec_audit.get("unresolved_gaps"))
+                    if str(_as_dict(item).get("severity") or "") in {"critical", "high"}
+                    and str(_as_dict(item).get("title") or "").strip()
+                ],
+            ],
+        }
+    else:
+        try:
+            repo_execution = execute_development_code_workspace(
+                project_key=project_key,
+                github_repo=state.get("githubRepo"),
+                code_workspace=code_workspace,
+            )
+        except Exception as exc:
+            repo_execution = {
+                "mode": "execution_error",
+                "workspace_path": "",
+                "worktree_path": None,
+                "repo_root": None,
+                "materialized_file_count": 0,
+                "install": {"status": "skipped", "command": "", "exit_code": None, "duration_ms": 0, "stdout_tail": "", "stderr_tail": ""},
+                "build": {"status": "skipped", "command": "", "exit_code": None, "duration_ms": 0, "stdout_tail": "", "stderr_tail": ""},
+                "test": {"status": "skipped", "command": "", "exit_code": None, "duration_ms": 0, "stdout_tail": "", "stderr_tail": ""},
+                "ready": False,
+                "errors": [str(exc) or "Repo execution failed unexpectedly."],
+            }
+    updated_delivery_plan = dict(delivery_plan)
+    updated_delivery_plan["repo_execution"] = repo_execution
+    execution = _updated_development_execution(
+        state,
+        "repo_executions",
+        node_id,
+        {
+            **repo_execution,
+            "runtime_node": node_context,
+        },
+    )
+    return NodeResult(
+        state_patch={
+            "delivery_plan": updated_delivery_plan,
+            "repo_execution": repo_execution,
+            "development_execution": execution,
+            _skill_plan_state_key(node_id): {
+                "phase": "development",
+                "node_id": node_id,
+                "agent_label": "Repo Executor",
+                "objective": "Materialize the code workspace into a real repo/worktree and verify install/build/test.",
+                "candidate_skills": ["repo-materialization", "build-verification"],
+                "selected_skills": ["repo-materialization", "build-verification"],
+                "quality_targets": _phase_quality_targets("development"),
+                "delegations": [],
+                "mode": "deterministic-reference",
+                "execution_note": "Trust actual file materialization and command results over speculative readiness.",
+            },
+            _delegation_state_key(node_id): [],
+        },
+        artifacts=_artifacts(
+            {
+                "name": "repo-execution",
+                "kind": "development",
+                "mode": str(repo_execution.get("mode") or "unknown"),
+                "ready": repo_execution.get("ready") is True,
+                "materialized_file_count": int(repo_execution.get("materialized_file_count", 0) or 0),
+                "workspace_path": str(repo_execution.get("workspace_path") or ""),
+                "build_status": str(_as_dict(repo_execution.get("build")).get("status") or "unknown"),
+                "test_status": str(_as_dict(repo_execution.get("test")).get("status") or "unknown"),
+                "errors": [str(item) for item in _as_list(repo_execution.get("errors")) if str(item).strip()],
+            }
+        ),
+        metrics={
+            "repo_execution_ready": repo_execution.get("ready") is True,
+            "repo_execution_mode": str(repo_execution.get("mode") or "unknown"),
+        },
+    )
+
+
 def _development_qa_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
+    node_context = _development_runtime_node_context(node_id, state)
+    focus_work_unit_ids = {
+        str(item).strip()
+        for item in _as_list(node_context.get("focus_work_unit_ids"))
+        if str(item).strip()
+    }
     build = _as_dict(state.get("integrated_build"))
     code = str(build.get("code", ""))
+    delivery_plan = _as_dict(state.get("delivery_plan"))
     milestones = []
     for raw in state.get("milestones", []) or []:
         if not isinstance(raw, dict):
@@ -6843,9 +13536,64 @@ def _development_qa_handler(node_id: str, state: dict[str, Any]) -> NodeResult:
                 "reason": "Generated build is previewable and structurally complete." if "<html" in code.lower() else "No previewable build artifact was generated.",
             }
         )
+    work_unit_results = []
+    wave_totals: dict[int, dict[str, int]] = {}
+    for raw_unit in _as_list(delivery_plan.get("work_unit_contracts")):
+        unit = _as_dict(raw_unit)
+        unit_id = str(unit.get("work_package_id") or unit.get("id") or "").strip()
+        if focus_work_unit_ids and unit_id not in focus_work_unit_ids:
+            continue
+        acceptance = [
+            str(item).strip()
+            for item in _as_list(unit.get("acceptance_criteria"))
+            if str(item).strip()
+        ]
+        checks = acceptance or [
+            str(item).strip()
+            for item in _as_list(unit.get("qa_checks"))
+            if str(item).strip()
+        ]
+        scores = [_milestone_score(check, code) for check in checks[:3]]
+        score = max(scores) if scores else (1.0 if "<html" in code.lower() else 0.0)
+        wave_index = int(unit.get("wave_index", 0) or 0)
+        status = "satisfied" if score >= 0.55 else "not_satisfied"
+        work_unit_results.append(
+            {
+                "id": unit_id,
+                "wave_index": wave_index,
+                "lane": str(unit.get("lane") or "").strip(),
+                "status": status,
+                "reason": (
+                    "The integrated build still reflects the unit acceptance and QA signals."
+                    if status == "satisfied"
+                    else "The integrated build does not yet satisfy this work unit's local acceptance checks."
+                ),
+            }
+        )
+        wave_entry = wave_totals.setdefault(wave_index, {"satisfied": 0, "total": 0})
+        wave_entry["total"] += 1
+        if status == "satisfied":
+            wave_entry["satisfied"] += 1
+    wave_results = [
+        {
+            "wave_index": wave_index,
+            "status": "satisfied" if counts["total"] > 0 and counts["satisfied"] == counts["total"] else "not_satisfied",
+            "satisfied": counts["satisfied"],
+            "total": counts["total"],
+        }
+        for wave_index, counts in sorted(wave_totals.items())
+    ]
+    current_report = {
+        "milestone_results": milestones,
+        "work_unit_results": work_unit_results,
+        "wave_results": wave_results,
+        "runtime_node": node_context,
+    }
+    execution = _updated_development_execution(state, "qa_reports", node_id, current_report)
+    aggregate_report = _aggregate_qa_report({**state, "development_execution": execution})
     return NodeResult(
         state_patch={
-            "qa_report": {"milestone_results": milestones},
+            "qa_report": aggregate_report,
             _skill_plan_state_key(node_id): {
                 "phase": "development",
                 "node_id": node_id,
@@ -6870,7 +13618,14 @@ def _development_security_handler(
     provider_registry: ProviderRegistry | None = None,
     llm_runtime: LLMRuntime | None = None,
 ) -> NodeResult:
+    node_context = _development_runtime_node_context(node_id, state)
+    focus_work_unit_ids = {
+        str(item).strip()
+        for item in _as_list(node_context.get("focus_work_unit_ids"))
+        if str(item).strip()
+    }
     code = str(_as_dict(state.get("integrated_build")).get("code", ""))
+    delivery_plan = _as_dict(state.get("delivery_plan"))
     findings = []
     if "eval(" in code:
         findings.append("Avoid eval() in generated artifacts.")
@@ -6907,18 +13662,46 @@ def _development_security_handler(
             feedback = _as_dict(delegated.get("feedback"))
             if feedback:
                 peer_feedback.append(feedback)
-        merged_findings = _dedupe_strings(
+        merged_blockers = _dedupe_strings(
             findings + [
                 str(item)
                 for feedback in peer_feedback
-                for item in _as_list(_as_dict(feedback).get("blockers")) + _as_list(_as_dict(feedback).get("recommendations"))
+                for item in _as_list(_as_dict(feedback).get("blockers"))
+                if str(item).strip() and not _is_non_blocking_review_finding(item)
+            ]
+        )
+        merged_recommendations = _dedupe_strings(
+            [
+                str(item)
+                for feedback in peer_feedback
+                for item in _as_list(_as_dict(feedback).get("recommendations"))
                 if str(item).strip()
             ]
         )
-        security_report = {
-            "status": "pass" if not [item for item in merged_findings if "Avoid " in item or "Remove " in item] else "warning",
-            "findings": merged_findings or findings,
+        work_unit_results = [
+            {
+                "id": str(_as_dict(unit).get("work_package_id") or _as_dict(unit).get("id") or "").strip(),
+                "wave_index": int(_as_dict(unit).get("wave_index", 0) or 0),
+                "status": "pass" if not merged_blockers else "warning",
+                "checks": [str(item).strip() for item in _as_list(_as_dict(unit).get("security_checks")) if str(item).strip()],
+            }
+            for unit in _as_list(delivery_plan.get("work_unit_contracts"))
+            if isinstance(unit, dict)
+            and (
+                not focus_work_unit_ids
+                or str(_as_dict(unit).get("work_package_id") or _as_dict(unit).get("id") or "").strip() in focus_work_unit_ids
+            )
+        ]
+        current_report = {
+            "status": "pass" if not merged_blockers else "warning",
+            "findings": merged_blockers or findings,
+            "blockers": merged_blockers,
+            "recommendations": merged_recommendations,
+            "work_unit_results": work_unit_results,
+            "runtime_node": node_context,
         }
+        execution = _updated_development_execution(state, "security_reports", node_id, current_report)
+        security_report = _aggregate_security_report({**state, "development_execution": execution})
         return NodeResult(
             state_patch={
                 "security_report": security_report,
@@ -6943,9 +13726,33 @@ def _development_security_handler(
 
     if _provider_backed_lifecycle_available(provider_registry):
         return autonomous()
+    work_unit_results = [
+        {
+            "id": str(_as_dict(unit).get("work_package_id") or _as_dict(unit).get("id") or "").strip(),
+            "wave_index": int(_as_dict(unit).get("wave_index", 0) or 0),
+            "status": status,
+            "checks": [str(item).strip() for item in _as_list(_as_dict(unit).get("security_checks")) if str(item).strip()],
+        }
+        for unit in _as_list(delivery_plan.get("work_unit_contracts"))
+        if isinstance(unit, dict)
+        and (
+            not focus_work_unit_ids
+            or str(_as_dict(unit).get("work_package_id") or _as_dict(unit).get("id") or "").strip() in focus_work_unit_ids
+        )
+    ]
+    current_report = {
+        "status": status,
+        "findings": findings,
+        "blockers": [item for item in findings if not item.startswith("No obvious")],
+        "recommendations": [],
+        "work_unit_results": work_unit_results,
+        "runtime_node": node_context,
+    }
+    execution = _updated_development_execution(state, "security_reports", node_id, current_report)
+    security_report = _aggregate_security_report({**state, "development_execution": execution})
     return NodeResult(
         state_patch={
-            "security_report": {"status": status, "findings": findings},
+            "security_report": security_report,
             _skill_plan_state_key(node_id): {
                 "phase": "development",
                 "node_id": node_id,
@@ -6970,9 +13777,17 @@ def _development_reviewer_handler(
     provider_registry: ProviderRegistry | None = None,
     llm_runtime: LLMRuntime | None = None,
 ) -> NodeResult:
+    node_context = _development_runtime_node_context(node_id, state)
+    is_final_review = str(node_context.get("stage") or "") == "final_review" or node_id == "reviewer"
     build = _as_dict(state.get("integrated_build"))
     qa_report = _as_dict(state.get("qa_report"))
     security_report = _as_dict(state.get("security_report"))
+    decision_context = _decision_context_from_state(state, compact=True)
+    decision_scope = _decision_scope_for_phase(
+        state,
+        phase="development",
+        selected_design=_as_dict(state.get("selected_design")) or _selected_design_from_state(state),
+    )
     initial_code = str(build.get("code", ""))
     build_sections = [str(item) for item in _as_list(build.get("build_sections")) if str(item).strip()]
 
@@ -6993,7 +13808,38 @@ def _development_reviewer_handler(
         delegation_records = list(delegations or [])
         peer_reviews = list(peer_feedback or [])
         review_milestones = [dict(item) for item in _as_list(snapshot.get("milestone_results"))]
+        review_work_units = [dict(item) for item in _as_list(snapshot.get("work_unit_results")) if isinstance(item, dict)]
+        review_waves = [dict(item) for item in _as_list(_as_dict(state.get("qa_report")).get("wave_results")) if isinstance(item, dict)]
         review_security = _as_dict(snapshot.get("security_report"))
+        repo_execution = _as_dict(snapshot.get("repo_execution_report")) or _as_dict(state.get("repo_execution"))
+        delivery_plan = _as_dict(state.get("delivery_plan")) or _build_development_delivery_plan(
+            state,
+            selected_design=_as_dict(state.get("selected_design")) or _selected_design_from_state(state),
+            implementation_plan=_as_dict(state.get("implementation_plan")),
+        )
+        critical_lookup = {str(item) for item in _as_list(delivery_plan.get("critical_path")) if str(item).strip()}
+        unresolved_blockers = [str(item) for item in _as_list(snapshot.get("blockers")) if str(item).strip()]
+        delivery_plan["work_packages"] = [
+            {
+                **dict(item),
+                "status": (
+                    "completed"
+                    if not unresolved_blockers
+                    else "blocked" if str(_as_dict(item).get("id", "")) in critical_lookup else "completed"
+                ),
+            }
+            for item in _as_list(delivery_plan.get("work_packages"))
+            if isinstance(item, dict)
+        ]
+        development_handoff = _build_development_handoff(
+            state=state,
+            delivery_plan=delivery_plan,
+            snapshot={
+                **snapshot,
+                "milestone_results": review_milestones,
+                "security_report": review_security,
+            },
+        )
         estimated_cost = round(
             0.9
             + len(_selected_feature_names(state)) * 0.08
@@ -7004,12 +13850,21 @@ def _development_reviewer_handler(
         development = {
             "code": code,
             "milestone_results": review_milestones,
+            "work_unit_results": review_work_units,
+            "wave_results": review_waves,
+            "decision_scope": decision_scope,
+            "decision_context_fingerprint": str(decision_context.get("fingerprint") or ""),
             "review_summary": {
                 "milestonesSatisfied": int(snapshot.get("milestones_satisfied", 0) or 0),
                 "milestonesTotal": int(snapshot.get("milestones_total", len(review_milestones)) or len(review_milestones)),
                 "securityStatus": str(review_security.get("status", "pass") or "pass"),
                 "blockerCount": len(_as_list(snapshot.get("blockers"))),
+                "deployReadiness": str(development_handoff.get("readiness_status", "needs_rework")),
+                "repoExecutionReady": repo_execution.get("ready") is True,
             },
+            "delivery_plan": delivery_plan,
+            "handoff": development_handoff,
+            "repo_execution": repo_execution,
         }
         if critique_history:
             development["critique_history"] = critique_history
@@ -7017,16 +13872,37 @@ def _development_reviewer_handler(
             development["peer_feedback"] = peer_reviews
         integrated_build = dict(build)
         integrated_build["code"] = code
+        integrated_build["decision_scope"] = decision_scope
+        integrated_build["decision_context_fingerprint"] = str(decision_context.get("fingerprint") or "")
         if build_sections:
             integrated_build["build_sections"] = build_sections
         artifact_payload = {"name": "milestone-report", "kind": "development", **development}
+        execution = _updated_development_execution(
+            state,
+            "reviews",
+            node_id,
+            {
+                "runtime_node": node_context,
+                "review_summary": dict(development.get("review_summary", {})),
+                "handoff": development_handoff,
+                "blockers": [str(item) for item in _as_list(snapshot.get("blockers")) if str(item).strip()],
+                "mode": mode,
+            },
+        )
         return NodeResult(
             state_patch={
                 "integrated_build": integrated_build,
                 "code": code,
-                "qa_report": {"milestone_results": review_milestones},
+                "qa_report": {
+                    "milestone_results": review_milestones,
+                    "work_unit_results": review_work_units,
+                    "wave_results": review_waves,
+                },
                 "security_report": review_security,
                 "development": development,
+                "delivery_plan": delivery_plan,
+                "development_handoff": development_handoff,
+                "development_execution": execution,
                 "review": development,
                 "_build_iteration": iteration_count,
                 "estimated_cost_usd": estimated_cost,
@@ -7037,6 +13913,7 @@ def _development_reviewer_handler(
             },
             artifacts=_artifacts(
                 artifact_payload,
+                {"name": "deploy-handoff", "kind": "development", **development_handoff},
                 *([{"name": f"{node_id}-skill-plan", "kind": "skill-plan", **plan}] if plan else []),
                 *[
                     {
@@ -7058,6 +13935,21 @@ def _development_reviewer_handler(
             1 for item in baseline_snapshot["milestone_results"] if _as_dict(item).get("status") == "satisfied"
         )
         baseline_snapshot["milestones_total"] = len(baseline_snapshot["milestone_results"])
+    if qa_report.get("work_unit_results"):
+        baseline_snapshot["work_unit_results"] = list(qa_report.get("work_unit_results", []))
+        baseline_snapshot["blockers"] = [
+            *[
+                item
+                for item in _as_list(baseline_snapshot.get("blockers"))
+                if isinstance(item, str) and not item.startswith("Work unit not satisfied:")
+            ],
+            *[
+                f"Work unit not satisfied: {str(_as_dict(item).get('id') or '').strip()}"
+                for item in _as_list(qa_report.get("work_unit_results"))
+                if _as_dict(item).get("status") != "satisfied"
+                and str(_as_dict(item).get("id") or "").strip()
+            ],
+        ]
     if security_report:
         baseline_snapshot["security_report"] = security_report
         if security_report.get("status") == "pass":
@@ -7066,6 +13958,48 @@ def _development_reviewer_handler(
                 for item in _as_list(baseline_snapshot.get("blockers"))
                 if isinstance(item, str) and item not in _as_list(security_report.get("findings"))
             ]
+    if not is_final_review:
+        wave_review = {
+            "node_id": node_id,
+            "wave_index": node_context.get("wave_index"),
+            "work_unit_ids": [
+                str(item).strip()
+                for item in _as_list(node_context.get("work_unit_ids"))
+                if str(item).strip()
+            ],
+            "focus_work_unit_ids": [
+                str(item).strip()
+                for item in _as_list(node_context.get("focus_work_unit_ids"))
+                if str(item).strip()
+            ],
+            "ready": not [str(item) for item in _as_list(baseline_snapshot.get("blockers")) if str(item).strip()],
+            "blockers": [str(item) for item in _as_list(baseline_snapshot.get("blockers")) if str(item).strip()],
+            "milestones_satisfied": int(baseline_snapshot.get("milestones_satisfied", 0) or 0),
+            "milestones_total": int(baseline_snapshot.get("milestones_total", 0) or 0),
+            "security_status": str(_as_dict(baseline_snapshot.get("security_report")).get("status") or "pass"),
+        }
+        execution = _updated_development_execution(state, "reviews", node_id, wave_review)
+        return NodeResult(
+            state_patch={
+                "development_execution": execution,
+                "wave_review": wave_review,
+                _skill_plan_state_key(node_id): {
+                    "phase": "development",
+                    "node_id": node_id,
+                    "agent_label": "Wave Reviewer",
+                    "objective": "Close the current wave before unlocking downstream work.",
+                    "candidate_skills": ["delivery-review", "policy-review"],
+                    "selected_skills": ["delivery-review", "policy-review"],
+                    "quality_targets": _phase_quality_targets("development"),
+                    "delegations": [],
+                    "mode": "deterministic-wave-gate",
+                    "execution_note": "Keep validation local to the current wave and expose unresolved blockers immediately.",
+                },
+                _delegation_state_key(node_id): [],
+            },
+            artifacts=_artifacts({"name": "wave-review", "kind": "development", **wave_review}),
+            metrics={"review_mode": "wave-gate"},
+        )
     if not _provider_backed_lifecycle_available(provider_registry):
         return finalize(
             code=initial_code,
@@ -7123,7 +14057,7 @@ def _development_reviewer_handler(
             str(item)
             for feedback in peer_feedback
             for item in _as_list(_as_dict(feedback).get("blockers"))
-            if str(item).strip()
+            if str(item).strip() and not _is_non_blocking_review_finding(item)
         ]
         if peer_blockers:
             snapshot = dict(snapshot)
@@ -7146,6 +14080,7 @@ def _development_reviewer_handler(
                     "Return JSON with keys code, revision_summary, resolved_blockers, remaining_risks.\n"
                     f"Spec: {state.get('spec')}\n"
                     f"Selected features: {_selected_feature_names(state)}\n"
+                    f"Decision context: {decision_context}\n"
                     f"Milestones: {state.get('milestones')}\n"
                     f"Current quality snapshot: {snapshot}\n"
                     f"Peer feedback: {peer_feedback}\n"
@@ -7226,57 +14161,593 @@ def _market_size_from_spec(spec: str, keywords: list[str]) -> str:
     return "Early but expanding workflow productivity segment"
 
 
+def _estimate_use_case_effort_hours(
+    use_case: dict[str, Any],
+    features: list[dict[str, Any]],
+    *,
+    preset: str,
+    kind: str,
+) -> tuple[int, int, int]:
+    priority = str(use_case.get("priority", "should") or "should")
+    related_features = _use_case_related_features(use_case, features)
+    base = {"must": 12, "should": 8, "could": 6}.get(priority, 8)
+    base += 2 * sum(
+        1 if str(feature.get("implementation_cost", "medium")) == "medium" else 2 if str(feature.get("implementation_cost")) == "high" else 0
+        for feature in related_features
+    )
+    if kind == "operations":
+        base += 3
+    if preset == "full":
+        base = math.ceil(base * 1.2)
+    elif preset == "minimal":
+        base = max(8, math.ceil(base * 0.82))
+    definition = max(2, math.ceil(base * 0.2))
+    implementation = max(4, math.ceil(base * 0.58))
+    verification = max(2, base - definition - implementation)
+    return definition, implementation, verification
+
+
+def _implementation_assignee(kind: str, preset: str, use_case: dict[str, Any]) -> tuple[str, list[str]]:
+    category = str(use_case.get("category", ""))
+    if kind == "operations" or any(term in category for term in ("ガバナンス", "品質", "リリース", "プラットフォーム")):
+        if preset == "minimal":
+            return "planner", ["solution-architecture", "workflow-design"]
+        return "backend-builder", ["api-design", "domain-modeling"]
+    if any(term in category for term in ("設定", "運営")) and preset != "minimal":
+        return "backend-builder", ["configuration-management", "integration"]
+    return "frontend-builder", ["responsive-ui", "interaction-design"]
+
+
+def _verification_assignee(preset: str, use_case: dict[str, Any]) -> tuple[str, list[str]]:
+    if preset == "full":
+        return "qa-engineer", ["quality-assurance", "acceptance-testing"]
+    if "ガバナンス" in str(use_case.get("category", "")) and preset != "minimal":
+        return "reviewer", ["delivery-review", "policy-review"]
+    return "reviewer", ["acceptance-testing", "delivery-review"]
+
+
+_ASSIGNEE_DAILY_CAPACITY_HOURS: dict[str, int] = {
+    "planner": 6,
+    "frontend-builder": 6,
+    "backend-builder": 6,
+    "qa-engineer": 5,
+    "reviewer": 5,
+    "security-reviewer": 4,
+}
+
+_PLANNING_WORKDAYS_PER_WEEK = 5
+
+
+def _planning_task_duration_days(effort_hours: int, assignee: str) -> int:
+    capacity = _ASSIGNEE_DAILY_CAPACITY_HOURS.get(assignee, 6)
+    return max(1, math.ceil(max(effort_hours, 1) / capacity))
+
+
 def _build_plan_estimates(state: dict[str, Any]) -> list[dict[str, Any]]:
-    feature_count = len(list(state.get("feature_selections", [])))
-    base_effort = max(feature_count, 4) * 10
+    kind = _infer_product_kind(str(state.get("spec", "")))
+    features = _planning_selected_or_default_features(state)
+    selected_features = [feature for feature in features if feature.get("selected") is True] or features
+    use_cases = _planning_use_cases_from_state(state)
+    milestones = _planning_milestones_from_state(state)
     presets = [
         ("minimal", "Minimal", 0.7, 0.6, ["planner", "frontend-builder", "reviewer"], ["feature-prioritization", "responsive-ui"]),
         ("standard", "Standard", 1.0, 1.0, ["planner", "frontend-builder", "backend-builder", "reviewer"], ["feature-prioritization", "responsive-ui", "api-design"]),
         ("full", "Full", 1.35, 1.4, ["planner", "frontend-builder", "backend-builder", "qa-engineer", "security-reviewer", "reviewer"], ["feature-prioritization", "responsive-ui", "api-design", "quality-assurance", "security-review"]),
     ]
     estimates: list[dict[str, Any]] = []
-    for preset, label, effort_factor, cost_factor, agents, skills in presets:
-        effort = math.ceil(base_effort * effort_factor)
-        duration_weeks = max(1, math.ceil(effort / 32))
+    for preset, label, effort_factor, cost_factor, agents, base_skills in presets:
+        included_use_cases = _plan_estimate_use_cases(use_cases, preset)
+        grouped_use_cases: dict[str, list[dict[str, Any]]] = {}
+        for use_case in included_use_cases:
+            category = str(use_case.get("category", "") or "Core flow")
+            grouped_use_cases.setdefault(category, []).append(use_case)
+
+        epics: list[dict[str, Any]] = []
+        wbs: list[dict[str, Any]] = []
+        review_task_ids_by_use_case: dict[str, str] = {}
+        assignee_available_day: dict[str, int] = {}
+        task_end_day: dict[str, int] = {}
+
+        for epic_index, (category, epic_use_cases) in enumerate(grouped_use_cases.items()):
+            epic_id = f"epic-{preset}-{_slug(category, prefix='track')}"
+            epic_priority = min(
+                (_planning_priority_rank(str(use_case.get("priority", "should"))) for use_case in epic_use_cases),
+                default=1,
+            )
+            epics.append(
+                {
+                    "id": epic_id,
+                    "name": f"{category} track",
+                    "description": f"{category} に関する主要導線と運用条件を成立させる。",
+                    "use_cases": [str(use_case.get("title", "")) for use_case in epic_use_cases if str(use_case.get("title", "")).strip()],
+                    "priority": "must" if epic_priority == 0 else "should" if epic_priority == 1 else "could",
+                    "stories": _dedupe_strings(
+                        [
+                            str(story)
+                            for use_case in epic_use_cases
+                            for story in _as_list(use_case.get("related_stories"))
+                            if str(story).strip()
+                        ]
+                    )[:6],
+                }
+            )
+
+            for use_case_index, use_case in enumerate(epic_use_cases):
+                use_case_id = str(use_case.get("id", f"uc-{epic_index}-{use_case_index}"))
+                definition_effort, implementation_effort, verification_effort = _estimate_use_case_effort_hours(
+                    use_case,
+                    selected_features,
+                    preset=preset,
+                    kind=kind,
+                )
+                implementation_assignee, implementation_skills = _implementation_assignee(kind, preset, use_case)
+                verification_assignee, verification_skills = _verification_assignee(preset, use_case)
+                define_assignee = "planner"
+                define_duration = _planning_task_duration_days(definition_effort, define_assignee)
+                define_start = assignee_available_day.get(define_assignee, 0)
+                define_end = define_start + define_duration
+                implementation_duration = _planning_task_duration_days(implementation_effort, implementation_assignee)
+                implementation_start = max(
+                    define_end,
+                    assignee_available_day.get(implementation_assignee, 0),
+                )
+                implementation_end = implementation_start + implementation_duration
+                verification_duration = _planning_task_duration_days(verification_effort, verification_assignee)
+                verification_start = max(
+                    implementation_end,
+                    assignee_available_day.get(verification_assignee, 0),
+                )
+                verification_end = verification_start + verification_duration
+
+                define_id = f"wbs-{preset}-{use_case_id}-define"
+                build_id = f"wbs-{preset}-{use_case_id}-build"
+                review_id = f"wbs-{preset}-{use_case_id}-review"
+                review_task_ids_by_use_case[use_case_id] = review_id
+                assignee_available_day[define_assignee] = define_end
+                assignee_available_day[implementation_assignee] = implementation_end
+                assignee_available_day[verification_assignee] = verification_end
+                task_end_day[define_id] = define_end
+                task_end_day[build_id] = implementation_end
+                task_end_day[review_id] = verification_end
+
+                wbs.extend(
+                    [
+                        {
+                            "id": define_id,
+                            "epic_id": epic_id,
+                            "title": f"Define acceptance for {use_case.get('title', 'use case')}",
+                            "description": "受け入れ条件、計測、停止条件を固める。",
+                            "assignee_type": "agent",
+                            "assignee": "planner",
+                            "skills": ["acceptance-design", "instrumentation-planning"],
+                            "depends_on": [],
+                            "effort_hours": definition_effort,
+                            "start_day": define_start,
+                            "duration_days": define_duration,
+                            "status": "pending",
+                        },
+                        {
+                            "id": build_id,
+                            "epic_id": epic_id,
+                            "title": f"Implement {use_case.get('title', 'use case')}",
+                            "description": "主要導線と必要な状態遷移を実装する。",
+                            "assignee_type": "agent",
+                            "assignee": implementation_assignee,
+                            "skills": implementation_skills,
+                            "depends_on": [define_id],
+                            "effort_hours": implementation_effort,
+                            "start_day": implementation_start,
+                            "duration_days": implementation_duration,
+                            "status": "pending",
+                        },
+                        {
+                            "id": review_id,
+                            "epic_id": epic_id,
+                            "title": f"Verify {use_case.get('title', 'use case')}",
+                            "description": "受け入れ条件、記録、例外系を検証する。",
+                            "assignee_type": "agent",
+                            "assignee": verification_assignee,
+                            "skills": verification_skills,
+                            "depends_on": [build_id],
+                            "effort_hours": verification_effort,
+                            "start_day": verification_start,
+                            "duration_days": verification_duration,
+                            "status": "pending",
+                        },
+                    ]
+                )
+
+        if milestones:
+            milestone_epic_id = f"epic-{preset}-milestone-validation"
+            epics.append(
+                {
+                    "id": milestone_epic_id,
+                    "name": "Milestone validation",
+                    "description": "各マイルストーンの完了証跡と停止条件を確認する。",
+                    "use_cases": [str(item.get("name", "")) for item in milestones if str(item.get("name", "")).strip()],
+                    "priority": "must",
+                    "stories": [],
+                }
+            )
+            for milestone_index, milestone in enumerate(milestones):
+                dependency_ids = [
+                    review_task_ids_by_use_case[str(use_case_id)]
+                    for use_case_id in _as_list(milestone.get("depends_on_use_cases"))
+                    if str(use_case_id) in review_task_ids_by_use_case
+                ]
+                milestone_assignee = "qa-engineer" if preset == "full" else "reviewer"
+                milestone_skills = (
+                    ["milestone-review", "quality-gating"]
+                    if preset == "full"
+                    else ["delivery-review", "quality-gating"]
+                )
+                dependency_ready_day = max(
+                    (task_end_day.get(task_id, 0) for task_id in dependency_ids),
+                    default=milestone_index * 3,
+                )
+                milestone_start = max(
+                    dependency_ready_day,
+                    assignee_available_day.get(milestone_assignee, 0),
+                )
+                milestone_effort = max(3, math.ceil((len(dependency_ids) or 1) * 1.5))
+                milestone_duration = _planning_task_duration_days(milestone_effort, milestone_assignee)
+                milestone_id = f"wbs-{preset}-{str(milestone.get('id', milestone_index))}-gate"
+                wbs.append(
+                    {
+                        "id": milestone_id,
+                        "epic_id": milestone_epic_id,
+                        "title": f"Validate {milestone.get('name', 'milestone')}",
+                        "description": "完了証跡、停止条件、判断責任者を確認する。",
+                        "assignee_type": "agent",
+                        "assignee": milestone_assignee,
+                        "skills": milestone_skills,
+                        "depends_on": dependency_ids,
+                        "effort_hours": milestone_effort,
+                        "start_day": milestone_start,
+                        "duration_days": milestone_duration,
+                        "status": "pending",
+                    }
+                )
+                assignee_available_day[milestone_assignee] = milestone_start + milestone_duration
+                task_end_day[milestone_id] = milestone_start + milestone_duration
+
+        total_effort = sum(int(item.get("effort_hours", 0)) for item in wbs)
+        collaboration_buffer = max(4, math.ceil(total_effort * 0.08 * effort_factor))
+        total_effort += collaboration_buffer
+        total_duration_days = max(
+            (int(item.get("start_day", 0)) + int(item.get("duration_days", 1)) for item in wbs),
+            default=1,
+        )
+        duration_weeks = max(1, math.ceil(total_duration_days / _PLANNING_WORKDAYS_PER_WEEK))
+        rate = {"minimal": 92, "standard": 108, "full": 126}[preset]
+        total_cost = round(total_effort * rate * cost_factor + len(agents) * 240, 2)
+        skills_used = _dedupe_strings(
+            list(base_skills)
+            + [
+                str(skill)
+                for item in wbs
+                for skill in _as_list(item.get("skills"))
+                if str(skill).strip()
+            ]
+        )
         estimates.append(
             {
                 "preset": preset,
                 "label": label,
-                "description": f"{label} scope for the selected lifecycle features",
-                "total_effort_hours": effort,
-                "total_cost_usd": round(2800 * cost_factor + feature_count * 180, 2),
+                "description": f"{label} scope covering the selected use cases and milestone evidence loops",
+                "total_effort_hours": total_effort,
+                "total_cost_usd": total_cost,
                 "duration_weeks": duration_weeks,
-                "epics": [
-                    {
-                        "id": f"epic-{preset}-foundation",
-                        "name": "Lifecycle foundation",
-                        "description": "Backend record, phase flow, and operator UI alignment",
-                        "use_cases": ["uc-lifecycle-001"],
-                        "priority": "must",
-                        "stories": ["0", "1"],
-                    }
-                ],
-                "wbs": [
-                    {
-                        "id": f"wbs-{preset}-01",
-                        "epic_id": f"epic-{preset}-foundation",
-                        "title": "Model lifecycle state in the control plane",
-                        "description": "Persist phase state, artifacts, releases, and feedback.",
-                        "assignee_type": "agent",
-                        "assignee": "planner",
-                        "skills": ["solution-architecture"],
-                        "depends_on": [],
-                        "effort_hours": max(6, effort // 4),
-                        "start_day": 0,
-                        "duration_days": max(2, duration_weeks * 2),
-                        "status": "pending",
-                    }
-                ],
+                "epics": epics,
+                "wbs": wbs,
                 "agents_used": agents,
-                "skills_used": skills,
+                "skills_used": skills_used,
             }
         )
     return estimates
+
+
+def _planning_coverage_summary(
+    *,
+    analysis: dict[str, Any],
+    features: list[dict[str, Any]],
+    plan_estimates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    selected_features = [
+        str(item.get("feature", "")).strip()
+        for item in features
+        if item.get("selected") is True and str(item.get("feature", "")).strip()
+    ]
+    use_cases = [_as_dict(item) for item in _as_list(analysis.get("use_cases")) if _as_dict(item)]
+    milestones = [_as_dict(item) for item in _as_list(analysis.get("recommended_milestones")) if _as_dict(item)]
+    traceability = [_as_dict(item) for item in _as_list(analysis.get("traceability")) if _as_dict(item)]
+    required_use_cases = _planning_required_traceability_use_cases(use_cases, milestones)
+    traced_features = {
+        str(item.get("feature", "")).strip()
+        for item in traceability
+        if str(item.get("feature", "")).strip()
+    }
+    milestone_use_case_ids = {
+        str(use_case_id)
+        for milestone in milestones
+        for use_case_id in _as_list(milestone.get("depends_on_use_cases"))
+        if str(use_case_id).strip()
+    }
+    traced_use_case_ids = {
+        str(item.get("use_case_id", "")).strip()
+        for item in traceability
+        if str(item.get("use_case_id", "")).strip()
+    }
+    required_traceability_ids = {
+        str(item.get("id", "")).strip()
+        for item in required_use_cases
+        if str(item.get("id", "")).strip()
+    }
+    preset_breakdown = [
+        {
+            "preset": str(plan.get("preset", "")),
+            "epic_count": len([_as_dict(item) for item in _as_list(plan.get("epics")) if _as_dict(item)]),
+            "wbs_count": len([_as_dict(item) for item in _as_list(plan.get("wbs")) if _as_dict(item)]),
+            "total_effort_hours": int(float(plan.get("total_effort_hours", 0) or 0)),
+        }
+        for plan in plan_estimates
+        if isinstance(plan, dict)
+    ]
+    return {
+        "selected_feature_count": len(selected_features),
+        "job_story_count": len(_as_list(analysis.get("job_stories"))),
+        "use_case_count": len(use_cases),
+        "actor_count": len(_as_list(analysis.get("actors"))),
+        "role_count": len(_as_list(analysis.get("roles"))),
+        "traceability_count": len(traceability),
+        "required_traceability_use_case_count": len(required_traceability_ids),
+        "milestone_count": len(milestones),
+        "uncovered_features": [name for name in selected_features if name not in traced_features],
+        "use_cases_without_milestone": [
+            str(item.get("title", ""))
+            for item in use_cases
+            if str(item.get("id", "")) not in milestone_use_case_ids and str(item.get("title", "")).strip()
+        ],
+        "use_cases_without_traceability": [
+            str(item.get("title", ""))
+            for item in use_cases
+            if str(item.get("id", "")) not in traced_use_case_ids and str(item.get("title", "")).strip()
+        ],
+        "required_use_cases_without_traceability": [
+            str(item.get("title", ""))
+            for item in required_use_cases
+            if str(item.get("id", "")) not in traced_use_case_ids and str(item.get("title", "")).strip()
+        ],
+        "preset_breakdown": preset_breakdown,
+    }
+
+
+def _planning_feature_defaults_need_backfill(
+    state: dict[str, Any],
+    features: list[dict[str, Any]],
+    analysis: dict[str, Any],
+) -> bool:
+    if not features:
+        return True
+    kind = _infer_product_kind(str(state.get("spec", "")))
+    if kind == "generic":
+        return False
+    generic_feature_names = {name.casefold() for name, *_ in _feature_catalog_for_spec({"spec": ""})}
+    current_feature_names = {
+        str(item.get("feature", "")).strip().casefold()
+        for item in features
+        if str(item.get("feature", "")).strip()
+    }
+    use_case_ids = {
+        str(item.get("id", "")).strip()
+        for item in _as_list(analysis.get("use_cases"))
+        if isinstance(item, dict)
+    }
+    if current_feature_names and current_feature_names.issubset(generic_feature_names):
+        return True
+    return any(item.startswith("uc-generic-") for item in use_case_ids)
+
+
+def _planning_bundle_needs_backfill(
+    state: dict[str, Any],
+    analysis: dict[str, Any],
+    features: list[dict[str, Any]],
+) -> bool:
+    if not analysis:
+        return True
+    selected_feature_count = len([item for item in features if item.get("selected") is True])
+    use_case_count = len(_as_list(analysis.get("use_cases")))
+    return (
+        _planning_feature_defaults_need_backfill(state, features, analysis)
+        or len(_as_list(analysis.get("job_stories"))) < 4
+        or len(_as_list(analysis.get("actors"))) < 3
+        or len(_as_list(analysis.get("roles"))) < 3
+        or use_case_count < max(4, selected_feature_count)
+        or _planning_analysis_consistency_needs_backfill(state, analysis)
+    )
+
+
+def _planning_analysis_consistency_needs_backfill(
+    state: dict[str, Any],
+    analysis: dict[str, Any],
+) -> bool:
+    kind = _infer_product_kind(str(state.get("spec", "")))
+    if kind == "generic" or not analysis:
+        return False
+    design_style = str(_as_dict(_as_dict(analysis.get("design_tokens")).get("style")).get("name", "")).casefold()
+    business_model = _as_dict(analysis.get("business_model"))
+    customer_segments = {
+        str(item).strip().casefold()
+        for item in _as_list(business_model.get("customer_segments"))
+        if str(item).strip()
+    }
+    channels = {
+        str(item).strip().casefold()
+        for item in _as_list(business_model.get("channels"))
+        if str(item).strip()
+    }
+    kano_features = {
+        str(_as_dict(item).get("feature", "")).strip().casefold()
+        for item in _as_list(analysis.get("kano_features"))
+        if str(_as_dict(item).get("feature", "")).strip()
+    }
+    persona_roles = {
+        str(_as_dict(item).get("role", "")).strip().casefold()
+        for item in _as_list(analysis.get("personas"))
+        if _as_dict(item)
+    }
+    negative_persona_names = {
+        str(_as_dict(item).get("name", "")).strip().casefold()
+        for item in _as_list(analysis.get("negative_personas"))
+        if _as_dict(item)
+    }
+    kill_conditions = " ".join(
+        str(_as_dict(item).get("condition", "")).strip()
+        for item in _as_list(analysis.get("kill_criteria"))
+        if _as_dict(item)
+    ).casefold()
+    red_team_titles = " ".join(
+        str(_as_dict(item).get("title", "")).strip()
+        for item in _as_list(analysis.get("red_team_findings"))
+        if _as_dict(item)
+    ).casefold()
+    planning_context = _as_dict(analysis.get("planning_context"))
+    generic_feature_names = {name.casefold() for name, *_ in _feature_catalog_for_spec({"spec": ""})}
+    if "balanced product" in design_style or "バランス型プロダクト" in design_style:
+        return True
+    if customer_segments & {"primary users", "product teams"}:
+        return True
+    if channels & {"web", "mobile", "team sharing"}:
+        return True
+    if kano_features and kano_features.issubset(generic_feature_names):
+        return True
+    if kind == "operations":
+        if not any(("platform lead" in role or "workflow operator" in role) for role in persona_roles):
+            return True
+        if negative_persona_names and negative_persona_names & {"impatient evaluator", "すぐ離脱する評価者"}:
+            return True
+        if any(marker in kill_conditions for marker in ("configuration and recovery", "release quality", "core workflow ready")):
+            return True
+        if any(marker in red_team_titles for marker in ("configuration and recovery", "release quality", "core workflow ready")):
+            return True
+    return str(planning_context.get("product_kind", "")).strip() not in {"", kind}
+
+
+def _planning_plan_estimates_need_backfill(
+    features: list[dict[str, Any]],
+    plan_estimates: list[dict[str, Any]],
+) -> bool:
+    selected_feature_count = len([item for item in features if item.get("selected") is True]) or len(features)
+    if not plan_estimates:
+        return True
+    for plan in plan_estimates:
+        epics = [_as_dict(item) for item in _as_list(plan.get("epics")) if _as_dict(item)]
+        wbs = [_as_dict(item) for item in _as_list(plan.get("wbs")) if _as_dict(item)]
+        if len(epics) < 2 or len(wbs) < max(6, selected_feature_count * 2):
+            return True
+        scheduled_workdays = max(
+            (int(item.get("start_day", 0)) + int(item.get("duration_days", 1)) for item in wbs),
+            default=1,
+        )
+        expected_weeks = max(1, math.ceil(scheduled_workdays / _PLANNING_WORKDAYS_PER_WEEK))
+        if int(plan.get("duration_weeks", 0) or 0) != expected_weeks:
+            return True
+    return False
+
+
+def backfill_planning_artifacts(project_record: dict[str, Any]) -> dict[str, Any]:
+    project = dict(project_record)
+    if not str(project.get("spec", "")).strip():
+        return project
+
+    analysis = _as_dict(project.get("analysis"))
+    features = [_as_dict(item) for item in _as_list(project.get("features")) if _as_dict(item)]
+    plan_estimates = [_as_dict(item) for item in _as_list(project.get("planEstimates")) if _as_dict(item)]
+    feature_defaults_replaced = _planning_feature_defaults_need_backfill(project, features, analysis)
+
+    if feature_defaults_replaced:
+        features = _default_feature_selections_for_spec(project)
+        project["features"] = features
+
+    working_state = {**project, "feature_selections": features or _default_feature_selections_for_spec(project)}
+    bundle = _build_story_architecture_bundle(working_state)
+    solution = _solution_bundle(working_state)
+    personas, stories, journeys = _build_persona_bundle(working_state)
+    review_defaults = _planning_review_defaults(
+        working_state,
+        features=features or _default_feature_selections_for_spec(project),
+        personas=personas,
+        milestones=list(solution.get("recommended_milestones", [])),
+    )
+
+    if _planning_bundle_needs_backfill(working_state, analysis, features):
+        analysis = {
+            **{key: value for key, value in analysis.items() if key not in {"canonical", "localized", "display_language", "localization_status"}},
+            "personas": personas,
+            "user_stories": stories,
+            "user_journeys": journeys,
+            "job_stories": list(bundle.get("job_stories", [])),
+            "actors": list(bundle.get("actors", [])),
+            "roles": list(bundle.get("roles", [])),
+            "use_cases": list(bundle.get("use_cases", [])),
+            "ia_analysis": _as_dict(bundle.get("ia_analysis")),
+            "business_model": _as_dict(solution.get("business_model")),
+            "recommended_milestones": list(solution.get("recommended_milestones", [])),
+            "design_tokens": _as_dict(solution.get("design_tokens")),
+            "kano_features": list(_default_kano_features_for_spec(working_state)),
+            "feature_decisions": _build_feature_decisions(working_state, features),
+            "recommendations": _planning_recommendations(working_state),
+            "rejected_features": list(review_defaults.get("rejected_features", [])),
+            "assumptions": list(review_defaults.get("assumptions", [])),
+            "red_team_findings": list(review_defaults.get("red_team_findings", [])),
+            "negative_personas": list(review_defaults.get("negative_personas", [])),
+            "kill_criteria": list(review_defaults.get("kill_criteria", [])),
+            "judge_summary": _planning_fallback_judge_summary(
+                _planning_recommendations(working_state),
+                review_defaults,
+            ),
+        }
+    else:
+        analysis = dict(analysis)
+
+    working_state.update(
+        {
+            "analysis": analysis,
+            "use_cases": list(analysis.get("use_cases", [])),
+            "recommended_milestones": list(analysis.get("recommended_milestones") or solution.get("recommended_milestones", [])),
+        }
+    )
+    traceability = _build_traceability(working_state, features, _planning_milestones_from_state(working_state))
+    if len(traceability) >= len([item for item in features if item.get("selected") is True]):
+        analysis["traceability"] = traceability
+    analysis["planning_context"] = _planning_context_payload(
+        working_state,
+        features=features,
+        personas=[_as_dict(item) for item in _as_list(analysis.get("personas")) if _as_dict(item)],
+        use_cases=[_as_dict(item) for item in _as_list(analysis.get("use_cases")) if _as_dict(item)],
+        milestones=[_as_dict(item) for item in _as_list(analysis.get("recommended_milestones")) if _as_dict(item)],
+        design_tokens=_as_dict(analysis.get("design_tokens")),
+        business_model=_as_dict(analysis.get("business_model")),
+    )
+
+    if _planning_plan_estimates_need_backfill(features, plan_estimates):
+        plan_estimates = _build_plan_estimates(working_state)
+        project["planEstimates"] = plan_estimates
+
+    analysis["coverage_summary"] = _planning_coverage_summary(
+        analysis=analysis,
+        features=features,
+        plan_estimates=plan_estimates,
+    )
+    project["analysis"] = analysis
+    project["features"] = features
+    project["planEstimates"] = plan_estimates
+    value_contract = build_value_contract(project)
+    project["valueContract"] = value_contract or None
+    project["outcomeTelemetryContract"] = (
+        build_outcome_telemetry_contract(project, value_contract=value_contract) or None
+    )
+    return project
 
 
 def _selected_design_from_state(state: dict[str, Any]) -> dict[str, Any]:
@@ -7290,6 +14761,165 @@ def _selected_design_from_state(state: dict[str, Any]) -> dict[str, Any]:
             if isinstance(variant, dict) and variant.get("id") == selected_id:
                 return dict(variant)
     return {}
+
+
+def _decision_context_from_state(
+    state: dict[str, Any],
+    *,
+    compact: bool,
+) -> dict[str, Any]:
+    existing = _as_dict(state.get("decision_context"))
+    if existing:
+        return existing
+    return build_lifecycle_decision_context(state, target_language="en", compact=compact)
+
+
+def _decision_scope_for_phase(
+    state: dict[str, Any],
+    *,
+    phase: str,
+    selected_design: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    decision_context = _decision_context_from_state(state, compact=True)
+    project_frame = _as_dict(decision_context.get("project_frame"))
+    decision_graph = _as_dict(decision_context.get("decision_graph"))
+    selected = selected_design or _selected_design_from_state(state)
+    selected_feature_names = [
+        str(item.get("name") or item.get("feature") or "").strip()
+        for item in _as_list(project_frame.get("selected_features"))
+        if str(_as_dict(item).get("name") or _as_dict(item).get("feature") or "").strip()
+    ]
+    primary_use_case_ids = [
+        str(_as_dict(item).get("id") or "").strip()
+        for item in _as_list(project_frame.get("primary_use_cases"))
+        if str(_as_dict(item).get("id") or "").strip()
+    ]
+    milestone_ids = [
+        str(_as_dict(item).get("id") or "").strip()
+        for item in _as_list(project_frame.get("milestones"))
+        if str(_as_dict(item).get("id") or "").strip()
+    ]
+    thesis_ids = [
+        str(_as_dict(item).get("id") or "").strip()
+        for item in _as_list(decision_graph.get("nodes"))
+        if str(_as_dict(item).get("type")) == "thesis" and str(_as_dict(item).get("id") or "").strip()
+    ][:3]
+    risk_ids = [
+        str(_as_dict(item).get("id") or "").strip()
+        for item in _as_list(decision_graph.get("nodes"))
+        if str(_as_dict(item).get("type")) == "risk" and str(_as_dict(item).get("id") or "").strip()
+    ][:3]
+    scope = {
+        "phase": phase,
+        "fingerprint": str(decision_context.get("fingerprint") or ""),
+        "lead_thesis": str(project_frame.get("lead_thesis") or ""),
+        "thesis_ids": [item for item in thesis_ids if item],
+        "risk_ids": [item for item in risk_ids if item],
+        "primary_use_case_ids": [item for item in primary_use_case_ids if item][:4],
+        "selected_features": [item for item in selected_feature_names if item][:5],
+        "milestone_ids": [item for item in milestone_ids if item][:4],
+    }
+    if selected:
+        scope["selected_design_id"] = str(selected.get("id") or "")
+        scope["selected_design_name"] = str(selected.get("pattern_name") or "")
+    return scope
+
+
+def _preview_theme_tokens(
+    *,
+    visual_style: str,
+    primary: str,
+    accent: str,
+    background: str,
+    text_color: str,
+) -> dict[str, str]:
+    if visual_style == "obsidian-atelier":
+        return {
+            "canvas": (
+                "radial-gradient(circle at 15% 15%, rgba(245, 158, 11, 0.16), transparent 22%), "
+                "radial-gradient(circle at 82% 18%, rgba(37, 99, 235, 0.16), transparent 26%), "
+                "linear-gradient(180deg, #060b14 0%, #0b1020 44%, #101a2f 100%)"
+            ),
+            "panel": "rgba(11, 16, 32, 0.82)",
+            "shell": "rgba(6, 11, 20, 0.92)",
+            "text": _accessible_preview_text_color(
+                preferred=text_color,
+                background="#0b1020",
+                light_fallback="#f8fafc",
+                dark_fallback="#152033",
+            ),
+            "muted": "#93a4bd",
+            "border": "rgba(148, 163, 184, 0.16)",
+            "surface": "rgba(255, 255, 255, 0.04)",
+            "surface_strong": "rgba(148, 163, 184, 0.08)",
+            "shadow": "0 36px 120px rgba(2, 6, 23, 0.48)",
+            "topbar": "rgba(17, 24, 39, 0.68)",
+            "rail": "linear-gradient(180deg, rgba(245,158,11,0.16), rgba(37,99,235,0.06))",
+            "accent_soft": "rgba(245, 158, 11, 0.16)",
+            "backdrop": "blur(18px)",
+        }
+    if visual_style == "ivory-signal":
+        return {
+            "canvas": (
+                "radial-gradient(circle at 16% 18%, rgba(37, 99, 235, 0.12), transparent 20%), "
+                "radial-gradient(circle at 82% 12%, rgba(245, 158, 11, 0.12), transparent 22%), "
+            "linear-gradient(160deg, #f6efe5 0%, #f5f7fb 52%, #e9eef8 100%)"
+        ),
+        "panel": "rgba(255, 251, 246, 0.82)",
+        "shell": "rgba(255, 247, 238, 0.92)",
+        "text": _accessible_preview_text_color(
+            preferred=text_color,
+            background="#f8fafc",
+            light_fallback="#f8fafc",
+            dark_fallback="#14213d",
+        ),
+        "muted": "#5f6b7f",
+        "border": "rgba(20, 33, 61, 0.12)",
+        "surface": "rgba(255, 255, 255, 0.72)",
+        "surface_strong": "rgba(20, 33, 61, 0.05)",
+        "shadow": "0 32px 90px rgba(15, 23, 42, 0.12)",
+            "topbar": "rgba(255, 250, 244, 0.76)",
+            "rail": "linear-gradient(135deg, rgba(37,99,235,0.08), rgba(245,158,11,0.08))",
+            "accent_soft": "rgba(37, 99, 235, 0.1)",
+            "backdrop": "blur(16px)",
+        }
+    return {
+        "canvas": (
+            "linear-gradient(180deg, rgba(255,255,255,0.85), rgba(255,255,255,0.55)), "
+            f"linear-gradient(160deg, #e2e8f0 0%, {background} 58%, #eef2ff 100%)"
+        ),
+        "panel": "rgba(255,255,255,0.88)",
+        "shell": "rgba(255,255,255,0.92)",
+        "text": _accessible_preview_text_color(
+            preferred=text_color,
+            background=background,
+            light_fallback="#f8fafc",
+            dark_fallback="#0f172a",
+        ),
+        "muted": "#5b6474",
+        "border": "rgba(15, 23, 42, 0.12)",
+        "surface": "rgba(255,255,255,0.72)",
+        "surface_strong": "rgba(15, 23, 42, 0.05)",
+        "shadow": "0 24px 60px rgba(15, 23, 42, 0.08)",
+        "topbar": "rgba(255,255,255,0.76)",
+        "rail": "linear-gradient(135deg, rgba(59,130,246,0.08), rgba(245,158,11,0.08))",
+        "accent_soft": "rgba(59, 130, 246, 0.08)",
+        "backdrop": "blur(10px)",
+    }
+
+
+def _preview_style_class(visual_style: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "-", str(visual_style or "").strip().lower()).strip("-")
+    return normalized or "balanced-product"
+
+
+def _preview_surface_mode_label(visual_style: str, shell_layout: str) -> str:
+    normalized_style = str(visual_style or "").strip().lower()
+    if normalized_style == "obsidian-atelier":
+        return "制御室ビュー"
+    if normalized_style == "ivory-signal":
+        return "判断ギャラリー"
+    return "主要ワークサーフェス" if str(shell_layout or "").strip().lower() == "top-nav" else "主要ワークスペース"
 
 
 def _build_preview_html(
@@ -7307,71 +14937,183 @@ def _build_preview_html(
     section_focus: list[str] | None = None,
     mode: str = "design",
 ) -> str:
-    prototype_payload = _as_dict(prototype)
+    preview_kind = _infer_prototype_context_kind(prototype)
+    prototype_payload = _sanitize_design_prototype(_as_dict(prototype), kind=preview_kind)
     design_tokens_payload = _as_dict(design_tokens)
     shell = _as_dict(prototype_payload.get("app_shell"))
+    design_anchor = _as_dict(prototype_payload.get("design_anchor"))
+    visual_direction = _as_dict(prototype_payload.get("visual_direction"))
     screens = [dict(item) for item in _as_list(prototype_payload.get("screens")) if isinstance(item, dict)]
     flows = [dict(item) for item in _as_list(prototype_payload.get("flows")) if isinstance(item, dict)]
     primary_navigation = [dict(item) for item in _as_list(shell.get("primary_navigation")) if isinstance(item, dict)]
     status_badges = [str(item) for item in _as_list(shell.get("status_badges")) if str(item).strip()] or features[:3]
+    if preview_kind == "operations" and screens:
+        primary_navigation = [
+            {
+                "id": str(screen.get("id") or f"screen-{index + 1}"),
+                "label": _preferred_operations_screen_label(
+                    screen_id=str(screen.get("id") or f"screen-{index + 1}"),
+                    label=str(screen.get("title") or f"画面 {index + 1}"),
+                    variant_style=str(screen.get("variant_style") or visual_direction.get("visual_style") or ""),
+                ),
+                "priority": "primary" if index < 3 else "secondary",
+            }
+            for index, screen in enumerate(screens[:4])
+        ]
+        status_badges = [
+            _preferred_operations_screen_label(
+                screen_id=str(screen.get("id") or f"screen-{index + 1}"),
+                label=str(screen.get("title") or f"画面 {index + 1}"),
+                variant_style=str(screen.get("variant_style") or visual_direction.get("visual_style") or ""),
+            )
+            for index, screen in enumerate(screens[:3])
+        ]
     focus_ids = {str(item).strip() for item in _as_list(section_focus) if str(item).strip()}
     if focus_ids:
         ordered = [screen for screen in screens if str(screen.get("id")) in focus_ids]
         screens = ordered or screens
     active_screen = screens[0] if screens else {}
+    active_screen_id = str(active_screen.get("id") or "screen-1")
     active_modules = [dict(item) for item in _as_list(_as_dict(active_screen).get("modules")) if isinstance(item, dict)]
     interaction_principles = [
         str(item) for item in _as_list(prototype_payload.get("interaction_principles")) if str(item).strip()
     ]
     if interaction_notes:
-        interaction_principles = _dedupe_strings(interaction_principles + [str(item) for item in interaction_notes if str(item).strip()])
+        interaction_principles = _dedupe_strings(
+            interaction_principles + [str(item) for item in interaction_notes if str(item).strip()]
+        )
     backend_modules = [dict(item) for item in _as_list(backend_entities) if isinstance(item, dict)]
     milestone_payload = [dict(item) for item in _as_list(milestones) if isinstance(item, dict)]
-    body_font = str(_as_dict(design_tokens_payload.get("typography")).get("body") or "Noto Sans JP")
-    heading_font = str(_as_dict(design_tokens_payload.get("typography")).get("heading") or "IBM Plex Sans")
+    body_font = str(visual_direction.get("body_font") or _as_dict(design_tokens_payload.get("typography")).get("body") or "Noto Sans JP")
+    heading_font = str(visual_direction.get("display_font") or _as_dict(design_tokens_payload.get("typography")).get("heading") or "IBM Plex Sans")
     background = str(_as_dict(design_tokens_payload.get("colors")).get("background") or "#f8fafc")
+    text_color = str(_as_dict(design_tokens_payload.get("colors")).get("text") or primary or "")
     prototype_kind = str(prototype_payload.get("kind") or "product-workspace")
     shell_layout = str(shell.get("layout") or "sidebar")
     density = str(shell.get("density") or "medium")
+    visual_style = str(visual_direction.get("visual_style") or "balanced-product")
+    theme = _preview_theme_tokens(
+        visual_style=visual_style,
+        primary=primary,
+        accent=accent,
+        background=background,
+        text_color=text_color,
+    )
+    preview_style_class = _preview_style_class(visual_style)
+    surface_mode_label = _preview_surface_mode_label(visual_style, shell_layout)
+    localized_title = _preview_copy_or_fallback(
+        title,
+        fallback="オペレーター主導のマルチエージェント ライフサイクルワークスペース",
+        max_length=96,
+    )
+    localized_subtitle = _preview_copy_or_fallback(
+        subtitle,
+        fallback=_preview_subtitle_fallback(
+            screens=screens[:4],
+            flows=flows[:3],
+            features=features,
+            variant_style=visual_style,
+        ),
+        max_length=180,
+    )
 
     nav_items_html = "".join(
-        f'<li><a href="#{escape(str(item.get("id") or "screen"))}">{escape(str(item.get("label") or "Section"))}</a></li>'
+        (
+            f'<li><a href="#{escape(str(item.get("id") or "screen"))}" data-screen-target="{escape(str(item.get("id") or "screen"))}" data-tab="true" role="tab" aria-selected="{"true" if str(item.get("id") or "screen") == active_screen_id else "false"}" aria-controls="{escape(str(item.get("id") or "screen"))}">'
+            f'<span>{escape(_design_preview_text(item.get("label") or "セクション"))}</span>'
+            f"<small>{escape(_design_preview_text(item.get('priority') or 'primary'))}</small>"
+            "</a></li>"
+        )
         for item in primary_navigation[:6]
     )
     badge_html = "".join(
-        f"<span class='status-badge'>{escape(item)}</span>"
+        f"<span class='status-badge'>{escape(_design_preview_text(item))}</span>"
         for item in status_badges[:4]
     )
+    shell_meta_html = "".join(
+        f"<span class='shell-chip'>{escape(_design_preview_text(item))}</span>"
+        for item in _dedupe_strings(
+            [
+                str(design_anchor.get("pattern_name") or ""),
+                f"{prototype_kind} shell",
+                f"{shell_layout} nav",
+                f"{density} density",
+            ]
+        )[:4]
+        if item
+    )
     action_html = "".join(
-        f'<button type="button" aria-label="{escape(str(action))}">{escape(str(action))}</button>'
+        f'<button type="button" aria-label="{escape(_preview_primary_action(action, screen=_as_dict(active_screen)))}">{escape(_preview_primary_action(action, screen=_as_dict(active_screen)))}</button>'
         for action in _as_list(_as_dict(active_screen).get("primary_actions"))[:3]
-        if str(action).strip()
+        if _preview_primary_action(action, screen=_as_dict(active_screen))
+    )
+    review_table_html = "".join(
+        (
+            "<tr>"
+            f"<td>{escape(_design_preview_text(screen.get('title') or '画面'))}</td>"
+            f"<td>{escape(_preview_screen_purpose(screen))}</td>"
+            f"<td>{escape(_preview_primary_action((_as_list(screen.get('primary_actions')) or [''])[0], screen=screen))}</td>"
+            "</tr>"
+        )
+        for screen in screens[:4]
+    )
+    status_list_html = "".join(
+        (
+            "<li>"
+            f"<strong>{escape(_design_preview_text(item.get('name') or item.get('id') or '状態'))}</strong>"
+            f"<span>{escape(_design_preview_text(item.get('criteria') or item.get('status') or '次の判断を確認'))}</span>"
+            "</li>"
+        )
+        for item in milestone_payload[:4]
+    ) or "".join(
+        (
+            "<li>"
+            f"<strong>{escape(_design_preview_text(flow.get('name') or '主要フロー'))}</strong>"
+            f"<span>{escape(_design_preview_text(flow.get('goal') or '主要判断の次アクションを定義する'))}</span>"
+            "</li>"
+        )
+        for flow in flows[:3]
+    )
+    form_options_html = "".join(
+        f"<option>{escape(_design_preview_text(item))}</option>"
+        for item in status_badges[:3]
+    ) or "<option>要確認</option>"
+    tab_html = "".join(
+        (
+            f'<button type="button" class="preview-tab{" is-active" if str(screen.get("id") or "screen") == active_screen_id else ""}" '
+            f'id="{escape(str(screen.get("id") or "screen"))}-tab" role="tab" data-tab-target="{escape(str(screen.get("id") or "screen"))}" '
+            f'aria-selected="{"true" if str(screen.get("id") or "screen") == active_screen_id else "false"}" '
+            f'aria-controls="{escape(str(screen.get("id") or "screen"))}">'
+            f"{escape(_design_preview_text(screen.get('title') or '画面'))}"
+            "</button>"
+        )
+        for screen in screens[:4]
     )
     active_module_html = "".join(
         (
             "<article class='module-card'>"
-            f"<p class='module-type'>{escape(str(module.get('type') or 'panel'))}</p>"
-            f"<h3>{escape(str(module.get('name') or 'Module'))}</h3>"
-            f"<ul>{''.join(f'<li>{escape(str(item))}</li>' for item in _as_list(module.get('items'))[:4] if str(item).strip())}</ul>"
+            f"<p class='module-type'>{escape(_design_preview_text(module.get('type') or 'panel'))}</p>"
+            f"<h3>{escape(_design_preview_text(module.get('name') or 'Module'))}</h3>"
+            f"<ul>{''.join(f'<li>{escape(_design_preview_text(item))}</li>' for item in _as_list(module.get('items'))[:4] if str(item).strip())}</ul>"
             "</article>"
         )
         for module in active_modules[:4]
     )
     screen_gallery_html = "".join(
         (
-            f'<article class="screen-frame" id="{escape(str(screen.get("id") or "screen"))}" data-screen-id="{escape(str(screen.get("id") or "screen"))}">'
+            f'<article class="screen-frame{" is-hidden" if str(screen.get("id") or "screen") != active_screen_id else ""}" id="{escape(str(screen.get("id") or "screen"))}" data-screen-id="{escape(str(screen.get("id") or "screen"))}" role="tabpanel" aria-labelledby="{escape(str(screen.get("id") or "screen"))}-tab" aria-hidden="{"false" if str(screen.get("id") or "screen") == active_screen_id else "true"}">'
             '<div class="screen-topbar">'
-            f"<span>{escape(str(screen.get('title') or 'Screen'))}</span>"
-            f"<span>{escape(str(screen.get('layout') or 'layout'))}</span>"
+            f"<span>{escape(_design_preview_text(screen.get('title') or 'Screen'))}</span>"
+            f"<span>{escape(_design_preview_text(screen.get('layout') or 'layout'))}</span>"
             "</div>"
-            f"<h3>{escape(str(screen.get('headline') or screen.get('title') or 'Screen headline'))}</h3>"
-            f"<p>{escape(str(screen.get('purpose') or ''))}</p>"
+            f"<h3>{escape(_design_preview_text(screen.get('headline') or screen.get('title') or 'Screen headline'))}</h3>"
+            f"<p>{escape(_preview_screen_purpose(screen))}</p>"
             '<div class="screen-modules">'
             + "".join(
                 (
                     '<div class="mini-module">'
-                    f"<p>{escape(str(module.get('name') or 'Module'))}</p>"
-                    f"<span>{escape(str((_as_list(module.get('items')) or [''])[0]))}</span>"
+                    f"<p>{escape(_design_preview_text(module.get('name') or 'Module'))}</p>"
+                    f"<span>{escape(_design_preview_text(str((_as_list(module.get('items')) or [''])[0])))}</span>"
                     "</div>"
                 )
                 for module in [dict(item) for item in _as_list(screen.get("modules")) if isinstance(item, dict)][:3]
@@ -7384,56 +15126,96 @@ def _build_preview_html(
     flow_html = "".join(
         (
             "<article class='flow-card'>"
-            f"<h3>{escape(str(flow.get('name') or 'Flow'))}</h3>"
-            f"<ol>{''.join(f'<li>{escape(str(step))}</li>' for step in _as_list(flow.get('steps'))[:5] if str(step).strip())}</ol>"
-            f"<p>{escape(str(flow.get('goal') or ''))}</p>"
+            f"<h3>{escape(_design_preview_text(flow.get('name') or 'Flow'))}</h3>"
+            f"<ol>{''.join(f'<li>{escape(_design_preview_text(step))}</li>' for step in _as_list(flow.get('steps'))[:5] if str(step).strip())}</ol>"
+            f"<p>{escape(_design_preview_text(flow.get('goal') or ''))}</p>"
             "</article>"
         )
         for flow in flows[:3]
     )
     principle_html = "".join(
-        f"<li>{escape(item)}</li>"
+        f"<li>{escape(_design_preview_text(item))}</li>"
         for item in interaction_principles[:4]
     )
     entity_html = "".join(
-        f"<li>{escape(str(entity.get('name') or entity.get('title') or 'Entity'))}</li>"
+        (
+            "<li>"
+            f"<strong>{escape(_design_preview_text(entity.get('name') or entity.get('title') or 'Entity'))}</strong>"
+            f"<span>{escape(_design_preview_text(entity.get('description') or ''))}</span>"
+            "</li>"
+        )
         for entity in backend_modules[:6]
     )
     milestone_html = "".join(
         (
             "<li>"
-            f"<strong>{escape(str(item.get('name') or item.get('id') or 'Milestone'))}</strong>"
-            f"<span>{escape(str(item.get('criteria') or item.get('status') or ''))}</span>"
+            f"<strong>{escape(_design_preview_text(item.get('name') or item.get('id') or 'Milestone'))}</strong>"
+            f"<span>{escape(_design_preview_text(item.get('criteria') or item.get('status') or ''))}</span>"
             "</li>"
         )
         for item in milestone_payload[:4]
+    )
+    shell_html = (
+        f"""
+      <aside class="sidebar panel shell-rail">
+        <div class="eyebrow"><span class="accent" aria-hidden="true"></span> オペレーターシェル</div>
+        <p class="shell-title">{escape(localized_title)}</p>
+        <div class="shell-meta">{shell_meta_html}</div>
+        <p class="shell-note">{escape(localized_subtitle)}</p>
+        <div class="status-row">{badge_html}</div>
+        <nav aria-label="主要ナビゲーション">
+          <ul role="tablist">{nav_items_html}</ul>
+        </nav>
+      </aside>
+        """
+        if shell_layout != "top-nav"
+        else f"""
+      <header class="panel shell-topbar">
+        <div class="shell-topbar-head">
+          <div>
+            <div class="eyebrow"><span class="accent" aria-hidden="true"></span> オペレーターシェル</div>
+            <p class="shell-title">{escape(localized_title)}</p>
+            <div class="shell-meta">{shell_meta_html}</div>
+            <p class="shell-note">{escape(localized_subtitle)}</p>
+          </div>
+          <div class="status-row">{badge_html}</div>
+        </div>
+        <nav class="top-nav" aria-label="主要ナビゲーション">
+          <ul role="tablist">{nav_items_html}</ul>
+        </nav>
+      </header>
+        """
     )
     return f"""<!doctype html>
 <html lang="ja">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{escape(title)}</title>
+  <title>{escape(localized_title)}</title>
   <style>
     :root {{
       --bg: {background};
-      --panel: rgba(255,255,255,0.88);
-      --text: {primary};
+      --canvas: {theme["canvas"]};
+      --panel: {theme["panel"]};
+      --shell: {theme["shell"]};
+      --text: {theme["text"]};
       --accent: {accent};
-      --muted: #5b6474;
-      --border: rgba(15, 23, 42, 0.12);
-      --surface: rgba(255,255,255,0.72);
-      --surface-strong: rgba(15, 23, 42, 0.05);
+      --muted: {theme["muted"]};
+      --border: {theme["border"]};
+      --surface: {theme["surface"]};
+      --surface-strong: {theme["surface_strong"]};
+      --shadow: {theme["shadow"]};
+      --topbar: {theme["topbar"]};
+      --rail: {theme["rail"]};
+      --accent-soft: {theme["accent_soft"]};
+      --backdrop: {theme["backdrop"]};
     }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
       font-family: "{escape(body_font)}", "Hiragino Sans", sans-serif;
       color: var(--text);
-      background:
-        linear-gradient(180deg, rgba(255,255,255,0.85), rgba(255,255,255,0.55)),
-        radial-gradient(circle at top left, rgba(59,130,246,0.08), transparent 28%),
-        linear-gradient(160deg, #e2e8f0 0%, {background} 58%, #eef2ff 100%);
+      background: var(--canvas);
     }}
     main {{
       max-width: 1360px;
@@ -7451,11 +15233,11 @@ def _build_preview_html(
       border: 1px solid var(--border);
       border-radius: 24px;
       padding: 24px;
-      box-shadow: 0 24px 60px rgba(15, 23, 42, 0.08);
-      backdrop-filter: blur(10px);
+      box-shadow: var(--shadow);
+      backdrop-filter: var(--backdrop);
     }}
     h1, h2, h3, h4 {{ font-family: "{escape(heading_font)}", "Hiragino Sans", sans-serif; }}
-    h1 {{ margin: 0; font-size: clamp(1.5rem, 3vw, 2.6rem); line-height: 1.05; }}
+    h1 {{ margin: 0; font-size: clamp(1.35rem, 2.2vw, 1.8rem); line-height: 1.08; }}
     h2 {{ margin: 0 0 10px; font-size: 0.95rem; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }}
     h3 {{ margin: 0; font-size: 1rem; }}
     p {{ color: var(--muted); line-height: 1.6; margin: 0; }}
@@ -7464,13 +15246,28 @@ def _build_preview_html(
       position: sticky;
       top: 24px;
     }}
+    .shell-rail {{
+      background: linear-gradient(180deg, var(--shell), color-mix(in srgb, var(--shell) 86%, transparent));
+      overflow: hidden;
+      position: sticky;
+    }}
+    .shell-rail::after {{
+      content: "";
+      position: absolute;
+      inset: auto -18% -22% 18%;
+      height: 180px;
+      background: var(--rail);
+      filter: blur(26px);
+      pointer-events: none;
+      opacity: 0.95;
+    }}
     .eyebrow {{
       display: inline-flex;
       align-items: center;
       gap: 8px;
       padding: 7px 11px;
       border-radius: 999px;
-      background: rgba(255,255,255,0.72);
+      background: color-mix(in srgb, var(--surface) 84%, transparent);
       border: 1px solid var(--border);
       font-size: 0.82rem;
     }}
@@ -7488,7 +15285,7 @@ def _build_preview_html(
       display: grid;
       gap: 10px;
     }}
-    .sidebar nav a {{
+    .sidebar nav a, .top-nav a {{
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -7496,12 +15293,47 @@ def _build_preview_html(
       color: var(--text);
       padding: 12px 14px;
       border-radius: 16px;
-      border: 1px solid transparent;
-      background: rgba(15, 23, 42, 0.03);
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--surface-strong) 90%, transparent);
+      gap: 10px;
+      transition: transform 160ms ease, border-color 160ms ease, background 160ms ease;
     }}
-    .sidebar nav a:hover {{
-      border-color: var(--border);
-      background: rgba(255,255,255,0.92);
+    .sidebar nav a:hover, .top-nav a:hover {{
+      background: color-mix(in srgb, var(--surface) 92%, transparent);
+      transform: translateY(-1px);
+    }}
+    .sidebar nav a[aria-selected="true"], .top-nav a[aria-selected="true"] {{
+      border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+      background: color-mix(in srgb, var(--accent) 16%, var(--surface));
+    }}
+    .sidebar nav a span, .top-nav a span {{
+      font-weight: 600;
+    }}
+    .sidebar nav a small, .top-nav a small {{
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 0.66rem;
+      color: var(--muted);
+    }}
+    .shell-topbar {{
+      display: grid;
+      gap: 18px;
+      background: linear-gradient(180deg, var(--shell), var(--topbar));
+    }}
+    .shell-topbar-head {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+    }}
+    .top-nav ul {{
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
     }}
     .status-row {{
       display: flex;
@@ -7509,12 +15341,44 @@ def _build_preview_html(
       gap: 8px;
       margin-top: 18px;
     }}
+    .shell-meta {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }}
+    .shell-title {{
+      margin: 14px 0 0;
+      font-family: "{escape(heading_font)}", "Hiragino Sans", sans-serif;
+      font-size: 0.94rem;
+      line-height: 1.35;
+      color: color-mix(in srgb, var(--text) 90%, var(--muted));
+      letter-spacing: 0.02em;
+    }}
+    .shell-chip {{
+      display: inline-flex;
+      align-items: center;
+      padding: 7px 10px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--surface) 90%, transparent);
+      border: 1px solid var(--border);
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }}
+    .shell-note {{
+      margin-top: 12px;
+      font-size: 0.84rem;
+      line-height: 1.55;
+      max-width: 34ch;
+    }}
     .status-badge {{
       display: inline-flex;
       align-items: center;
       padding: 8px 10px;
       border-radius: 999px;
-      background: rgba(255,255,255,0.8);
+      background: color-mix(in srgb, var(--surface) 88%, transparent);
       border: 1px solid var(--border);
       font-size: 0.76rem;
     }}
@@ -7532,7 +15396,17 @@ def _build_preview_html(
     .topbar-copy {{
       max-width: 640px;
       display: grid;
-      gap: 12px;
+      gap: 8px;
+    }}
+    .surface-title {{
+      margin: 0;
+      font-family: "{escape(heading_font)}", "Hiragino Sans", sans-serif;
+      font-size: clamp(1.08rem, 1.8vw, 1.42rem);
+      line-height: 1.2;
+    }}
+    .surface-copy {{
+      font-size: 0.84rem;
+      max-width: 44ch;
     }}
     .topbar-actions {{
       display: flex;
@@ -7542,21 +15416,26 @@ def _build_preview_html(
     }}
     .topbar-actions button {{
       appearance: none;
-      border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));
-      background: color-mix(in srgb, var(--accent) 16%, white);
+      border: 1px solid color-mix(in srgb, var(--accent) 36%, var(--border));
+      background: color-mix(in srgb, var(--accent) 18%, var(--surface));
       color: var(--text);
       border-radius: 14px;
       padding: 11px 14px;
       font-size: 0.85rem;
       font-weight: 600;
       cursor: pointer;
+      transition: transform 160ms ease, background 160ms ease, border-color 160ms ease;
     }}
-    .hero-surface {{
+    .topbar-actions button:hover {{
+      transform: translateY(-1px);
+      background: color-mix(in srgb, var(--accent) 24%, var(--surface));
+    }}
+    .command-surface {{
       display: grid;
       gap: 16px;
-      background: linear-gradient(180deg, rgba(255,255,255,0.94), rgba(255,255,255,0.78));
+      background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 94%, transparent), color-mix(in srgb, var(--panel) 78%, transparent));
     }}
-    .hero-metadata {{
+    .command-metadata {{
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 12px;
@@ -7586,7 +15465,7 @@ def _build_preview_html(
     .module-card {{
       border-radius: 18px;
       border: 1px solid var(--border);
-      background: rgba(255,255,255,0.9);
+      background: color-mix(in srgb, var(--surface) 92%, transparent);
       padding: 16px;
     }}
     .module-card ul {{
@@ -7608,19 +15487,48 @@ def _build_preview_html(
     }}
     .screen-gallery {{
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: 1fr;
       gap: 16px;
+    }}
+    .preview-tabs {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 12px;
+    }}
+    .preview-tab {{
+      appearance: none;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--surface) 92%, transparent);
+      color: var(--text);
+      border-radius: 999px;
+      padding: 9px 14px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 160ms ease, border-color 160ms ease, background 160ms ease;
+    }}
+    .preview-tab:hover {{
+      transform: translateY(-1px);
+    }}
+    .preview-tab.is-active {{
+      border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+      background: color-mix(in srgb, var(--accent) 18%, var(--surface));
     }}
     .screen-frame {{
       border-radius: 22px;
       border: 1px solid var(--border);
-      background: rgba(255,255,255,0.92);
+      background: color-mix(in srgb, var(--surface) 94%, transparent);
       padding: 16px;
       min-height: 240px;
       display: grid;
       align-content: start;
       gap: 12px;
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.5);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.12);
+      transition: opacity 180ms ease, transform 180ms ease;
+    }}
+    .screen-frame.is-hidden {{
+      display: none;
     }}
     .screen-topbar {{
       display: flex;
@@ -7637,7 +15545,7 @@ def _build_preview_html(
     }}
     .mini-module {{
       border-radius: 14px;
-      background: var(--surface-strong);
+      background: linear-gradient(180deg, var(--surface-strong), color-mix(in srgb, var(--accent-soft) 32%, var(--surface-strong)));
       padding: 12px;
       border: 1px solid rgba(15,23,42,0.06);
     }}
@@ -7654,10 +15562,28 @@ def _build_preview_html(
     .flow-card {{
       border-radius: 18px;
       border: 1px solid var(--border);
-      background: rgba(255,255,255,0.9);
+      background: color-mix(in srgb, var(--surface) 92%, transparent);
       padding: 16px;
       display: grid;
       gap: 12px;
+    }}
+    .evidence-table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.84rem;
+    }}
+    .evidence-table th,
+    .evidence-table td {{
+      text-align: left;
+      padding: 12px 10px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }}
+    .evidence-table th {{
+      font-size: 0.72rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
     }}
     .flow-card ol {{
       display: grid;
@@ -7666,6 +15592,7 @@ def _build_preview_html(
     .rail-list {{
       display: grid;
       gap: 10px;
+      padding-left: 0;
     }}
     .rail-list li {{
       border-radius: 14px;
@@ -7675,8 +15602,84 @@ def _build_preview_html(
       gap: 6px;
       list-style: none;
     }}
+    .rail-list span {{
+      color: var(--muted);
+      font-size: 0.8rem;
+      line-height: 1.5;
+    }}
     .rail-list strong {{
       font-size: 0.86rem;
+    }}
+    .review-form {{
+      display: grid;
+      gap: 12px;
+    }}
+    .review-form label {{
+      display: grid;
+      gap: 6px;
+      font-size: 0.8rem;
+      color: var(--muted);
+    }}
+    .review-form input,
+    .review-form select,
+    .review-form textarea {{
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: color-mix(in srgb, var(--surface) 94%, transparent);
+      color: var(--text);
+      padding: 11px 12px;
+      font: inherit;
+    }}
+    .review-form textarea {{
+      min-height: 92px;
+      resize: vertical;
+    }}
+    .review-form-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }}
+    .review-form-actions button {{
+      appearance: none;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--surface-strong) 92%, transparent);
+      color: var(--text);
+      border-radius: 14px;
+      padding: 10px 14px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 160ms ease, border-color 160ms ease, background 160ms ease;
+    }}
+    .review-form-actions button:hover {{
+      transform: translateY(-1px);
+      border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+    }}
+    .accordion {{
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--surface) 94%, transparent);
+      overflow: hidden;
+    }}
+    .accordion-toggle {{
+      width: 100%;
+      appearance: none;
+      border: 0;
+      border-bottom: 1px solid var(--border);
+      background: transparent;
+      color: var(--text);
+      padding: 14px 16px;
+      text-align: left;
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+    }}
+    .accordion-panel {{
+      padding: 14px 16px;
+    }}
+    .accordion-panel[hidden] {{
+      display: none;
     }}
     .principles {{
       display: grid;
@@ -7691,81 +15694,245 @@ def _build_preview_html(
       letter-spacing: 0.08em;
       color: var(--muted);
     }}
+    .preview-style-obsidian-atelier .command-surface {{
+      border-color: color-mix(in srgb, var(--accent) 20%, var(--border));
+      background:
+        linear-gradient(180deg, rgba(8, 13, 24, 0.96), rgba(14, 22, 38, 0.9)),
+        linear-gradient(135deg, rgba(245, 158, 11, 0.12), transparent 45%);
+    }}
+    .preview-style-obsidian-atelier .metric,
+    .preview-style-obsidian-atelier .module-card,
+    .preview-style-obsidian-atelier .flow-card,
+    .preview-style-obsidian-atelier .screen-frame,
+    .preview-style-obsidian-atelier .rail-list li {{
+      border-color: rgba(148, 163, 184, 0.18);
+      background: linear-gradient(180deg, rgba(15, 23, 42, 0.88), rgba(15, 23, 42, 0.72));
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+    }}
+    .preview-style-obsidian-atelier .preview-tab.is-active,
+    .preview-style-obsidian-atelier .sidebar nav a[aria-selected="true"] {{
+      box-shadow: 0 18px 36px rgba(245, 158, 11, 0.12);
+    }}
+    .preview-style-obsidian-atelier .mini-module {{
+      border-color: rgba(245, 158, 11, 0.12);
+      background: linear-gradient(180deg, rgba(245, 158, 11, 0.14), rgba(30, 41, 59, 0.5));
+    }}
+    .preview-style-ivory-signal .command-surface {{
+      gap: 22px;
+      border-color: rgba(37, 99, 235, 0.12);
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(248, 250, 252, 0.82)),
+        linear-gradient(135deg, rgba(37, 99, 235, 0.08), rgba(245, 158, 11, 0.04));
+    }}
+    .preview-style-ivory-signal .topbar {{
+      display: grid;
+      grid-template-columns: minmax(0, 1.18fr) minmax(18rem, 0.82fr);
+      align-items: stretch;
+    }}
+    .preview-style-ivory-signal .surface-title {{
+      font-size: clamp(1.4rem, 2.8vw, 2.2rem);
+      max-width: 15ch;
+      line-height: 1.05;
+      letter-spacing: -0.02em;
+    }}
+    .preview-style-ivory-signal .surface-copy {{
+      max-width: 52ch;
+      font-size: 0.88rem;
+    }}
+    .preview-style-ivory-signal .topbar-actions {{
+      align-content: start;
+      justify-content: flex-start;
+      padding: 18px;
+      border-radius: 20px;
+      border: 1px solid rgba(20, 33, 61, 0.08);
+      background: linear-gradient(180deg, rgba(255,255,255,0.92), rgba(246,239,229,0.8));
+      box-shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
+    }}
+    .preview-style-ivory-signal .metric,
+    .preview-style-ivory-signal .module-card,
+    .preview-style-ivory-signal .flow-card,
+    .preview-style-ivory-signal .screen-frame,
+    .preview-style-ivory-signal .rail-list li {{
+      border-color: rgba(20, 33, 61, 0.08);
+      background: linear-gradient(180deg, rgba(255,255,255,0.96), rgba(248,250,252,0.88));
+      box-shadow: 0 20px 48px rgba(15, 23, 42, 0.07);
+    }}
+    .preview-style-ivory-signal .preview-tab {{
+      background: rgba(255,255,255,0.78);
+    }}
+    .preview-style-ivory-signal .preview-tab.is-active,
+    .preview-style-ivory-signal .top-nav a[aria-selected="true"] {{
+      box-shadow: 0 14px 34px rgba(37, 99, 235, 0.12);
+    }}
+    .preview-style-ivory-signal .mini-module {{
+      border-color: rgba(37, 99, 235, 0.08);
+      background: linear-gradient(180deg, rgba(255,255,255,0.96), rgba(226,232,240,0.72));
+    }}
     @media (max-width: 1100px) {{
-      .workspace, .secondary-grid, .screen-gallery, .module-grid, .hero-metadata {{
+      .workspace, .secondary-grid, .screen-gallery, .module-grid, .command-metadata {{
+        grid-template-columns: 1fr;
+      }}
+      .preview-style-ivory-signal .topbar {{
         grid-template-columns: 1fr;
       }}
       .sidebar {{
         position: static;
       }}
+      .shell-topbar-head {{
+        flex-direction: column;
+      }}
     }}
     @media (max-width: 860px) {{
       main {{ padding: 18px 14px 32px; }}
       .panel, .screen-frame {{ border-radius: 18px; }}
+      .top-nav ul {{
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+      }}
     }}
   </style>
 </head>
-<body data-prototype-kind="{escape(prototype_kind)}" data-density="{escape(density)}">
+<body class="preview-style-{escape(preview_style_class)}" data-prototype-kind="{escape(prototype_kind)}" data-density="{escape(density)}">
   <main>
-    <section class="workspace" aria-label="Prototype workspace">
-      <aside class="sidebar panel">
-        <div class="eyebrow"><span class="accent" aria-hidden="true"></span> Product Prototype</div>
-        <h1>{escape(title)}</h1>
-        <p style="margin-top:12px">{escape(subtitle)}</p>
-        <div class="status-row">{badge_html}</div>
-        <nav aria-label="Primary navigation">
-          <ul>{nav_items_html}</ul>
-        </nav>
-      </aside>
+    <section class="workspace" aria-label="プロトタイプワークスペース">
+      {shell_html}
       <div class="content">
-        <section class="panel hero-surface">
+        <section class="panel command-surface">
           <div class="topbar">
             <div class="topbar-copy">
-              <span class="mode-chip">{escape(mode)} prototype</span>
-              <h1>{escape(str(_as_dict(active_screen).get("headline") or title))}</h1>
-              <p>{escape(str(_as_dict(active_screen).get("purpose") or subtitle))}</p>
+              <span class="mode-chip">{escape(surface_mode_label)}</span>
+              <h1 class="surface-title">{escape(_design_preview_text(_as_dict(active_screen).get("headline") or title))}</h1>
+              <p class="surface-copy">{escape(_design_preview_text(_as_dict(active_screen).get("supporting_text") or _as_dict(active_screen).get("purpose") or subtitle))}</p>
             </div>
             <div class="topbar-actions">{action_html}</div>
           </div>
-          <div class="hero-metadata">
+          <div class="command-metadata">
             <div class="metric">
-              <p>Active Screen</p>
-              <strong>{escape(str(_as_dict(active_screen).get("title") or "Primary workspace"))}</strong>
+              <p>アクティブ画面</p>
+              <strong>{escape(_design_preview_text(_as_dict(active_screen).get("title") or "主要ワークスペース"))}</strong>
             </div>
             <div class="metric">
-              <p>Primary Flow</p>
-              <strong>{escape(str(_as_dict(flows[0] if flows else {}).get("name") or "Core workflow"))}</strong>
+              <p>主要フロー</p>
+              <strong>{escape(_design_preview_text(_as_dict(flows[0] if flows else {}).get("name") or "中核フロー"))}</strong>
             </div>
             <div class="metric">
-              <p>Layout</p>
-              <strong>{escape(str(_as_dict(active_screen).get("layout") or shell_layout))}</strong>
+              <p>レイアウト</p>
+              <strong>{escape(_design_preview_text(_as_dict(active_screen).get("layout") or shell_layout))}</strong>
             </div>
           </div>
           <div class="module-grid">{active_module_html}</div>
         </section>
         <section class="secondary-grid">
           <div class="panel">
-            <h2>Prototype Screens</h2>
-            <div class="screen-gallery" aria-label="Prototype screens">{screen_gallery_html}</div>
+            <h2>画面ストーリーボード</h2>
+            <div class="preview-tabs" role="tablist" aria-label="画面切替">{tab_html}</div>
+            <div class="screen-gallery" aria-label="画面ストーリーボード">{screen_gallery_html}</div>
           </div>
           <div class="panel">
-            <h2>Interaction Principles</h2>
+            <h2>操作原則</h2>
             <ul class="principles">{principle_html}</ul>
           </div>
         </section>
         <section class="secondary-grid">
           <div class="panel">
-            <h2>Primary Flows</h2>
+            <h2>主要フロー</h2>
             <div class="rail-list">{flow_html}</div>
           </div>
           <div class="panel">
-            <h2>{escape("Milestone Readiness" if mode == "build" else "System Signals")}</h2>
-            <ul class="rail-list">{milestone_html or entity_html}</ul>
+            <h2>{escape("マイルストーン準備" if mode == "build" else "システムシグナル")}</h2>
+            <ul class="rail-list">{status_list_html or entity_html}</ul>
+          </div>
+        </section>
+        <section class="secondary-grid">
+          <div class="panel">
+            <h2>判断テーブル</h2>
+            <table class="evidence-table" aria-label="判断テーブル">
+              <thead>
+                <tr>
+                  <th>画面</th>
+                  <th>目的</th>
+                  <th>主操作</th>
+                </tr>
+              </thead>
+              <tbody>{review_table_html}</tbody>
+            </table>
+          </div>
+          <div class="panel">
+            <h2>承認フォーム</h2>
+            <form class="review-form" aria-label="承認フォーム">
+              <label>
+                判定
+                <select name="decision">
+                  <option>承認して次へ進む</option>
+                  <option>条件付きで差し戻す</option>
+                  <option>追加検証が必要</option>
+                </select>
+              </label>
+              <label>
+                担当レーン
+                <select name="lane">{form_options_html}</select>
+              </label>
+              <label>
+                コメント
+                <textarea name="comment" placeholder="判断理由、懸念、次のアクションを記録します。"></textarea>
+              </label>
+              <div class="review-form-actions">
+                <button type="button">承認パケットを作成</button>
+                <button type="button">差し戻し条件を追加</button>
+              </div>
+            </form>
+            <div class="accordion" data-accordion>
+              <button type="button" class="accordion-toggle" aria-expanded="false">品質ゲートの確認</button>
+              <div class="accordion-panel" hidden>
+                <ul class="rail-list">{milestone_html or entity_html}</ul>
+              </div>
+            </div>
           </div>
         </section>
       </div>
     </section>
   </main>
+  <script>
+    (() => {{
+      const tabs = Array.from(document.querySelectorAll('[data-tab-target]'));
+      const navLinks = Array.from(document.querySelectorAll('[data-screen-target]'));
+      const panels = Array.from(document.querySelectorAll('[data-screen-id]'));
+      const showScreen = (screenId) => {{
+        panels.forEach((panel) => {{
+          const active = panel.dataset.screenId === screenId;
+          panel.classList.toggle('is-hidden', !active);
+          panel.setAttribute('aria-hidden', active ? 'false' : 'true');
+        }});
+        tabs.forEach((tab) => {{
+          const active = tab.getAttribute('data-tab-target') === screenId;
+          tab.classList.toggle('is-active', active);
+          tab.setAttribute('aria-selected', active ? 'true' : 'false');
+        }});
+        navLinks.forEach((link) => {{
+          const active = link.getAttribute('data-screen-target') === screenId;
+          link.setAttribute('aria-selected', active ? 'true' : 'false');
+        }});
+      }};
+      tabs.forEach((tab) => tab.addEventListener('click', () => showScreen(tab.getAttribute('data-tab-target') || '')));
+      navLinks.forEach((link) => link.addEventListener('click', (event) => {{
+        event.preventDefault();
+        showScreen(link.getAttribute('data-screen-target') || '');
+      }}));
+      document.querySelectorAll('[data-accordion] .accordion-toggle').forEach((button) => {{
+        button.addEventListener('click', () => {{
+          const panel = button.nextElementSibling;
+          const expanded = button.getAttribute('aria-expanded') === 'true';
+          button.setAttribute('aria-expanded', expanded ? 'false' : 'true');
+          if (panel) {{
+            panel.hidden = expanded;
+          }}
+        }});
+      }});
+      if (panels[0]) {{
+        showScreen(panels[0].dataset.screenId || '{escape(active_screen_id)}');
+      }}
+    }})();
+  </script>
 </body>
 </html>"""
 

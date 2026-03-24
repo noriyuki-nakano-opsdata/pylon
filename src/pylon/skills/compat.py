@@ -133,20 +133,11 @@ class SkillCompatibilityLayer:
         )
         snapshot_id = uuid.uuid4().hex
         manifest_skills: list[dict[str, Any]] = []
-        imported: list[ImportedSkillRecord] = []
-        if source_format == "agent-skills-spec":
-            skill_root = session.checkout_dir / "skills"
-            for skill_dir in sorted(skill_root.iterdir()):
-                if not skill_dir.is_dir() or not (skill_dir / "SKILL.md").exists():
-                    continue
-                imported.append(
-                    adapter.normalize_skill(
-                        source_root=session.checkout_dir,
-                        source_payload=source_payload,
-                        source_revision=revision,
-                        skill_dir=skill_dir,
-                    )
-                )
+        imported = adapter.import_records(
+            source_root=session.checkout_dir,
+            source_payload=source_payload,
+            source_revision=revision,
+        )
         resolved_tool_candidate_decisions = (
             dict(tool_candidate_decisions)
             if tool_candidate_decisions is not None
@@ -184,6 +175,7 @@ class SkillCompatibilityLayer:
                     "name": record.normalized_name,
                     "description": record.description,
                     "version": record.version,
+                    "category": record.category,
                     "source_skill_path": record.source_skill_path,
                     "references": [asdict(item) for item in record.references],
                     "context_contracts": [asdict(item) for item in record.context_contracts],
@@ -668,6 +660,7 @@ class SkillCompatibilityLayer:
                 "name": record.normalized_name,
                 "version": record.version,
                 "description": record.description,
+                "category": record.category,
                 "source": str(source_payload.get("location", source_id)),
                 "source_kind": "imported",
                 "source_id": source_id,

@@ -120,6 +120,11 @@ class TestPredefinedMetrics:
             "provider_fallback_count",
             "provider_circuit_open_count",
             "llm_cache_savings_usd",
+            "skill_import_job_count",
+            "skill_import_job_duration_seconds",
+            "skill_import_queue_depth",
+            "skill_import_worker_is_leader",
+            "skill_import_worker_heartbeat_unix",
         }
         assert set(PREDEFINED_METRICS.keys()) == expected
 

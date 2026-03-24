@@ -1,0 +1,6 @@
+interface:
+  display_name: "Customer Onboarding Playbooks"
+  short_description: "Milestone-based onboarding and activation"
+  default_prompt: "Use $customer-onboarding-playbooks to design a milestone-based onboarding plan with clear owners, risks, and time-to-value checkpoints."
+policy:
+  allow_implicit_invocation: true

@@ -15,6 +15,7 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
+from pylon.control_plane.lifecycle_handlers import ensure_lifecycle_workflow_handlers
 from pylon.control_plane.workflow_service import WorkflowControlPlaneStore
 from pylon.lifecycle import (
     default_lifecycle_project_record,
@@ -27,6 +28,8 @@ from pylon.observability.query_service import (
     rebuild_run_query_payload,
 )
 from pylon.observability.run_payload import build_public_run_payload
+from pylon.repository.checkpoint import Checkpoint
+from pylon.repository.workflow import WorkflowRun
 from pylon.runtime import (
     execute_project_sync,
     normalize_runtime_input,
@@ -37,6 +40,16 @@ from pylon.runtime.llm import ProviderRegistry
 from pylon.types import RunStatus, RunStopReason
 
 logger = logging.getLogger(__name__)
+
+_LIFECYCLE_PHASE_ORDER = (
+    "research",
+    "planning",
+    "design",
+    "approval",
+    "development",
+    "deploy",
+    "iterate",
+)
 
 TERMINAL_ASYNC_RUN_STATUSES = frozenset(
     {
@@ -114,6 +127,41 @@ def _phase_is_in_progress(
     )
 
 
+def _project_has_downstream_progress(
+    project_record: Mapping[str, Any],
+    *,
+    phase: str,
+) -> bool:
+    try:
+        phase_index = _LIFECYCLE_PHASE_ORDER.index(phase)
+    except ValueError:
+        return False
+    downstream_phases = _LIFECYCLE_PHASE_ORDER[phase_index + 1 :]
+    if any(
+        isinstance(entry, Mapping)
+        and str(entry.get("phase", "")) in downstream_phases
+        and str(entry.get("status", "")) not in {"", "locked"}
+        for entry in project_record.get("phaseStatuses", [])
+    ):
+        return True
+    return any(
+        _phase_has_persisted_output(project_record, phase=downstream_phase)
+        for downstream_phase in downstream_phases
+        if downstream_phase in {"research", "planning", "design", "development"}
+    )
+
+
+def _run_backfilled_spec(run_record: Mapping[str, Any]) -> str:
+    for field_name in ("state", "input_data", "input"):
+        payload = run_record.get(field_name)
+        if not isinstance(payload, Mapping):
+            continue
+        spec = str(payload.get("spec", "") or "").strip()
+        if spec:
+            return spec
+    return ""
+
+
 def sync_lifecycle_project_for_run(
     store: WorkflowControlPlaneStore,
     *,
@@ -189,10 +237,17 @@ def reconcile_lifecycle_projects_for_terminal_runs(
         candidate_runs = ordered_runs if replay_full_history else ordered_runs[-1:]
         for run_record in candidate_runs:
             existing = store.get_surface_record("lifecycle_projects", lifecycle_key)
+            if (
+                isinstance(existing, dict)
+                and str(run_record.get("status", "")) != RunStatus.COMPLETED.value
+                and _project_has_downstream_progress(existing, phase=phase)
+            ):
+                continue
             if isinstance(existing, dict) and not _lifecycle_project_sync_needed(
                 existing,
                 phase=phase,
                 run_id=str(run_record.get("id", "")),
+                run_record=run_record,
                 force=replay_full_history,
             ):
                 continue
@@ -219,10 +274,20 @@ def _lifecycle_project_sync_needed(
     *,
     phase: str,
     run_id: str,
+    run_record: Mapping[str, Any] | None = None,
     force: bool = False,
 ) -> bool:
     if force:
         return True
+    if (
+        run_record is not None
+        and str(run_record.get("status", "")) != RunStatus.COMPLETED.value
+        and _project_has_downstream_progress(project_record, phase=phase)
+    ):
+        return False
+    if run_record is not None and not str(project_record.get("spec", "") or "").strip():
+        if _run_backfilled_spec(run_record):
+            return True
     phase_status = next(
         (
             str(entry.get("status", ""))
@@ -278,6 +343,12 @@ class AsyncWorkflowRunManager:
         project = self._store.get_workflow_project(workflow_id, tenant_id=tenant_id)
         if project is None:
             raise KeyError(f"Workflow not found: {workflow_id}")
+        ensure_lifecycle_workflow_handlers(
+            self._store,
+            workflow_id=workflow_id,
+            tenant_id=tenant_id,
+            provider_registry=self._provider_registry,
+        )
 
         normalized_idempotency_key = (idempotency_key or "").strip()
         if normalized_idempotency_key:
@@ -465,6 +536,15 @@ class AsyncWorkflowRunManager:
                 node_handlers=self._store.get_node_handlers(workflow_id),
                 agent_handlers=self._store.get_agent_handlers(workflow_id),
                 provider_registry=self._provider_registry,
+                progress_callback=lambda run, checkpoints: self._persist_progress_snapshot(
+                    run_id=run_id,
+                    workflow_id=workflow_id,
+                    tenant_id=tenant_id,
+                    input_data=input_data,
+                    run=run,
+                    checkpoints=checkpoints,
+                    project_name=project.name,
+                ),
             )
             stored = self._persist_artifacts(
                 run_id=run_id,
@@ -580,6 +660,61 @@ class AsyncWorkflowRunManager:
             self._store.put_approval_record(approval_payload)
         self._notify_terminal_run(stored, workflow_id=workflow_id, tenant_id=tenant_id)
         return stored
+
+    def _persist_progress_snapshot(
+        self,
+        *,
+        run_id: str,
+        workflow_id: str,
+        tenant_id: str,
+        input_data: Any,
+        run: WorkflowRun,
+        checkpoints: tuple[Checkpoint, ...],
+        project_name: str,
+    ) -> None:
+        try:
+            existing = self._store.get_run_record(run_id)
+            if not isinstance(existing, dict):
+                return
+            expected_record_version = int(existing.get("record_version", 1))
+            artifacts = ExecutionArtifacts(run=run, checkpoints=checkpoints)
+            run_record = serialize_run(
+                artifacts,
+                project_name=project_name,
+                workflow_name=workflow_id,
+                input_data=input_data,
+            )
+            run_record["id"] = run_id
+            run_record["execution_mode"] = "async"
+            runtime_metrics = dict(run_record.get("runtime_metrics") or {})
+            runtime_metrics["async_worker"] = {
+                "status": "running",
+                "thread_name": threading.current_thread().name,
+            }
+            run_record["runtime_metrics"] = runtime_metrics
+            if existing.get("correlation_id") is not None:
+                run_record["correlation_id"] = existing.get("correlation_id")
+            if existing.get("trace_id") is not None:
+                run_record["trace_id"] = existing.get("trace_id")
+            for checkpoint in checkpoints:
+                checkpoint_payload = checkpoint.to_dict()
+                checkpoint_payload["run_id"] = run_id
+                checkpoint_payload["workflow_run_id"] = run_id
+                self._store.put_checkpoint_record(checkpoint_payload)
+            self._store.put_run_record(
+                run_record,
+                workflow_id=workflow_id,
+                tenant_id=tenant_id,
+                parameters=dict(existing.get("parameters", {})),
+                expected_record_version=expected_record_version,
+            )
+        except Exception:
+            self._logger.exception(
+                "async_workflow_run_progress_persist_failed workflow_id=%s tenant_id=%s run_id=%s",
+                workflow_id,
+                tenant_id,
+                run_id,
+            )
 
     def _persist_failed_record(
         self,
