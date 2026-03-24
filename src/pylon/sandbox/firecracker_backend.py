@@ -470,6 +470,137 @@ class DockerSandboxBackend(SandboxBackend):
         session._active = False
 
 
+class LocalProcessSandboxBackend(SandboxBackend):
+    """Explicit host-process backend for trusted internal tools."""
+
+    def __init__(self) -> None:
+        self._workspaces: dict[str, Path] = {}
+
+    async def create(
+        self,
+        template: str = "",
+        *,
+        timeout: int = 300,
+        env_vars: dict[str, str] | None = None,
+    ) -> SandboxSession:
+        import uuid
+
+        session_id = f"local_{uuid.uuid4().hex[:8]}"
+        workspace_dir = Path(tempfile.mkdtemp(prefix=f"{session_id}-"))
+        session = SandboxSession(
+            id=session_id,
+            backend=SandboxBackendType.LOCAL,
+            template=template or "local",
+            timeout=timeout,
+            metadata={
+                "workspace_dir": str(workspace_dir),
+                "env_vars": dict(env_vars or {}),
+            },
+        )
+        self._workspaces[session_id] = workspace_dir
+        return session
+
+    async def execute(
+        self,
+        session: SandboxSession,
+        code: str,
+        *,
+        language: str = "python",
+        timeout: int = 30,
+    ) -> ExecutionResult:
+        if language == "python":
+            command = f"python - <<'PY'\n{code}\nPY"
+        else:
+            command = f"cat <<'PYLON_CODE' | {language}\n{code}\nPYLON_CODE"
+        return await self.execute_command(
+            session,
+            command,
+            cwd="/workspace",
+            timeout=timeout,
+        )
+
+    async def execute_command(
+        self,
+        session: SandboxSession,
+        command: str,
+        *,
+        cwd: str = "/workspace",
+        timeout: int = 30,
+        env_vars: dict[str, str] | None = None,
+    ) -> ExecutionResult:
+        workspace_dir = self._workspaces.get(session.id)
+        if workspace_dir is None:
+            return ExecutionResult(exit_code=1, error="Session not found or expired")
+
+        target_cwd = workspace_dir / _workspace_relative_path(cwd)
+        target_cwd.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                cwd=str(target_cwd),
+                env={
+                    **os.environ,
+                    **dict(session.metadata.get("env_vars", {})),
+                    **dict(env_vars or {}),
+                },
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                executable="/bin/sh",
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return ExecutionResult(
+                stdout=stdout.decode("utf-8", errors="replace"),
+                stderr=stderr.decode("utf-8", errors="replace"),
+                exit_code=proc.returncode or 0,
+                duration_ms=(time.monotonic() - started) * 1000,
+            )
+        except TimeoutError:
+            return ExecutionResult(
+                exit_code=124,
+                timed_out=True,
+                duration_ms=(time.monotonic() - started) * 1000,
+            )
+        except Exception as exc:
+            return ExecutionResult(
+                exit_code=1,
+                error=str(exc),
+                duration_ms=(time.monotonic() - started) * 1000,
+            )
+
+    async def write_file(
+        self,
+        session: SandboxSession,
+        path: str,
+        content: str | bytes,
+    ) -> None:
+        workspace_dir = self._workspaces.get(session.id)
+        if workspace_dir is None:
+            raise RuntimeError("Session not found")
+        target = workspace_dir / _workspace_relative_path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, bytes):
+            target.write_bytes(content)
+        else:
+            target.write_text(content, encoding="utf-8")
+
+    async def read_file(
+        self,
+        session: SandboxSession,
+        path: str,
+    ) -> str:
+        workspace_dir = self._workspaces.get(session.id)
+        if workspace_dir is None:
+            raise RuntimeError("Session not found")
+        return (workspace_dir / _workspace_relative_path(path)).read_text(encoding="utf-8")
+
+    async def destroy(self, session: SandboxSession) -> None:
+        workspace_dir = self._workspaces.pop(session.id, None)
+        if workspace_dir is not None:
+            shutil.rmtree(workspace_dir, ignore_errors=True)
+        session._active = False
+
+
 class SandboxManager:
     """Selects sandbox backend based on backend type."""
 
@@ -494,6 +625,8 @@ class SandboxManager:
                 )
             elif backend_type == SandboxBackendType.DOCKER:
                 self._backends[backend_type] = DockerSandboxBackend(image=self._docker_image)
+            elif backend_type == SandboxBackendType.LOCAL:
+                self._backends[backend_type] = LocalProcessSandboxBackend()
             else:
                 raise ValueError(f"No backend for {backend_type}")
         return self._backends[backend_type]
