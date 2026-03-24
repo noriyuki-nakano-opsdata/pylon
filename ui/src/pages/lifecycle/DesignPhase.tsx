@@ -72,7 +72,11 @@ import type {
   LifecycleDecisionContext,
   LifecycleDecisionContextIssue,
   LifecycleDecisionFrame,
+  PrototypeFlow,
   PrototypeScreen,
+  PrototypeSpecComponent,
+  PrototypeSpecRoute,
+  PrototypeSpecState,
 } from "@/types/lifecycle";
 
 const DESIGN_AGENTS = [
@@ -565,6 +569,52 @@ function prototypeFileKindLabel(value: string | null | undefined): string {
   return presentNamedItem(value) || value;
 }
 
+function prototypeFrameworkTargetLabel(value: string | null | undefined): string {
+  if (!value) return "未設定";
+  if (value.toLowerCase() === "nextjs-app-router") return "Next.js App Router";
+  return presentNamedItem(value) || value;
+}
+
+function activePrototypeStates(
+  variant: DesignVariant | null,
+  activeScreenId: string | null,
+): PrototypeSpecState[] {
+  const stateMatrix = variant?.prototype_spec?.state_matrix ?? {};
+  if (activeScreenId && stateMatrix[activeScreenId]?.length) {
+    return stateMatrix[activeScreenId].slice(0, 4);
+  }
+  const fallbackStates = Object.values(stateMatrix).flat();
+  return fallbackStates.slice(0, 4);
+}
+
+function activePrototypeRoutes(
+  variant: DesignVariant | null,
+  activeScreenId: string | null,
+): PrototypeSpecRoute[] {
+  const routes = variant?.prototype_spec?.routes ?? [];
+  if (activeScreenId) {
+    const scoped = routes.filter((route) => route.screen_id === activeScreenId);
+    if (scoped.length > 0) return scoped.slice(0, 3);
+  }
+  return routes.slice(0, 3);
+}
+
+function activePrototypeComponents(
+  variant: DesignVariant | null,
+  activeScreenId: string | null,
+): PrototypeSpecComponent[] {
+  const components = variant?.prototype_spec?.components ?? [];
+  if (activeScreenId) {
+    const scoped = components.filter((component) => component.screen_id === activeScreenId);
+    if (scoped.length > 0) return scoped.slice(0, 4);
+  }
+  return components.slice(0, 4);
+}
+
+function acceptanceFlowsFor(variant: DesignVariant | null): PrototypeFlow[] {
+  return (variant?.prototype_spec?.acceptance_flows ?? []).slice(0, 3);
+}
+
 function firstEvidenceFor(variant: DesignVariant, labelFragments: string[]): string {
   const item = scoreItems(variant).find((entry) => labelFragments.some((fragment) => entry.label.includes(fragment)));
   return item?.evidence ?? "";
@@ -760,6 +810,10 @@ export function DesignPhase() {
   }, [activeVariant?.id, activeVariant?.prototype?.screens]);
 
   const activeScreen = activeScreenFor(activeVariant, activeScreenId);
+  const activePrototypeStatesList = activePrototypeStates(activeVariant, activeScreen?.id ?? activeScreenId);
+  const activePrototypeRoutesList = activePrototypeRoutes(activeVariant, activeScreen?.id ?? activeScreenId);
+  const activePrototypeComponentsList = activePrototypeComponents(activeVariant, activeScreen?.id ?? activeScreenId);
+  const acceptanceFlows = acceptanceFlowsFor(activeVariant);
   const activePreviewHtml = activeVariant ? localizePreviewHtmlForDisplay(activeVariant.preview_html) : "";
   const projectFrame = projectFrameOf(lc.decisionContext);
   const contextIssues = contextIssuesOf(lc.decisionContext);
@@ -1722,6 +1776,118 @@ export function DesignPhase() {
                         ) : null}
                       </div>
                     </div>
+                    {activeVariant?.prototype_spec ? (
+                      <div className="rounded-[1.6rem] border border-border/70 bg-background/78 p-5">
+                        <p className="text-[11px] font-semibold tracking-[0.18em] text-muted-foreground">試作仕様カバレッジ</p>
+                        <div className="mt-4 flex flex-wrap gap-2">
+                          <Badge variant="assistive" size="field">
+                            {prototypeFrameworkTargetLabel(activeVariant.prototype_spec.framework_target)}
+                          </Badge>
+                          <Badge variant="optional" size="field">
+                            {(activeVariant.prototype_spec.routes ?? []).length} ルート設計
+                          </Badge>
+                          <Badge variant="optional" size="field">
+                            {(activeVariant.prototype_spec.components ?? []).length} コンポーネント責務
+                          </Badge>
+                          <Badge variant="optional" size="field">
+                            {(activeVariant.prototype_spec.quality_targets ?? []).length} 品質ターゲット
+                          </Badge>
+                        </div>
+
+                        {(activeVariant.prototype_spec.quality_targets ?? []).length > 0 ? (
+                          <div className="mt-4">
+                            <p className="text-[11px] font-semibold tracking-[0.14em] text-muted-foreground">品質ターゲット</p>
+                            <div className="mt-2 flex flex-wrap gap-2">
+                              {(activeVariant.prototype_spec.quality_targets ?? []).slice(0, 4).map((target) => (
+                                <Badge key={target} variant="optional" size="field">
+                                  {presentNamedItem(target)}
+                                </Badge>
+                              ))}
+                            </div>
+                          </div>
+                        ) : null}
+
+                        <div className="mt-4 grid gap-3">
+                          {activePrototypeStatesList.length > 0 ? (
+                            <div className="rounded-2xl border border-border/60 bg-card/70 px-4 py-3">
+                              <p className="text-[11px] font-semibold tracking-[0.14em] text-muted-foreground">
+                                状態マトリクス
+                              </p>
+                              <div className="mt-3 space-y-3">
+                                {activePrototypeStatesList.map((state) => (
+                                  <div key={`${state.state}-${state.trigger}`} className="rounded-2xl border border-border/50 bg-background/70 px-3 py-3">
+                                    <p className="text-xs font-semibold tracking-[0.14em] text-foreground/88">
+                                      {presentNamedItem(state.state)}
+                                    </p>
+                                    <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                                      {presentNamedItem(state.trigger)}
+                                    </p>
+                                    <p className="mt-2 text-xs leading-5 text-foreground/88">
+                                      {presentNamedItem(state.summary)}
+                                    </p>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          ) : null}
+
+                          {(activePrototypeRoutesList.length > 0 || activePrototypeComponentsList.length > 0) ? (
+                            <div className="rounded-2xl border border-border/60 bg-card/70 px-4 py-3">
+                              <p className="text-[11px] font-semibold tracking-[0.14em] text-muted-foreground">画面ごとの構成</p>
+                              <div className="mt-3 grid gap-3 md:grid-cols-2">
+                                {activePrototypeRoutesList.length > 0 ? (
+                                  <div className="space-y-2">
+                                    {activePrototypeRoutesList.map((route) => (
+                                      <div key={route.id} className="rounded-2xl border border-border/50 bg-background/70 px-3 py-3">
+                                        <p className="text-xs font-semibold tracking-[0.14em] text-muted-foreground">{route.path}</p>
+                                        <p className="mt-1 text-xs leading-5 text-foreground/88">
+                                          {presentNamedItem(route.title || route.headline)}
+                                        </p>
+                                      </div>
+                                    ))}
+                                  </div>
+                                ) : null}
+                                {activePrototypeComponentsList.length > 0 ? (
+                                  <div className="space-y-2">
+                                    {activePrototypeComponentsList.map((component) => (
+                                      <div key={component.id} className="rounded-2xl border border-border/50 bg-background/70 px-3 py-3">
+                                        <p className="text-xs font-semibold tracking-[0.14em] text-muted-foreground">
+                                          {presentNamedItem(component.kind)}
+                                        </p>
+                                        <p className="mt-1 text-xs leading-5 text-foreground/88">
+                                          {presentNamedItem(component.title)}
+                                        </p>
+                                      </div>
+                                    ))}
+                                  </div>
+                                ) : null}
+                              </div>
+                            </div>
+                          ) : null}
+
+                          {acceptanceFlows.length > 0 ? (
+                            <div className="rounded-2xl border border-border/60 bg-card/70 px-4 py-3">
+                              <p className="text-[11px] font-semibold tracking-[0.14em] text-muted-foreground">受け入れフロー</p>
+                              <div className="mt-3 space-y-3">
+                                {acceptanceFlows.map((flow) => (
+                                  <div key={flow.id} className="rounded-2xl border border-border/50 bg-background/70 px-3 py-3">
+                                    <p className="text-xs font-semibold tracking-[0.14em] text-foreground/88">
+                                      {presentNamedItem(flow.name)}
+                                    </p>
+                                    <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                                      {flow.steps.map((step) => presentNamedItem(step)).join(" / ")}
+                                    </p>
+                                    <p className="mt-2 text-xs leading-5 text-foreground/88">
+                                      目的: {presentNamedItem(flow.goal)}
+                                    </p>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          ) : null}
+                        </div>
+                      </div>
+                    ) : null}
                     {activeVariant?.prototype_app ? (
                       <div className="rounded-[1.6rem] border border-border/70 bg-background/78 p-5">
                         <p className="text-[11px] font-semibold tracking-[0.18em] text-muted-foreground">実装ハンドオフ試作</p>

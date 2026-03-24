@@ -147,6 +147,98 @@ function makeLifecycleState(): LifecycleWorkspaceView {
         pattern_name: "Ivory Signal Gallery",
         description: "An art-directed operations suite.",
         preview_html: "<!doctype html><html><body>preview</body></html>",
+        prototype_spec: {
+          schema_version: "1",
+          framework_target: "nextjs-app-router",
+          title: "Lifecycle Workspace",
+          subtitle: "Approval-aware control plane",
+          shell: {
+            kind: "product-workspace",
+            layout: "sidebar",
+            density: "balanced",
+            status_badges: ["approval"],
+            primary_navigation: [{ id: "workspace", label: "Workspace", priority: "primary" }],
+          },
+          theme: {
+            primary: "#0f766e",
+            accent: "#f59e0b",
+            background: "#f8fafc",
+            surface: "#ffffff",
+            text: "#0f172a",
+            heading_font: "IBM Plex Sans",
+            body_font: "IBM Plex Sans",
+          },
+          selected_features: ["research workspace", "approval gate"],
+          screens: [
+            {
+              id: "workspace",
+              title: "Lifecycle Workspace — Active Run View",
+              headline: "Run discovery-to-build workflow",
+              purpose: "Primary work area for each phase",
+              layout: "command-center",
+              supporting_text: "",
+              primary_actions: ["Approve"],
+              modules: [{ name: "Approval Gate", type: "panel", items: ["Evidence", "Decision"] }],
+              success_state: "",
+            },
+          ],
+          routes: [
+            {
+              id: "route-workspace",
+              screen_id: "workspace",
+              path: "/",
+              segment: "workspace",
+              title: "Lifecycle Workspace",
+              headline: "Run discovery-to-build workflow",
+              layout: "command-center",
+              primary_actions: ["Approve"],
+              states: ["default", "review_ready", "approved"],
+            },
+          ],
+          components: [
+            {
+              id: "component-approval-gate",
+              screen_id: "workspace",
+              kind: "panel",
+              title: "Approval Gate",
+              purpose: "Evidence と Decision を同じ面に保つ",
+              data_keys: ["approvalPacket", "decisionLog"],
+            },
+          ],
+          mock_data: {
+            approvals: [
+              { id: "approval-1", status: "pending" },
+            ],
+          },
+          state_matrix: {
+            workspace: [
+              {
+                state: "review_ready",
+                trigger: "根拠確認が完了したとき",
+                summary: "承認理由と根拠リンクを同じ面で固定できる",
+              },
+            ],
+          },
+          interaction_map: [
+            {
+              screen_id: "workspace",
+              action: "承認パケットを開く",
+              result: "Evidence と Decision を同じ面で確認する",
+            },
+          ],
+          acceptance_flows: [
+            {
+              id: "acceptance-1",
+              name: "Evidence to Approval",
+              steps: ["Review evidence", "Capture rationale", "Approve"],
+              goal: "handoff",
+            },
+          ],
+          quality_targets: [
+            "承認理由と根拠リンクを同じ文脈で確認できること",
+            "主要操作がキーボードでも迷わず辿れること",
+          ],
+        },
         tokens: { in: 4200, out: 3100 },
         cost_usd: 0.28,
         scores: { ux_quality: 0.94, code_quality: 0.89, performance: 0.88, accessibility: 0.93 },
@@ -246,6 +338,87 @@ function makeLifecycleState(): LifecycleWorkspaceView {
         pattern_name: "Obsidian Control Atelier",
         description: "A denser control-room workspace.",
         preview_html: "<!doctype html><html><body>preview b</body></html>",
+        prototype_spec: {
+          schema_version: "1",
+          framework_target: "nextjs-app-router",
+          title: "Command Deck",
+          subtitle: "Dense operator cockpit",
+          shell: {
+            kind: "control-center",
+            layout: "sidebar",
+            density: "high",
+            status_badges: ["lineage"],
+            primary_navigation: [{ id: "deck", label: "Command Deck", priority: "primary" }],
+          },
+          theme: {
+            primary: "#0f172a",
+            accent: "#f97316",
+            background: "#020617",
+            surface: "#0f172a",
+            text: "#e2e8f0",
+            heading_font: "IBM Plex Sans",
+            body_font: "IBM Plex Sans",
+          },
+          selected_features: ["artifact lineage", "run ledger"],
+          screens: [
+            {
+              id: "deck",
+              title: "Command Deck",
+              headline: "Trace artifact lineage",
+              purpose: "Phase artifacts and lineage",
+              layout: "command-center",
+              supporting_text: "",
+              primary_actions: ["Review planning"],
+              modules: [{ name: "Run Monitor", type: "panel", items: ["Approval packet", "Decision log"] }],
+              success_state: "",
+            },
+          ],
+          routes: [
+            {
+              id: "route-deck",
+              screen_id: "deck",
+              path: "/",
+              segment: "deck",
+              title: "Command Deck",
+              headline: "Trace artifact lineage",
+              layout: "command-center",
+              primary_actions: ["Review planning"],
+              states: ["default", "blocked"],
+            },
+          ],
+          components: [
+            {
+              id: "component-run-monitor",
+              screen_id: "deck",
+              kind: "panel",
+              title: "Run Monitor",
+              purpose: "判断と系譜を同じ面で追跡する",
+              data_keys: ["runLedger", "decisionLog"],
+            },
+          ],
+          mock_data: {},
+          state_matrix: {
+            deck: [
+              {
+                state: "blocked",
+                trigger: "系譜または承認情報が欠けたとき",
+                summary: "復旧レーンをその場で開き、欠落を埋め直せる",
+              },
+            ],
+          },
+          interaction_map: [],
+          acceptance_flows: [
+            {
+              id: "acceptance-2",
+              name: "Lineage Review",
+              steps: ["Trace", "Review", "Recover"],
+              goal: "lineage",
+            },
+          ],
+          quality_targets: [
+            "成果物の系譜を operator 目線で読めること",
+          ],
+        },
         tokens: { in: 3800, out: 2800 },
         cost_usd: 0.04,
         scores: { ux_quality: 0.91, code_quality: 0.9, performance: 0.87, accessibility: 0.9 },
@@ -388,8 +561,13 @@ describe("DesignPhase", () => {
     expect(screen.getByText("プレビュー品質")).toBeInTheDocument();
     expect(screen.getByText("文言品質")).toBeInTheDocument();
     expect(screen.getByText("引き継ぎ準備度")).toBeInTheDocument();
+    expect(screen.getByText("試作仕様カバレッジ")).toBeInTheDocument();
+    expect(screen.getByText("品質ターゲット")).toBeInTheDocument();
+    expect(screen.getByText("状態マトリクス")).toBeInTheDocument();
+    expect(screen.getByText("受け入れフロー")).toBeInTheDocument();
     expect(screen.getByText("Next.js")).toBeInTheDocument();
     expect(screen.getByText("App Router")).toBeInTheDocument();
+    expect(screen.getByText("Next.js App Router")).toBeInTheDocument();
     expect(screen.queryByText("handoff 準備度")).not.toBeInTheDocument();
     expect(screen.queryByText("採用判断サマリー")).not.toBeInTheDocument();
     expect(screen.queryByText("構造差分レビュー")).not.toBeInTheDocument();
@@ -552,6 +730,25 @@ describe("DesignPhase", () => {
     fireEvent.click(screen.getByRole("button", { name: "判断概要" }));
 
     expect(screen.getAllByText("要再生成").length).toBeGreaterThan(0);
+  });
+
+  it("renders without crashing when prototype_spec has missing arrays", () => {
+    const state = makeLifecycleState();
+    state.designVariants[0] = {
+      ...state.designVariants[0],
+      prototype_spec: {
+        schema_version: "1",
+        framework_target: "nextjs-app-router",
+        title: "T",
+        subtitle: "S",
+      } as typeof state.designVariants[0]["prototype_spec"],
+    };
+
+    renderSubject(state);
+
+    expect(screen.getByText("0 ルート設計")).toBeInTheDocument();
+    expect(screen.getByText("0 コンポーネント責務")).toBeInTheDocument();
+    expect(screen.getByText("0 品質ターゲット")).toBeInTheDocument();
   });
 
   it("shows restoring telemetry instead of zero-node warmup copy for completed design runs", () => {
