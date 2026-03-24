@@ -389,6 +389,9 @@ class APIObservabilityConfig:
     telemetry_sink_backend: TelemetrySinkBackend = TelemetrySinkBackend.NONE
     telemetry_export_path: str | None = None
     metrics_namespace: str = "pylon"
+    secrets_backend: str | None = None
+    secret_audit_backend: str | None = None
+    sandbox_backend: str | None = None
     open_telemetry: OpenTelemetryConfig = field(default_factory=OpenTelemetryConfig)
 
     @classmethod
@@ -446,6 +449,24 @@ class APIObservabilityConfig:
                 "observability.metrics_namespace must be a non-empty string",
                 details={"metrics_namespace": metrics_namespace},
             )
+        secrets_backend = raw.get("secrets_backend")
+        if secrets_backend is not None and not isinstance(secrets_backend, str):
+            raise ConfigError(
+                "observability.secrets_backend must be a string",
+                details={"secrets_backend": secrets_backend},
+            )
+        secret_audit_backend = raw.get("secret_audit_backend")
+        if secret_audit_backend is not None and not isinstance(secret_audit_backend, str):
+            raise ConfigError(
+                "observability.secret_audit_backend must be a string",
+                details={"secret_audit_backend": secret_audit_backend},
+            )
+        sandbox_backend = raw.get("sandbox_backend")
+        if sandbox_backend is not None and not isinstance(sandbox_backend, str):
+            raise ConfigError(
+                "observability.sandbox_backend must be a string",
+                details={"sandbox_backend": sandbox_backend},
+            )
         try:
             open_telemetry = OpenTelemetryConfig.from_mapping(raw.get("open_telemetry"))
         except ValueError as exc:
@@ -462,6 +483,9 @@ class APIObservabilityConfig:
             telemetry_sink_backend=telemetry_sink_backend,
             telemetry_export_path=telemetry_export_path,
             metrics_namespace=metrics_namespace,
+            secrets_backend=secrets_backend,
+            secret_audit_backend=secret_audit_backend,
+            sandbox_backend=sandbox_backend,
             open_telemetry=open_telemetry,
         )
 
@@ -757,6 +781,9 @@ def build_api_server(
                 if config.middleware.rate_limit.enabled
                 else None
             ),
+            secrets_backend=config.observability.secrets_backend,
+            secret_audit_backend=config.observability.secret_audit_backend,
+            sandbox_backend=config.observability.sandbox_backend,
             metrics_namespace=config.observability.metrics_namespace,
             enable_prometheus_exporter=(
                 config.observability.exporter_backend

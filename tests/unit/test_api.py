@@ -45,7 +45,11 @@ from pylon.api.schemas import (
 )
 from pylon.api.server import APIServer, Request, Response
 from pylon.approval.types import compute_approval_binding_hash
-from pylon.control_plane import ControlPlaneBackend, InMemoryWorkflowControlPlaneStore
+from pylon.control_plane import (
+    ControlPlaneBackend,
+    InMemoryWorkflowControlPlaneStore,
+    SQLiteWorkflowControlPlaneStore,
+)
 from pylon.dsl.parser import PylonProject
 from pylon.errors import ConcurrencyError
 from pylon.lifecycle import build_lifecycle_approval_binding
@@ -432,10 +436,16 @@ class TestServerRouting:
 
         resp = server.handle_request("GET", "/ready")
 
-        assert resp.status_code == 200
-        assert resp.body["status"] == "ready"
-        assert resp.body["ready"] is True
+        assert resp.status_code == 503
+        assert resp.body["status"] == "not_ready"
+        assert resp.body["ready"] is False
         assert "checks" in resp.body
+        control_plane = next(
+            item for item in resp.body["checks"] if item["name"] == "control_plane"
+        )
+        assert control_plane["backend"] == "memory"
+        assert control_plane["readiness_tier"] == "reference"
+        assert control_plane["production_capable"] is False
 
     def test_metrics_endpoint_renders_prometheus_text(self):
         server, _ = build_api_server(
@@ -1070,6 +1080,68 @@ class TestAgentRoutes:
         assert check["status"] == "unhealthy"
         assert check["pending"] >= 1
         assert "backlog exists" in check["message"]
+
+    def test_readiness_bundle_marks_single_node_stack_as_production_capable(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        observability = build_api_observability_bundle(
+            control_plane_store=SQLiteWorkflowControlPlaneStore(
+                str(tmp_path / "control-plane.db")
+            ),
+            auth_backend=AuthBackend.JWT_HS256.value,
+            rate_limit_backend="sqlite",
+            secrets_backend="file_vault",
+            secret_audit_backend="jsonl",
+            sandbox_backend="docker",
+            metrics_namespace="pylon",
+            enable_prometheus_exporter=False,
+        )
+
+        report = observability.readiness_checker.run_all_sync()
+
+        assert report["status"] == "healthy"
+        checks = {item["name"]: item for item in report["checks"]}
+        assert checks["control_plane"]["readiness_tier"] == "single-node"
+        assert checks["control_plane"]["production_capable"] is True
+        assert checks["auth"]["readiness_tier"] == "single-node"
+        assert checks["auth"]["production_capable"] is True
+        assert checks["rate_limit"]["readiness_tier"] == "single-node"
+        assert checks["rate_limit"]["production_capable"] is True
+        assert checks["secrets"]["readiness_tier"] == "single-node"
+        assert checks["secrets"]["production_capable"] is True
+        assert checks["secret_audit"]["readiness_tier"] == "single-node"
+        assert checks["secret_audit"]["production_capable"] is True
+        assert checks["sandbox"]["readiness_tier"] == "single-node"
+        assert checks["sandbox"]["production_capable"] is True
+
+    def test_readiness_bundle_marks_unknown_backends_as_not_production_capable(
+        self,
+    ) -> None:
+        observability = build_api_observability_bundle(
+            control_plane_store=InMemoryWorkflowControlPlaneStore(),
+            auth_backend="my_custom_auth",
+            rate_limit_backend="my_custom_rl",
+            secrets_backend="my_custom_secrets",
+            secret_audit_backend="my_custom_audit",
+            sandbox_backend="my_custom_sandbox",
+            metrics_namespace="pylon",
+            enable_prometheus_exporter=False,
+        )
+
+        report = observability.readiness_checker.run_all_sync()
+
+        checks = {item["name"]: item for item in report["checks"]}
+        assert checks["auth"]["production_capable"] is False
+        assert checks["auth"]["readiness_tier"] == "unknown"
+        assert checks["rate_limit"]["production_capable"] is False
+        assert checks["rate_limit"]["readiness_tier"] == "unknown"
+        assert checks["secrets"]["production_capable"] is False
+        assert checks["secrets"]["readiness_tier"] == "unknown"
+        assert checks["secret_audit"]["production_capable"] is False
+        assert checks["secret_audit"]["readiness_tier"] == "unknown"
+        assert checks["sandbox"]["production_capable"] is False
+        assert checks["sandbox"]["readiness_tier"] == "unknown"
 
     def test_features_endpoint_returns_product_surface_manifest(self):
         server, _ = _server_with_routes()
@@ -4615,3 +4687,36 @@ class TestHealthChecker:
         assert system_check["name"] == "system"
         assert system_check["status"] == "healthy"
         assert "timestamp" in body
+
+
+class TestCountWorkflowProjects:
+    """Tests for the count_workflow_projects method on store backends."""
+
+    def test_in_memory_store_count_empty(self):
+        store = InMemoryWorkflowControlPlaneStore()
+        assert store.count_workflow_projects() == 0
+
+    def test_in_memory_store_count_after_register(self):
+        store = InMemoryWorkflowControlPlaneStore()
+        project = _workflow_project("proj-a")
+        store.register_workflow_project("wf-1", project, tenant_id="default")
+        assert store.count_workflow_projects() == 1
+        store.register_workflow_project("wf-2", project, tenant_id="default")
+        assert store.count_workflow_projects() == 2
+
+    def test_in_memory_store_count_after_remove(self):
+        store = InMemoryWorkflowControlPlaneStore()
+        project = _workflow_project("proj-b")
+        store.register_workflow_project("wf-1", project, tenant_id="default")
+        store.register_workflow_project("wf-2", project, tenant_id="other")
+        assert store.count_workflow_projects() == 2
+        store.remove_workflow_project("wf-1", tenant_id="default")
+        assert store.count_workflow_projects() == 1
+
+    def test_in_memory_store_count_matches_list_all(self):
+        store = InMemoryWorkflowControlPlaneStore()
+        project = _workflow_project("proj-c")
+        store.register_workflow_project("wf-1", project, tenant_id="t1")
+        store.register_workflow_project("wf-2", project, tenant_id="t2")
+        store.register_workflow_project("wf-3", project, tenant_id="t1")
+        assert store.count_workflow_projects() == len(store.list_all_workflow_projects())

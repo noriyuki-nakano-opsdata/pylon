@@ -25,6 +25,7 @@ const STATUS_MAP: Record<
   healthy: { label: "Healthy", variant: "success" },
   degraded: { label: "Degraded", variant: "warning" },
   down: { label: "Down", variant: "destructive" },
+  not_ready: { label: "Not Ready", variant: "warning" },
   // Circuit breaker
   closed: { label: "Closed", variant: "success" },
   open: { label: "Open", variant: "destructive" },

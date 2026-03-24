@@ -308,6 +308,13 @@ class SQLiteWorkflowControlPlaneStore:
             for row in rows
         ]
 
+    def count_workflow_projects(self) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS cnt FROM workflow_projects"
+            ).fetchone()
+        return int(row["cnt"]) if row is not None else 0
+
     def get_run_record(self, run_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute(

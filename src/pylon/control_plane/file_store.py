@@ -161,6 +161,11 @@ class JsonFileWorkflowControlPlaneStore:
         results.sort(key=lambda item: (item[0], item[1]))
         return results
 
+    def count_workflow_projects(self) -> int:
+        with self._lock:
+            state = self._read_state()
+        return len(state["workflow_projects"])
+
     def get_run_record(self, run_id: str) -> dict[str, Any] | None:
         with self._lock:
             state = self._read_state()

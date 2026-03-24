@@ -31,6 +31,7 @@ export const queryKeys = {
   providers: {
     list: () => ["providers"] as const,
     health: () => ["providers", "health"] as const,
+    readiness: () => ["providers", "readiness"] as const,
   },
   models: {
     all: ["models"] as const,

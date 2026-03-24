@@ -110,7 +110,9 @@ def test_build_api_server_with_default_stack() -> None:
     resp = server.handle_request("GET", "/health")
     assert resp.status_code == 200
     ready = server.handle_request("GET", "/ready")
-    assert ready.status_code == 200
+    assert ready.status_code == 503
+    assert ready.body["status"] == "not_ready"
+    assert ready.body["ready"] is False
     metrics = server.handle_request("GET", "/metrics")
     assert metrics.status_code == 200
     assert metrics.headers["content-type"].startswith("text/plain")
@@ -121,6 +123,52 @@ def test_build_api_server_with_default_stack() -> None:
     assert agent.headers["x-trace-id"]
     assert agent.headers["x-span-id"]
     assert agent.headers["traceparent"].startswith("00-")
+
+
+def test_build_api_server_with_single_node_production_stack(tmp_path: Path) -> None:
+    server, _ = build_api_server(
+        APIServerConfig.from_mapping(
+            {
+                "control_plane": {
+                    "backend": "sqlite",
+                    "path": str(tmp_path / "control-plane.db"),
+                },
+                "middleware": {
+                    "auth": {
+                        "backend": "jwt_hs256",
+                        "jwt_secret": "super-secret",
+                    },
+                    "tenant": {"require_tenant": False},
+                    "rate_limit": {
+                        "enabled": True,
+                        "backend": "sqlite",
+                        "path": str(tmp_path / "rate-limit.db"),
+                        "requests_per_second": 100.0,
+                        "burst": 10,
+                    },
+                },
+                "observability": {
+                    "secrets_backend": "file_vault",
+                    "secret_audit_backend": "jsonl",
+                    "sandbox_backend": "docker",
+                },
+            }
+        )
+    )
+
+    ready = server.handle_request("GET", "/ready")
+
+    assert ready.status_code == 200
+    assert ready.body["status"] == "ready"
+    assert ready.body["ready"] is True
+    checks = {item["name"]: item for item in ready.body["checks"]}
+    assert checks["control_plane"]["readiness_tier"] == "single-node"
+    assert checks["control_plane"]["production_capable"] is True
+    assert checks["auth"]["backend"] == "jwt_hs256"
+    assert checks["rate_limit"]["backend"] == "sqlite"
+    assert checks["secrets"]["backend"] == "file_vault"
+    assert checks["secret_audit"]["backend"] == "jsonl"
+    assert checks["sandbox"]["backend"] == "docker"
 
 
 def test_build_api_server_registers_canonical_public_contract() -> None:
@@ -216,6 +264,15 @@ def test_rate_limit_config_rejects_invalid_bucket_scope() -> None:
         RateLimitMiddlewareConfig.from_mapping(
             {"enabled": True, "bucket_scope": "invalid"}
         )
+
+
+def test_observability_config_rejects_non_string_runtime_backends() -> None:
+    with pytest.raises(ConfigError, match="observability.secrets_backend must be a string"):
+        APIServerConfig.from_mapping({"observability": {"secrets_backend": 123}})
+    with pytest.raises(ConfigError, match="observability.secret_audit_backend must be a string"):
+        APIServerConfig.from_mapping({"observability": {"secret_audit_backend": 123}})
+    with pytest.raises(ConfigError, match="observability.sandbox_backend must be a string"):
+        APIServerConfig.from_mapping({"observability": {"sandbox_backend": 123}})
 
 
 def test_rate_limit_config_rejects_missing_redis_url() -> None:
