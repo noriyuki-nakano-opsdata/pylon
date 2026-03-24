@@ -7,8 +7,10 @@ for compliance and forensics.
 from __future__ import annotations
 
 import enum
+import json
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 
 class AccessAction(enum.Enum):
@@ -85,3 +87,59 @@ class SecretAudit:
     def count(self) -> int:
         """Total number of audit entries."""
         return len(self._entries)
+
+
+class JSONLSecretAudit(SecretAudit):
+    """Durable audit backend backed by an append-only JSONL file."""
+
+    def __init__(self, path: str | Path) -> None:
+        super().__init__()
+        self._path = Path(path).expanduser().resolve()
+        self._load_existing()
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def log_access(
+        self,
+        key: str,
+        actor: str,
+        action: AccessAction,
+        *,
+        details: str = "",
+    ) -> AccessLogEntry:
+        entry = super().log_access(key, actor, action, details=details)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with self._path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "key": entry.key,
+                        "actor": entry.actor,
+                        "action": entry.action.value,
+                        "timestamp": entry.timestamp,
+                        "details": entry.details,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            handle.write("\n")
+        return entry
+
+    def _load_existing(self) -> None:
+        if not self._path.exists():
+            return
+        for line in self._path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            self._entries.append(
+                AccessLogEntry(
+                    key=str(payload["key"]),
+                    actor=str(payload["actor"]),
+                    action=AccessAction(str(payload["action"])),
+                    timestamp=float(payload["timestamp"]),
+                    details=str(payload.get("details", "")),
+                )
+            )

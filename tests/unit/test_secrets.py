@@ -1,11 +1,30 @@
 """Tests for Pylon secret management."""
 
+import io
+import json
+import os
 import time
+from urllib import error as urllib_error
 
-from pylon.secrets.audit import AccessAction, AccessLogEntry, SecretAudit
-from pylon.secrets.manager import SecretManager
+import pytest
+
+import pylon.secrets.vault as vault_module
+from pylon.secrets.audit import (
+    AccessAction,
+    AccessLogEntry,
+    JSONLSecretAudit,
+    SecretAudit,
+)
+from pylon.secrets.manager import SecretManager, VaultSecretManager
 from pylon.secrets.rotation import RotationPolicy, SecretRotation
-from pylon.secrets.vault import InMemoryVaultProvider, VaultConfig, build_path
+from pylon.secrets.vault import (
+    FileVaultProvider,
+    HTTPVaultProvider,
+    InMemoryVaultProvider,
+    VaultConfig,
+    VaultError,
+    build_path,
+)
 
 # ---------------------------------------------------------------------------
 # SecretManager
@@ -217,6 +236,144 @@ class TestVaultProvider:
         assert cfg.token == "root"
 
 
+class TestProductionVaultBackends:
+    def test_file_vault_roundtrip_persists_encrypted_payload(self, tmp_path):
+        path = tmp_path / "vault.json"
+        provider = FileVaultProvider(path, encryption_key=b"bootstrap-key")
+
+        provider.put("secret/tenant-a/db/password", {"value": "s3cret"})
+
+        assert provider.get("secret/tenant-a/db/password") == {"value": "s3cret"}
+        raw = path.read_text(encoding="utf-8")
+        assert "s3cret" not in raw
+        reopened = FileVaultProvider(path, encryption_key=b"bootstrap-key")
+        assert reopened.get("secret/tenant-a/db/password") == {"value": "s3cret"}
+        assert oct(os.stat(path).st_mode & 0o777) == "0o600"
+
+    def test_file_vault_requires_key(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("PYLON_FILE_VAULT_KEY", raising=False)
+        with pytest.raises(VaultError, match="requires encryption_key"):
+            FileVaultProvider(tmp_path / "vault.json")
+
+    def test_http_vault_provider_uses_kv_v2_urls_and_headers(self, monkeypatch):
+        requests: list[dict[str, object]] = []
+
+        class _FakeResponse:
+            def __init__(self, payload: dict[str, object]) -> None:
+                self._payload = payload
+
+            def read(self) -> bytes:
+                return json.dumps(self._payload).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+        def _fake_urlopen(request, timeout=0):
+            requests.append(
+                {
+                    "method": request.get_method(),
+                    "url": request.full_url,
+                    "headers": dict(request.header_items()),
+                    "body": request.data.decode("utf-8") if request.data else "",
+                    "timeout": timeout,
+                }
+            )
+            if request.get_method() == "GET":
+                return _FakeResponse({"data": {"data": {"password": "abc"}}})
+            if request.get_method() == "LIST":
+                return _FakeResponse({"data": {"keys": ["db/", "api"]}})
+            return _FakeResponse({})
+
+        monkeypatch.setattr(vault_module.urllib_request, "urlopen", _fake_urlopen)
+        provider = HTTPVaultProvider(
+            VaultConfig(
+                address="https://vault.example.com",
+                token="root-token",
+                namespace="tenant-space",
+                timeout_seconds=7.5,
+            )
+        )
+
+        provider.put("secret/tenant-a/db/password", {"password": "abc"})
+        secret = provider.get("secret/tenant-a/db/password")
+        keys = provider.list("secret/tenant-a")
+        deleted = provider.delete("secret/tenant-a/db/password")
+
+        assert secret == {"password": "abc"}
+        assert keys == ["secret/tenant-a/db", "secret/tenant-a/api"]
+        assert deleted is True
+        assert requests[0]["method"] == "POST"
+        assert requests[0]["url"] == "https://vault.example.com/v1/secret/data/tenant-a/db/password"
+        assert requests[0]["headers"]["X-vault-token"] == "root-token"
+        assert requests[0]["headers"]["X-vault-namespace"] == "tenant-space"
+        assert requests[1]["method"] == "GET"
+        assert requests[2]["method"] == "LIST"
+        assert requests[2]["url"] == "https://vault.example.com/v1/secret/metadata/tenant-a"
+        assert requests[3]["method"] == "DELETE"
+        assert requests[3]["url"] == "https://vault.example.com/v1/secret/metadata/tenant-a/db/password"
+
+    def test_http_vault_provider_wraps_http_errors(self, monkeypatch):
+        def _fake_urlopen(request, timeout=0):
+            raise urllib_error.HTTPError(
+                request.full_url,
+                403,
+                "forbidden",
+                hdrs=None,
+                fp=io.BytesIO(b'{"errors":["permission denied"]}'),
+            )
+
+        monkeypatch.setattr(vault_module.urllib_request, "urlopen", _fake_urlopen)
+        provider = HTTPVaultProvider(VaultConfig(address="https://vault.example.com", token="root"))
+
+        with pytest.raises(VaultError, match="permission denied"):
+            provider.get("secret/tenant-a/db/password")
+
+
+class TestVaultSecretManager:
+    def test_vault_secret_manager_preserves_versions_and_tenant_isolation(self):
+        provider = InMemoryVaultProvider()
+        audit = SecretAudit()
+        manager = VaultSecretManager("tenant-a", provider, audit=audit)
+        other_tenant = VaultSecretManager("tenant-b", provider)
+
+        meta_v1 = manager.store(
+            "db/password",
+            "first",
+            metadata={"env": "prod"},
+            actor="alice",
+        )
+        meta_v2 = manager.store("db/password", "second", actor="alice")
+        latest = manager.get("db/password", actor="bob")
+        version_one = manager.get_version("db/password", 1, actor="bob")
+        listed = manager.list("db/", actor="carol")
+
+        assert meta_v1.version == 1
+        assert meta_v2.version == 2
+        assert latest is not None
+        assert latest.value == "second"
+        assert latest.version == 2
+        assert version_one is not None
+        assert version_one.value == "first"
+        assert version_one.metadata == {"env": "prod"}
+        assert manager.version_count("db/password") == 2
+        assert [item.key for item in listed] == ["db/password"]
+        assert other_tenant.get("db/password") is None
+        assert audit.count() == 5
+
+    def test_vault_secret_provider_adapter_raises_for_missing_secret(self):
+        provider = InMemoryVaultProvider()
+        manager = VaultSecretManager("tenant-a", provider)
+        secret_provider = manager.as_secret_provider(actor="config-loader")
+
+        manager.store("api/token", "abc123")
+        assert secret_provider.get_secret("api/token") == "abc123"
+        with pytest.raises(KeyError, match="Secret not found"):
+            secret_provider.get_secret("missing")
+
+
 # ---------------------------------------------------------------------------
 # SecretRotation
 # ---------------------------------------------------------------------------
@@ -357,3 +514,18 @@ class TestSecretAudit:
         assert AccessAction.READ.value == "read"
         assert AccessAction.ROTATE.value == "rotate"
         assert AccessAction.LIST.value == "list"
+
+
+class TestJSONLSecretAudit:
+    def test_jsonl_audit_reloads_existing_entries(self, tmp_path):
+        path = tmp_path / "audit.jsonl"
+        audit = JSONLSecretAudit(path)
+
+        entry = audit.log_access("db/pass", "alice", AccessAction.READ, details="lookup")
+        reloaded = JSONLSecretAudit(path)
+
+        assert entry.key == "db/pass"
+        assert reloaded.count() == 1
+        result = reloaded.query(actor="alice")
+        assert len(result) == 1
+        assert result[0].details == "lookup"
